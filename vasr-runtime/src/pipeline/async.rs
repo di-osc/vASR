@@ -55,7 +55,6 @@ struct AsrJob {
 struct AsrSegmentJob {
     job_index: usize,
     speech_annotations: Vec<Annotation>,
-    segment_index: usize,
     segment_count: usize,
     offset: DurationMs,
     waveform: Waveform,
@@ -139,14 +138,14 @@ impl AsyncOfflinePipeline {
         }
 
         let buffer = options.stage_buffer.max(1);
-        let max_batch_size = options.asr_options.max_batch_size;
+        let max_batch_audio_sec = options.asr_options.max_batch_audio_sec;
         let (asr_tx, asr_rx) = mpsc::channel(buffer);
         let (result_tx, mut result_rx) = mpsc::channel(job_count);
 
         let asr_handle = spawn_asr_worker(
             Arc::clone(&self.inner),
             options.asr_options.clone(),
-            max_batch_size,
+            max_batch_audio_sec,
             asr_rx,
             result_tx,
         );
@@ -206,7 +205,6 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
             } else {
                 Vec::new()
             },
-            segment_index,
             segment_count,
             offset: segment.range.start,
             waveform,
@@ -259,7 +257,7 @@ fn spawn_vad_worker(
 fn spawn_asr_worker(
     pipeline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    max_batch_size: usize,
+    max_batch_audio_sec: f32,
     mut asr_rx: mpsc::Receiver<AsrPipelineMessage>,
     result_tx: mpsc::Sender<StageResult>,
 ) -> JoinHandle<Result<()>> {
@@ -269,13 +267,9 @@ fn spawn_asr_worker(
         while let Some(message) = recv_asr_message(&mut pending, &mut asr_rx).await {
             match message {
                 AsrPipelineMessage::Job(job) => {
-                    let jobs = collect_job_microbatch(
-                        job,
-                        max_batch_size.max(1),
-                        &mut asr_rx,
-                        &mut pending,
-                    )
-                    .await;
+                    let jobs =
+                        collect_job_microbatch(job, max_batch_audio_sec, &mut asr_rx, &mut pending)
+                            .await;
                     if jobs.is_empty() {
                         continue;
                     }
@@ -301,7 +295,7 @@ fn spawn_asr_worker(
                 AsrPipelineMessage::Segment(segment) => {
                     let segments = collect_segment_microbatch(
                         segment,
-                        max_batch_size.max(1),
+                        max_batch_audio_sec,
                         &mut asr_rx,
                         &mut pending,
                     )
@@ -341,36 +335,53 @@ async fn recv_asr_message(
 
 async fn collect_job_microbatch(
     first: AsrJob,
-    max_batch_size: usize,
+    max_batch_audio_sec: f32,
     asr_rx: &mut mpsc::Receiver<AsrPipelineMessage>,
     pending: &mut VecDeque<AsrPipelineMessage>,
 ) -> Vec<AsrJob> {
+    let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut jobs = vec![first];
-    if max_batch_size <= 1 {
-        return jobs;
-    }
-    while jobs.len() < max_batch_size {
+    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
         match asr_rx.try_recv() {
-            Ok(AsrPipelineMessage::Job(job)) => jobs.push(job),
+            Ok(AsrPipelineMessage::Job(job)) => {
+                let next_audio_sec = job.waveform.duration_seconds() as f32;
+                if max_batch_audio_sec > 0.0
+                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                {
+                    pending.push_back(AsrPipelineMessage::Job(job));
+                    break;
+                }
+                audio_sec += next_audio_sec;
+                jobs.push(job);
+            }
             Ok(message) => {
-                pending.push_front(message);
-                break;
+                pending.push_back(message);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return jobs,
         }
     }
-    if jobs.len() >= max_batch_size {
-        return jobs;
-    }
-    while jobs.len() < max_batch_size {
-        match asr_rx.recv().await {
-            Some(AsrPipelineMessage::Job(job)) => jobs.push(job),
-            Some(message) => {
-                pending.push_front(message);
-                break;
+    const COLLECT_WAIT_MS: u64 = 500;
+    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(COLLECT_WAIT_MS),
+            asr_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(AsrPipelineMessage::Job(job))) => {
+                let next_audio_sec = job.waveform.duration_seconds() as f32;
+                if max_batch_audio_sec > 0.0
+                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                {
+                    pending.push_back(AsrPipelineMessage::Job(job));
+                    break;
+                }
+                audio_sec += next_audio_sec;
+                jobs.push(job);
             }
-            None => break,
+            Ok(Some(message)) => pending.push_back(message),
+            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
     jobs
@@ -378,36 +389,53 @@ async fn collect_job_microbatch(
 
 async fn collect_segment_microbatch(
     first: AsrSegmentJob,
-    max_batch_size: usize,
+    max_batch_audio_sec: f32,
     asr_rx: &mut mpsc::Receiver<AsrPipelineMessage>,
     pending: &mut VecDeque<AsrPipelineMessage>,
 ) -> Vec<AsrSegmentJob> {
+    let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut segments = vec![first];
-    if max_batch_size <= 1 {
-        return segments;
-    }
-    while segments.len() < max_batch_size {
+    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
         match asr_rx.try_recv() {
-            Ok(AsrPipelineMessage::Segment(segment)) => segments.push(segment),
+            Ok(AsrPipelineMessage::Segment(segment)) => {
+                let next_audio_sec = segment.waveform.duration_seconds() as f32;
+                if max_batch_audio_sec > 0.0
+                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                {
+                    pending.push_back(AsrPipelineMessage::Segment(segment));
+                    break;
+                }
+                audio_sec += next_audio_sec;
+                segments.push(segment);
+            }
             Ok(message) => {
-                pending.push_front(message);
-                break;
+                pending.push_back(message);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return segments,
         }
     }
-    if segments.len() >= max_batch_size {
-        return segments;
-    }
-    while segments.len() < max_batch_size {
-        match asr_rx.recv().await {
-            Some(AsrPipelineMessage::Segment(segment)) => segments.push(segment),
-            Some(message) => {
-                pending.push_front(message);
-                break;
+    const COLLECT_WAIT_MS: u64 = 500;
+    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(COLLECT_WAIT_MS),
+            asr_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(AsrPipelineMessage::Segment(segment))) => {
+                let next_audio_sec = segment.waveform.duration_seconds() as f32;
+                if max_batch_audio_sec > 0.0
+                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                {
+                    pending.push_back(AsrPipelineMessage::Segment(segment));
+                    break;
+                }
+                audio_sec += next_audio_sec;
+                segments.push(segment);
             }
-            None => break,
+            Ok(Some(message)) => pending.push_back(message),
+            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
     segments
@@ -670,13 +698,12 @@ mod tests {
         });
         let (asr_tx, asr_rx) = mpsc::channel(4);
         let (result_tx, mut result_rx) = mpsc::channel(4);
-        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 4, asr_rx, result_tx);
+        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 60.0, asr_rx, result_tx);
 
         asr_tx
             .send(AsrPipelineMessage::Segment(AsrSegmentJob {
                 job_index: 0,
                 speech_annotations: Vec::new(),
-                segment_index: 0,
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),
@@ -726,7 +753,7 @@ mod tests {
         });
         let (asr_tx, asr_rx) = mpsc::channel(4);
         let (result_tx, mut result_rx) = mpsc::channel(4);
-        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 4, asr_rx, result_tx);
+        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 60.0, asr_rx, result_tx);
 
         asr_tx
             .send(AsrPipelineMessage::Job(AsrJob {
@@ -740,7 +767,6 @@ mod tests {
             .send(AsrPipelineMessage::Segment(AsrSegmentJob {
                 job_index: 1,
                 speech_annotations: Vec::new(),
-                segment_index: 0,
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),

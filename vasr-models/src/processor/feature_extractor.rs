@@ -7,7 +7,7 @@
 use anyhow::Result;
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 #[derive(Debug, Clone)]
 pub struct Features {
@@ -21,24 +21,7 @@ pub struct Features {
 /// - `input_features`: shape `(num_mel_bins=128, frames)`, matching HF layout.
 /// - `feature_attention_mask`: shape `(frames,)`, 1 for real frames (no padding).
 pub fn extract_features(wav_16k_mono: &[f32]) -> Result<Features> {
-    // Defaults from `preprocessor_config.json` used by Qwen3-ASR.
-    let cfg = WhisperFeatureExtractorConfig::default();
-    let frames = wav_16k_mono.len() / cfg.hop_length;
-
-    if frames == 0 {
-        return Ok(Features {
-            input_features: vec![vec![]; cfg.feature_size],
-            feature_attention_mask: vec![],
-        });
-    }
-
-    let wav_f64: Vec<f64> = wav_16k_mono.iter().map(|&x| f64::from(x)).collect();
-    let input_features = extract_log_mel_frames(&cfg, wav_f64.len(), frames, |src| wav_f64[src])?;
-
-    Ok(Features {
-        input_features,
-        feature_attention_mask: vec![1u8; frames],
-    })
+    OFFLINE_EXTRACTOR.extract_features(wav_16k_mono)
 }
 
 /// Extract real-frame log-mel features using a longer zero-padded waveform length.
@@ -49,116 +32,171 @@ pub fn extract_features_with_padded_waveform_len(
     wav_16k_mono: &[f32],
     padded_len: usize,
 ) -> Result<Features> {
-    let cfg = WhisperFeatureExtractorConfig::default();
-    if padded_len < wav_16k_mono.len() {
-        anyhow::bail!(
-            "padded waveform length {} is shorter than waveform length {}",
-            padded_len,
-            wav_16k_mono.len()
-        );
-    }
-
-    let frames_total = padded_len / cfg.hop_length;
-    let frames = if wav_16k_mono.is_empty() {
-        0
-    } else {
-        wav_16k_mono
-            .len()
-            .div_ceil(cfg.hop_length)
-            .min(frames_total)
-    };
-
-    if frames == 0 {
-        return Ok(Features {
-            input_features: vec![vec![]; cfg.feature_size],
-            feature_attention_mask: vec![],
-        });
-    }
-
-    let input_features = extract_log_mel_frames(&cfg, padded_len, frames, |src| {
-        wav_16k_mono.get(src).copied().map(f64::from).unwrap_or(0.0)
-    })?;
-
-    Ok(Features {
-        input_features,
-        feature_attention_mask: vec![1u8; frames],
-    })
+    OFFLINE_EXTRACTOR.extract_features_with_padded_waveform_len(wav_16k_mono, padded_len)
 }
 
-fn extract_log_mel_frames<F>(
-    cfg: &WhisperFeatureExtractorConfig,
-    source_len: usize,
-    frames: usize,
-    sample_at: F,
-) -> Result<Vec<Vec<f32>>>
-where
-    F: Fn(usize) -> f64,
-{
-    if source_len == 0 {
-        return Ok(vec![vec![]; cfg.feature_size]);
-    }
+static OFFLINE_EXTRACTOR: LazyLock<OfflineFeatureExtractor> =
+    LazyLock::new(OfflineFeatureExtractor::new);
 
-    let window = hann_window_periodic(cfg.n_fft);
-    let mel_filters_t = mel_filter_bank_slaney_t(
-        1 + cfg.n_fft / 2,
-        cfg.feature_size,
-        0.0,
-        cfg.max_frequency_hz,
-        cfg.sampling_rate_hz,
-    );
+struct OfflineFeatureExtractor {
+    cfg: WhisperFeatureExtractorConfig,
+    window: Vec<f64>,
+    mel_filters_sparse: Vec<Vec<(usize, f64)>>,
+    fft: Arc<dyn rustfft::Fft<f64>>,
+}
 
-    let n_freq = 1 + cfg.n_fft / 2;
-    let mut planner = FftPlanner::<f64>::new();
-    let fft = planner.plan_fft_forward(cfg.n_fft);
-
-    let mut buf: Vec<rustfft::num_complex::Complex<f64>> =
-        vec![rustfft::num_complex::Complex::new(0.0, 0.0); cfg.n_fft];
-    let mut mags: Vec<f64> = vec![0.0; n_freq];
-
-    // (feature_size, frames)
-    let mut log_spec: Vec<Vec<f32>> = (0..cfg.feature_size)
-        .map(|_| Vec::with_capacity(frames))
-        .collect();
-    let mut max_log: f32 = f32::NEG_INFINITY;
-
-    for frame_idx in 0..frames {
-        let start = frame_idx * cfg.hop_length;
-
-        for i in 0..cfg.n_fft {
-            let idx = start as isize + i as isize - (cfg.n_fft / 2) as isize;
-            let src = reflect_index(idx, source_len);
-            let x = sample_at(src);
-            buf[i] = rustfft::num_complex::Complex::new(x * window[i], 0.0);
-        }
-
-        fft.process(&mut buf);
-
-        for k in 0..n_freq {
-            let c = buf[k];
-            mags[k] = c.re.mul_add(c.re, c.im * c.im);
-        }
-
-        for (mel_row, filter_row) in log_spec.iter_mut().zip(mel_filters_t.iter()) {
-            let mut sum = 0.0f64;
-            for (w, mag) in filter_row.iter().zip(mags.iter()) {
-                sum = (*w).mul_add(*mag, sum);
-            }
-            if sum < cfg.mel_floor {
-                sum = cfg.mel_floor;
-            }
-            let log10 = sum.log10() as f32;
-            if log10 > max_log {
-                max_log = log10;
-            }
-            mel_row.push(log10);
+impl OfflineFeatureExtractor {
+    fn new() -> Self {
+        let cfg = WhisperFeatureExtractorConfig::default();
+        let window = hann_window_periodic(cfg.n_fft);
+        let mel_filters_t = mel_filter_bank_slaney_t(
+            1 + cfg.n_fft / 2,
+            cfg.feature_size,
+            0.0,
+            cfg.max_frequency_hz,
+            cfg.sampling_rate_hz,
+        );
+        let mel_filters_sparse = mel_filters_t
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .enumerate()
+                    .filter(|(_, w)| *w != 0.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(cfg.n_fft);
+        Self {
+            cfg,
+            window,
+            mel_filters_sparse,
+            fft,
         }
     }
 
-    // Dynamic range compression, matching HF:
-    //   log_spec = max(log_spec, max(log_spec) - 8)
-    //   log_spec = (log_spec + 4) / 4
+    fn extract_features(&self, wav_16k_mono: &[f32]) -> Result<Features> {
+        let frames = wav_16k_mono.len() / self.cfg.hop_length;
+        if frames == 0 {
+            return Ok(Features {
+                input_features: vec![vec![]; self.cfg.feature_size],
+                feature_attention_mask: vec![],
+            });
+        }
+
+        let wav_f64: Vec<f64> = wav_16k_mono.iter().map(|&x| f64::from(x)).collect();
+        let input_features =
+            self.extract_log_mel_frames(wav_f64.len(), frames, |src| wav_f64[src])?;
+
+        Ok(Features {
+            input_features,
+            feature_attention_mask: vec![1u8; frames],
+        })
+    }
+
+    fn extract_features_with_padded_waveform_len(
+        &self,
+        wav_16k_mono: &[f32],
+        padded_len: usize,
+    ) -> Result<Features> {
+        if padded_len < wav_16k_mono.len() {
+            anyhow::bail!(
+                "padded waveform length {} is shorter than waveform length {}",
+                padded_len,
+                wav_16k_mono.len()
+            );
+        }
+
+        let frames_total = padded_len / self.cfg.hop_length;
+        let frames = if wav_16k_mono.is_empty() {
+            0
+        } else {
+            wav_16k_mono
+                .len()
+                .div_ceil(self.cfg.hop_length)
+                .min(frames_total)
+        };
+
+        if frames == 0 {
+            return Ok(Features {
+                input_features: vec![vec![]; self.cfg.feature_size],
+                feature_attention_mask: vec![],
+            });
+        }
+
+        let input_features = self.extract_log_mel_frames(padded_len, frames, |src| {
+            wav_16k_mono.get(src).copied().map(f64::from).unwrap_or(0.0)
+        })?;
+
+        Ok(Features {
+            input_features,
+            feature_attention_mask: vec![1u8; frames],
+        })
+    }
+
+    fn extract_log_mel_frames<F>(
+        &self,
+        source_len: usize,
+        frames: usize,
+        sample_at: F,
+    ) -> Result<Vec<Vec<f32>>>
+    where
+        F: Fn(usize) -> f64,
+    {
+        if source_len == 0 {
+            return Ok(vec![vec![]; self.cfg.feature_size]);
+        }
+
+        let n_freq = 1 + self.cfg.n_fft / 2;
+        let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); self.cfg.n_fft];
+        let mut mags: Vec<f64> = vec![0.0; n_freq];
+
+        let mut log_spec: Vec<Vec<f32>> = (0..self.cfg.feature_size)
+            .map(|_| Vec::with_capacity(frames))
+            .collect();
+        let mut max_log: f32 = f32::NEG_INFINITY;
+
+        for frame_idx in 0..frames {
+            let start = frame_idx * self.cfg.hop_length;
+
+            for i in 0..self.cfg.n_fft {
+                let idx = start as isize + i as isize - (self.cfg.n_fft / 2) as isize;
+                let src = reflect_index(idx, source_len);
+                let x = sample_at(src);
+                buf[i] = Complex::new(x * self.window[i], 0.0);
+            }
+
+            self.fft.process(&mut buf);
+
+            for k in 0..n_freq {
+                let c = buf[k];
+                mags[k] = c.re.mul_add(c.re, c.im * c.im);
+            }
+
+            for (mel_row, filter_row) in log_spec.iter_mut().zip(self.mel_filters_sparse.iter()) {
+                let mut sum = 0.0f64;
+                for &(idx, w) in filter_row {
+                    sum = w.mul_add(mags[idx], sum);
+                }
+                if sum < self.cfg.mel_floor {
+                    sum = self.cfg.mel_floor;
+                }
+                let log10 = sum.log10() as f32;
+                if log10 > max_log {
+                    max_log = log10;
+                }
+                mel_row.push(log10);
+            }
+        }
+
+        compress_log_spec(log_spec.as_mut_slice(), max_log);
+        Ok(log_spec)
+    }
+}
+
+fn compress_log_spec(log_spec: &mut [Vec<f32>], max_log: f32) {
     let floor = max_log - 8.0f32;
-    for mel in &mut log_spec {
+    for mel in log_spec {
         for v in mel {
             if *v < floor {
                 *v = floor;
@@ -166,8 +204,6 @@ where
             *v = (*v + 4.0f32) / 4.0f32;
         }
     }
-
-    Ok(log_spec)
 }
 
 /// Incremental log-mel feature extraction for streaming transcription.

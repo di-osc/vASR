@@ -38,29 +38,13 @@ pub struct CommonModelArgs {
     #[arg(long, default_value_t = 512, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
-    /// PagedAttention KV pool as a fraction of total GPU memory (CUDA). Used when `pa_context_len` is 0.
+    /// Target GPU memory utilization for model weights plus PagedAttention KV cache (CUDA).
     #[arg(
-        long = "pa-gpu-memory-fraction",
+        long = "gpu-memory-utilization",
         default_value_t = 0.65,
-        env = "VASR_PA_GPU_MEMORY_FRACTION"
+        env = "VASR_GPU_MEMORY_UTILIZATION"
     )]
-    pub pa_gpu_memory_fraction: f32,
-
-    /// Explicit KV context tokens. Set 0 to auto-size from `--pa-gpu-memory-fraction`.
-    #[arg(
-        long = "pa-context-len",
-        default_value_t = 0,
-        env = "VASR_PA_CONTEXT_LEN"
-    )]
-    pub pa_context_len: usize,
-
-    /// PagedAttention block size. Supported values: 8, 16, 32.
-    #[arg(
-        long = "pa-block-size",
-        default_value_t = 32,
-        env = "VASR_PA_BLOCK_SIZE"
-    )]
-    pub pa_block_size: usize,
+    pub gpu_memory_utilization: f32,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -80,14 +64,6 @@ pub struct VadCliArgs {
     /// Minimum trailing silence in milliseconds before ending a speech segment.
     #[arg(long, default_value_t = 500, env = "VASR_VAD_MIN_SILENCE_MS")]
     pub vad_min_silence_ms: u64,
-
-    /// Merge adjacent offline VAD segments across gaps up to this many milliseconds.
-    #[arg(long, default_value_t = 2_000, env = "VASR_VAD_MERGE_MAX_GAP_MS")]
-    pub vad_merge_max_gap_ms: u64,
-
-    /// Maximum merged offline ASR slice duration in milliseconds.
-    #[arg(long, default_value_t = 30_000, env = "VASR_VAD_MERGE_MAX_SEGMENT_MS")]
-    pub vad_merge_max_segment_ms: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -117,7 +93,7 @@ pub fn init_logging(verbose: bool) {
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+        .with_timer(tracing_subscriber::fmt::time::SystemTime)
         .with_target(true)
         .compact()
         .init();
@@ -128,8 +104,7 @@ fn vad_options_from_args(vad: &VadCliArgs) -> VadOptions {
         threshold: vad.vad_threshold,
         min_speech_ms: vad.vad_min_speech_ms,
         min_silence_ms: vad.vad_min_silence_ms,
-        merge_max_gap_ms: vad.vad_merge_max_gap_ms,
-        merge_max_segment_ms: vad.vad_merge_max_segment_ms,
+        ..VadOptions::default()
     }
 }
 
@@ -173,8 +148,8 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.max_new_tokens == 0 {
         bail!("--max-new-tokens must be greater than zero");
     }
-    if !(args.pa_gpu_memory_fraction > 0.0 && args.pa_gpu_memory_fraction <= 1.0) {
-        bail!("--pa-gpu-memory-fraction must be in (0.0, 1.0]");
+    if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
+        bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
     }
     Ok(())
 }
@@ -182,19 +157,15 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
 #[cfg(any(feature = "metal", feature = "cuda"))]
 fn build_paged_cache_config(
     device: &Device,
-    pa_context_len: usize,
-    pa_gpu_memory_fraction: f32,
-    pa_block_size: usize,
+    gpu_memory_utilization: f32,
 ) -> Result<PagedCacheConfig> {
-    let memory = if pa_context_len > 0 {
-        PagedCacheMemory::ContextSize(pa_context_len)
-    } else if device.is_cuda() {
-        PagedCacheMemory::GpuMemoryFraction(pa_gpu_memory_fraction)
+    let memory = if device.is_cuda() {
+        PagedCacheMemory::GpuMemoryFraction(gpu_memory_utilization)
     } else {
         PagedCacheMemory::ContextSize(4096)
     };
     Ok(PagedCacheConfig {
-        block_size: pa_block_size,
+        block_size: 32,
         memory,
     })
 }
@@ -205,7 +176,7 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
         PagedCacheMemory::ContextSize(tokens) => format!("context_tokens={tokens}"),
         PagedCacheMemory::Blocks(blocks) => format!("blocks={blocks}"),
         PagedCacheMemory::GpuMemoryFraction(fraction) => {
-            format!("gpu_memory_fraction={fraction}")
+            format!("gpu_memory_utilization={fraction}")
         }
     };
     tracing::info!(
@@ -219,6 +190,11 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
     );
 }
 
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+fn bytes_to_mib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
     if !(0.0..=1.0).contains(&vad.vad_threshold) {
         bail!("--vad-threshold must be between 0.0 and 1.0");
@@ -228,12 +204,6 @@ fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
     }
     if vad.vad_min_silence_ms == 0 {
         bail!("--vad-min-silence-ms must be greater than zero");
-    }
-    if vad.vad_merge_max_gap_ms == 0 {
-        bail!("--vad-merge-max-gap-ms must be greater than zero");
-    }
-    if vad.vad_merge_max_segment_ms == 0 {
-        bail!("--vad-merge-max-segment-ms must be greater than zero");
     }
     Ok(())
 }
@@ -247,12 +217,7 @@ fn load_asr_model(
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
     #[cfg(any(feature = "metal", feature = "cuda"))]
-    let paged_cache_config = build_paged_cache_config(
-        &device,
-        args.pa_context_len,
-        args.pa_gpu_memory_fraction,
-        args.pa_block_size,
-    )?;
+    let paged_cache_config = build_paged_cache_config(&device, args.gpu_memory_utilization)?;
     let load_options = LoadOptions {
         dtype,
         use_flash_attn: device.is_cuda(),
@@ -305,12 +270,29 @@ fn load_asr_model(
     #[cfg(feature = "cuda-graph")]
     if let Some(max_batch) = cuda_graph_max_batch.filter(|&n| n > 0) {
         let prewarm_start = Instant::now();
-        let captured = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
-        tracing::info!(
-            target: "vasr_realtime::serve",
-            "CUDA decode graph prewarm: graphs={captured} max_batch={max_batch} elapsed={:.3}s.",
-            prewarm_start.elapsed().as_secs_f64()
-        );
+        let stats = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
+        if let (Some(before), Some(after)) = (stats.memory_before, stats.memory_after) {
+            let used_before = before.used();
+            let used_after = after.used();
+            tracing::info!(
+                target: "vasr_realtime::serve",
+                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB.",
+                stats.graphs,
+                prewarm_start.elapsed().as_secs_f64(),
+                bytes_to_mib(used_after.saturating_sub(used_before)),
+                bytes_to_mib(used_before),
+                bytes_to_mib(used_after),
+                bytes_to_mib(after.free),
+                bytes_to_mib(after.total),
+            );
+        } else {
+            tracing::info!(
+                target: "vasr_realtime::serve",
+                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s.",
+                stats.graphs,
+                prewarm_start.elapsed().as_secs_f64()
+            );
+        }
     }
     tracing::info!(
         target: "vasr_realtime::serve",

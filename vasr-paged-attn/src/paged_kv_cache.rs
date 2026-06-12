@@ -968,31 +968,12 @@ impl PagedKvCache {
         let mut all_contexts: Vec<u32> = Vec::with_capacity(steps.saturating_mul(batch));
         let mut max_context_lens = Vec::with_capacity(steps);
 
-        tracing::info!(
-            "decode_metadata_for_batch_steps: batch={batch} steps={steps} block_size={} max_tokens_per_seq={}",
-            self.block_size,
-            self.max_tokens_per_sequence
-        );
-        for seq in 0..batch {
-            let table = &block_tables[seq];
-            tracing::info!(
-                "  seq={seq} prompt_len={} block_table_len={} block_table={:?}",
-                prompt_lens[seq],
-                table.len(),
-                table,
-            );
-        }
         for step in 0..steps {
             let mut step_max_context = 0usize;
             for seq in 0..batch {
                 let position = prompt_lens[seq].checked_add(step).ok_or_else(|| {
                     candle_core::Error::Msg("batch decode slot position overflow".to_string())
                 })?;
-                let block_idx = position / self.block_size;
-                tracing::info!(
-                    "  step={step} seq={seq} position={position} block_idx={block_idx} table_len={}",
-                    block_tables[seq].len(),
-                );
                 let context_len = position.checked_add(1).ok_or_else(|| {
                     candle_core::Error::Msg("batch decode context length overflow".to_string())
                 })?;
@@ -1327,8 +1308,7 @@ mod tests {
         #[cfg(feature = "cuda-graph")]
         let padded_block_tables: Vec<Vec<usize>> = {
             let raw_max = block_tables.iter().map(Vec::len).max().unwrap_or(0);
-            let cols =
-                crate::model::cuda_graph::bucket_block_table_cols(raw_max, cache.block_size());
+            let cols = crate::cuda_graph::bucket_block_table_cols(raw_max, cache.block_size());
             block_tables
                 .iter()
                 .map(|table| {

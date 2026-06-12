@@ -6,7 +6,9 @@ pub struct AsrOptions {
     pub language: Option<String>,
     pub context: String,
     pub max_new_tokens: usize,
-    pub max_batch_size: usize,
+    /// Maximum concurrently decoded sequences. `0` uses the recognizer default.
+    pub decode_max_seqs: usize,
+    /// Maximum total audio duration (seconds) per ASR pool. `0` disables duration grouping.
     pub max_batch_audio_sec: f32,
     pub chunk_max_sec: Option<f32>,
 }
@@ -17,7 +19,7 @@ impl Default for AsrOptions {
             language: None,
             context: String::new(),
             max_new_tokens: 128,
-            max_batch_size: 0,
+            decode_max_seqs: 0,
             max_batch_audio_sec: 60.0,
             chunk_max_sec: None,
         }
@@ -55,10 +57,8 @@ pub struct VadOptions {
     pub min_speech_ms: u64,
     /// `max_end_silence_time` in funasr_onnx / fasr (default 500).
     pub min_silence_ms: u64,
-    /// Merge adjacent offline VAD segments across short gaps before ASR.
-    pub merge_max_gap_ms: u64,
-    /// Maximum merged offline ASR slice duration.
-    pub merge_max_segment_ms: u64,
+    /// Maximum offline VAD segment duration before ASR slicing.
+    pub max_segment_ms: u64,
 }
 
 impl Default for VadOptions {
@@ -67,8 +67,7 @@ impl Default for VadOptions {
             threshold: 0.5,
             min_speech_ms: 250,
             min_silence_ms: 500,
-            merge_max_gap_ms: 2_000,
-            merge_max_segment_ms: 30_000,
+            max_segment_ms: 30_000,
         }
     }
 }
@@ -82,8 +81,7 @@ mod tests {
         let opts = VadOptions::default();
         assert_eq!(opts.threshold, 0.5);
         assert_eq!(opts.min_silence_ms, 500);
-        assert_eq!(opts.merge_max_gap_ms, 2_000);
-        assert_eq!(opts.merge_max_segment_ms, 30_000);
+        assert_eq!(opts.max_segment_ms, 30_000);
     }
 }
 

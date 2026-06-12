@@ -182,10 +182,13 @@ fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     let cache = crate::modelscope_cache_dir();
     let target = cache.join(repo_id);
     if target.exists() {
-        tracing::info!("Model `{repo_id}` found at {}", target.display());
-        return Ok(target);
+        tracing::info!(
+            "Model `{repo_id}` found at {}, validating cache",
+            target.display()
+        );
+    } else {
+        tracing::info!("Downloading model `{repo_id}` to {}", cache.display());
     }
-    tracing::info!("Downloading model `{repo_id}` to {}", cache.display());
     block_on_async(crate::download::download_model(repo_id, &cache))
         .with_context(|| format!("failed to download model {repo_id:?} from ModelScope"))?;
     Ok(target)
@@ -254,7 +257,7 @@ fn shard_paths_from_local_index(model_dir: &Path, index_path: &Path) -> Result<V
     Ok(out)
 }
 
-fn ensure_weights_files(model_id_or_path: &str, model_dir: &Path) -> Result<Vec<PathBuf>> {
+fn ensure_weights_files(_model_id_or_path: &str, model_dir: &Path) -> Result<Vec<PathBuf>> {
     let single = model_dir.join("model.safetensors");
     if single.exists() {
         return Ok(vec![single]);

@@ -113,11 +113,10 @@ pub fn build_transcribe_service_from_parts(
     offline: Arc<vasr_runtime::OfflinePipeline>,
     asr_options: AsrOptions,
     vad_options: VadOptions,
-    max_batch_size: usize,
 ) -> Arc<TranscribeService> {
     build_transcribe_service(Arc::new(
         AsyncTranscribePipeline::new(vasr_audio::AudioLoader, offline, asr_options)
             .with_vad_options(vad_options)
-            .with_stage_buffer(max_batch_size),
+            .with_stage_buffer(20),
     ))
 }

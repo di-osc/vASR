@@ -18,7 +18,7 @@ Primary target:
 - Workload: one HTTP `/transcribe` request containing 20 wav files from
   `raw_audios`
 - Audio total duration: `1652.0855 s`
-- CUDA graph prewarm: `graphs=12`, `max_batch=20`
+- CUDA graph prewarm: `graphs=12`, `max_batch=20`; ASR pool bounded by `--max-batch-audio-sec`
 - VAD: FSMN VAD on CUDA unless noted otherwise
 
 Server command:
@@ -31,7 +31,6 @@ RUST_LOG=info ./target/release/vasr serve transcribe \
   --port 18080 \
   --device cuda \
   --dtype bf16 \
-  --max-batch-size 20 \
   --max-batch-audio-sec 180 \
   --vad-model /home/featurize/work/Qwen3ASR.rs/.cache/fsmn-vad
 ```

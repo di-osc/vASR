@@ -76,6 +76,9 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
 
     let mut total_audio_seconds = 0.0;
     let mut bad_count = 0usize;
+    let postprocess_start = Instant::now();
+    let mut response_seconds = 0.0;
+    let mut write_seconds = 0.0;
 
     for (path, outcome) in files.iter().zip(outcomes.iter()) {
         total_audio_seconds += outcome.audio_seconds;
@@ -86,7 +89,9 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
             })?;
         }
 
+        let response_start = Instant::now();
         let response = transcribe_response_for_outcome(path, outcome, batch_wall, files.len());
+        response_seconds += response_start.elapsed().as_secs_f64();
         if response.data.first().is_some_and(|item| item.is_bad) {
             bad_count += 1;
             let reason = outcome
@@ -105,10 +110,12 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
             );
         }
 
-        let file = fs::File::create(&output_path)
-            .with_context(|| format!("failed to create output file {}", output_path.display()))?;
-        serde_json::to_writer_pretty(&file, &response)
+        let write_start = Instant::now();
+        let json = serde_json::to_vec_pretty(&response)
+            .with_context(|| format!("failed to encode JSON for {}", output_path.display()))?;
+        fs::write(&output_path, json)
             .with_context(|| format!("failed to write JSON to {}", output_path.display()))?;
+        write_seconds += write_start.elapsed().as_secs_f64();
 
         tracing::debug!(
             target: "vasr_transcribe::run",
@@ -119,6 +126,14 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
 
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
+    tracing::info!(
+        target: "vasr_transcribe::run",
+        "Postprocess: files={} response={:.3}s write={:.3}s total={:.3}s.",
+        files.len(),
+        response_seconds,
+        write_seconds,
+        postprocess_start.elapsed().as_secs_f64(),
+    );
     tracing::info!(
         target: "vasr_transcribe::run",
         "Done: files={} bad={} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4}",

@@ -6,7 +6,7 @@
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
@@ -24,6 +24,36 @@ thread_local! {
 #[cfg(feature = "paged-attn")]
 const PAGED_CACHE_BLOCK_SIZE: usize = 32;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeStepDistribution {
+    count: usize,
+    min: usize,
+    p50: usize,
+    p90: usize,
+    max: usize,
+}
+
+fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistribution {
+    let mut steps = Vec::new();
+    for (&step, &count) in counts {
+        steps.extend(std::iter::repeat(step).take(count));
+    }
+    if steps.is_empty() {
+        return DecodeStepDistribution::default();
+    }
+    let len = steps.len();
+    let percentile = |pct: usize| -> usize {
+        let idx = len.saturating_sub(1).saturating_mul(pct).div_ceil(100);
+        steps[idx.min(len - 1)]
+    };
+    DecodeStepDistribution {
+        count: len,
+        min: steps[0],
+        p50: percentile(50),
+        p90: percentile(90),
+        max: steps[len - 1],
+    }
+}
 #[cfg(feature = "timing")]
 fn duration_to_us(d: std::time::Duration) -> u64 {
     let us = d.as_micros();
@@ -144,11 +174,6 @@ fn metal_argmax_scratch_for_device(device: &Device) -> Option<vasr_quant::MetalA
     } else {
         None
     }
-}
-
-#[cfg(not(feature = "metal-paged-attn"))]
-fn metal_argmax_scratch_for_device(_device: &Device) -> Option<()> {
-    None
 }
 
 #[cfg(feature = "metal-paged-attn")]
@@ -826,10 +851,11 @@ fn greedy_generate_cached_batch_impl(
     #[cfg(feature = "timing")]
     let start_prefill = std::time::Instant::now();
     let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
-    #[cfg(feature = "timing")]
-    let mut prefill_token_count = 0usize;
     let mut next_ids = None;
+    #[cfg(feature = "paged-attn")]
     let mut force_masked_decode = false;
+    #[cfg(not(feature = "paged-attn"))]
+    let force_masked_decode = false;
     #[cfg(feature = "paged-attn")]
     if metal_hybrid_paged_prefill_enabled(device, batch, opts.paged_runtime, opts.audio_features) {
         tracing::debug!(
@@ -872,14 +898,11 @@ fn greedy_generate_cached_batch_impl(
         next_ids = Some(state.next_ids);
         force_masked_decode = true;
         #[cfg(feature = "timing")]
-        {
-            prefill_token_count = prompt_lens
+        if let Some(t) = timings.as_mut() {
+            let prefill_token_count = prompt_lens
                 .iter()
                 .map(|&len| usize::try_from(len).unwrap_or(0))
                 .sum();
-        }
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
             let elapsed = duration_to_us(start_prefill.elapsed());
             t.prefill_us = t.prefill_us.saturating_add(elapsed);
             t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
@@ -1066,18 +1089,15 @@ fn greedy_generate_cached_batch_impl(
         } else {
             prompt_lens.clone()
         };
-        #[cfg(feature = "timing")]
-        {
-            prefill_token_count = prefill_prompt_lens
-                .iter()
-                .map(|&len| usize::try_from(len).unwrap_or(0))
-                .sum();
-        }
         let last_logits =
             gather_last_logits_for_prompt_lens(&logits, prefill_prompt_lens.as_slice())?;
         next_ids = Some(argmax_token_ids_from_logits(&last_logits, batch)?);
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
+            let prefill_token_count = prefill_prompt_lens
+                .iter()
+                .map(|&len| usize::try_from(len).unwrap_or(0))
+                .sum();
             t.prefill_us = t
                 .prefill_us
                 .saturating_add(duration_to_us(start_prefill.elapsed()));
@@ -1113,10 +1133,17 @@ fn greedy_generate_cached_batch_impl(
     let mut decode_argmax_us = 0u64;
     #[cfg(feature = "metal-paged-attn")]
     let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
+    let mut decode_active_slots_by_step: Vec<(usize, usize)> = Vec::new();
+    let mut decode_finished_slots_by_step: BTreeMap<usize, usize> = BTreeMap::new();
     let _linear_decode_guard = set_linear_is_prefill(false);
     for step in 0..opts.max_new_tokens {
         if finished.iter().all(|&x| x) {
             break;
+        }
+        let active_slots = finished.iter().filter(|&&done| !done).count();
+        decode_active_slots_by_step.push((step, active_slots));
+        if step % 50 == 0 || active_slots <= 2 {
+            tracing::debug!("batch decode | step={step} active_slots={active_slots}/{batch}",);
         }
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
@@ -1138,6 +1165,7 @@ fn greedy_generate_cached_batch_impl(
                 .ok_or_else(|| anyhow::anyhow!("missing next_id for batch index {i}"))?;
             if opts.eos_token_ids.contains(&tok) {
                 finished[i] = true;
+                *decode_finished_slots_by_step.entry(step).or_default() += 1;
                 tokens_in.push(eos_fill_id);
             } else {
                 generated[i].push(tok);
@@ -1218,6 +1246,62 @@ fn greedy_generate_cached_batch_impl(
                 decode_argmax_us.saturating_add(duration_to_us(start_argmax.elapsed()));
         }
         next_ids = next;
+    }
+    if !decode_active_slots_by_step.is_empty() {
+        let calls = decode_active_slots_by_step.len();
+        let total_active_slots = decode_active_slots_by_step
+            .iter()
+            .map(|(_, active)| *active)
+            .sum::<usize>();
+        let avg_active = total_active_slots as f64 / calls as f64;
+        let occupancy = if batch == 0 {
+            0.0
+        } else {
+            total_active_slots as f64 / (calls * batch) as f64
+        };
+        let max_active = decode_active_slots_by_step
+            .iter()
+            .map(|(_, active)| *active)
+            .max()
+            .unwrap_or(0);
+        let one_slot_calls = decode_active_slots_by_step
+            .iter()
+            .filter(|(_, active)| *active == 1)
+            .count();
+        let two_or_less_calls = decode_active_slots_by_step
+            .iter()
+            .filter(|(_, active)| *active <= 2)
+            .count();
+        let tail50_one_slot_calls = decode_active_slots_by_step
+            .iter()
+            .rev()
+            .take(50)
+            .filter(|(_, active)| *active == 1)
+            .count();
+        let tail50_two_or_less_calls = decode_active_slots_by_step
+            .iter()
+            .rev()
+            .take(50)
+            .filter(|(_, active)| *active <= 2)
+            .count();
+        let finished_steps = decode_step_distribution(&decode_finished_slots_by_step);
+        tracing::info!(
+            "batch decode summary | calls={} max_slots={} avg_active={:.2} occupancy={:.1}% max_active={} one_slot_calls={} two_or_less_calls={} tail50_one_slot_calls={} tail50_two_or_less_calls={} finished_slots={} finished_step_min/p50/p90/max={}/{}/{}/{}",
+            calls,
+            batch,
+            avg_active,
+            occupancy * 100.0,
+            max_active,
+            one_slot_calls,
+            two_or_less_calls,
+            tail50_one_slot_calls,
+            tail50_two_or_less_calls,
+            finished_steps.count,
+            finished_steps.min,
+            finished_steps.p50,
+            finished_steps.p90,
+            finished_steps.max,
+        );
     }
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {

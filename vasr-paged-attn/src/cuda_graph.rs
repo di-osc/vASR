@@ -1,7 +1,7 @@
 //! CUDA graph replay for single-token paged decode.
 
 use crate::decode_forward::PagedCudaDecodeForward;
-use crate::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
+use crate::paged_kv_cache::{PAD_SLOT_ID, PagedInputMetadata, PagedKvCache};
 use anyhow::{Result, anyhow, bail};
 use candle_core::cuda_backend::CudaDType;
 use candle_core::cuda_backend::cudarc::driver::sys::{
@@ -17,8 +17,54 @@ use vasr_quant::isq_linear::set_linear_is_prefill;
 pub const CUDA_GRAPH_CONTEXT_BUCKET_TOKENS: usize = 256;
 /// Maximum decode batch width for vLLM-style padded CUDA graph capture/replay.
 pub const CUDA_DECODE_GRAPH_MAX_BATCH: usize = 256;
-/// Maximum cached graphs keyed by block-table width (context bucket).
+/// Fixed block-table width for CUDA graph decode replay.
+pub const CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS: usize = 16;
+/// Maximum cached decode graphs.
 pub const CUDA_DECODE_GRAPH_MAX_GRAPHS: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CudaMemorySnapshot {
+    pub free: usize,
+    pub total: usize,
+}
+
+impl CudaMemorySnapshot {
+    pub fn used(self) -> usize {
+        self.total.saturating_sub(self.free)
+    }
+}
+
+pub fn cuda_memory_snapshot(device: &Device) -> Option<CudaMemorySnapshot> {
+    let cuda = device.as_cuda_device().ok()?;
+    match cuda.cuda_stream().context().mem_get_info() {
+        Ok((free, total)) => Some(CudaMemorySnapshot { free, total }),
+        Err(err) => {
+            tracing::debug!("CUDA memory snapshot unavailable: {err}");
+            None
+        }
+    }
+}
+
+pub fn bytes_to_mib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CudaGraphPrewarmStats {
+    pub graphs: usize,
+    pub memory_before: Option<CudaMemorySnapshot>,
+    pub memory_after: Option<CudaMemorySnapshot>,
+}
+
+impl CudaGraphPrewarmStats {
+    pub fn empty() -> Self {
+        Self {
+            graphs: 0,
+            memory_before: None,
+            memory_after: None,
+        }
+    }
+}
 
 /// Match osc-transformers/vLLM-style decode graph batch buckets.
 ///
@@ -399,9 +445,8 @@ pub fn pad_decode_batch_to_max(
         bail!("expected position_ids shape (3, batch, 1), got {pos_dims:?}");
     }
     let padded_position_ids = position_ids.pad_with_zeros(1, 0, max_batch - actual_batch)?;
-    let slot_mapping = metadata
-        .slot_mapping
-        .pad_with_zeros(0, 0, max_batch - actual_batch)?;
+    let slot_mapping =
+        pad_i64_vector_with_value(&metadata.slot_mapping, max_batch, PAD_SLOT_ID, device)?;
     let context_lens = pad_u32_vector_with_value(&metadata.context_lens, max_batch, 1, device)?;
     let block_tables = metadata
         .block_tables
@@ -468,6 +513,23 @@ fn pad_u32_vector_with_value(
     Ok(Tensor::cat(&[tensor, &pad], 0)?)
 }
 
+fn pad_i64_vector_with_value(
+    tensor: &Tensor,
+    target_len: usize,
+    value: i64,
+    device: &Device,
+) -> Result<Tensor> {
+    let len = tensor.dim(0)?;
+    if len > target_len {
+        bail!("cannot pad vector from {len} elements down to {target_len}");
+    }
+    if len == target_len {
+        return Ok(tensor.contiguous()?);
+    }
+    let pad = Tensor::from_vec(vec![value; target_len - len], (target_len - len,), device)?;
+    Ok(Tensor::cat(&[tensor, &pad], 0)?)
+}
+
 fn pad_block_table_cols(
     block_tables: &Tensor,
     batch: usize,
@@ -475,14 +537,8 @@ fn pad_block_table_cols(
     cols: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    if meta_cols == 0 {
-        return Ok(Tensor::zeros((batch, cols), DType::U32, device)?);
-    }
-    let tail = block_tables
-        .narrow(1, meta_cols - 1, 1)?
-        .broadcast_as((batch, cols - meta_cols))?
-        .contiguous()?;
-    Ok(Tensor::cat(&[block_tables, &tail], 1)?)
+    let pad = Tensor::zeros((batch, cols - meta_cols), DType::U32, device)?;
+    Ok(Tensor::cat(&[block_tables, &pad], 1)?)
 }
 
 impl std::fmt::Debug for DecodeCudaGraph {
@@ -632,7 +688,7 @@ fn set_capture_mem_pool(stream: &CudaStream) -> Result<()> {
 mod tests {
     use candle_core::{DType, Device, Tensor};
 
-    use crate::model::paged_kv_cache::PagedInputMetadata;
+    use crate::paged_kv_cache::{PAD_SLOT_ID, PagedInputMetadata};
 
     use super::{
         bucket_block_table_cols, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
@@ -710,6 +766,7 @@ mod tests {
             max_context_len: 129,
             token_attention_mask: None,
             prefill_attention_mask: None,
+            prefill_flash_params: None,
             prefill_causal_only: false,
             query_lens: None,
             kv_lens: None,
@@ -738,7 +795,16 @@ mod tests {
         assert_eq!(pos.dims(), &[3usize, 8, 1]);
         assert_eq!(
             padded.slot_mapping.to_vec1::<i64>()?,
-            vec![64, 96, 128, 0, 0, 0, 0, 0]
+            vec![
+                64,
+                96,
+                128,
+                PAD_SLOT_ID,
+                PAD_SLOT_ID,
+                PAD_SLOT_ID,
+                PAD_SLOT_ID,
+                PAD_SLOT_ID
+            ]
         );
         assert_eq!(
             padded.context_lens.to_vec1::<u32>()?,
@@ -749,9 +815,9 @@ mod tests {
         assert_eq!(
             padded.block_tables.to_vec2::<u32>()?,
             vec![
-                vec![1, 2, 3, 4, 4, 4, 4, 4],
-                vec![5, 6, 7, 8, 8, 8, 8, 8],
-                vec![9, 10, 11, 12, 12, 12, 12, 12],
+                vec![1, 2, 3, 4, 0, 0, 0, 0],
+                vec![5, 6, 7, 8, 0, 0, 0, 0],
+                vec![9, 10, 11, 12, 0, 0, 0, 0],
                 vec![0, 0, 0, 0, 0, 0, 0, 0],
                 vec![0, 0, 0, 0, 0, 0, 0, 0],
                 vec![0, 0, 0, 0, 0, 0, 0, 0],

@@ -17,6 +17,37 @@ use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
 use vasr_quant::isq_linear::set_linear_is_prefill;
 
+const DECODE_TOKEN_REPEAT_LIMIT: usize = 32;
+const DECODE_PATTERN_REPEAT_LIMIT: usize = 16;
+const DECODE_MAX_REPEAT_PATTERN_LEN: usize = 8;
+
+fn has_repeated_tail(tokens: &[u32]) -> bool {
+    if tokens.len() < DECODE_TOKEN_REPEAT_LIMIT {
+        return false;
+    }
+    if let Some(&last) = tokens.last() {
+        let repeated = tokens.iter().rev().take_while(|&&tok| tok == last).count();
+        if repeated >= DECODE_TOKEN_REPEAT_LIMIT {
+            return true;
+        }
+    }
+    for pattern_len in 2..=DECODE_MAX_REPEAT_PATTERN_LEN {
+        let needed = pattern_len.saturating_mul(DECODE_PATTERN_REPEAT_LIMIT);
+        if tokens.len() < needed {
+            continue;
+        }
+        let tail = &tokens[tokens.len() - pattern_len..];
+        let repeated = (0..DECODE_PATTERN_REPEAT_LIMIT).all(|repeat_idx| {
+            let start = tokens.len() - pattern_len * (repeat_idx + 1);
+            &tokens[start..start + pattern_len] == tail
+        });
+        if repeated {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct PagedBatchConfig {
     pub max_new_tokens: usize,
@@ -97,6 +128,16 @@ impl PagedDecodeSlot {
 
 pub fn paged_batch_free_slots(runtime: &mut PagedCacheRuntime, request_ids: &[usize]) {
     runtime.manager_mut().free_many(request_ids);
+}
+
+fn decode_step_required_tokens(
+    prompt_len: usize,
+    generated_len_before_step: usize,
+) -> Result<usize> {
+    prompt_len
+        .checked_add(generated_len_before_step)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| anyhow::anyhow!("paged slot token count overflow"))
 }
 
 fn cuda_packed_prefill_enabled() -> bool {
@@ -194,14 +235,9 @@ pub fn paged_batch_decode_slots_at_step(
         .first()
         .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
 
-    let mut forward_indices: Vec<usize> = (0..slots.len())
+    let forward_indices: Vec<usize> = (0..slots.len())
         .filter(|&i| !slots[i].finished && slots[i].decode_step == step)
         .collect();
-    tracing::info!(
-        "paged_batch_decode_slots_at_step: step={step} slots={} forward={}",
-        slots.len(),
-        forward_indices.len(),
-    );
     if forward_indices.is_empty() {
         return Ok(());
     }
@@ -209,20 +245,10 @@ pub fn paged_batch_decode_slots_at_step(
     let mut decodable_indices = Vec::with_capacity(forward_indices.len());
     for &i in &forward_indices {
         let slot = &slots[i];
-        let num_tokens = slot
-            .prompt_len_usize
-            .checked_add(slot.generated.len())
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| anyhow::anyhow!("paged slot token count overflow"))?;
+        let num_tokens = decode_step_required_tokens(slot.prompt_len_usize, slot.generated.len())?;
         let alloc_ok = runtime
             .manager_mut()
             .try_allocate_slots(slot.request_id, num_tokens)?;
-        tracing::info!(
-            "  slot[{i}] req={} prompt_len={} generated={} num_tokens={num_tokens} alloc={alloc_ok}",
-            slot.request_id,
-            slot.prompt_len_usize,
-            slot.generated.len(),
-        );
         if alloc_ok {
             decodable_indices.push(i);
         }
@@ -237,6 +263,7 @@ pub fn paged_batch_decode_slots_at_step(
         let tok = slots[i].next_id;
         if eos_token_ids.contains(&tok) {
             slots[i].finished = true;
+            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
             runtime.manager_mut().trim_request_to_num_tokens(
                 slots[i].request_id,
                 slots[i].prompt_len_usize + slots[i].generated.len(),
@@ -244,6 +271,15 @@ pub fn paged_batch_decode_slots_at_step(
             continue;
         }
         slots[i].generated.push(tok);
+        if has_repeated_tail(&slots[i].generated) {
+            slots[i].finished = true;
+            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+            runtime.manager_mut().trim_request_to_num_tokens(
+                slots[i].request_id,
+                slots[i].prompt_len_usize + slots[i].generated.len(),
+            );
+            continue;
+        }
         active_indices.push(i);
     }
 
@@ -661,6 +697,14 @@ pub fn paged_batch_decode_step(
             continue;
         }
         state.generated[i].push(tok);
+        if has_repeated_tail(&state.generated[i]) {
+            state.finished[i] = true;
+            runtime.manager_mut().trim_request_to_num_tokens(
+                state.request_ids[i],
+                state.prompt_lens_usize[i] + state.generated[i].len(),
+            );
+            continue;
+        }
         tokens_in.push(tok);
     }
 
@@ -774,7 +818,7 @@ fn paged_batch_decode_forward(
 
 #[cfg(test)]
 mod tests {
-    use super::PagedBatchState;
+    use super::{PagedBatchState, decode_step_required_tokens};
 
     #[test]
     fn active_indices_skips_finished_rows() {
@@ -793,5 +837,13 @@ mod tests {
             eos_token_ids: vec![0],
         };
         assert_eq!(state.active_indices(), vec![0, 2]);
+    }
+
+    #[test]
+    fn decode_step_allocation_covers_current_slot_position() -> anyhow::Result<()> {
+        assert_eq!(decode_step_required_tokens(31, 0)?, 33);
+        assert_eq!(decode_step_required_tokens(32, 0)?, 34);
+        assert_eq!(decode_step_required_tokens(64, 31)?, 97);
+        Ok(())
     }
 }

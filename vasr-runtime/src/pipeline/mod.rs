@@ -9,6 +9,7 @@ use crate::model::{
 
 const ASR_VAD_CONTEXT_PAD_MS: u64 = 500;
 const FULL_WAVEFORM_COVERAGE_GAP_MS: u64 = 20;
+const VAD_REFINE_SILENCE_MS: [u64; 2] = [500, 300];
 
 pub struct OfflinePipeline {
     pub vad: Option<Arc<dyn VadModel>>,
@@ -90,11 +91,8 @@ impl OfflinePipeline {
                 )
             })
             .collect();
-        let asr_segments = merge_vad_segments_for_asr(
-            segments.as_slice(),
-            vad_options.merge_max_gap_ms,
-            vad_options.merge_max_segment_ms,
-        );
+        let asr_segments =
+            split_vad_segments_for_asr(vad.as_ref(), waveform, segments.as_slice(), vad_options)?;
         let asr_segments = asr_segments
             .into_iter()
             .map(|mut segment| {
@@ -153,35 +151,128 @@ impl OfflinePipeline {
     }
 }
 
-fn merge_vad_segments_for_asr(
+fn split_vad_segments_for_asr(
+    vad: &dyn VadModel,
+    waveform: &Waveform,
     segments: &[VadSegment],
-    max_gap_ms: u64,
-    max_segment_ms: u64,
-) -> Vec<VadSegment> {
-    if segments.is_empty() || max_gap_ms == 0 || max_segment_ms == 0 {
-        return segments.to_vec();
+    vad_options: &VadOptions,
+) -> Result<Vec<VadSegment>> {
+    let max_segment_ms = vad_options.max_segment_ms;
+    if segments.is_empty() || max_segment_ms == 0 {
+        return Ok(segments.to_vec());
     }
 
-    let mut sorted = segments.to_vec();
-    sorted.sort_by_key(|segment| (segment.range.start, segment.range.end));
-    let mut merged: Vec<VadSegment> = Vec::with_capacity(sorted.len());
-
-    for segment in sorted {
-        let Some(last) = merged.last_mut() else {
-            merged.push(segment);
+    let mut split = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if segment_duration_ms(segment) <= max_segment_ms {
+            split.push(segment.clone());
             continue;
-        };
-        let gap = segment.range.start.0.saturating_sub(last.range.end.0);
-        let merged_duration = segment.range.end.0.saturating_sub(last.range.start.0);
-        if gap <= max_gap_ms && merged_duration <= max_segment_ms {
-            last.range.end = last.range.end.max(segment.range.end);
-            last.probability = last.probability.max(segment.probability);
-        } else {
-            merged.push(segment);
+        }
+
+        let refined = refine_long_vad_segment(vad, waveform, segment, vad_options, max_segment_ms)?;
+        split.extend(refined);
+    }
+
+    Ok(split)
+}
+
+fn refine_long_vad_segment(
+    vad: &dyn VadModel,
+    waveform: &Waveform,
+    segment: &VadSegment,
+    vad_options: &VadOptions,
+    max_segment_ms: u64,
+) -> Result<Vec<VadSegment>> {
+    let mut current = vec![segment.clone()];
+    for silence_ms in VAD_REFINE_SILENCE_MS {
+        if vad_options.min_silence_ms <= silence_ms {
+            continue;
+        }
+
+        let mut refined = Vec::new();
+        let mut changed = false;
+        for candidate in current {
+            if segment_duration_ms(&candidate) <= max_segment_ms {
+                refined.push(candidate);
+                continue;
+            }
+
+            let local =
+                detect_vad_with_min_silence(vad, waveform, &candidate, vad_options, silence_ms)?;
+            if local.is_empty() {
+                refined.push(candidate);
+                continue;
+            }
+            changed = true;
+            refined.extend(local);
+        }
+
+        current = refined;
+        if current
+            .iter()
+            .all(|candidate| segment_duration_ms(candidate) <= max_segment_ms)
+        {
+            return Ok(current);
+        }
+        if !changed {
+            break;
         }
     }
 
-    merged
+    Ok(current
+        .into_iter()
+        .flat_map(|candidate| hard_split_vad_segment(&candidate, max_segment_ms))
+        .collect())
+}
+
+fn detect_vad_with_min_silence(
+    vad: &dyn VadModel,
+    waveform: &Waveform,
+    segment: &VadSegment,
+    vad_options: &VadOptions,
+    min_silence_ms: u64,
+) -> Result<Vec<VadSegment>> {
+    let local_waveform = waveform.slice_ms(segment.range.start.0, segment.range.end.0);
+    let mut refined_options = vad_options.clone();
+    refined_options.min_silence_ms = min_silence_ms;
+    let local_segments = vad.detect(&local_waveform, &refined_options)?;
+    Ok(local_segments
+        .into_iter()
+        .map(|mut local| {
+            local.range.start.0 = local.range.start.0.saturating_add(segment.range.start.0);
+            local.range.end.0 = local
+                .range
+                .end
+                .0
+                .saturating_add(segment.range.start.0)
+                .min(segment.range.end.0);
+            local
+        })
+        .filter(|local| local.range.end.0 > local.range.start.0)
+        .collect())
+}
+
+fn hard_split_vad_segment(segment: &VadSegment, max_segment_ms: u64) -> Vec<VadSegment> {
+    if max_segment_ms == 0 || segment_duration_ms(segment) <= max_segment_ms {
+        return vec![segment.clone()];
+    }
+
+    let mut split = Vec::new();
+    let mut start = segment.range.start.0;
+    let end = segment.range.end.0;
+    while start < end {
+        let next = start.saturating_add(max_segment_ms).min(end);
+        split.push(VadSegment {
+            range: TimeRange::new(DurationMs(start), DurationMs(next)),
+            probability: segment.probability,
+        });
+        start = next;
+    }
+    split
+}
+
+fn segment_duration_ms(segment: &VadSegment) -> u64 {
+    segment.range.end.0.saturating_sub(segment.range.start.0)
 }
 
 pub(crate) fn padded_asr_range(waveform: &Waveform, segment: &VadSegment) -> TimeRange {

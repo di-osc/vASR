@@ -12,8 +12,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const FILES_URL: &str =
-    "https://modelscope.cn/api/v1/models/<model_id>/repo/files?Recursive=true";
+const FILES_URL: &str = "https://modelscope.cn/api/v1/models/<model_id>/repo/files?Recursive=true";
 const DOWNLOAD_URL: &str = "https://modelscope.cn/models/<model_id>/resolve/master/<path>";
 const COOKIES_FILE: &str = "cookies";
 
@@ -94,6 +93,20 @@ async fn get_client() -> anyhow::Result<reqwest::Client> {
     Ok(client.default_headers(default_headers).build()?)
 }
 
+fn partial_path_for(file_path: &Path) -> PathBuf {
+    let name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    file_path.with_file_name(format!("{name}.part"))
+}
+
+fn file_is_complete(file_path: &Path, size: u64) -> bool {
+    fs::metadata(file_path)
+        .map(|meta| meta.len() == size)
+        .unwrap_or(false)
+}
+
 async fn download_file(
     client: Arc<reqwest::Client>,
     model_id: String,
@@ -107,17 +120,13 @@ async fn download_file(
         fs::create_dir_all(parent)?;
     }
 
-    // Skip if already fully downloaded.
-    if file_path.exists() {
-        if let Ok(meta) = fs::metadata(&file_path) {
-            if meta.len() == repo_file.size {
-                bar.set_message(format!("{} (cached)", repo_file.name));
-                bar.set_length(1);
-                bar.set_position(1);
-                bar.finish();
-                return Ok(());
-            }
-        }
+    // If the final file exists with a wrong size, leave it in place while
+    // downloading to a .part file and replace it only after the new download has
+    // completed successfully. Complete cached files are filtered before tasks
+    // are spawned, so this is only a race-safety fallback.
+    if file_is_complete(&file_path, repo_file.size) {
+        bar.finish_and_clear();
+        return Ok(());
     }
 
     bar.set_message(repo_file.name.clone());
@@ -127,7 +136,12 @@ async fn download_file(
         .replace("<model_id>", &model_id)
         .replace("<path>", path);
 
-    let mut file = BufWriter::new(fs::File::create(&file_path)?);
+    let part_path = partial_path_for(&file_path);
+    if part_path.exists() {
+        fs::remove_file(&part_path)
+            .with_context(|| format!("failed to remove stale partial file {part_path:?}"))?;
+    }
+
     let response = client.get(&url).header(UA.0, UA.1).send().await?;
 
     let status = response.status();
@@ -140,13 +154,32 @@ async fn download_file(
         );
     }
 
-    let mut stream = response.bytes_stream();
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        file.write_all(&chunk)?;
-        bar.inc(chunk.len() as u64);
+    let mut written = 0u64;
+    {
+        let mut file = BufWriter::new(fs::File::create(&part_path)?);
+        let mut stream = response.bytes_stream();
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            file.write_all(&chunk)?;
+            written += chunk.len() as u64;
+            bar.inc(chunk.len() as u64);
+        }
+        file.flush()?;
     }
-    file.flush()?;
+
+    if written != repo_file.size {
+        let _ = fs::remove_file(&part_path);
+        bar.abandon();
+        bail!(
+            "incomplete download for {}: expected {} bytes, got {} bytes",
+            repo_file.name,
+            repo_file.size,
+            written
+        );
+    }
+
+    fs::rename(&part_path, &file_path)
+        .with_context(|| format!("failed to move {part_path:?} to {file_path:?}"))?;
     bar.finish();
     Ok(())
 }
@@ -186,7 +219,19 @@ pub async fn download_model(model_id: &str, save_dir: impl Into<PathBuf>) -> any
         .files
         .into_iter()
         .filter(|f| f.r#type == "blob")
+        .filter(|f| {
+            let file_path = model_dir.join(&f.path);
+            !file_is_complete(&file_path, f.size)
+        })
         .collect();
+
+    if repo_files.is_empty() {
+        tracing::info!(
+            "Model `{model_id}` cache is complete at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
 
     let bars = MultiProgress::new();
     let mut tasks = Vec::new();
@@ -200,9 +245,10 @@ pub async fn download_model(model_id: &str, save_dir: impl Into<PathBuf>) -> any
         let client = client.clone();
         let model_id = model_id.to_string();
         let save_dir = model_dir.clone();
-        let task = tokio::spawn(async move {
-            download_file(client, model_id, repo_file, save_dir, bar).await
-        });
+        let task =
+            tokio::spawn(
+                async move { download_file(client, model_id, repo_file, save_dir, bar).await },
+            );
         tasks.push(task);
     }
 

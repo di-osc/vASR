@@ -935,11 +935,8 @@ fn download_fsmn_vad() -> Result<PathBuf> {
     if target.exists() {
         return Ok(target);
     }
-    block_on_async(vasr_models::download::download_model(
-        FSMN_VAD_REPO,
-        &cache,
-    ))
-    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    block_on_async(vasr_models::download::download_model(FSMN_VAD_REPO, &cache))
+        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
     Ok(target)
 }
 

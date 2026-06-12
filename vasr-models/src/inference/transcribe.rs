@@ -212,17 +212,38 @@ fn prepared_prompt_len(prepared: &PreparedInputs) -> usize {
 fn rebatch_prepared_inputs(
     prepared: &[PreparedInputs],
     pad_id: u32,
-    max_batch_size: usize,
-    _varlen_stack: bool,
+    decode_max_seqs: usize,
+    continuous_paged: bool,
 ) -> Vec<Vec<(usize, PreparedInputs)>> {
     if prepared.is_empty() {
         return Vec::new();
     }
 
-    let count_cap = if max_batch_size == 0 {
+    if continuous_paged {
+        return vec![
+            prepared
+                .iter()
+                .enumerate()
+                .map(|(idx, src)| {
+                    let len = prepared_prompt_len(src);
+                    (
+                        idx,
+                        PreparedInputs {
+                            input_ids: src.input_ids[..len].to_vec(),
+                            attention_mask: vec![1u32; len],
+                            input_features: src.input_features.clone(),
+                            feature_attention_mask: src.feature_attention_mask.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        ];
+    }
+
+    let count_cap = if decode_max_seqs == 0 {
         prepared.len().max(1)
     } else {
-        max_batch_size
+        decode_max_seqs
     };
 
     let mut order: Vec<(usize, usize)> = prepared
@@ -382,9 +403,9 @@ pub(crate) fn generate_raw_prepared_batch(
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
     max_new_tokens: usize,
-    max_batch_size: usize,
+    decode_max_seqs: usize,
     eos_token_ids: &[u32],
-) -> Result<Vec<String>> {
+) -> Result<Vec<GeneratedRaw>> {
     if prepared.is_empty() {
         return Ok(vec![]);
     }
@@ -399,15 +420,15 @@ pub(crate) fn generate_raw_prepared_batch(
     let varlen_stack = use_varlen_paged_prepare(paged_runtime);
     #[cfg(not(feature = "paged-attn"))]
     let varlen_stack = false;
-    let effective_max_batch = if max_batch_size == 0 {
+    let effective_decode_max_seqs = if decode_max_seqs == 0 {
         prepared.len().max(1)
     } else {
-        max_batch_size
+        decode_max_seqs
     };
     let pad_id = paged_token_pad_id(processor)?;
     let micro_batches =
-        rebatch_prepared_inputs(prepared, pad_id, effective_max_batch, varlen_stack);
-    let mut out: Vec<Option<String>> = vec![None; prepared.len()];
+        rebatch_prepared_inputs(prepared, pad_id, effective_decode_max_seqs, varlen_stack);
+    let mut out: Vec<Option<GeneratedRaw>> = vec![None; prepared.len()];
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
@@ -482,7 +503,10 @@ pub(crate) fn generate_raw_prepared_batch(
                     "raw ASR decode"
                 );
             }
-            out[orig_idx] = Some(raw);
+            out[orig_idx] = Some(GeneratedRaw {
+                text: raw,
+                token_count: ids.len(),
+            });
         }
     }
     out.into_iter()
@@ -512,6 +536,93 @@ struct ChunkItem {
     offset_sec: f32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GeneratedRaw {
+    text: String,
+    token_count: usize,
+}
+
+#[cfg(feature = "timing")]
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchDist {
+    min: f64,
+    p50: f64,
+    p90: f64,
+    max: f64,
+    avg: f64,
+}
+
+#[cfg(feature = "timing")]
+fn dist_from_usize(values: &[usize]) -> BatchDist {
+    if values.is_empty() {
+        return BatchDist::default();
+    }
+    let mut sorted = values.iter().map(|&v| v as f64).collect::<Vec<_>>();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    dist_from_sorted(sorted.as_slice())
+}
+
+#[cfg(feature = "timing")]
+fn dist_from_f32(values: &[f32]) -> BatchDist {
+    if values.is_empty() {
+        return BatchDist::default();
+    }
+    let mut sorted = values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    dist_from_sorted(sorted.as_slice())
+}
+
+#[cfg(feature = "timing")]
+fn dist_from_sorted(sorted: &[f64]) -> BatchDist {
+    let len = sorted.len();
+    let percentile = |pct: usize| -> f64 {
+        let idx = len.saturating_sub(1).saturating_mul(pct).div_ceil(100);
+        sorted[idx.min(len - 1)]
+    };
+    let sum: f64 = sorted.iter().sum();
+    BatchDist {
+        min: sorted[0],
+        p50: percentile(50),
+        p90: percentile(90),
+        max: sorted[len - 1],
+        avg: sum / len as f64,
+    }
+}
+
+fn raw_preview(text: &str) -> String {
+    const LIMIT: usize = 160;
+    let mut out = text.chars().take(LIMIT).collect::<String>();
+    if text.chars().count() > LIMIT {
+        out.push_str("...");
+    }
+    out
+}
+
+fn chunk_offset_sec(chunk: &ChunkItem) -> f32 {
+    #[cfg(feature = "forced-aligner")]
+    {
+        chunk.offset_sec
+    }
+    #[cfg(not(feature = "forced-aligner"))]
+    {
+        let _ = chunk;
+        0.0
+    }
+}
+
+fn log_max_new_tokens_hit(chunk_idx: usize, chunk: &ChunkItem, token_count: usize, raw: &str) {
+    tracing::warn!(
+        target: "vasr_transcribe::pipeline",
+        "ASR chunk reached max_new_tokens | chunk_idx={} orig_index={} audio_sec={:.2} offset_sec={:.2} tokens={} raw_preview={:?}",
+        chunk_idx,
+        chunk.orig_index,
+        chunk_audio_seconds(chunk.wav.len()),
+        chunk_offset_sec(chunk),
+        token_count,
+        raw_preview(raw).as_str(),
+    );
+}
+
 struct ChunkAsrBatch<'a> {
     thinker: &'a ThinkerForConditionalGeneration,
     processor: &'a AsrProcessor,
@@ -522,7 +633,7 @@ struct ChunkAsrBatch<'a> {
     prompts: &'a [String],
     forced_langs_norm: &'a [Option<String>],
     max_new_tokens: usize,
-    max_batch_size: usize,
+    decode_max_seqs: usize,
     max_batch_audio_sec: f32,
     bucket_by_length: bool,
     eos_token_ids: &'a [u32],
@@ -561,31 +672,18 @@ fn chunk_audio_seconds(samples: usize) -> f32 {
     samples as f32 / SAMPLE_RATE_HZ as f32
 }
 
-fn effective_max_batch_count(max_batch_size: usize, chunk_len: usize) -> usize {
-    if max_batch_size == 0 {
-        chunk_len.max(1)
-    } else {
-        max_batch_size
-    }
-}
-
-/// Group chunk indices into ASR micro-batches bounded by total audio seconds and/or count.
+/// Group chunk indices into ASR pools bounded only by total audio seconds.
 fn group_chunk_indices(
     ordered_indices: &[usize],
     chunks: &[ChunkItem],
-    max_batch_size: usize,
     max_batch_audio_sec: f32,
 ) -> Result<Vec<Vec<usize>>> {
     if ordered_indices.is_empty() {
         return Ok(Vec::new());
     }
 
-    let count_cap = effective_max_batch_count(max_batch_size, ordered_indices.len());
     if max_batch_audio_sec <= 0.0 {
-        return Ok(ordered_indices
-            .chunks(count_cap)
-            .map(|group| group.to_vec())
-            .collect());
+        return Ok(vec![ordered_indices.to_vec()]);
     }
 
     let mut groups = Vec::new();
@@ -610,8 +708,7 @@ fn group_chunk_indices(
 
         let exceeds_duration =
             !current.is_empty() && current_sec + sec > max_batch_audio_sec + f32::EPSILON;
-        let exceeds_count = !current.is_empty() && current.len() >= count_cap;
-        if exceeds_duration || exceeds_count {
+        if exceeds_duration {
             groups.push(current);
             current = Vec::new();
             current_sec = 0.0;
@@ -619,12 +716,6 @@ fn group_chunk_indices(
 
         current.push(idx);
         current_sec += sec;
-
-        if current.len() >= count_cap {
-            groups.push(current);
-            current = Vec::new();
-            current_sec = 0.0;
-        }
     }
 
     if !current.is_empty() {
@@ -650,12 +741,8 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
         let mut per_chunk_lang: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let mut per_chunk_text: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let ordered: Vec<usize> = (0..batch.chunks.len()).collect();
-        let index_groups = group_chunk_indices(
-            ordered.as_slice(),
-            batch.chunks,
-            batch.max_batch_size,
-            batch.max_batch_audio_sec,
-        )?;
+        let index_groups =
+            group_chunk_indices(ordered.as_slice(), batch.chunks, batch.max_batch_audio_sec)?;
 
         for batch_chunk_idx in index_groups {
             let chunk_batch: Vec<&ChunkItem> = batch_chunk_idx
@@ -692,7 +779,7 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
                 batch.paged_runtime,
                 prepared.as_slice(),
                 batch.max_new_tokens,
-                batch.max_batch_size,
+                batch.decode_max_seqs,
                 batch.eos_token_ids,
             )?;
 
@@ -705,11 +792,19 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
             }
 
             for (c, raw) in chunk_batch.iter().zip(raws.iter()) {
+                if raw.token_count >= batch.max_new_tokens {
+                    let chunk_idx = batch
+                        .chunks
+                        .iter()
+                        .position(|chunk| std::ptr::eq(chunk, *c))
+                        .unwrap_or(c.orig_index);
+                    log_max_new_tokens_hit(chunk_idx, c, raw.token_count, raw.text.as_str());
+                }
                 let forced = batch
                     .forced_langs_norm
                     .get(c.orig_index)
                     .and_then(|x| x.as_deref());
-                let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+                let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
                 per_chunk_lang.push(lang);
                 per_chunk_text.push(text);
             }
@@ -728,12 +823,8 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
         lb.cmp(&la).then_with(|| a.cmp(&b))
     });
 
-    let index_groups = group_chunk_indices(
-        indices.as_slice(),
-        batch.chunks,
-        batch.max_batch_size,
-        batch.max_batch_audio_sec,
-    )?;
+    let index_groups =
+        group_chunk_indices(indices.as_slice(), batch.chunks, batch.max_batch_audio_sec)?;
 
     for batch_chunk_idx in index_groups {
         let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(batch_chunk_idx.len());
@@ -778,7 +869,7 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
             batch.paged_runtime,
             prepared.as_slice(),
             batch.max_new_tokens,
-            batch.max_batch_size,
+            batch.decode_max_seqs,
             batch.eos_token_ids,
         )?;
         if raws.len() != batch_chunk_idx.len() {
@@ -797,11 +888,14 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
                 .chunks
                 .get(chunk_idx)
                 .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+            if raw.token_count >= batch.max_new_tokens {
+                log_max_new_tokens_hit(chunk_idx, c, raw.token_count, raw.text.as_str());
+            }
             let forced = batch
                 .forced_langs_norm
                 .get(c.orig_index)
                 .and_then(|x| x.as_deref());
-            let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+            let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
 
             let slot_lang = per_chunk_lang
                 .get_mut(chunk_idx)
@@ -841,9 +935,10 @@ fn generate_raw_prepared_batch_timed(
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
     max_new_tokens: usize,
+    decode_max_seqs: usize,
     eos_token_ids: &[u32],
     timings: &mut TranscribeTimings,
-) -> Result<Vec<String>> {
+) -> Result<Vec<GeneratedRaw>> {
     if prepared.is_empty() {
         return Ok(vec![]);
     }
@@ -858,8 +953,14 @@ fn generate_raw_prepared_batch_timed(
     #[cfg(not(feature = "paged-attn"))]
     let varlen_stack = false;
     let pad_id = paged_token_pad_id(processor)?;
-    let micro_batches = rebatch_prepared_inputs(prepared, pad_id, prepared.len(), varlen_stack);
-    let mut out: Vec<Option<String>> = vec![None; prepared.len()];
+    let effective_decode_max_seqs = if decode_max_seqs == 0 {
+        prepared.len().max(1)
+    } else {
+        decode_max_seqs
+    };
+    let micro_batches =
+        rebatch_prepared_inputs(prepared, pad_id, effective_decode_max_seqs, varlen_stack);
+    let mut out: Vec<Option<GeneratedRaw>> = vec![None; prepared.len()];
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
@@ -907,12 +1008,10 @@ fn generate_raw_prepared_batch_timed(
             .audio_encoder_us
             .saturating_add(duration_to_us(start_audio.elapsed()));
 
-        #[cfg_attr(not(feature = "paged-attn"), allow(unused_mut))]
-        let mut gen_timings = GenerationTimings::default();
         #[cfg(feature = "paged-attn")]
-        let gen_ids = if let Some(runtime) = paged_runtime {
+        let (gen_ids, gen_timings) = if let Some(runtime) = paged_runtime {
             use crate::inference::batch_scheduler::run_paged_prepared_batch_timed;
-            let (ids, gt) = run_paged_prepared_batch_timed(
+            run_paged_prepared_batch_timed(
                 thinker,
                 device,
                 runtime,
@@ -920,13 +1019,11 @@ fn generate_raw_prepared_batch_timed(
                 &audio_features,
                 max_new_tokens,
                 eos_token_ids,
-                batch_prepared.len(),
+                decode_max_seqs,
                 pad_id,
-            )?;
-            gen_timings = gt;
-            ids
+            )?
         } else {
-            let (ids, gt) = greedy_generate_cached_batch_timed(
+            greedy_generate_cached_batch_timed(
                 thinker,
                 device,
                 ids_rows.as_slice(),
@@ -934,9 +1031,7 @@ fn generate_raw_prepared_batch_timed(
                 Some(&audio_features),
                 max_new_tokens,
                 eos_token_ids,
-            )?;
-            gen_timings = gt;
-            ids
+            )?
         };
         #[cfg(not(feature = "paged-attn"))]
         let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
@@ -961,17 +1056,21 @@ fn generate_raw_prepared_batch_timed(
 
         let start_decode = std::time::Instant::now();
         for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
+            let token_count = ids.len();
             let raw = processor.tokenizer.decode(ids.as_slice())?;
             if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
                 tracing::debug!(
                     target: "vasr_models::inference::transcribe",
                     orig_idx,
-                    tokens = ids.len(),
+                    tokens = token_count,
                     raw = raw.as_str(),
                     "raw ASR decode"
                 );
             }
-            out[orig_idx] = Some(raw);
+            out[orig_idx] = Some(GeneratedRaw {
+                text: raw,
+                token_count,
+            });
         }
         timings.tokenizer_decode_us = timings
             .tokenizer_decode_us
@@ -1004,12 +1103,8 @@ fn run_asr_on_chunks_batched_timed(
         let mut per_chunk_lang: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let mut per_chunk_text: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let ordered: Vec<usize> = (0..batch.chunks.len()).collect();
-        let index_groups = group_chunk_indices(
-            ordered.as_slice(),
-            batch.chunks,
-            batch.max_batch_size,
-            batch.max_batch_audio_sec,
-        )?;
+        let index_groups =
+            group_chunk_indices(ordered.as_slice(), batch.chunks, batch.max_batch_audio_sec)?;
 
         for batch_chunk_idx in index_groups {
             timings.batches = timings.batches.saturating_add(1);
@@ -1058,6 +1153,11 @@ fn run_asr_on_chunks_batched_timed(
             let pre_prefill_forward = timings.generation.prefill_forward_us;
             let pre_decode = timings.generation.decode_us;
             let pre_decode_forward = timings.generation.decode_forward_us;
+            let pre_decode_graph = timings.generation.decode_graph_replay_us;
+            let pre_decode_argmax = timings.generation.decode_argmax_us;
+            let pre_decode_metadata = timings.generation.decode_metadata_us;
+            let pre_decode_token_tensor = timings.generation.decode_token_tensor_us;
+            let pre_decode_embed = timings.generation.decode_embed_us;
             let pre_steps = timings.generation.steps;
             let pre_tokens = timings.generation.tokens_generated;
 
@@ -1069,6 +1169,7 @@ fn run_asr_on_chunks_batched_timed(
                 batch.paged_runtime,
                 prepared.as_slice(),
                 batch.max_new_tokens,
+                batch.decode_max_seqs,
                 batch.eos_token_ids,
                 timings,
             )?;
@@ -1089,14 +1190,54 @@ fn run_asr_on_chunks_batched_timed(
             let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
             let batch_decode_fwd_ms =
                 (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
+            let batch_decode_graph_ms =
+                (timings.generation.decode_graph_replay_us - pre_decode_graph) as f64 / 1000.0;
+            let batch_decode_argmax_ms =
+                (timings.generation.decode_argmax_us - pre_decode_argmax) as f64 / 1000.0;
+            let batch_decode_metadata_ms =
+                (timings.generation.decode_metadata_us - pre_decode_metadata) as f64 / 1000.0;
+            let batch_decode_token_tensor_ms = (timings.generation.decode_token_tensor_us
+                - pre_decode_token_tensor) as f64
+                / 1000.0;
+            let batch_decode_embed_ms =
+                (timings.generation.decode_embed_us - pre_decode_embed) as f64 / 1000.0;
             let batch_steps = timings.generation.steps - pre_steps;
             let batch_tokens = timings.generation.tokens_generated - pre_tokens;
+            let token_counts = raws.iter().map(|r| r.token_count).collect::<Vec<_>>();
+            let token_dist = dist_from_usize(token_counts.as_slice());
+            let audio_seconds = chunk_batch
+                .iter()
+                .map(|chunk| chunk_audio_seconds(chunk.wav.len()))
+                .collect::<Vec<_>>();
+            let audio_dist = dist_from_f32(audio_seconds.as_slice());
+            let prepare_norm_ms = prepare_timings.normalize_us as f64 / 1000.0;
+            let prepare_token_lookup_ms = prepare_timings.token_lookup_us as f64 / 1000.0;
+            let prepare_feature_ms = prepare_timings.feature_extract_us as f64 / 1000.0;
+            let prepare_tokenize_ms = prepare_timings.tokenize_expand_us as f64 / 1000.0;
+            let prepare_pad_ms = prepare_timings.pad_us as f64 / 1000.0;
+            let prepare_other_ms = prepare_us as f64 / 1000.0
+                - prepare_norm_ms
+                - prepare_token_lookup_ms
+                - prepare_feature_ms
+                - prepare_tokenize_ms
+                - prepare_pad_ms;
             eprintln!(
-                "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (fwd={:.1}) | steps={} tokens={}",
+                "[vasr batch {}/{}] items={} | audio_sec min/p50/p90/max/avg={:.1}/{:.1}/{:.1}/{:.1}/{:.1} | prepare={:.1}ms (norm={:.1} tok_lookup={:.1} feat={:.1} tok_expand={:.1} pad={:.1} other={:.1}) | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (graph={:.1} fwd={:.1} argmax={:.1} meta={:.1} tok_tensor={:.1} embed={:.1}) | steps={} tokens={} tok/seq min/p50/p90/max/avg={:.0}/{:.0}/{:.0}/{:.0}/{:.1}",
                 timings.batches,
                 batch.chunks.len(),
                 chunk_batch.len(),
+                audio_dist.min,
+                audio_dist.p50,
+                audio_dist.p90,
+                audio_dist.max,
+                audio_dist.avg,
                 prepare_us as f64 / 1000.0,
+                prepare_norm_ms,
+                prepare_token_lookup_ms,
+                prepare_feature_ms,
+                prepare_tokenize_ms,
+                prepare_pad_ms,
+                prepare_other_ms,
                 batch_ae_ms,
                 batch_prefill_ms,
                 batch_prefill_inputs_ms,
@@ -1104,10 +1245,35 @@ fn run_asr_on_chunks_batched_timed(
                 batch_prefill_fwd_ms,
                 batch_prefill_other_ms,
                 batch_decode_ms,
+                batch_decode_graph_ms,
                 batch_decode_fwd_ms,
+                batch_decode_argmax_ms,
+                batch_decode_metadata_ms,
+                batch_decode_token_tensor_ms,
+                batch_decode_embed_ms,
                 batch_steps,
                 batch_tokens,
+                token_dist.min,
+                token_dist.p50,
+                token_dist.p90,
+                token_dist.max,
+                token_dist.avg,
             );
+            if token_dist.max >= batch.max_new_tokens as f64 {
+                for (c, raw) in chunk_batch.iter().zip(raws.iter()) {
+                    if raw.token_count < batch.max_new_tokens {
+                        continue;
+                    }
+                    eprintln!(
+                        "[vasr max-new hit] orig_index={} audio_sec={:.2} offset_sec={:.2} tokens={} raw_preview={:?}",
+                        c.orig_index,
+                        chunk_audio_seconds(c.wav.len()),
+                        chunk_offset_sec(c),
+                        raw.token_count,
+                        raw_preview(raw.text.as_str()),
+                    );
+                }
+            }
 
             if raws.len() != chunk_batch.len() {
                 bail!(
@@ -1122,7 +1288,7 @@ fn run_asr_on_chunks_batched_timed(
                     .forced_langs_norm
                     .get(c.orig_index)
                     .and_then(|x| x.as_deref());
-                let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+                let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
                 per_chunk_lang.push(lang);
                 per_chunk_text.push(text);
             }
@@ -1141,12 +1307,8 @@ fn run_asr_on_chunks_batched_timed(
     let mut per_chunk_lang: Vec<Option<String>> = vec![None; batch.chunks.len()];
     let mut per_chunk_text: Vec<Option<String>> = vec![None; batch.chunks.len()];
 
-    let index_groups = group_chunk_indices(
-        indices.as_slice(),
-        batch.chunks,
-        batch.max_batch_size,
-        batch.max_batch_audio_sec,
-    )?;
+    let index_groups =
+        group_chunk_indices(indices.as_slice(), batch.chunks, batch.max_batch_audio_sec)?;
 
     for batch_chunk_idx in index_groups {
         timings.batches = timings.batches.saturating_add(1);
@@ -1202,6 +1364,11 @@ fn run_asr_on_chunks_batched_timed(
         let pre_prefill_forward = timings.generation.prefill_forward_us;
         let pre_decode = timings.generation.decode_us;
         let pre_decode_forward = timings.generation.decode_forward_us;
+        let pre_decode_graph = timings.generation.decode_graph_replay_us;
+        let pre_decode_argmax = timings.generation.decode_argmax_us;
+        let pre_decode_metadata = timings.generation.decode_metadata_us;
+        let pre_decode_token_tensor = timings.generation.decode_token_tensor_us;
+        let pre_decode_embed = timings.generation.decode_embed_us;
         let pre_steps = timings.generation.steps;
         let pre_tokens = timings.generation.tokens_generated;
 
@@ -1213,6 +1380,7 @@ fn run_asr_on_chunks_batched_timed(
             batch.paged_runtime,
             prepared.as_slice(),
             batch.max_new_tokens,
+            batch.decode_max_seqs,
             batch.eos_token_ids,
             timings,
         )?;
@@ -1233,14 +1401,53 @@ fn run_asr_on_chunks_batched_timed(
         let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
         let batch_decode_fwd_ms =
             (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
+        let batch_decode_graph_ms =
+            (timings.generation.decode_graph_replay_us - pre_decode_graph) as f64 / 1000.0;
+        let batch_decode_argmax_ms =
+            (timings.generation.decode_argmax_us - pre_decode_argmax) as f64 / 1000.0;
+        let batch_decode_metadata_ms =
+            (timings.generation.decode_metadata_us - pre_decode_metadata) as f64 / 1000.0;
+        let batch_decode_token_tensor_ms =
+            (timings.generation.decode_token_tensor_us - pre_decode_token_tensor) as f64 / 1000.0;
+        let batch_decode_embed_ms =
+            (timings.generation.decode_embed_us - pre_decode_embed) as f64 / 1000.0;
         let batch_steps = timings.generation.steps - pre_steps;
         let batch_tokens = timings.generation.tokens_generated - pre_tokens;
+        let token_counts = raws.iter().map(|r| r.token_count).collect::<Vec<_>>();
+        let token_dist = dist_from_usize(token_counts.as_slice());
+        let audio_seconds = batch_chunk_idx
+            .iter()
+            .map(|&chunk_idx| chunk_audio_seconds(batch.chunks[chunk_idx].wav.len()))
+            .collect::<Vec<_>>();
+        let audio_dist = dist_from_f32(audio_seconds.as_slice());
+        let prepare_norm_ms = prepare_timings.normalize_us as f64 / 1000.0;
+        let prepare_token_lookup_ms = prepare_timings.token_lookup_us as f64 / 1000.0;
+        let prepare_feature_ms = prepare_timings.feature_extract_us as f64 / 1000.0;
+        let prepare_tokenize_ms = prepare_timings.tokenize_expand_us as f64 / 1000.0;
+        let prepare_pad_ms = prepare_timings.pad_us as f64 / 1000.0;
+        let prepare_other_ms = prepare_us as f64 / 1000.0
+            - prepare_norm_ms
+            - prepare_token_lookup_ms
+            - prepare_feature_ms
+            - prepare_tokenize_ms
+            - prepare_pad_ms;
         eprintln!(
-            "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (fwd={:.1}) | steps={} tokens={}",
+            "[vasr batch {}/{}] items={} | audio_sec min/p50/p90/max/avg={:.1}/{:.1}/{:.1}/{:.1}/{:.1} | prepare={:.1}ms (norm={:.1} tok_lookup={:.1} feat={:.1} tok_expand={:.1} pad={:.1} other={:.1}) | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (graph={:.1} fwd={:.1} argmax={:.1} meta={:.1} tok_tensor={:.1} embed={:.1}) | steps={} tokens={} tok/seq min/p50/p90/max/avg={:.0}/{:.0}/{:.0}/{:.0}/{:.1}",
             timings.batches,
             batch.chunks.len(),
             batch_chunk_idx.len(),
+            audio_dist.min,
+            audio_dist.p50,
+            audio_dist.p90,
+            audio_dist.max,
+            audio_dist.avg,
             prepare_us as f64 / 1000.0,
+            prepare_norm_ms,
+            prepare_token_lookup_ms,
+            prepare_feature_ms,
+            prepare_tokenize_ms,
+            prepare_pad_ms,
+            prepare_other_ms,
             batch_ae_ms,
             batch_prefill_ms,
             batch_prefill_inputs_ms,
@@ -1248,10 +1455,42 @@ fn run_asr_on_chunks_batched_timed(
             batch_prefill_fwd_ms,
             batch_prefill_other_ms,
             batch_decode_ms,
+            batch_decode_graph_ms,
             batch_decode_fwd_ms,
+            batch_decode_argmax_ms,
+            batch_decode_metadata_ms,
+            batch_decode_token_tensor_ms,
+            batch_decode_embed_ms,
             batch_steps,
             batch_tokens,
+            token_dist.min,
+            token_dist.p50,
+            token_dist.p90,
+            token_dist.max,
+            token_dist.avg,
         );
+        if token_dist.max >= batch.max_new_tokens as f64 {
+            for (k, raw) in raws.iter().enumerate() {
+                if raw.token_count < batch.max_new_tokens {
+                    continue;
+                }
+                let Some(&chunk_idx) = batch_chunk_idx.get(k) else {
+                    continue;
+                };
+                let Some(c) = batch.chunks.get(chunk_idx) else {
+                    continue;
+                };
+                eprintln!(
+                    "[vasr max-new hit] chunk_idx={} orig_index={} audio_sec={:.2} offset_sec={:.2} tokens={} raw_preview={:?}",
+                    chunk_idx,
+                    c.orig_index,
+                    chunk_audio_seconds(c.wav.len()),
+                    chunk_offset_sec(c),
+                    raw.token_count,
+                    raw_preview(raw.text.as_str()),
+                );
+            }
+        }
         if raws.len() != batch_chunk_idx.len() {
             bail!(
                 "internal error: raw output batch size mismatch: expected={}, got={}",
@@ -1268,11 +1507,14 @@ fn run_asr_on_chunks_batched_timed(
                 .chunks
                 .get(chunk_idx)
                 .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+            if raw.token_count >= batch.max_new_tokens {
+                log_max_new_tokens_hit(chunk_idx, c, raw.token_count, raw.text.as_str());
+            }
             let forced = batch
                 .forced_langs_norm
                 .get(c.orig_index)
                 .and_then(|x| x.as_deref());
-            let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+            let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
 
             let slot_lang = per_chunk_lang
                 .get_mut(chunk_idx)
@@ -1367,7 +1609,7 @@ pub fn transcribe(
         prompts: prompts.as_slice(),
         forced_langs_norm: forced_langs_norm.as_slice(),
         max_new_tokens: opts.max_new_tokens,
-        max_batch_size: opts.max_batch_size,
+        decode_max_seqs: opts.decode_max_seqs,
         max_batch_audio_sec: opts.max_batch_audio_sec,
         bucket_by_length: opts.bucket_by_length,
         eos_token_ids: eos_token_ids.as_slice(),
@@ -1496,7 +1738,7 @@ pub fn transcribe_timed(
         prompts: prompts.as_slice(),
         forced_langs_norm: forced_langs_norm.as_slice(),
         max_new_tokens: opts.max_new_tokens,
-        max_batch_size: opts.max_batch_size,
+        decode_max_seqs: opts.decode_max_seqs,
         max_batch_audio_sec: opts.max_batch_audio_sec,
         bucket_by_length: opts.bucket_by_length,
         eos_token_ids: eos_token_ids.as_slice(),
@@ -1759,7 +2001,6 @@ pub fn transcribe_with_forced_aligner_timed(
     let index_groups = group_chunk_indices(
         indices.as_slice(),
         chunks.as_slice(),
-        opts.max_batch_size,
         opts.max_batch_audio_sec,
     )?;
 
@@ -1811,6 +2052,7 @@ pub fn transcribe_with_forced_aligner_timed(
             None,
             prepared.as_slice(),
             opts.max_new_tokens,
+            opts.decode_max_seqs,
             eos_token_ids.as_slice(),
             &mut timings,
         )?;
@@ -1831,7 +2073,7 @@ pub fn transcribe_with_forced_aligner_timed(
             let forced = forced_langs_norm
                 .get(c.orig_index)
                 .and_then(|x| x.as_deref());
-            let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+            let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
             batch_lang.push(lang);
             batch_text.push(text);
         }
@@ -2078,7 +2320,6 @@ pub fn transcribe_with_forced_aligner(
     let index_groups = group_chunk_indices(
         indices.as_slice(),
         chunks.as_slice(),
-        opts.max_batch_size,
         opts.max_batch_audio_sec,
     )?;
 
@@ -2122,7 +2363,7 @@ pub fn transcribe_with_forced_aligner(
             None,
             prepared.as_slice(),
             opts.max_new_tokens,
-            opts.max_batch_size,
+            opts.decode_max_seqs,
             eos_token_ids.as_slice(),
         )?;
         if raws.len() != batch_chunk_idx.len() {
@@ -2142,7 +2383,7 @@ pub fn transcribe_with_forced_aligner(
             let forced = forced_langs_norm
                 .get(c.orig_index)
                 .and_then(|x| x.as_deref());
-            let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+            let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
             batch_lang.push(lang);
             batch_text.push(text);
         }
@@ -2505,7 +2746,7 @@ mod batch_grouping_tests {
             chunk_with_seconds(30.0),
         ];
         let indices = vec![0, 1, 2, 3];
-        let groups = group_chunk_indices(indices.as_slice(), &chunks, 0, 60.0)?;
+        let groups = group_chunk_indices(indices.as_slice(), &chunks, 60.0)?;
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0], vec![0, 1, 2]);
         assert_eq!(groups[1], vec![3]);
@@ -2515,9 +2756,22 @@ mod batch_grouping_tests {
     #[test]
     fn group_chunk_indices_puts_oversized_chunk_alone() -> anyhow::Result<()> {
         let chunks = vec![chunk_with_seconds(65.0), chunk_with_seconds(5.0)];
-        let groups = group_chunk_indices(&[0, 1], &chunks, 0, 60.0)?;
+        let groups = group_chunk_indices(&[0, 1], &chunks, 60.0)?;
         assert_eq!(groups, vec![vec![0], vec![1]]);
         assert!(chunk_audio_seconds(chunks[0].wav.len()) > 60.0);
+        Ok(())
+    }
+
+    #[test]
+    fn group_chunk_indices_without_audio_budget_keeps_one_pool() -> anyhow::Result<()> {
+        let chunks = vec![
+            chunk_with_seconds(1.0),
+            chunk_with_seconds(2.0),
+            chunk_with_seconds(3.0),
+            chunk_with_seconds(4.0),
+        ];
+        let groups = group_chunk_indices(&[0, 1, 2, 3], &chunks, 0.0)?;
+        assert_eq!(groups, vec![vec![0, 1, 2, 3]]);
         Ok(())
     }
 }

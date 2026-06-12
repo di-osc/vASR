@@ -170,9 +170,12 @@ impl Qwen3Asr {
 
     /// Pre-capture a vLLM-style padded CUDA decode graph at max_batch.
     #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
-    pub fn prewarm_cuda_decode_graphs(&self, max_batch: usize) -> Result<usize> {
+    pub fn prewarm_cuda_decode_graphs(
+        &self,
+        max_batch: usize,
+    ) -> Result<vasr_paged_attn::cuda_graph::CudaGraphPrewarmStats> {
         let Some(runtime) = self.paged_cache.as_ref() else {
-            return Ok(0);
+            return Ok(vasr_paged_attn::cuda_graph::CudaGraphPrewarmStats::empty());
         };
         let mut guard = runtime
             .lock()

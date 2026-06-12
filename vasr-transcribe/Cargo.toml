@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt", "time"] }
+tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
 vasr-audio = { path = "../vasr-audio" }
 vasr-data = { path = "../vasr-data" }
 vasr-models = { path = "../vasr-models" }
@@ -29,7 +29,8 @@ vasr-runtime = { path = "../vasr-runtime", features = ["async"] }
 [features]
 default = []
 accelerate = ["vasr-runtime/accelerate"]
-cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing", "paged-attn"]
+cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing", "paged-attn", "cuda-graph"]
+cuda-graph = []
 metal = ["vasr-runtime/metal", "vasr-runtime/timing", "paged-attn"]
 paged-attn = ["vasr-runtime/paged-attn"]
 

@@ -55,9 +55,9 @@ pub struct TranscribeOptions {
     pub language: Batch<Option<String>>,
     pub return_timestamps: bool,
     pub max_new_tokens: usize,
-    /// Maximum number of chunks/segments per ASR micro-batch. `0` means no count cap.
-    pub max_batch_size: usize,
-    /// Maximum total audio duration (seconds) per ASR micro-batch. `0` disables duration grouping.
+    /// Maximum concurrently decoded sequences. `0` uses the scheduler default.
+    pub decode_max_seqs: usize,
+    /// Maximum total audio duration (seconds) per ASR pool. `0` disables duration grouping.
     pub max_batch_audio_sec: f32,
     pub chunk_max_sec: Option<f32>,
     /// If true, bucket chunked audio by length before batching to reduce padding overhead.
@@ -71,7 +71,7 @@ impl Default for TranscribeOptions {
             language: Batch::one(None),
             return_timestamps: false,
             max_new_tokens: 0,
-            max_batch_size: 0,
+            decode_max_seqs: 0,
             max_batch_audio_sec: 180.0,
             chunk_max_sec: None,
             bucket_by_length: true,

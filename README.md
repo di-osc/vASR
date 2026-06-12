@@ -120,8 +120,7 @@ or `VASR_VAD_THRESHOLD` to tune segmentation. Additional VAD tuning flags:
 
 - `--vad-min-speech-ms` (default `250`)
 - `--vad-min-silence-ms` (default `500`)
-- `--vad-merge-max-gap-ms` (default `2000`)
-- `--vad-merge-max-segment-ms` (default `30000`)
+- `--vad-max-segment-sec` (default `30`)
 
 When `--vad-model` is omitted, vASR downloads/uses `funasr/fsmn-vad` from the Hugging Face cache.
 

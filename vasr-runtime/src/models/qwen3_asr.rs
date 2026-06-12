@@ -52,7 +52,7 @@ impl AsrModel for Qwen3AsrModel {
             language: Batch::one(options.language.clone()),
             return_timestamps: false,
             max_new_tokens: options.max_new_tokens,
-            max_batch_size: options.max_batch_size,
+            decode_max_seqs: options.decode_max_seqs,
             max_batch_audio_sec: options.max_batch_audio_sec,
             chunk_max_sec: options.chunk_max_sec,
             bucket_by_length: !continuous_paged_batch_enabled(),

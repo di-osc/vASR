@@ -227,9 +227,9 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
                 format!("failed to create output directory {}", parent.display())
             })?;
         }
-        let file = fs::File::create(output)
-            .with_context(|| format!("failed to create output file {}", output.display()))?;
-        serde_json::to_writer_pretty(&file, &report)
+        let json = serde_json::to_vec_pretty(&report)
+            .with_context(|| format!("failed to encode JSON for {}", output.display()))?;
+        fs::write(output, json)
             .with_context(|| format!("failed to write JSON to {}", output.display()))?;
         tracing::info!(
             target: "vasr_transcribe::benchmark",

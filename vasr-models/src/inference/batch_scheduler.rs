@@ -6,7 +6,7 @@
 //! segments with [`AsrProcessor::prepare_batch_varlen`] so admit waves can pad locally and
 //! prefill with per-row `query_lens` / flash varlen metadata.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
@@ -34,6 +34,7 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
+    explicit_decode_max_seqs: Option<usize>,
     pub continuous_batch: bool,
 }
 
@@ -41,19 +42,39 @@ impl Default for AsrBatchSchedulerConfig {
     fn default() -> Self {
         Self {
             max_num_seqs: 8,
+            explicit_decode_max_seqs: None,
             continuous_batch: continuous_batch_enabled(),
         }
     }
 }
 
 impl AsrBatchSchedulerConfig {
-    pub fn from_max_batch_size(max_batch_size: usize) -> Self {
+    pub fn from_decode_max_seqs(decode_max_seqs: usize) -> Self {
         let mut config = Self::default();
-        if max_batch_size > 0 {
-            config.max_num_seqs = max_batch_size;
+        if decode_max_seqs > 0 {
+            config.max_num_seqs = decode_max_seqs;
+            config.explicit_decode_max_seqs = Some(decode_max_seqs);
         }
         config
     }
+
+    fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
+        self.explicit_decode_max_seqs
+            .or_else(|| runtime_decode_max_seqs(runtime))
+            .unwrap_or(self.max_num_seqs)
+    }
+}
+
+fn runtime_decode_max_seqs(runtime: &PagedCacheRuntime) -> Option<usize> {
+    #[cfg(feature = "cuda-graph")]
+    {
+        let max_batch = runtime.cuda_decode_graph_max_batch();
+        if max_batch > 0 {
+            return Some(max_batch);
+        }
+    }
+    let _ = runtime;
+    None
 }
 
 fn continuous_batch_enabled() -> bool {
@@ -68,6 +89,125 @@ pub(crate) fn continuous_paged_batch_enabled() -> bool {
 struct RunningSlot {
     client_index: usize,
     slot: PagedDecodeSlot,
+}
+
+#[derive(Debug, Default)]
+struct ContinuousDecodeDebug {
+    finished_slots_by_step: BTreeMap<usize, usize>,
+    tail_active_slots: VecDeque<usize>,
+    total_decode_calls: usize,
+    total_active_slots: usize,
+    max_active_slots: usize,
+    one_slot_calls: usize,
+    two_or_less_slot_calls: usize,
+}
+
+impl ContinuousDecodeDebug {
+    fn record_active(&mut self, step: usize, active_slots: usize) {
+        self.total_decode_calls = self.total_decode_calls.saturating_add(1);
+        self.total_active_slots = self.total_active_slots.saturating_add(active_slots);
+        self.max_active_slots = self.max_active_slots.max(active_slots);
+        if active_slots == 1 {
+            self.one_slot_calls = self.one_slot_calls.saturating_add(1);
+        }
+        if active_slots <= 2 {
+            self.two_or_less_slot_calls = self.two_or_less_slot_calls.saturating_add(1);
+        }
+        self.tail_active_slots.push_back(active_slots);
+        while self.tail_active_slots.len() > 50 {
+            self.tail_active_slots.pop_front();
+        }
+
+        if step % 50 == 0 || active_slots == 1 {
+            tracing::debug!(
+                target: "vasr_transcribe::pipeline",
+                "continuous decode | step={step} active_slots={active_slots}",
+            );
+        }
+    }
+
+    fn record_finished(&mut self, running: &[Option<RunningSlot>]) {
+        for entry in running.iter().filter_map(Option::as_ref) {
+            if !entry.slot.finished {
+                continue;
+            }
+            *self
+                .finished_slots_by_step
+                .entry(entry.slot.decode_step)
+                .or_default() += 1;
+        }
+    }
+
+    fn log_summary(&self, max_slots: usize) {
+        if self.total_decode_calls == 0 && self.finished_slots_by_step.is_empty() {
+            return;
+        }
+
+        let avg_active = if self.total_decode_calls == 0 {
+            0.0
+        } else {
+            self.total_active_slots as f64 / self.total_decode_calls as f64
+        };
+        let occupancy = if self.total_decode_calls == 0 || max_slots == 0 {
+            0.0
+        } else {
+            self.total_active_slots as f64 / (self.total_decode_calls * max_slots) as f64
+        };
+        let tail_one_slot_calls = self.tail_active_slots.iter().filter(|&&n| n == 1).count();
+        let tail_two_or_less_slot_calls =
+            self.tail_active_slots.iter().filter(|&&n| n <= 2).count();
+        let finished_steps = decode_step_distribution(&self.finished_slots_by_step);
+
+        tracing::info!(
+            target: "vasr_transcribe::pipeline",
+            "continuous decode summary | calls={} max_slots={} avg_active={:.2} occupancy={:.1}% max_active={} one_slot_calls={} two_or_less_calls={} tail50_one_slot_calls={} tail50_two_or_less_calls={} finished_slots={} finished_step_min/p50/p90/max={}/{}/{}/{}",
+            self.total_decode_calls,
+            max_slots,
+            avg_active,
+            occupancy * 100.0,
+            self.max_active_slots,
+            self.one_slot_calls,
+            self.two_or_less_slot_calls,
+            tail_one_slot_calls,
+            tail_two_or_less_slot_calls,
+            finished_steps.count,
+            finished_steps.min,
+            finished_steps.p50,
+            finished_steps.p90,
+            finished_steps.max,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeStepDistribution {
+    count: usize,
+    min: usize,
+    p50: usize,
+    p90: usize,
+    max: usize,
+}
+
+fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistribution {
+    let mut steps = Vec::new();
+    for (&step, &count) in counts {
+        steps.extend(std::iter::repeat(step).take(count));
+    }
+    if steps.is_empty() {
+        return DecodeStepDistribution::default();
+    }
+    let len = steps.len();
+    let percentile = |pct: usize| -> usize {
+        let idx = len.saturating_sub(1).saturating_mul(pct).div_ceil(100);
+        steps[idx.min(len - 1)]
+    };
+    DecodeStepDistribution {
+        count: len,
+        min: steps[0],
+        p50: percentile(50),
+        p90: percentile(90),
+        max: steps[len - 1],
+    }
 }
 
 #[derive(Debug)]
@@ -215,12 +355,6 @@ impl AsrBatchScheduler {
         &self.config
     }
 
-    fn allocate_request_id(&mut self) -> usize {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        id
-    }
-
     /// Run one homogeneous micro-batch (same padded `seq_len` across rows).
     pub fn run_micro_batch(
         &mut self,
@@ -287,7 +421,11 @@ impl AsrBatchScheduler {
             return Ok(vec![vec![]; batch]);
         }
 
-        let max_slots = self.config.max_num_seqs.max(1).min(batch);
+        let mut runtime_guard = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        let max_num_seqs = self.config.continuous_max_num_seqs(&runtime_guard);
+        let max_slots = max_num_seqs.max(1).min(batch);
         let mut waiting: VecDeque<usize> = (0..batch).collect();
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = vec![vec![]; batch];
@@ -314,15 +452,13 @@ impl AsrBatchScheduler {
                 "continuous batch audio token mismatch: prepared placeholders={audio_cursor} audio_features={total_audio_tokens}"
             );
         }
-
-        let mut runtime_guard = runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
         let kv_block_capacity =
             PagedBlockManager::allocatable_block_capacity(runtime_guard.stats().num_blocks);
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
+            let mut decode_debug = ContinuousDecodeDebug::default();
             loop {
+                decode_debug.record_finished(running.as_slice());
                 free_finished_running(
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
@@ -341,6 +477,7 @@ impl AsrBatchScheduler {
                 if !active_steps.is_empty() {
                     let step_groups = group_running_by_decode_step(active_steps.as_slice());
                     for (step, slot_indices) in step_groups {
+                        decode_debug.record_active(step, slot_indices.len());
                         let mut batch_slots: Vec<PagedDecodeSlot> = slot_indices
                             .iter()
                             .map(|&slot_idx| {
@@ -389,6 +526,7 @@ impl AsrBatchScheduler {
                     }
                 }
 
+                decode_debug.record_finished(running.as_slice());
                 free_finished_running(
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
@@ -504,6 +642,7 @@ impl AsrBatchScheduler {
                 }
             }
 
+            decode_debug.log_summary(max_slots);
             Ok(outputs)
         })();
 
@@ -532,9 +671,9 @@ pub fn run_paged_micro_batch(
     audio_features: Option<&Tensor>,
     max_new_tokens: usize,
     eos_token_ids: &[u32],
-    max_batch_size: usize,
+    decode_max_seqs: usize,
 ) -> Result<Vec<Vec<u32>>> {
-    let config = AsrBatchSchedulerConfig::from_max_batch_size(max_batch_size);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     scheduler.run_micro_batch(
         thinker,
@@ -556,10 +695,10 @@ pub fn run_paged_prepared_batch(
     audio_features: &Tensor,
     max_new_tokens: usize,
     eos_token_ids: &[u32],
-    max_batch_size: usize,
+    decode_max_seqs: usize,
     pad_id: u32,
 ) -> Result<Vec<Vec<u32>>> {
-    let config = AsrBatchSchedulerConfig::from_max_batch_size(max_batch_size);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     if scheduler.config.continuous_batch {
         scheduler.run_continuous_prepared(
@@ -602,10 +741,10 @@ pub fn run_paged_prepared_batch_timed(
     audio_features: &Tensor,
     max_new_tokens: usize,
     eos_token_ids: &[u32],
-    max_batch_size: usize,
+    decode_max_seqs: usize,
     pad_id: u32,
 ) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
-    let config = AsrBatchSchedulerConfig::from_max_batch_size(max_batch_size);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     let mut timings = GenerationTimings::default();
     let ids = if scheduler.config.continuous_batch {
@@ -630,7 +769,7 @@ pub fn run_paged_prepared_batch_timed(
             audio_features,
             max_new_tokens,
             eos_token_ids,
-            max_batch_size,
+            decode_max_seqs,
             pad_id,
         )?;
         let elapsed = duration_to_us(start.elapsed());

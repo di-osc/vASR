@@ -9,9 +9,9 @@ use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::cuda_graph::{
-    CUDA_DECODE_GRAPH_MAX_GRAPHS, DecodeCudaGraph, bucket_block_table_cols,
-    cuda_graph_batch_bucket, cuda_graph_batch_buckets, cuda_graph_prewarm_batch_limit,
-    pad_decode_batch_to_max,
+    CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS, CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats,
+    DecodeCudaGraph, bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
+    cuda_graph_prewarm_batch_limit, cuda_memory_snapshot, pad_decode_batch_to_max,
 };
 #[cfg(feature = "cuda-graph")]
 use crate::decode_forward::PagedCudaDecodeForward;
@@ -23,7 +23,7 @@ use crate::paged_kv_cache::PagedKvCache;
 pub enum PagedCacheMemory {
     ContextSize(usize),
     Blocks(usize),
-    /// KV pool budget = `fraction * total_vram - already_used` at allocation time (CUDA only).
+    /// KV pool budget = `fraction * total_vram - already_used - margin` at allocation time (CUDA only).
     GpuMemoryFraction(f32),
 }
 
@@ -136,10 +136,11 @@ fn cuda_memory_mib(gpu_id: usize) -> Result<(u64, u64)> {
 fn cuda_kv_byte_budget(gpu_id: usize, fraction: f32) -> Result<usize> {
     let (total_mib, used_mib) = cuda_memory_mib(gpu_id)?;
     let target_mib = ((total_mib as f64) * f64::from(fraction)).floor() as u64;
-    let budget_mib = target_mib.saturating_sub(used_mib);
+    let margin_mib = std::cmp::max(512u64, ((total_mib as f64) * 0.02).ceil() as u64);
+    let budget_mib = target_mib.saturating_sub(used_mib.saturating_add(margin_mib));
     if budget_mib == 0 {
         candle_core::bail!(
-            "GPU KV budget exhausted: total_mib={total_mib} used_mib={used_mib} fraction={fraction}"
+            "GPU KV budget exhausted: total_mib={total_mib} used_mib={used_mib} margin_mib={margin_mib} fraction={fraction}"
         );
     }
     usize::try_from(budget_mib)
@@ -375,7 +376,6 @@ impl PagedBlockManager {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CudaDecodeGraphKey {
     batch: usize,
-    block_table_cols: usize,
 }
 
 #[derive(Debug)]
@@ -481,6 +481,11 @@ impl PagedCacheRuntime {
     }
 
     #[cfg(feature = "cuda-graph")]
+    pub fn cuda_decode_graph_max_batch(&self) -> usize {
+        self.cuda_graph_max_batch
+    }
+
+    #[cfg(feature = "cuda-graph")]
     pub fn cuda_decode_graphs_enabled(&self) -> bool {
         !self.cuda_decode_graphs_disabled && self.cuda_graph_max_batch > 0
     }
@@ -499,7 +504,7 @@ impl PagedCacheRuntime {
     fn cuda_decode_graph_key(
         &self,
         input_ids: &Tensor,
-        metadata: &PagedInputMetadata,
+        _metadata: &PagedInputMetadata,
     ) -> Result<CudaDecodeGraphKey> {
         let (actual_batch, q_len) = input_ids.dims2()?;
         if q_len != 1 {
@@ -515,17 +520,12 @@ impl PagedCacheRuntime {
             );
         }
 
-        let meta_cols = metadata.block_tables.dim(1)?;
-        let graph_cols = bucket_block_table_cols(meta_cols, self.cache.block_size());
         let graph_batch = cuda_graph_batch_bucket(actual_batch, max_batch).ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "CUDA decode graph has no batch bucket for actual_batch={actual_batch} max_batch={max_batch}"
             ))
         })?;
-        Ok(CudaDecodeGraphKey {
-            batch: graph_batch,
-            block_table_cols: graph_cols,
-        })
+        Ok(CudaDecodeGraphKey { batch: graph_batch })
     }
 
     #[cfg(feature = "cuda-graph")]
@@ -535,6 +535,10 @@ impl PagedCacheRuntime {
         metadata: &PagedInputMetadata,
     ) -> Result<bool> {
         if !self.cuda_decode_graphs_enabled() {
+            return Ok(false);
+        }
+        let meta_cols = metadata.block_tables.dim(1)?;
+        if meta_cols > CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS {
             return Ok(false);
         }
         let key = self.cuda_decode_graph_key(input_ids, metadata)?;
@@ -584,7 +588,7 @@ impl PagedCacheRuntime {
             candle_core::bail!("CUDA decode graph disabled for key={key:?}");
         }
         let graph_batch = key.batch;
-        let graph_cols = key.block_table_cols;
+        let graph_cols = CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS;
         let device = input_ids.device();
 
         let run_graph = |graph: &DecodeCudaGraph| -> Result<Tensor> {
@@ -630,6 +634,7 @@ impl PagedCacheRuntime {
         .map_err(|err| {
             candle_core::Error::Msg(format!("CUDA decode graph capture padding failed: {err}"))
         })?;
+        let mem_before = cuda_memory_snapshot(device);
         let (graph, warmup_logits) = DecodeCudaGraph::capture_decode(
             thinker,
             &self.cache,
@@ -639,13 +644,32 @@ impl PagedCacheRuntime {
         )
         .map_err(|err| {
             candle_core::Error::Msg(format!(
-                "CUDA decode graph capture failed for batch={graph_batch} block_table_cols={graph_cols}: {err}"
+                "CUDA decode graph capture failed for batch={graph_batch} fixed_block_table_cols={graph_cols}: {err}"
             ))
         })?;
         self.insert_cuda_decode_graph(key, graph);
-        tracing::debug!(
-            "CUDA decode graph captured batch={graph_batch} block_table_cols={graph_cols}"
-        );
+        let mem_after = cuda_memory_snapshot(device);
+        if let (Some(before), Some(after)) = (mem_before, mem_after) {
+            let used_before = before.used();
+            let used_after = after.used();
+            let delta = used_after.saturating_sub(used_before);
+            tracing::info!(
+                target: "vasr_transcribe::serve",
+                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} graphs={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB",
+                self.cuda_decode_graphs.len(),
+                bytes_to_mib(delta),
+                bytes_to_mib(used_before),
+                bytes_to_mib(used_after),
+                bytes_to_mib(after.free),
+                bytes_to_mib(after.total),
+            );
+        } else {
+            tracing::info!(
+                target: "vasr_transcribe::serve",
+                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} graphs={}",
+                self.cuda_decode_graphs.len()
+            );
+        }
         warmup_logits
             .narrow(0, 0, actual_batch)
             .map_err(|err| candle_core::Error::from(err))
@@ -657,50 +681,76 @@ impl PagedCacheRuntime {
         thinker: &M,
         device: &Device,
         max_batch: usize,
-    ) -> Result<usize> {
+    ) -> Result<CudaGraphPrewarmStats> {
         if !device.is_cuda() || max_batch == 0 {
-            return Ok(0);
+            return Ok(CudaGraphPrewarmStats::empty());
         }
 
-        let block_size = self.cache.block_size();
-        let base_block_table_cols = crate::cuda_graph::cuda_graph_block_bucket(block_size);
-        let block_table_col_buckets = [base_block_table_cols, base_block_table_cols * 2];
-        let limit = cuda_graph_prewarm_batch_limit(max_batch);
+        let graph_block_table_cols = CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS;
+        let requested_limit = cuda_graph_prewarm_batch_limit(max_batch);
+        let capacity_limit = self
+            .cache
+            .num_blocks()
+            .saturating_sub(1)
+            .checked_div(graph_block_table_cols)
+            .unwrap_or(0);
+        let limit = requested_limit.min(capacity_limit);
+        if limit == 0 {
+            candle_core::bail!(
+                "CUDA decode graph prewarm requires at least {} KV blocks, got {}",
+                graph_block_table_cols.saturating_add(1),
+                self.cache.num_blocks()
+            );
+        }
         self.cuda_graph_max_batch = limit;
         self.cuda_decode_graphs_disabled = false;
         self.cuda_decode_graph_disabled_keys.clear();
         self.cuda_decode_graphs.clear();
 
+        let mem_before = cuda_memory_snapshot(device);
         let mut captured = 0usize;
-        for block_table_cols in block_table_col_buckets {
-            for batch in cuda_graph_batch_buckets(limit) {
-                let graph = DecodeCudaGraph::capture_batch_warmup(
-                    thinker,
-                    &self.cache,
-                    batch,
-                    block_table_cols,
-                    device,
-                )
-                .map_err(|err| {
-                    candle_core::Error::Msg(format!(
-                        "CUDA decode graph prewarm failed for batch={batch} block_table_cols={block_table_cols}: {err}"
-                    ))
-                })?;
-                self.insert_cuda_decode_graph(
-                    CudaDecodeGraphKey {
-                        batch,
-                        block_table_cols,
-                    },
-                    graph,
-                );
-                captured = captured.saturating_add(1);
-            }
+        for batch in cuda_graph_batch_buckets(limit) {
+            let graph = DecodeCudaGraph::capture_batch_warmup(
+                thinker,
+                &self.cache,
+                batch,
+                graph_block_table_cols,
+                device,
+            )
+            .map_err(|err| {
+                candle_core::Error::Msg(format!(
+                    "CUDA decode graph prewarm failed for batch={batch} fixed_block_table_cols={graph_block_table_cols}: {err}"
+                ))
+            })?;
+            self.insert_cuda_decode_graph(CudaDecodeGraphKey { batch }, graph);
+            captured = captured.saturating_add(1);
         }
+        let mem_after = cuda_memory_snapshot(device);
 
-        tracing::info!(
-            "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} block_table_cols={block_table_col_buckets:?} (osc-transformers/vLLM-style padded replay)"
-        );
-        Ok(captured)
+        if let (Some(before), Some(after)) = (mem_before, mem_after) {
+            let used_before = before.used();
+            let used_after = after.used();
+            let delta = used_after.saturating_sub(used_before);
+            tracing::info!(
+                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} kv_blocks={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB (nano-vLLM-style fixed block-table replay)",
+                self.cache.num_blocks(),
+                bytes_to_mib(delta),
+                bytes_to_mib(used_before),
+                bytes_to_mib(used_after),
+                bytes_to_mib(after.free),
+                bytes_to_mib(after.total),
+            );
+        } else {
+            tracing::info!(
+                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} kv_blocks={} (nano-vLLM-style fixed block-table replay)",
+                self.cache.num_blocks()
+            );
+        }
+        Ok(CudaGraphPrewarmStats {
+            graphs: captured,
+            memory_before: mem_before,
+            memory_after: mem_after,
+        })
     }
 }
 
@@ -779,7 +829,57 @@ mod tests {
 
     #[cfg(feature = "cuda-graph")]
     #[test]
-    fn cuda_graph_disable_is_scoped_to_the_padded_key() -> anyhow::Result<()> {
+    fn cuda_graph_disable_is_scoped_to_the_batch_key() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let mut runtime = PagedCacheRuntime::new(
+            1,
+            1,
+            8,
+            DType::F32,
+            &device,
+            PagedCacheConfig {
+                block_size: 16,
+                memory: PagedCacheMemory::Blocks(8),
+            },
+        )?;
+        runtime.set_cuda_graph_max_batch_for_test(20);
+
+        let input_ids = Tensor::zeros((5usize, 1usize), DType::U32, &device)?;
+        let block_tables = Tensor::zeros((5usize, 16usize), DType::U32, &device)?;
+        let slot_mapping = Tensor::zeros((5usize,), DType::I64, &device)?;
+        let context_lens = Tensor::zeros((5usize,), DType::U32, &device)?;
+        let metadata = crate::paged_kv_cache::PagedInputMetadata {
+            slot_mapping,
+            block_tables,
+            context_lens,
+            max_context_len: 272,
+            token_attention_mask: None,
+            prefill_attention_mask: None,
+            prefill_flash_params: None,
+            prefill_causal_only: false,
+            query_lens: None,
+            kv_lens: None,
+            cu_seqlens_q: None,
+            cu_seqlens_kv: None,
+            max_query_len: None,
+            max_kv_len: None,
+        };
+
+        let key = runtime.cuda_decode_graph_key(&input_ids, &metadata)?;
+        assert_eq!(key.batch, 8);
+        assert!(runtime.cuda_decode_graph_enabled_for(&input_ids, &metadata)?);
+
+        runtime.disable_cuda_decode_graph_for(&input_ids, &metadata)?;
+        assert!(!runtime.cuda_decode_graph_enabled_for(&input_ids, &metadata)?);
+
+        let smaller_input_ids = Tensor::zeros((4usize, 1usize), DType::U32, &device)?;
+        assert!(runtime.cuda_decode_graph_enabled_for(&smaller_input_ids, &metadata)?);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda-graph")]
+    #[test]
+    fn cuda_graph_is_disabled_when_block_table_exceeds_fixed_width() -> anyhow::Result<()> {
         let device = Device::Cpu;
         let mut runtime = PagedCacheRuntime::new(
             1,
@@ -798,13 +898,14 @@ mod tests {
         let block_tables = Tensor::zeros((5usize, 17usize), DType::U32, &device)?;
         let slot_mapping = Tensor::zeros((5usize,), DType::I64, &device)?;
         let context_lens = Tensor::zeros((5usize,), DType::U32, &device)?;
-        let metadata = crate::model::paged_kv_cache::PagedInputMetadata {
+        let metadata = crate::paged_kv_cache::PagedInputMetadata {
             slot_mapping,
             block_tables,
             context_lens,
             max_context_len: 272,
             token_attention_mask: None,
             prefill_attention_mask: None,
+            prefill_flash_params: None,
             prefill_causal_only: false,
             query_lens: None,
             kv_lens: None,
@@ -814,16 +915,7 @@ mod tests {
             max_kv_len: None,
         };
 
-        let key = runtime.cuda_decode_graph_key(&input_ids, &metadata)?;
-        assert_eq!(key.batch, 8);
-        assert_eq!(key.block_table_cols, 32);
-        assert!(runtime.cuda_decode_graph_enabled_for(&input_ids, &metadata)?);
-
-        runtime.disable_cuda_decode_graph_for(&input_ids, &metadata)?;
         assert!(!runtime.cuda_decode_graph_enabled_for(&input_ids, &metadata)?);
-
-        let smaller_input_ids = Tensor::zeros((4usize, 1usize), DType::U32, &device)?;
-        assert!(runtime.cuda_decode_graph_enabled_for(&smaller_input_ids, &metadata)?);
         Ok(())
     }
 }
