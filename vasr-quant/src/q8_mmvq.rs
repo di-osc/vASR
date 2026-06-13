@@ -13,8 +13,6 @@ use candle_core::{CudaDevice, CudaStorage, DType, Device, Result, Shape, Storage
 const Q8_1_BLOCK_SIZE: usize = 32;
 const Q8_1_TYPE_SIZE: usize = 36;
 const MATRIX_ROW_PADDING: usize = 512;
-pub const MMVQ_MAX_BATCH: usize = 8;
-
 type PlainLauncher = unsafe extern "C" fn(
     vx: *const std::ffi::c_void,
     vy: *const std::ffi::c_void,
@@ -250,7 +248,7 @@ fn tensor_from_cuda_slice<T: DeviceRepr + CudaDType>(
     )
 }
 
-pub fn can_run(w: &QTensor, xs: &Tensor) -> bool {
+fn can_run_with_max_batch(w: &QTensor, xs: &Tensor, max_batch: usize) -> bool {
     if w.dtype() != GgmlDType::Q8_0 || !w.device().is_cuda() {
         return false;
     }
@@ -260,10 +258,23 @@ pub fn can_run(w: &QTensor, xs: &Tensor) -> bool {
     let flat_batch = xs.dims()[..xs.dims().len().saturating_sub(1)]
         .iter()
         .product::<usize>();
-    (1..=MMVQ_MAX_BATCH).contains(&flat_batch)
+    flat_batch > 0 && flat_batch <= max_batch
 }
 
-pub fn can_run_fused_glu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> bool {
+pub fn can_run(w: &QTensor, xs: &Tensor) -> bool {
+    can_run_with_max_batch(w, xs, 8)
+}
+
+pub fn can_run_decode(w: &QTensor, xs: &Tensor) -> bool {
+    can_run_with_max_batch(w, xs, i32::MAX as usize)
+}
+
+fn can_run_fused_glu_with_max_batch(
+    gate_w: &QTensor,
+    up_w: &QTensor,
+    xs: &Tensor,
+    max_batch: usize,
+) -> bool {
     gate_w.dtype() == GgmlDType::Q8_0
         && up_w.dtype() == GgmlDType::Q8_0
         && gate_w.device().is_cuda()
@@ -275,12 +286,16 @@ pub fn can_run_fused_glu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> bool 
             let flat_batch = xs.dims()[..xs.dims().len().saturating_sub(1)]
                 .iter()
                 .product::<usize>();
-            (1..=MMVQ_MAX_BATCH).contains(&flat_batch)
+            flat_batch > 0 && flat_batch <= max_batch
         }
 }
 
+pub fn can_run_fused_glu_decode(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> bool {
+    can_run_fused_glu_with_max_batch(gate_w, up_w, xs, i32::MAX as usize)
+}
+
 pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
-    if !can_run(w, xs) {
+    if !can_run_decode(w, xs) {
         candle_core::bail!("q8_mmvq: unsupported fast path input");
     }
     let Device::Cuda(dev) = w.device() else {
@@ -413,7 +428,7 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
 }
 
 pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<Tensor> {
-    if !can_run_fused_glu(gate_w, up_w, xs) {
+    if !can_run_fused_glu_decode(gate_w, up_w, xs) {
         candle_core::bail!("q8_mmvq fused_glu: unsupported fast path input");
     }
     let Device::Cuda(dev) = gate_w.device() else {

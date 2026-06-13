@@ -1319,64 +1319,69 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
   extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_plain(                  \
       const void *vx, const void *vy, void *dst, int ncols_x, int nrows_x,     \
       int stride_col_y, int stride_col_dst, int b_size, void *stream) {        \
-    const unsigned int rows_per_block =                                        \
-        (b_size <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_PLAIN : 2;             \
-    const unsigned int nblocks =                                               \
-        (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);       \
-    unsigned int nwarps;                                                       \
-    if (b_size == 1) {                                                         \
-      nwarps = MMVQ_NWARPS_SINGLE_COL_PLAIN;                                   \
-    } else if (b_size <= 4) {                                                  \
-      nwarps = 4;                                                              \
-    } else {                                                                   \
-      nwarps = 2;                                                              \
-    }                                                                          \
-    dim3 grid(nblocks, 1, 1);                                                  \
-    dim3 block(WARP_SIZE, nwarps, 1);                                          \
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
-    switch (b_size) {                                                          \
+    for (int col0 = 0; col0 < b_size; col0 += 8) {                             \
+      const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
+      const unsigned int rows_per_block =                                      \
+          (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_PLAIN : 2;             \
+      const unsigned int nblocks =                                             \
+          (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);     \
+      unsigned int nwarps;                                                     \
+      if (cols == 1) {                                                         \
+        nwarps = MMVQ_NWARPS_SINGLE_COL_PLAIN;                                 \
+      } else if (cols <= 4) {                                                  \
+        nwarps = 4;                                                            \
+      } else {                                                                 \
+        nwarps = 2;                                                            \
+      }                                                                        \
+      dim3 grid(nblocks, 1, 1);                                                \
+      dim3 block(WARP_SIZE, nwarps, 1);                                        \
+      const block_q8_1 *vy_col = ((const block_q8_1 *)vy) + col0 * stride_col_y; \
+      dst_c_type *dst_col = ((dst_c_type *)dst) + col0 * stride_col_dst;       \
+      switch (cols) {                                                          \
     case 1:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda1<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 2:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda2<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 3:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda3<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 4:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda4<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 5:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda5<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 6:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda6<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 7:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda7<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     case 8:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda8<<<grid, block, 0, s>>>(        \
-          vx, vy, (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y,           \
+          vx, vy_col, dst_col, ncols_x, nrows_x, stride_col_y,                 \
           stride_col_dst);                                                     \
       break;                                                                   \
     default:                                                                   \
       break;                                                                   \
+      }                                                                        \
     }                                                                          \
   }
 
@@ -1385,64 +1390,69 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
       const void *vx_gate, const void *vx_up, const void *vy, void *dst,       \
       int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,          \
       int b_size, int activation, void *stream) {                              \
-    const unsigned int rows_per_block =                                        \
-        (b_size <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_FUSED_GLU : 2;         \
-    const unsigned int nblocks =                                               \
-        (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);       \
-    unsigned int nwarps;                                                       \
-    if (b_size == 1) {                                                         \
-      nwarps = MMVQ_NWARPS_SINGLE_COL_FUSED_GLU;                               \
-    } else if (b_size <= 4) {                                                  \
-      nwarps = 4;                                                              \
-    } else {                                                                   \
-      nwarps = 2;                                                              \
-    }                                                                          \
-    dim3 grid(nblocks, 1, 1);                                                  \
-    dim3 block(WARP_SIZE, nwarps, 1);                                          \
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
-    switch (b_size) {                                                          \
+    for (int col0 = 0; col0 < b_size; col0 += 8) {                             \
+      const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
+      const unsigned int rows_per_block =                                      \
+          (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_FUSED_GLU : 2;         \
+      const unsigned int nblocks =                                             \
+          (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);     \
+      unsigned int nwarps;                                                     \
+      if (cols == 1) {                                                         \
+        nwarps = MMVQ_NWARPS_SINGLE_COL_FUSED_GLU;                             \
+      } else if (cols <= 4) {                                                  \
+        nwarps = 4;                                                            \
+      } else {                                                                 \
+        nwarps = 2;                                                            \
+      }                                                                        \
+      dim3 grid(nblocks, 1, 1);                                                \
+      dim3 block(WARP_SIZE, nwarps, 1);                                        \
+      const block_q8_1 *vy_col = ((const block_q8_1 *)vy) + col0 * stride_col_y; \
+      dst_c_type *dst_col = ((dst_c_type *)dst) + col0 * stride_col_dst;       \
+      switch (cols) {                                                          \
     case 1:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda1<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 2:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda2<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 3:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda3<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 4:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda4<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 5:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda5<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 6:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda6<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 7:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda7<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     case 8:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda8<<<grid, block, 0, s>>>(    \
-          vx_gate, vx_up, vy, (dst_c_type *)dst, ncols_x, nrows_x,             \
+          vx_gate, vx_up, vy_col, dst_col, ncols_x, nrows_x,                   \
           stride_col_y, stride_col_dst, activation);                           \
       break;                                                                   \
     default:                                                                   \
       break;                                                                   \
+      }                                                                        \
     }                                                                          \
   }
 

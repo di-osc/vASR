@@ -379,12 +379,15 @@ pub fn try_fused_q8_silu_gate_up(
     if gate.bias.is_some() || up.bias.is_some() {
         return Ok(None);
     }
+    if linear_is_prefill() {
+        return Ok(None);
+    }
     let (QMatMul::QTensor(gate_q), QMatMul::QTensor(up_q)) =
         (gate.matmul.as_ref(), up.matmul.as_ref())
     else {
         return Ok(None);
     };
-    if !crate::q8_mmvq::can_run_fused_glu(gate_q, up_q, x) {
+    if !crate::q8_mmvq::can_run_fused_glu_decode(gate_q, up_q, x) {
         return Ok(None);
     }
     Ok(Some(crate::q8_mmvq::fused_glu_silu(gate_q, up_q, x)?))
@@ -414,12 +417,27 @@ impl candle_core::Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
-            if crate::q8_mmvq::can_run(qtensor, x) {
+            let can_run_q8_mmvq = if linear_is_prefill() {
+                crate::q8_mmvq::can_run(qtensor, x)
+            } else {
+                crate::q8_mmvq::can_run_decode(qtensor, x)
+            };
+            if can_run_q8_mmvq {
                 let mut ys = crate::q8_mmvq::plain(qtensor, x)?;
                 if let Some(bias) = &self.bias {
                     ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
                 }
                 return Ok(ys);
+            }
+            if qtensor.dtype() == GgmlDType::Q8_0
+                && qtensor.device().is_cuda()
+                && !linear_is_prefill()
+            {
+                candle_core::bail!(
+                    "CUDA Q8_0 linear is not covered by q8_mmvq fast path: input_shape={:?} input_dtype={:?}",
+                    x.dims(),
+                    x.dtype()
+                );
             }
         }
 
