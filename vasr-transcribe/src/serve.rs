@@ -2,21 +2,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::runtime::{
+    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrModel,
+    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
+};
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use candle_core::Device;
 use clap::Args;
-use vasr_audio::AudioLoader;
-use vasr_models::qwen3_asr::LoadOptions;
-use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
+use vasr_data::AudioLoader;
+use vasr_models::asr::qwen3asr::LoadOptions;
+use vasr_models::asr::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use vasr_models::qwen3_asr::model::paged_cache_runtime::{
+use vasr_models::asr::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
-};
-use vasr_runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrModel,
-    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
 
 use crate::pipeline::AsyncTranscribePipeline;
@@ -58,7 +58,7 @@ pub struct VadCliArgs {
     pub vad_model: Option<String>,
 
     /// FSMN VAD speech probability threshold (`speech_noise_thres`).
-    #[arg(long, default_value_t = 0.5, env = "VASR_VAD_THRESHOLD")]
+    #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
     pub vad_threshold: f32,
 
     /// Minimum speech duration in milliseconds before a segment is confirmed.
@@ -110,7 +110,7 @@ pub type TranscribeArgs = ServeTranscribeArgs;
 
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_transcribe=info,vasr_runtime=info"
+        "warn,vasr_transcribe=debug,vasr_models=debug"
     } else {
         "warn,vasr_transcribe=info"
     };
@@ -210,7 +210,7 @@ mod tests {
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
                 vad_model: None,
-                vad_threshold: 0.5,
+                vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 500,
                 vad_max_segment_sec: 30.0,

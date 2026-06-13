@@ -11,10 +11,11 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use vasr_audio::{AudioLoadOptions, AudioLoader};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
-use vasr_runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
-use vasr_runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
+use vasr_data::{AudioLoadOptions, AudioLoader};
+
+use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
+use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 
 const DEFAULT_STAGE_BUFFER: usize = 4;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
@@ -370,6 +371,7 @@ struct AsrSegmentJob {
     job_index: usize,
     job_audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
+    segment_index: usize,
     segment_count: usize,
     offset: DurationMs,
     waveform: Waveform,
@@ -386,7 +388,7 @@ struct SegmentJobState {
     index: usize,
     audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
-    timeline: Timeline,
+    segment_annotations: Vec<Option<Vec<Annotation>>>,
     segment_count: usize,
     segments_done: usize,
 }
@@ -425,6 +427,7 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
             } else {
                 Vec::new()
             },
+            segment_index,
             segment_count,
             offset: segment.range.start,
             waveform,
@@ -915,26 +918,46 @@ fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegment
                 index: segment.job_index,
                 audio_seconds: segment.job_audio_seconds,
                 speech_annotations: segment.speech_annotations.clone(),
-                timeline: Timeline::new("offline_audio"),
+                segment_annotations: vec![None; segment.segment_count],
                 segment_count: segment.segment_count,
                 segments_done: 0,
             });
         if !segment.speech_annotations.is_empty() {
             entry.speech_annotations = segment.speech_annotations.clone();
         }
-        if entry.timeline.annotations.is_empty() && !entry.speech_annotations.is_empty() {
+        if entry.segment_count != segment.segment_count {
+            tracing::warn!(
+                target: "vasr_transcribe::pipeline",
+                "VAD segment count changed for job={} previous={} new={}",
+                segment.job_index,
+                entry.segment_count,
+                segment.segment_count
+            );
+            entry.segment_count = segment.segment_count;
             entry
-                .timeline
-                .annotations
-                .extend(entry.speech_annotations.clone());
+                .segment_annotations
+                .resize_with(segment.segment_count, || None);
         }
-        entry.segment_count = segment.segment_count;
+    }
+}
+
+fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
+    let mut timeline = Timeline::new("offline_audio");
+    timeline.annotations.extend(job.speech_annotations);
+    for annotations in job.segment_annotations.into_iter().flatten() {
+        timeline.annotations.extend(annotations);
+    }
+    TranscribeItemOutcome {
+        index: job.index,
+        result: Ok(timeline),
+        audio_seconds: job.audio_seconds,
+        bad_component: None,
     }
 }
 
 #[derive(Debug)]
 struct SegmentAsrInference {
-    targets: Vec<(usize, DurationMs)>,
+    targets: Vec<(usize, usize, DurationMs)>,
     segment_audio_seconds: f64,
     active_job_count: usize,
 }
@@ -948,9 +971,9 @@ fn run_segment_asr_inference(
         .iter()
         .map(|segment| segment.waveform.clone())
         .collect();
-    let targets: Vec<(usize, DurationMs)> = segments
+    let targets: Vec<(usize, usize, DurationMs)> = segments
         .iter()
-        .map(|segment| (segment.job_index, segment.offset))
+        .map(|segment| (segment.job_index, segment.segment_index, segment.offset))
         .collect();
     let active_job_count = segments
         .iter()
@@ -992,22 +1015,28 @@ fn finish_segment_asr_batch(
                 stage_start.elapsed().as_secs_f64(),
             );
             if timelines.len() == inference.targets.len() {
-                for ((job_index, offset), asr_timeline) in
+                for ((job_index, segment_index, offset), asr_timeline) in
                     inference.targets.into_iter().zip(timelines)
                 {
                     if let Some(job) = state.jobs.get_mut(&job_index) {
-                        job.timeline
-                            .annotations
-                            .extend(offset_annotations(asr_timeline.annotations, offset));
-                        job.segments_done = job.segments_done.saturating_add(1);
+                        if segment_index >= job.segment_annotations.len() {
+                            tracing::warn!(
+                                target: "vasr_transcribe::pipeline",
+                                "VAD segment index out of range for job={} segment_index={} segment_count={}",
+                                job_index,
+                                segment_index,
+                                job.segment_annotations.len()
+                            );
+                            continue;
+                        }
+                        if job.segment_annotations[segment_index].is_none() {
+                            job.segments_done = job.segments_done.saturating_add(1);
+                        }
+                        job.segment_annotations[segment_index] =
+                            Some(offset_annotations(asr_timeline.annotations, offset));
                         if job.segments_done >= job.segment_count {
                             if let Some(job) = state.jobs.remove(&job_index) {
-                                completed.push(TranscribeItemOutcome {
-                                    index: job.index,
-                                    result: Ok(job.timeline),
-                                    audio_seconds: job.audio_seconds,
-                                    bad_component: None,
-                                });
+                                completed.push(finish_segment_job(job));
                             }
                         }
                     }
@@ -1088,9 +1117,6 @@ fn run_asr_jobs_batch(
                 audio_seconds: job.waveform.duration_seconds(),
                 bad_component: None,
             }),
-            VadPreparation::FullSpeech { speech_annotations } => {
-                raw_jobs.push((job, speech_annotations))
-            }
             VadPreparation::Disabled => raw_jobs.push((job, Vec::new())),
         }
     }
@@ -1218,13 +1244,6 @@ fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
                 .sum();
             (prepared.segments.len(), speech_seconds)
         }
-        VadPreparation::FullSpeech { speech_annotations } => {
-            let speech_seconds = speech_annotations
-                .iter()
-                .map(|annotation| annotation.range.duration().0 as f64 / 1000.0)
-                .sum();
-            (1, speech_seconds)
-        }
         VadPreparation::Disabled | VadPreparation::NoSpeech => (0, 0.0),
     }
 }
@@ -1316,12 +1335,12 @@ fn outcome_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{AsrModel, VadSegment};
     use std::sync::{Arc, Mutex};
     use vasr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
         TimeRange,
     };
-    use vasr_runtime::{AsrModel, StreamingAsrModel, VadSegment};
 
     #[derive(Default)]
     struct BatchRecordingAsr {
@@ -1358,10 +1377,6 @@ mod tests {
                     timeline
                 })
                 .collect())
-        }
-
-        fn start_stream(&self, _options: &AsrOptions) -> Result<Box<dyn StreamingAsrModel>> {
-            anyhow::bail!("not implemented")
         }
     }
 
@@ -1484,6 +1499,7 @@ mod tests {
                 job_index: 0,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
+                segment_index: 0,
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),
@@ -1541,6 +1557,7 @@ mod tests {
                 job_index: 1,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
+                segment_index: 0,
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),

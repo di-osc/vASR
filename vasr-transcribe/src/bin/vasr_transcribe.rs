@@ -25,7 +25,7 @@ struct Cli {
 enum Command {
     /// Start the offline transcribe HTTP service.
     Serve(ServeTranscribeArgs),
-    /// Transcribe local audio files and write `{stem}.transcribe.json` outputs.
+    /// Transcribe local audio files and write `{stem}-transcription.json` outputs.
     Run(RunTranscribeArgs),
     /// Benchmark ASR CER against a `VasrRecordList` MessagePack file.
     Benchmark(BenchmarkTranscribeArgs),

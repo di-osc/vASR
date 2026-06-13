@@ -20,19 +20,19 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
-vasr-audio = { path = "../vasr-audio" }
-vasr-data = { path = "../vasr-data" }
+vasr-data = { path = "../vasr-data", features = ["audio-loading"] }
 vasr-models = { path = "../vasr-models" }
 uuid = "1"
-vasr-runtime = { path = "../vasr-runtime", features = ["async"] }
 
 [features]
 default = []
-accelerate = ["vasr-runtime/accelerate"]
-cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing", "paged-attn", "cuda-graph"]
+accelerate = ["vasr-models/accelerate"]
+cuda = ["cuda-vad", "vasr-models/cuda", "vasr-models/cuda-graph", "vasr-models/flash-attn", "vasr-models/cuda-quant", "timing", "paged-attn", "cuda-graph"]
 cuda-graph = []
-metal = ["vasr-runtime/metal", "vasr-runtime/timing", "paged-attn"]
-paged-attn = ["vasr-runtime/paged-attn"]
+cuda-vad = ["vasr-models/cuda-vad"]
+metal = ["vasr-models/metal-paged-attn", "timing", "paged-attn"]
+paged-attn = ["vasr-models/paged-attn"]
+timing = ["vasr-models/timing"]
 
 [lints]
 workspace = true

@@ -2,20 +2,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::runtime::{
+    AsrModel, AsrOptions, FsmnVadModel, Qwen3AsrModel, RealtimePipeline, VadModel, VadOptions,
+    auto_dtype, device_label, resolve_device,
+};
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use candle_core::Device;
 use clap::Args;
-use vasr_models::qwen3_asr::LoadOptions;
-use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
+use vasr_models::asr::qwen3asr::LoadOptions;
+use vasr_models::asr::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use vasr_models::qwen3_asr::model::paged_cache_runtime::{
+use vasr_models::asr::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
-};
-use vasr_runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, Qwen3AsrModel, RealtimePipeline,
-    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
 
 use crate::server::{RealtimeService, RealtimeSession};
@@ -54,7 +54,7 @@ pub struct VadCliArgs {
     pub vad_model: Option<String>,
 
     /// FSMN VAD speech probability threshold (`speech_noise_thres`).
-    #[arg(long, default_value_t = 0.5, env = "VASR_VAD_THRESHOLD")]
+    #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
     pub vad_threshold: f32,
 
     /// Minimum speech duration in milliseconds before a segment is confirmed.
@@ -85,7 +85,7 @@ pub struct RealtimeArgs {
 
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_realtime=info,vasr_runtime=info"
+        "warn,vasr_realtime=info"
     } else {
         "warn,vasr_realtime=info"
     };
@@ -119,8 +119,8 @@ pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
     let vad_options = vad_options_from_args(&args.vad);
     let realtime_service = Arc::new(RealtimeService {
         make_session: Arc::new(move || {
-            let vad = load_fsmn_vad(&vad_model)?.start_stream(&vad_options)?;
-            let asr_stream = realtime_asr.start_stream(&AsrOptions {
+            let vad = load_fsmn_vad(&vad_model)?.new_stream(&vad_options)?;
+            let asr_stream = realtime_asr.new_stream(&AsrOptions {
                 max_new_tokens,
                 ..AsrOptions::default()
             })?;
@@ -299,13 +299,7 @@ fn load_asr_model(
         "Model loaded in {:.3}s.",
         model_load_start.elapsed().as_secs_f64()
     );
-    let asr_scheduler = InferenceScheduler::start("asr");
-    let base_asr: Arc<dyn AsrModel> = Arc::new(qwen3_asr);
-    let asr: Arc<dyn AsrModel> = Arc::new(ScheduledAsrModel::new(
-        Arc::clone(&base_asr),
-        asr_scheduler.clone(),
-    ));
-    Ok(asr)
+    Ok(Arc::new(qwen3_asr))
 }
 
 fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {

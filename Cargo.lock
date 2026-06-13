@@ -4897,22 +4897,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vasr-audio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "vasr-data",
- "vasr-models",
-]
-
-[[package]]
 name = "vasr-data"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest 0.13.4",
  "rmp-serde",
+ "rubato",
  "serde",
  "serde_bytes",
  "serde_json",
+ "symphonia",
  "thiserror 2.0.18",
  "unicode-general-category",
  "uuid",
@@ -4924,7 +4920,6 @@ version = "0.1.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
- "base64 0.22.1",
  "bindgen_cuda",
  "bytemuck",
  "candle-core",
@@ -4938,21 +4933,22 @@ dependencies = [
  "half",
  "indicatif 0.18.4",
  "intel-mkl-src",
+ "kaldi-fbank-rust-kautism",
  "lindera",
  "lindera-ipadic",
+ "ndarray",
  "rayon",
  "reqwest 0.13.4",
- "rubato",
  "rustfft",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
- "symphonia",
  "tokenizers 0.23.1",
  "tokio",
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
+ "vasr-data",
  "vasr-paged-attn",
  "vasr-quant",
 ]
@@ -5003,26 +4999,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vasr-audio",
- "vasr-data",
- "vasr-models",
- "vasr-runtime",
-]
-
-[[package]]
-name = "vasr-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "kaldi-fbank-rust-kautism",
- "ndarray",
- "rayon",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
  "vasr-data",
  "vasr-models",
 ]
@@ -5042,10 +5018,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vasr-audio",
  "vasr-data",
  "vasr-models",
- "vasr-runtime",
 ]
 
 [[package]]

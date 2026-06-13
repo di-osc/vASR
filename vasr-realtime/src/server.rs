@@ -1,8 +1,8 @@
 use crate::protocol::{ClientRealtimeEvent, ServerRealtimeEvent};
+use crate::runtime::RealtimePipeline;
 use base64::Engine;
 use futures_util::StreamExt;
 use vasr_data::{AnnotationPayload, AnnotationStatus, AudioBytesStream};
-use vasr_runtime::RealtimePipeline;
 
 use std::sync::Arc;
 

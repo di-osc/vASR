@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod pipeline;
 pub mod protocol;
 pub mod run;
+mod runtime;
 pub mod serve;
 pub mod server;
 

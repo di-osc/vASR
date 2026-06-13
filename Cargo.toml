@@ -1,9 +1,7 @@
 [workspace]
 members = [
   "vasr-models",
-  "vasr-audio",
   "vasr-data",
-  "vasr-runtime",
   "vasr-transcribe",
   "vasr-realtime",
   "vasr-paged-attn",

@@ -1,5 +1,6 @@
 //! vASR data model types shared by offline and realtime inference.
 
+pub mod audio;
 mod cer;
 mod extract_audio;
 mod media;
@@ -11,6 +12,7 @@ mod timeline;
 mod token;
 mod waveform;
 
+pub use audio::{AudioInput, AudioLoadOptions, AudioLoader, SAMPLE_RATE_HZ, normalize_audio_input};
 pub use cer::{CerStats, compute_cer, normalize_for_cer};
 pub use extract_audio::{
     ExtractAudioSummary, extract_embedded_audio, extract_embedded_audio_from_msgpack,

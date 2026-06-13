@@ -15,12 +15,12 @@ pub struct RunTranscribeArgs {
     pub pipeline: TranscribePipelineArgs,
 
     /// Audio file or directory containing audio files.
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(short = 'i', long, value_name = "PATH")]
     pub input: PathBuf,
 
-    /// Output file or directory. Directory mode writes `{stem}.transcribe.json` per input.
-    #[arg(short, long, value_name = "PATH")]
-    pub output: PathBuf,
+    /// Output file or directory. Defaults to `{stem}-transcription.json` beside each input.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 
     /// Recursively scan subdirectories when `--input` is a directory.
     #[arg(long, default_value_t = false)]
@@ -51,7 +51,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     }
 
     let multiple_inputs = files.len() > 1 || args.input.is_dir();
-    validate_output_target(&args.output, multiple_inputs)?;
+    validate_output_target(args.output.as_deref(), multiple_inputs)?;
 
     let pipeline = build_async_transcribe_pipeline(&args.pipeline, args.language.clone())?;
     let inputs = files
@@ -82,7 +82,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
 
     for (path, outcome) in files.iter().zip(outcomes.iter()) {
         total_audio_seconds += outcome.audio_seconds;
-        let output_path = resolve_output_json_path(&args.output, path, multiple_inputs)?;
+        let output_path = resolve_output_json_path(args.output.as_deref(), path, multiple_inputs)?;
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create output directory {}", parent.display())
@@ -239,9 +239,11 @@ fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn validate_output_target(output: &Path, multiple_inputs: bool) -> Result<()> {
+fn validate_output_target(output: Option<&Path>, multiple_inputs: bool) -> Result<()> {
     if multiple_inputs {
-        if output.extension().is_some_and(|ext| ext == "json") {
+        if let Some(output) = output
+            && output.extension().is_some_and(|ext| ext == "json")
+        {
             bail!(
                 "when transcribing multiple files, --output must be a directory, not `{}`",
                 output.display()
@@ -253,20 +255,28 @@ fn validate_output_target(output: &Path, multiple_inputs: bool) -> Result<()> {
 }
 
 pub fn resolve_output_json_path(
-    output: &Path,
+    output: Option<&Path>,
     audio: &Path,
     multiple_inputs: bool,
 ) -> Result<PathBuf> {
-    if !multiple_inputs && output.extension().is_some_and(|ext| ext == "json") {
-        return Ok(output.to_path_buf());
+    if let Some(output) = output {
+        if !multiple_inputs && output.extension().is_some_and(|ext| ext == "json") {
+            return Ok(output.to_path_buf());
+        }
     }
 
     let stem = audio
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid audio file name: {}", audio.display()))?;
+    let file_name = format!("{stem}-transcription.json");
 
-    Ok(output.join(format!("{stem}.transcribe.json")))
+    if let Some(output) = output {
+        return Ok(output.join(file_name));
+    }
+
+    let parent = audio.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(file_name))
 }
 
 #[cfg(test)]
@@ -277,18 +287,25 @@ mod tests {
     #[test]
     fn resolve_output_json_path_uses_stem_for_directory_output() {
         let output = resolve_output_json_path(
-            Path::new("/tmp/out"),
+            Some(Path::new("/tmp/out")),
             Path::new("/data/audio (1).wav"),
             true,
         )
         .expect("resolve output");
-        assert_eq!(output, Path::new("/tmp/out/audio (1).transcribe.json"));
+        assert_eq!(output, Path::new("/tmp/out/audio (1)-transcription.json"));
+    }
+
+    #[test]
+    fn resolve_output_json_path_defaults_next_to_input() {
+        let output = resolve_output_json_path(None, Path::new("/data/audio (1).wav"), true)
+            .expect("resolve output");
+        assert_eq!(output, Path::new("/data/audio (1)-transcription.json"));
     }
 
     #[test]
     fn resolve_output_json_path_honors_explicit_json_file() {
         let output = resolve_output_json_path(
-            Path::new("/tmp/custom.transcribe.json"),
+            Some(Path::new("/tmp/custom.transcribe.json")),
             Path::new("/data/audio.wav"),
             false,
         )

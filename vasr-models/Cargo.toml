@@ -28,6 +28,8 @@ safetensors = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"
 rayon = "1"
+kaldi-fbank-rust-kautism = "0.1.0"
+ndarray = "0.17"
 
 accelerate-src = { version = "0.3.2", optional = true }
 bindgen_cuda = { version = "0.1.5", optional = true }
@@ -37,12 +39,10 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 
 vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
 vasr-quant = { path = "../vasr-quant", default-features = false }
+vasr-data = { path = "../vasr-data" }
 
-symphonia = { version = "0.6", features = ["all-codecs", "all-formats"], optional = true }
-rubato = { version = "3", optional = true }
-base64 = { version = "0.22", optional = true }
-lindera = { version = "2.2.0", optional = true }
-lindera-ipadic = { version = "2.2.0", optional = true }
+lindera = { version = "2.2.0", features = ["embed-ipadic"] }
+lindera-ipadic = { version = "2.2.0", features = ["embed-ipadic"] }
 unicode-general-category = "1.1.0"
 unicode-normalization = "0.1"
 
@@ -64,6 +64,7 @@ cuda-base = [
   "dep:half",
   "vasr-quant/cuda",
 ]
+cuda-vad = ["candle-core/cuda", "candle-nn/cuda"]
 cuda-graph = ["cuda-paged-attn", "vasr-paged-attn/cuda-graph"]
 cuda-quant = ["cuda-base", "vasr-quant/cuda-quant"]
 cudnn = ["cuda-base", "candle-core/cudnn"]
@@ -91,14 +92,7 @@ cuda-paged-attn = [
 ]
 cudarc = ["dep:cudarc"]
 
-audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64"]
-
-forced-aligner = [
-  "dep:lindera",
-  "dep:lindera-ipadic",
-  "lindera/embed-ipadic",
-  "lindera-ipadic/embed-ipadic",
-]
+audio-loading = ["vasr-data/audio-loading"]
 
 integration-tests = []
 timing = ["vasr-quant/timing"]
