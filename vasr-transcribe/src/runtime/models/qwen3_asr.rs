@@ -77,6 +77,9 @@ fn tokens_per_sec(tokens: usize, us: u64) -> f64 {
 
 #[cfg(feature = "timing")]
 fn log_transcribe_timings(items: usize, t: &TranscribeTimings) {
+    if std::env::var_os("VASR_DEBUG_QWEN3_ASR_TIMING").is_none() {
+        return;
+    }
     tracing::debug!(
         target: "vasr_transcribe::runtime::models::qwen3_asr",
         "qwen3_asr_timing | items={} | chunks={} | batches={} | total={:.3}s | normalize={:.3}s | chunking={:.3}s | prepare={:.3}s | prepare_norm={:.3}s | prepare_tok_lookup={:.3}s | prepare_feat={:.3}s | prepare_tok_expand={:.3}s | prepare_pad={:.3}s | stack={:.3}s | audio_encoder={:.3}s | prefill={:.3}s | prefill_tokens={} | prefill_tok_s={:.1} | prefill_inputs={:.3}s | prefill_rope={:.3}s | prefill_metadata={:.3}s | prefill_mask={:.3}s | prefill_forward={:.3}s | prefill_gather={:.3}s | prefill_decode_setup={:.3}s | prefill_argmax={:.3}s | decode={:.3}s | decode_tok_s={:.1} | decode_token_tensor={:.3}s | decode_embed={:.3}s | decode_position={:.3}s | decode_metadata={:.3}s | decode_graph_replay={:.3}s | decode_forward={:.3}s | decode_pre_argmax_sync={:.3}s | decode_argmax={:.3}s | decode_steps={} | generated_tokens={} | token_decode={:.3}s",

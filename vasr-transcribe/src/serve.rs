@@ -19,10 +19,8 @@ use vasr_models::asr::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
 
-use crate::pipeline::AsyncTranscribePipeline;
+use crate::pipeline::{AsyncTranscribePipeline, default_stage_buffer};
 use crate::server::build_transcribe_service_from_parts;
-
-const DEFAULT_STAGE_BUFFER: usize = 20;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -154,7 +152,7 @@ pub fn build_async_transcribe_pipeline(
         asr_options_from_pipeline(pipeline, language),
     )
     .with_vad_options(vad_options_from_pipeline(pipeline))
-    .with_stage_buffer(DEFAULT_STAGE_BUFFER))
+    .with_stage_buffer(default_stage_buffer()))
 }
 
 pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {

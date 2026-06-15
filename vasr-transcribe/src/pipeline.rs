@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
@@ -17,7 +18,10 @@ use vasr_data::{AudioLoadOptions, AudioLoader};
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 
-const DEFAULT_STAGE_BUFFER: usize = 4;
+const DEFAULT_STAGE_BUFFER: usize = 20;
+const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
+const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
+const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
@@ -114,14 +118,29 @@ impl AsyncTranscribePipeline {
         }
 
         let buffer = self.stage_buffer;
+        let loaded_queue_memory = loaded_queue_memory_budget();
+        tracing::info!(
+            target: "vasr_transcribe::pipeline",
+            "pipeline queues | stage_buffer={} loaded_queue_memory={}MiB loaded_queue_memory_source={} permit_size={}MiB",
+            buffer,
+            loaded_queue_memory.capacity_permits,
+            loaded_queue_memory.source,
+            BYTES_PER_MEMORY_PERMIT / (1024 * 1024)
+        );
         let (loaded_tx, loaded_rx) = mpsc::channel(buffer);
         let (asr_tx, asr_rx) = mpsc::channel(buffer);
         let (result_tx, mut result_rx) = mpsc::channel(unique_inputs.len());
 
         let loader = self.loader.clone();
         let load_options = self.load_options.clone();
-        let loader_handle =
-            spawn_loader_worker(unique_inputs, loader, load_options, buffer, loaded_tx);
+        let loader_handle = spawn_loader_worker(
+            unique_inputs,
+            loader,
+            load_options,
+            buffer,
+            loaded_queue_memory,
+            loaded_tx,
+        );
 
         let offline = Arc::clone(&self.offline);
         let vad_options = self.parallel_options.vad_options.clone();
@@ -207,6 +226,182 @@ impl AsyncTranscribePipeline {
             bad_component,
         }
     }
+}
+
+pub fn default_stage_buffer() -> usize {
+    DEFAULT_STAGE_BUFFER
+}
+
+#[derive(Clone)]
+struct LoadedQueueMemoryBudget {
+    semaphore: Arc<Semaphore>,
+    capacity_permits: usize,
+    source: &'static str,
+}
+
+fn loaded_queue_memory_budget() -> LoadedQueueMemoryBudget {
+    let LoadedQueueMemoryBudgetConfig { permits, source } = loaded_queue_memory_budget_permits(
+        std::env::var("VASR_LOADED_QUEUE_MEMORY_MB").ok().as_deref(),
+        std::env::var("VASR_LOADED_QUEUE_MEMORY_FRACTION")
+            .ok()
+            .as_deref(),
+        total_memory_bytes(),
+    );
+    LoadedQueueMemoryBudget {
+        semaphore: Arc::new(Semaphore::new(permits)),
+        capacity_permits: permits,
+        source,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadedQueueMemoryBudgetConfig {
+    permits: usize,
+    source: &'static str,
+}
+
+fn loaded_queue_memory_budget_permits(
+    memory_mb: Option<&str>,
+    fraction: Option<&str>,
+    total_memory_bytes: Option<u64>,
+) -> LoadedQueueMemoryBudgetConfig {
+    if let Some(value) = memory_mb {
+        match value.parse::<usize>() {
+            Ok(mb) if mb > 0 => {
+                return LoadedQueueMemoryBudgetConfig {
+                    permits: mb,
+                    source: "env:VASR_LOADED_QUEUE_MEMORY_MB",
+                };
+            }
+            _ => tracing::warn!(
+                target: "vasr_transcribe::pipeline",
+                "ignoring invalid VASR_LOADED_QUEUE_MEMORY_MB={value:?}; expected a positive integer"
+            ),
+        }
+    }
+
+    let fraction_from_env = fraction.is_some();
+    let memory_fraction = match fraction {
+        Some(value) => match value.parse::<f64>() {
+            Ok(n) if n.is_finite() && n > 0.0 => n,
+            _ => {
+                tracing::warn!(
+                    target: "vasr_transcribe::pipeline",
+                    "ignoring invalid VASR_LOADED_QUEUE_MEMORY_FRACTION={value:?}; expected a positive number"
+                );
+                DEFAULT_LOADED_QUEUE_MEMORY_FRACTION
+            }
+        },
+        None => DEFAULT_LOADED_QUEUE_MEMORY_FRACTION,
+    };
+
+    let permits = total_memory_bytes
+        .and_then(|bytes| {
+            let permits =
+                ((bytes as f64 * memory_fraction) / BYTES_PER_MEMORY_PERMIT as f64).floor();
+            if permits.is_finite() && permits >= 1.0 && permits <= usize::MAX as f64 {
+                Some(permits as usize)
+            } else {
+                None
+            }
+        })
+        .filter(|&permits: &usize| permits > 0)
+        .unwrap_or(DEFAULT_STAGE_BUFFER)
+        .max(MIN_LOADED_QUEUE_MEMORY_PERMITS);
+    let source = if total_memory_bytes.is_some() {
+        if fraction_from_env {
+            "env:VASR_LOADED_QUEUE_MEMORY_FRACTION"
+        } else {
+            "system-memory-fraction"
+        }
+    } else {
+        "fallback:stage_buffer"
+    };
+    LoadedQueueMemoryBudgetConfig { permits, source }
+}
+
+fn loaded_job_memory_permits(job: &LoadedJob) -> usize {
+    let bytes = job
+        .waveform
+        .samples
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>());
+    bytes
+        .saturating_add(BYTES_PER_MEMORY_PERMIT - 1)
+        .saturating_div(BYTES_PER_MEMORY_PERMIT)
+        .max(1)
+}
+
+async fn acquire_loaded_job_memory(
+    budget: &LoadedQueueMemoryBudget,
+    job: &LoadedJob,
+) -> Result<OwnedSemaphorePermit> {
+    let permits = loaded_job_memory_permits(job).min(budget.capacity_permits);
+    let permits = u32::try_from(permits)
+        .map_err(|_| anyhow::anyhow!("loaded queue memory permit count overflows u32"))?;
+    budget
+        .semaphore
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| anyhow::anyhow!("loaded queue memory limiter closed"))
+}
+
+fn log_loaded_queue_backpressure(
+    job: &LoadedJob,
+    loaded_tx: &mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
+    memory_permits_needed: usize,
+    loaded_queue_memory: &LoadedQueueMemoryBudget,
+) {
+    let queue_full = loaded_tx.capacity() == 0;
+    let memory_full = loaded_queue_memory.semaphore.available_permits() < memory_permits_needed;
+    if !queue_full && !memory_full {
+        return;
+    }
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "loader backpressure | job={} queue_full={} memory_wait={} audio={:.2}s queued_capacity={} memory_needed={}MiB memory_available={}MiB memory_budget={}MiB",
+        job.index,
+        queue_full,
+        memory_full,
+        job.waveform.duration_seconds(),
+        loaded_tx.capacity(),
+        memory_permits_needed,
+        loaded_queue_memory.semaphore.available_permits(),
+        loaded_queue_memory.capacity_permits,
+    );
+}
+
+fn total_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        total_memory_bytes_from_proc_meminfo("/proc/meminfo").ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn total_memory_bytes_from_proc_meminfo(path: impl AsRef<Path>) -> Result<u64> {
+    let text = fs::read_to_string(path)?;
+    parse_meminfo_kib(&text, "MemTotal:")
+        .and_then(|kib| kib.checked_mul(1024))
+        .ok_or_else(|| anyhow::anyhow!("MemTotal not found in /proc/meminfo"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_kib(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let value = parts.next()?.parse::<u64>().ok()?;
+        return Some(value);
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -356,6 +551,7 @@ fn duplicate_outcome_from(
 struct LoadedJob {
     index: usize,
     waveform: Waveform,
+    _queue_memory_permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug)]
@@ -440,6 +636,7 @@ fn spawn_loader_worker(
     loader: AudioLoader,
     load_options: AudioLoadOptions,
     max_in_flight: usize,
+    loaded_queue_memory: LoadedQueueMemoryBudget,
     loaded_tx: mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
@@ -448,11 +645,11 @@ fn spawn_loader_worker(
         for input in inputs {
             spawn_loader_task(&mut tasks, loader.clone(), load_options.clone(), input);
             if tasks.len() >= max_in_flight {
-                send_next_loaded(&mut tasks, &loaded_tx).await?;
+                send_next_loaded(&mut tasks, &loaded_queue_memory, &loaded_tx).await?;
             }
         }
         while !tasks.is_empty() {
-            send_next_loaded(&mut tasks, &loaded_tx).await?;
+            send_next_loaded(&mut tasks, &loaded_queue_memory, &loaded_tx).await?;
         }
         Ok(())
     })
@@ -465,7 +662,6 @@ fn spawn_loader_task(
     input: TranscribeInput,
 ) {
     tasks.spawn(async move {
-        let stage_start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = input.source.clone();
             move || loader.load(&source, &load_options)
@@ -473,17 +669,11 @@ fn spawn_loader_task(
         .await;
 
         match loaded {
-            Ok(Ok(waveform)) => {
-                log_loader(
-                    input.index,
-                    waveform.duration_seconds(),
-                    stage_start.elapsed().as_secs_f64(),
-                );
-                Ok(LoadedJob {
-                    index: input.index,
-                    waveform,
-                })
-            }
+            Ok(Ok(waveform)) => Ok(LoadedJob {
+                index: input.index,
+                waveform,
+                _queue_memory_permit: None,
+            }),
             Ok(Err(error)) => Err(TranscribeItemOutcome {
                 index: input.index,
                 result: Err(error),
@@ -502,9 +692,10 @@ fn spawn_loader_task(
 
 async fn send_next_loaded(
     tasks: &mut JoinSet<Result<LoadedJob, TranscribeItemOutcome>>,
+    loaded_queue_memory: &LoadedQueueMemoryBudget,
     loaded_tx: &mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
 ) -> Result<()> {
-    let message = match tasks.join_next().await {
+    let mut message = match tasks.join_next().await {
         Some(Ok(message)) => message,
         Some(Err(error)) => Err(TranscribeItemOutcome {
             index: 0,
@@ -514,6 +705,12 @@ async fn send_next_loaded(
         }),
         None => return Ok(()),
     };
+    if let Ok(job) = &mut message {
+        let memory_permits_needed =
+            loaded_job_memory_permits(job).min(loaded_queue_memory.capacity_permits);
+        log_loaded_queue_backpressure(job, loaded_tx, memory_permits_needed, loaded_queue_memory);
+        job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+    }
     loaded_tx
         .send(message)
         .await
@@ -1248,16 +1445,6 @@ fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
     }
 }
 
-fn log_loader(index: usize, audio_seconds: f64, wall_seconds: f64) {
-    let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "loader | job={index} | audio={audio_seconds:.2}s | spent={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
-        metrics.speedup,
-        metrics.rtf
-    );
-}
-
 fn log_vad(
     index: usize,
     audio_seconds: f64,
@@ -1266,7 +1453,7 @@ fn log_vad(
     wall_seconds: f64,
 ) {
     let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::debug!(
+    tracing::info!(
         target: "vasr_transcribe::pipeline",
         "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | spent={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
@@ -1341,6 +1528,60 @@ mod tests {
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
         TimeRange,
     };
+
+    #[test]
+    fn loaded_queue_memory_budget_defaults_to_twenty_percent_of_total_memory() {
+        assert_eq!(
+            loaded_queue_memory_budget_permits(None, None, Some(64 * 1024 * 1024 * 1024)),
+            LoadedQueueMemoryBudgetConfig {
+                permits: 13_107,
+                source: "system-memory-fraction"
+            }
+        );
+    }
+
+    #[test]
+    fn loaded_queue_memory_budget_accepts_explicit_mb_override() {
+        assert_eq!(
+            loaded_queue_memory_budget_permits(
+                Some("512"),
+                Some("0.5"),
+                Some(64 * 1024 * 1024 * 1024),
+            ),
+            LoadedQueueMemoryBudgetConfig {
+                permits: 512,
+                source: "env:VASR_LOADED_QUEUE_MEMORY_MB"
+            }
+        );
+    }
+
+    #[test]
+    fn loaded_queue_memory_budget_accepts_fraction_override() {
+        assert_eq!(
+            loaded_queue_memory_budget_permits(None, Some("0.10"), Some(64 * 1024 * 1024 * 1024)),
+            LoadedQueueMemoryBudgetConfig {
+                permits: 6_553,
+                source: "env:VASR_LOADED_QUEUE_MEMORY_FRACTION"
+            }
+        );
+    }
+
+    #[test]
+    fn loaded_job_memory_permits_rounds_up_to_megabytes() {
+        let job = LoadedJob {
+            index: 0,
+            waveform: Waveform::new(vec![0.0; 1024 * 1024 + 1], 16_000),
+            _queue_memory_permit: None,
+        };
+        assert_eq!(loaded_job_memory_permits(&job), 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_mem_total_from_proc_meminfo() {
+        let text = "MemAvailable:    98765 kB\nMemTotal:       123456 kB\n";
+        assert_eq!(parse_meminfo_kib(text, "MemTotal:"), Some(123_456));
+    }
 
     #[derive(Default)]
     struct BatchRecordingAsr {

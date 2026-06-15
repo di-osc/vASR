@@ -110,7 +110,7 @@ impl FsmnVadModel {
         let detection = self.detect_offline(waveform, options)?;
         let segments = detection.segments;
         let timing = detection.timing;
-        tracing::info!(
+        tracing::debug!(
             target: "vasr_models::vad::fsmn",
             "fsmn_vad | audio={:.2}s | chunks={} | segments={} | pcm={:.3}s | frontend={:.3}s | forward={:.3}s | segmenter={:.3}s",
             waveform.duration_seconds(),

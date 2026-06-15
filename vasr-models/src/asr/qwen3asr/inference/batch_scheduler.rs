@@ -118,7 +118,7 @@ impl ContinuousDecodeDebug {
             self.tail_active_slots.pop_front();
         }
 
-        if step % 50 == 0 || active_slots == 1 {
+        if std::env::var_os("VASR_DEBUG_CONTINUOUS_DECODE_STEPS").is_some() {
             tracing::debug!(
                 target: "vasr_transcribe::pipeline",
                 "continuous decode | step={step} active_slots={active_slots}",
@@ -143,11 +143,6 @@ impl ContinuousDecodeDebug {
             return;
         }
 
-        let avg_active = if self.total_decode_calls == 0 {
-            0.0
-        } else {
-            self.total_active_slots as f64 / self.total_decode_calls as f64
-        };
         let occupancy = if self.total_decode_calls == 0 || max_slots == 0 {
             0.0
         } else {
@@ -160,28 +155,23 @@ impl ContinuousDecodeDebug {
 
         tracing::debug!(
             target: "vasr_transcribe::pipeline",
-            "continuous decode summary | calls={} max_slots={} avg_active={:.2} occupancy={:.1}% max_active={} one_slot_calls={} two_or_less_calls={} tail50_one_slot_calls={} tail50_two_or_less_calls={} finished_slots={} finished_step_min/p50/p90/max={}/{}/{}/{}",
-            self.total_decode_calls,
-            max_slots,
-            avg_active,
-            occupancy * 100.0,
+            "continuous decode | slots={}/{} calls={} occ={:.1}% steps=min/p50/p90/max:{}/{}/{}/{} tail50_one={} tail50_le2={}",
             self.max_active_slots,
-            self.one_slot_calls,
-            self.two_or_less_slot_calls,
-            tail_one_slot_calls,
-            tail_two_or_less_slot_calls,
-            finished_steps.count,
+            max_slots,
+            self.total_decode_calls,
+            occupancy * 100.0,
             finished_steps.min,
             finished_steps.p50,
             finished_steps.p90,
             finished_steps.max,
+            tail_one_slot_calls,
+            tail_two_or_less_slot_calls,
         );
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct DecodeStepDistribution {
-    count: usize,
     min: usize,
     p50: usize,
     p90: usize,
@@ -202,7 +192,6 @@ fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistri
         steps[idx.min(len - 1)]
     };
     DecodeStepDistribution {
-        count: len,
         min: steps[0],
         p50: percentile(50),
         p90: percentile(90),
