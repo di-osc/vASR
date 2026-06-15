@@ -1063,13 +1063,11 @@ async fn handle_dynamic_segment_encoded_message(
         ),
         Err(error) => (segments, Err(error), Vec::new()),
     };
-    prepare_segment_job_state(segment_state, consumed_segments.as_slice());
     let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
     for outcome in outcomes {
         let _ = result_tx.send(outcome).await;
     }
     for failure in encoded_failures {
-        prepare_segment_job_state(segment_state, failure.segments.as_slice());
         let outcomes = finish_segment_asr_batch(
             segment_state,
             failure.segments.as_slice(),
@@ -1302,7 +1300,6 @@ fn spawn_asr_worker(
                         };
                         send_segment_encode_request(&segment_encode_tx, request).await;
                     } else {
-                        prepare_segment_job_state(&mut fallback_segment_state, &segments);
                         let batch = tokio::task::spawn_blocking({
                             let offline = Arc::clone(&offline);
                             let asr_options = asr_options.clone();
@@ -1755,6 +1752,7 @@ fn finish_segment_asr_batch(
     if segments.is_empty() {
         return Vec::new();
     }
+    prepare_segment_job_state(state, segments);
 
     let mut completed = Vec::new();
     match batch {
@@ -1841,7 +1839,6 @@ fn run_segment_microbatch(
         return Vec::new();
     }
 
-    prepare_segment_job_state(state, &segments);
     let stage_start = Instant::now();
     let batch = run_segment_asr_inference(offline, &segments, asr_options);
     finish_segment_asr_batch(state, &segments, stage_start, batch)
@@ -2276,6 +2273,39 @@ mod tests {
             .to_string();
         assert!(err.contains("encoded feature failed"));
         assert!(!state.jobs.contains_key(&7));
+        Ok(())
+    }
+
+    #[test]
+    fn segment_batch_error_registers_missing_job_state() -> Result<()> {
+        let mut state = SegmentAsrState::default();
+        let segments = vec![AsrSegmentJob {
+            job_index: 11,
+            job_audio_seconds: 2.5,
+            speech_annotations: Vec::new(),
+            segment_index: 0,
+            segment_count: 1,
+            offset: DurationMs(0),
+            waveform: Waveform::new(vec![0.1; 160], 16_000),
+        }];
+
+        let failed = finish_segment_asr_batch(
+            &mut state,
+            segments.as_slice(),
+            Instant::now(),
+            Err(anyhow::anyhow!("first encoded batch failed")),
+        );
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].index, 11);
+        assert_eq!(failed[0].audio_seconds, 2.5);
+        let err = failed[0]
+            .result
+            .as_ref()
+            .expect_err("missing-state encode failure should still return an outcome")
+            .to_string();
+        assert!(err.contains("first encoded batch failed"));
+        assert!(state.jobs.is_empty());
         Ok(())
     }
 
