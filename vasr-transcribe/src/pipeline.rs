@@ -958,9 +958,31 @@ fn spawn_segment_decoder_worker(
         let mut segment_state = SegmentAsrState::default();
         #[cfg(feature = "paged-attn")]
         {
-            if let Some(first) = encoded_rx.recv().await {
+            while let Some(first) = encoded_rx.recv().await {
+                let SegmentEncodedMessage {
+                    segments,
+                    stage_start,
+                    batch,
+                } = first;
+                let initial = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let outcomes = finish_segment_asr_batch(
+                            &mut segment_state,
+                            &segments,
+                            stage_start,
+                            Err(error),
+                        );
+                        for outcome in outcomes {
+                            let _ = result_tx.send(outcome).await;
+                        }
+                        continue;
+                    }
+                };
                 handle_dynamic_segment_encoded_message(
-                    first,
+                    segments,
+                    stage_start,
+                    initial,
                     encoded_rx,
                     &offline,
                     &asr_options,
@@ -968,6 +990,7 @@ fn spawn_segment_decoder_worker(
                     &result_tx,
                 )
                 .await;
+                break;
             }
         }
         #[cfg(not(feature = "paged-attn"))]
@@ -987,30 +1010,15 @@ fn spawn_segment_decoder_worker(
 
 #[cfg(feature = "paged-attn")]
 async fn handle_dynamic_segment_encoded_message(
-    first: SegmentEncodedMessage,
+    segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+    initial: SegmentEncodedAsrBatch,
     mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
     result_tx: &mpsc::Sender<TranscribeItemOutcome>,
 ) {
-    let SegmentEncodedMessage {
-        segments,
-        stage_start,
-        batch,
-    } = first;
-    let initial = match batch {
-        Ok(batch) => batch,
-        Err(error) => {
-            let outcomes =
-                finish_segment_asr_batch(segment_state, &segments, stage_start, Err(error));
-            for outcome in outcomes {
-                let _ = result_tx.send(outcome).await;
-            }
-            return;
-        }
-    };
-
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(ASR_ENCODED_FEATURE_QUEUE);
     let forward_handle = tokio::spawn({
         let ready_tx = ready_tx.clone();
