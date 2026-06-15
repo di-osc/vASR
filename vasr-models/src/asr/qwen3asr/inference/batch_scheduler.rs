@@ -402,6 +402,10 @@ fn append_prepared_audio_batch(
     Ok(())
 }
 
+fn dynamic_source_poll_may_block(has_running: bool, waiting_len: usize) -> bool {
+    !has_running && waiting_len == 0
+}
+
 impl AsrBatchScheduler {
     pub fn new(config: AsrBatchSchedulerConfig) -> Self {
         Self {
@@ -845,7 +849,10 @@ impl AsrBatchScheduler {
                 let has_running_before_poll = running.iter().any(|entry| entry.is_some());
                 if !source_closed {
                     loop {
-                        match poll_source(!has_running_before_poll && waiting.is_empty())? {
+                        match poll_source(dynamic_source_poll_may_block(
+                            has_running_before_poll,
+                            waiting.len(),
+                        ))? {
                             PreparedAudioBatchPoll::Ready(batch) => {
                                 append_prepared_audio_batch(
                                     audio_token_id,
@@ -1135,7 +1142,8 @@ pub fn run_paged_prepared_batch_timed(
 mod tests {
     use super::{
         AsrBatchSchedulerConfig, PagedBlockManager, can_admit_with_projected_kv,
-        continuous_batch_enabled, group_running_by_decode_step, pad_prepared_wave_for_prefill,
+        continuous_batch_enabled, dynamic_source_poll_may_block, group_running_by_decode_step,
+        pad_prepared_wave_for_prefill,
     };
     use crate::processor::asr_processor::PreparedInputs;
 
@@ -1166,6 +1174,14 @@ mod tests {
         assert_eq!(capacity, 4);
         assert!(can_admit_with_projected_kv(&manager, capacity, 32, 0, 1));
         assert!(!can_admit_with_projected_kv(&manager, capacity, 128, 3, 1));
+    }
+
+    #[test]
+    fn dynamic_source_poll_blocks_only_when_decoder_is_idle() {
+        assert!(!dynamic_source_poll_may_block(true, 0));
+        assert!(!dynamic_source_poll_may_block(false, 1));
+        assert!(!dynamic_source_poll_may_block(true, 1));
+        assert!(dynamic_source_poll_may_block(false, 0));
     }
 
     #[test]
