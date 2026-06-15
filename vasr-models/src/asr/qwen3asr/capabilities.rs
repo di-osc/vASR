@@ -11,6 +11,10 @@ use super::{
 };
 
 impl OfflineAsrModel for Qwen3Asr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
         let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
         timelines

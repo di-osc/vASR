@@ -282,6 +282,65 @@ fn rebatch_prepared_inputs(
         .collect()
 }
 
+#[derive(Debug)]
+struct EncodedPreparedGroup {
+    chunk_indices: Vec<usize>,
+    prepared: Vec<PreparedInputs>,
+    audio_features_cpu: Tensor,
+}
+
+#[derive(Debug)]
+pub struct EncodedAsrBatch {
+    audio_len: usize,
+    chunks: Vec<ChunkItem>,
+    forced_langs_norm: Vec<Option<String>>,
+    groups: Vec<EncodedPreparedGroup>,
+}
+
+impl EncodedAsrBatch {
+    pub fn len(&self) -> usize {
+        self.audio_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.audio_len == 0
+    }
+
+    pub fn merge(batches: Vec<Self>) -> Result<Self> {
+        let audio_len = batches.iter().map(|batch| batch.audio_len).sum();
+        let chunk_count = batches.iter().map(|batch| batch.chunks.len()).sum();
+        let group_count = batches.iter().map(|batch| batch.groups.len()).sum();
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut forced_langs_norm = Vec::with_capacity(audio_len);
+        let mut groups = Vec::with_capacity(group_count);
+        let mut audio_offset = 0usize;
+        let mut chunk_offset = 0usize;
+
+        for mut batch in batches {
+            for chunk in &mut batch.chunks {
+                chunk.orig_index = chunk.orig_index.saturating_add(audio_offset);
+            }
+            for group in &mut batch.groups {
+                for chunk_idx in &mut group.chunk_indices {
+                    *chunk_idx = chunk_idx.saturating_add(chunk_offset);
+                }
+            }
+            audio_offset = audio_offset.saturating_add(batch.audio_len);
+            chunk_offset = chunk_offset.saturating_add(batch.chunks.len());
+            chunks.extend(batch.chunks);
+            forced_langs_norm.extend(batch.forced_langs_norm);
+            groups.extend(batch.groups);
+        }
+
+        Ok(Self {
+            audio_len,
+            chunks,
+            forced_langs_norm,
+            groups,
+        })
+    }
+}
+
 #[cfg(feature = "timing")]
 fn merge_generation_timings(dst: &mut TranscribeTimings, src: &GenerationTimings) {
     dst.generation.prompt_tensors_us = dst
@@ -579,6 +638,112 @@ fn log_max_new_tokens_hit(chunk_idx: usize, chunk: &ChunkItem, token_count: usiz
         token_count,
         raw_preview(raw).as_str(),
     );
+}
+
+fn prepare_items_for_runtime(
+    processor: &AsrProcessor,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
+    items: &[(&str, &AudioInput<'_>)],
+) -> Result<Vec<PreparedInputs>> {
+    #[cfg(feature = "paged-attn")]
+    {
+        if use_varlen_paged_prepare(paged_runtime) {
+            return processor.prepare_batch_varlen(items);
+        }
+    }
+    processor.prepare_batch(items)
+}
+
+fn encode_prepared_audio_features_cpu(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
+    prepared: &[PreparedInputs],
+) -> Result<Tensor> {
+    #[cfg(feature = "paged-attn")]
+    let varlen_stack = use_varlen_paged_prepare(paged_runtime);
+    #[cfg(not(feature = "paged-attn"))]
+    let varlen_stack = false;
+    let (input_features, feature_lens) = if varlen_stack {
+        stack_features_varlen(prepared, device)?
+    } else {
+        stack_features(prepared, device)?
+    };
+    let audio_features =
+        thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+    Ok(audio_features.to_device(&Device::Cpu)?)
+}
+
+fn generate_raw_prepared_batch_with_audio_features(
+    thinker: &ThinkerForConditionalGeneration,
+    processor: &AsrProcessor,
+    device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
+    prepared: &[PreparedInputs],
+    audio_features: &Tensor,
+    max_new_tokens: usize,
+    _decode_max_seqs: usize,
+    eos_token_ids: &[u32],
+) -> Result<Vec<GeneratedRaw>> {
+    if prepared.is_empty() {
+        return Ok(vec![]);
+    }
+    let max_new_tokens = if max_new_tokens == 0 {
+        256
+    } else {
+        max_new_tokens
+    };
+    let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
+    let attn_rows: Vec<&[u32]> = prepared
+        .iter()
+        .map(|p| p.attention_mask.as_slice())
+        .collect();
+    #[cfg(feature = "paged-attn")]
+    let pad_id = paged_token_pad_id(processor)?;
+    #[cfg(feature = "paged-attn")]
+    let gen_ids = if let Some(runtime) = paged_runtime {
+        use crate::inference::batch_scheduler::run_paged_prepared_batch;
+        run_paged_prepared_batch(
+            thinker,
+            device,
+            runtime,
+            prepared,
+            audio_features,
+            max_new_tokens,
+            eos_token_ids,
+            _decode_max_seqs,
+            pad_id,
+        )?
+    } else {
+        let _ = (ids_rows.as_slice(), attn_rows.as_slice());
+        bail!("paged-attn build requires a shared paged runtime for offline ASR generation")
+    };
+    #[cfg(not(feature = "paged-attn"))]
+    let gen_ids = greedy_generate_cached_batch(
+        thinker,
+        device,
+        ids_rows.as_slice(),
+        attn_rows.as_slice(),
+        Some(audio_features),
+        max_new_tokens,
+        eos_token_ids,
+    )?;
+
+    if gen_ids.len() != prepared.len() {
+        bail!(
+            "internal error: generated batch size mismatch: expected={}, got={}",
+            prepared.len(),
+            gen_ids.len()
+        );
+    }
+    gen_ids
+        .into_iter()
+        .map(|ids| {
+            let token_count = ids.len();
+            let text = processor.tokenizer.decode(ids.as_slice())?;
+            Ok(GeneratedRaw { text, token_count })
+        })
+        .collect()
 }
 
 struct ChunkAsrBatch<'a> {
@@ -1634,6 +1799,221 @@ pub fn transcribe(
     }
 
     Ok(out)
+}
+
+pub fn encode_audio_features_to_cpu(
+    model: &AsrModel,
+    processor: &AsrProcessor,
+    device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
+    audio: &[AudioInput<'_>],
+    opts: &TranscribeOptions,
+) -> Result<EncodedAsrBatch> {
+    if opts.return_timestamps {
+        bail!(
+            "return_timestamps is not supported by qwen3asr staged transcribe; run an aligner model separately"
+        );
+    }
+
+    let contexts = opts.context.broadcast(audio.len(), "context")?;
+    let forced_langs = opts.language.broadcast(audio.len(), "language")?;
+    let mut forced_langs_norm: Vec<Option<String>> = Vec::with_capacity(forced_langs.len());
+    for l in forced_langs {
+        forced_langs_norm.push(normalize_forced_language(l)?);
+    }
+    let chunk_max_sec = opts
+        .chunk_max_sec
+        .unwrap_or(MAX_ASR_INPUT_SECONDS)
+        .min(MAX_ASR_INPUT_SECONDS);
+
+    let mut prompts: Vec<String> = Vec::with_capacity(audio.len());
+    for (ctx, lang) in contexts.iter().zip(forced_langs_norm.iter()) {
+        prompts.push(processor.build_text_prompt(ctx.as_str(), lang.as_deref()));
+    }
+
+    let mut chunks: Vec<ChunkItem> = Vec::new();
+    for (orig_index, item) in audio.iter().enumerate() {
+        let wav = crate::audio::normalize::normalize_audio_input(item)?;
+        let parts =
+            crate::audio::chunking::split_audio_into_chunks(&wav, SAMPLE_RATE_HZ, chunk_max_sec)?;
+        for part in parts {
+            chunks.push(ChunkItem {
+                orig_index,
+                wav: part.wav,
+                offset_sec: part.offset_sec,
+            });
+        }
+    }
+
+    if chunks.is_empty() {
+        return Ok(EncodedAsrBatch {
+            audio_len: audio.len(),
+            chunks,
+            forced_langs_norm,
+            groups: Vec::new(),
+        });
+    }
+
+    let mut ordered_indices: Vec<usize> = (0..chunks.len()).collect();
+    if opts.bucket_by_length {
+        ordered_indices.sort_by(|&a, &b| {
+            let la = chunks[a].wav.len();
+            let lb = chunks[b].wav.len();
+            lb.cmp(&la).then_with(|| a.cmp(&b))
+        });
+    }
+    let index_groups = group_chunk_indices(
+        ordered_indices.as_slice(),
+        &chunks,
+        opts.max_batch_audio_sec,
+    )?;
+    let mut groups = Vec::with_capacity(index_groups.len());
+    for chunk_indices in index_groups {
+        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(chunk_indices.len());
+        for &chunk_idx in &chunk_indices {
+            let chunk = chunks
+                .get(chunk_idx)
+                .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+            audio_inputs.push(AudioInput::Waveform {
+                samples: chunk.wav.as_slice(),
+                sample_rate: SAMPLE_RATE_HZ,
+            });
+        }
+
+        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(chunk_indices.len());
+        for (&chunk_idx, audio_input) in chunk_indices.iter().zip(audio_inputs.iter()) {
+            let chunk = chunks
+                .get(chunk_idx)
+                .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+            let prompt = prompts.get(chunk.orig_index).ok_or_else(|| {
+                anyhow::anyhow!("missing prompt for orig_index {}", chunk.orig_index)
+            })?;
+            items.push((prompt.as_str(), audio_input));
+        }
+
+        let prepared = prepare_items_for_runtime(
+            processor,
+            #[cfg(feature = "paged-attn")]
+            paged_runtime,
+            items.as_slice(),
+        )?;
+        if prepared.len() != chunk_indices.len() {
+            bail!(
+                "internal error: staged prepare size mismatch: expected={}, got={}",
+                chunk_indices.len(),
+                prepared.len()
+            );
+        }
+        let audio_features_cpu = encode_prepared_audio_features_cpu(
+            &model.thinker,
+            device,
+            #[cfg(feature = "paged-attn")]
+            paged_runtime,
+            prepared.as_slice(),
+        )?;
+        groups.push(EncodedPreparedGroup {
+            chunk_indices,
+            prepared,
+            audio_features_cpu,
+        });
+    }
+
+    Ok(EncodedAsrBatch {
+        audio_len: audio.len(),
+        chunks,
+        forced_langs_norm,
+        groups,
+    })
+}
+
+pub fn decode_cpu_audio_features(
+    model: &AsrModel,
+    processor: &AsrProcessor,
+    device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
+    encoded: EncodedAsrBatch,
+    opts: &TranscribeOptions,
+) -> Result<Vec<AsrTranscription>> {
+    let eos_token_ids = build_eos_token_ids(processor)?;
+    let mut per_chunk_lang: Vec<Option<String>> = vec![None; encoded.chunks.len()];
+    let mut per_chunk_text: Vec<Option<String>> = vec![None; encoded.chunks.len()];
+
+    let mut prepared = Vec::new();
+    let mut chunk_indices = Vec::new();
+    let mut audio_feature_parts = Vec::new();
+    for group in encoded.groups {
+        prepared.extend(group.prepared);
+        chunk_indices.extend(group.chunk_indices);
+        audio_feature_parts.push(group.audio_features_cpu);
+    }
+
+    if !prepared.is_empty() {
+        let audio_features = if audio_feature_parts.len() == 1 {
+            audio_feature_parts
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("missing staged audio features"))?
+        } else {
+            Tensor::cat(audio_feature_parts.as_slice(), 0)?
+        };
+        let raws = generate_raw_prepared_batch_with_audio_features(
+            &model.thinker,
+            processor,
+            device,
+            #[cfg(feature = "paged-attn")]
+            paged_runtime,
+            prepared.as_slice(),
+            &audio_features,
+            opts.max_new_tokens,
+            opts.decode_max_seqs,
+            eos_token_ids.as_slice(),
+        )?;
+        if raws.len() != chunk_indices.len() {
+            bail!(
+                "internal error: staged raw output size mismatch: expected={}, got={}",
+                chunk_indices.len(),
+                raws.len()
+            );
+        }
+        for (&chunk_idx, raw) in chunk_indices.iter().zip(raws.iter()) {
+            let chunk = encoded
+                .chunks
+                .get(chunk_idx)
+                .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+            if raw.token_count >= opts.max_new_tokens {
+                log_max_new_tokens_hit(chunk_idx, chunk, raw.token_count, raw.text.as_str());
+            }
+            let forced = encoded
+                .forced_langs_norm
+                .get(chunk.orig_index)
+                .and_then(|x| x.as_deref());
+            let (lang, text) = parse_asr_output(Some(raw.text.as_str()), forced);
+            per_chunk_lang[chunk_idx] = Some(lang);
+            per_chunk_text[chunk_idx] = Some(text);
+        }
+    }
+
+    let mut out_langs: Vec<Vec<String>> = vec![Vec::new(); encoded.audio_len];
+    let mut out_texts: Vec<Vec<String>> = vec![Vec::new(); encoded.audio_len];
+    for (idx, chunk) in encoded.chunks.iter().enumerate() {
+        let lang = per_chunk_lang[idx]
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing staged chunk language {idx}"))?;
+        let text = per_chunk_text[idx]
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing staged chunk text {idx}"))?;
+        out_langs[chunk.orig_index].push(lang);
+        out_texts[chunk.orig_index].push(text);
+    }
+
+    Ok(out_langs
+        .into_iter()
+        .zip(out_texts)
+        .map(|(langs, texts)| AsrTranscription {
+            language: merge_languages(langs),
+            text: texts.join(""),
+            timestamps: None,
+        })
+        .collect())
 }
 
 #[cfg(feature = "timing")]

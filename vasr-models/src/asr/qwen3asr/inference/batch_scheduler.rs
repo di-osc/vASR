@@ -573,7 +573,8 @@ impl AsrBatchScheduler {
                         audio_offsets.as_slice(),
                         row_audio_lens.as_slice(),
                         wave_client_indices.as_slice(),
-                    )?;
+                    )?
+                    .to_device(device)?;
                     let engine_config = PagedBatchConfig {
                         max_new_tokens,
                         eos_token_ids: eos_token_ids.to_vec(),
@@ -712,6 +713,7 @@ pub fn run_paged_prepared_batch(
             None,
         )
     } else {
+        let audio_features = audio_features.to_device(device)?;
         let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
         let attn_rows: Vec<&[u32]> = prepared
             .iter()
@@ -723,7 +725,7 @@ pub fn run_paged_prepared_batch(
             runtime,
             ids_rows.as_slice(),
             attn_rows.as_slice(),
-            Some(audio_features),
+            Some(&audio_features),
             max_new_tokens,
             eos_token_ids,
         )

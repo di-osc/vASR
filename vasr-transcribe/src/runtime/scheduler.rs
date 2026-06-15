@@ -152,6 +152,10 @@ impl ScheduledAsrModel {
 }
 
 impl AsrModel for ScheduledAsrModel {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.inner.as_any()
+    }
+
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
         let inner = Arc::clone(&self.inner);
         let waveform = waveform.clone();
@@ -198,6 +202,10 @@ mod tests {
         }
 
         impl AsrModel for BatchOnlyAsr {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
             fn transcribe(&self, _waveform: &Waveform, _options: &AsrOptions) -> Result<Timeline> {
                 self.single_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Timeline::new("single"))

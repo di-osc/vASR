@@ -14,7 +14,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
+use vasr_models::asr::qwen3asr::EncodedAsrBatch;
 
+use crate::runtime::models::qwen3_asr::Qwen3AsrModel;
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 
@@ -23,6 +25,7 @@ const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
+const ASR_ENCODED_FEATURE_QUEUE: usize = 1;
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
     loader: AudioLoader,
@@ -894,6 +897,198 @@ async fn send_next_vad_task(
     }
 }
 
+#[derive(Debug)]
+struct SegmentEncodeRequest {
+    segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+}
+
+#[derive(Debug)]
+struct SegmentEncodedMessage {
+    segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+    batch: Result<SegmentEncodedAsrBatch>,
+}
+
+fn spawn_segment_encoder_worker(
+    offline: Arc<OfflinePipeline>,
+    asr_options: AsrOptions,
+    mut request_rx: mpsc::Receiver<SegmentEncodeRequest>,
+    encoded_tx: mpsc::Sender<SegmentEncodedMessage>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tracing::info!(
+            target: "vasr_transcribe::pipeline",
+            "asr audio_features queue | capacity={}",
+            ASR_ENCODED_FEATURE_QUEUE,
+        );
+        while let Some(request) = request_rx.recv().await {
+            let segments_for_result = request.segments.clone();
+            let batch = tokio::task::spawn_blocking({
+                let offline = Arc::clone(&offline);
+                let asr_options = asr_options.clone();
+                let segments = request.segments;
+                move || run_segment_asr_encode(&offline, &segments, &asr_options)
+            })
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
+            let message = SegmentEncodedMessage {
+                segments: segments_for_result,
+                stage_start: request.stage_start,
+                batch,
+            };
+            if encoded_tx.send(message).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_segment_decoder_worker(
+    offline: Arc<OfflinePipeline>,
+    asr_options: AsrOptions,
+    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    result_tx: mpsc::Sender<TranscribeItemOutcome>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut segment_state = SegmentAsrState::default();
+        while let Some(first) = encoded_rx.recv().await {
+            handle_ready_segment_encoded_messages(
+                first,
+                &mut encoded_rx,
+                &offline,
+                &asr_options,
+                &mut segment_state,
+                &result_tx,
+            )
+            .await;
+        }
+    })
+}
+
+async fn handle_segment_encoded_messages(
+    offline: &OfflinePipeline,
+    asr_options: &AsrOptions,
+    segment_state: &mut SegmentAsrState,
+    encoded_messages: Vec<SegmentEncodedMessage>,
+    result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+) {
+    let mut ok_batches = Vec::new();
+    for encoded in encoded_messages {
+        match encoded.batch {
+            Ok(batch) => ok_batches.push((encoded.segments, encoded.stage_start, batch)),
+            Err(error) => {
+                let outcomes = finish_segment_asr_batch(
+                    segment_state,
+                    &encoded.segments,
+                    encoded.stage_start,
+                    Err(error),
+                );
+                for outcome in outcomes {
+                    let _ = result_tx.send(outcome).await;
+                }
+            }
+        }
+    }
+    if ok_batches.is_empty() {
+        return;
+    }
+
+    let mut segments = Vec::new();
+    let mut stage_start = ok_batches[0].1;
+    let mut batches = Vec::with_capacity(ok_batches.len());
+    for (mut batch_segments, batch_start, batch) in ok_batches {
+        if batch_start < stage_start {
+            stage_start = batch_start;
+        }
+        segments.append(&mut batch_segments);
+        batches.push(batch);
+    }
+    let batch = SegmentEncodedAsrBatch::merge(batches);
+    handle_merged_segment_encoded_batch(
+        offline,
+        asr_options,
+        segment_state,
+        segments,
+        stage_start,
+        batch,
+        result_tx,
+    )
+    .await;
+}
+
+async fn handle_merged_segment_encoded_batch(
+    offline: &OfflinePipeline,
+    asr_options: &AsrOptions,
+    segment_state: &mut SegmentAsrState,
+    segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+    batch: Result<SegmentEncodedAsrBatch>,
+    result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+) {
+    let batch = match batch {
+        Ok(batch) => tokio::task::spawn_blocking({
+            let asr = Arc::clone(&offline.asr);
+            let asr_options = asr_options.clone();
+            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
+        })
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
+        Err(error) => Err(error),
+    };
+    let outcomes = finish_segment_asr_batch(segment_state, &segments, stage_start, batch);
+    for outcome in outcomes {
+        let _ = result_tx.send(outcome).await;
+    }
+}
+
+async fn handle_ready_segment_encoded_messages(
+    first: SegmentEncodedMessage,
+    segment_encoded_rx: &mut mpsc::Receiver<SegmentEncodedMessage>,
+    offline: &OfflinePipeline,
+    asr_options: &AsrOptions,
+    segment_state: &mut SegmentAsrState,
+    result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+) {
+    let mut messages = vec![first];
+    while let Ok(message) = segment_encoded_rx.try_recv() {
+        messages.push(message);
+    }
+    if messages.len() > 1 {
+        let segs: usize = messages.iter().map(|message| message.segments.len()).sum();
+        tracing::debug!(
+            target: "vasr_transcribe::pipeline",
+            "asr audio_features decode merge | batches={} segs={}",
+            messages.len(),
+            segs,
+        );
+    }
+    handle_segment_encoded_messages(offline, asr_options, segment_state, messages, result_tx).await;
+}
+
+async fn send_segment_encode_request(
+    segment_encode_tx: &mpsc::Sender<SegmentEncodeRequest>,
+    request: SegmentEncodeRequest,
+) {
+    let mut request = request;
+    loop {
+        match segment_encode_tx.try_send(request) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    target: "vasr_transcribe::pipeline",
+                    "ASR audio feature encoder closed"
+                );
+                return;
+            }
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                request = returned;
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
 fn spawn_asr_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
@@ -902,9 +1097,27 @@ fn spawn_asr_worker(
     result_tx: mpsc::Sender<TranscribeItemOutcome>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut segment_state = SegmentAsrState::default();
+        let mut fallback_segment_state = SegmentAsrState::default();
         let mut pending = VecDeque::new();
-        while let Some(message) = recv_asr_message(&mut pending, &mut asr_rx).await {
+        let (segment_encode_tx, segment_encode_rx) = mpsc::channel(ASR_ENCODED_FEATURE_QUEUE);
+        let (segment_encoded_tx, segment_encoded_rx) = mpsc::channel(ASR_ENCODED_FEATURE_QUEUE);
+        let segment_encoder_handle = spawn_segment_encoder_worker(
+            Arc::clone(&offline),
+            asr_options.clone(),
+            segment_encode_rx,
+            segment_encoded_tx,
+        );
+        let segment_decoder_handle = spawn_segment_decoder_worker(
+            Arc::clone(&offline),
+            asr_options.clone(),
+            segment_encoded_rx,
+            result_tx.clone(),
+        );
+
+        while let Some(message) = match pending.pop_front() {
+            Some(message) => Some(message),
+            None => asr_rx.recv().await,
+        } {
             match message {
                 Err(outcome) => {
                     let _ = result_tx.send(outcome).await;
@@ -956,35 +1169,47 @@ fn spawn_asr_worker(
                         &mut pending,
                     )
                     .await;
-                    prepare_segment_job_state(&mut segment_state, &segments);
                     let stage_start = Instant::now();
-                    let batch = tokio::task::spawn_blocking({
-                        let offline = Arc::clone(&offline);
-                        let asr_options = asr_options.clone();
-                        let segments = segments.clone();
-                        move || run_segment_asr_inference(&offline, &segments, &asr_options)
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR join error: {error}")));
-                    let outcomes =
-                        finish_segment_asr_batch(&mut segment_state, &segments, stage_start, batch);
-                    for outcome in outcomes {
-                        let _ = result_tx.send(outcome).await;
+                    if offline.asr.as_any().is::<Qwen3AsrModel>() {
+                        tracing::debug!(
+                            target: "vasr_transcribe::pipeline",
+                            "asr audio_features encode enqueue | segs={} queue_capacity={}",
+                            segments.len(),
+                            segment_encode_tx.capacity(),
+                        );
+                        let request = SegmentEncodeRequest {
+                            segments,
+                            stage_start,
+                        };
+                        send_segment_encode_request(&segment_encode_tx, request).await;
+                    } else {
+                        prepare_segment_job_state(&mut fallback_segment_state, &segments);
+                        let batch = tokio::task::spawn_blocking({
+                            let offline = Arc::clone(&offline);
+                            let asr_options = asr_options.clone();
+                            let segments = segments.clone();
+                            move || run_segment_asr_inference(&offline, &segments, &asr_options)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR join error: {error}")));
+                        let outcomes = finish_segment_asr_batch(
+                            &mut fallback_segment_state,
+                            &segments,
+                            stage_start,
+                            batch,
+                        );
+                        for outcome in outcomes {
+                            let _ = result_tx.send(outcome).await;
+                        }
                     }
                 }
             }
         }
-    })
-}
 
-async fn recv_asr_message(
-    pending: &mut VecDeque<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
-    asr_rx: &mut mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
-) -> Option<Result<AsrPipelineMessage, TranscribeItemOutcome>> {
-    match pending.pop_front() {
-        Some(message) => Some(message),
-        None => asr_rx.recv().await,
-    }
+        drop(segment_encode_tx);
+        let _ = segment_encoder_handle.await;
+        let _ = segment_decoder_handle.await;
+    })
 }
 
 async fn collect_job_microbatch(
@@ -1159,11 +1384,61 @@ struct SegmentAsrInference {
     active_job_count: usize,
 }
 
+#[derive(Debug)]
+struct SegmentEncodedAsrBatch {
+    inference: SegmentAsrInference,
+    waveforms: Vec<Waveform>,
+    encoded: EncodedAsrBatch,
+}
+
+impl SegmentEncodedAsrBatch {
+    fn merge(batches: Vec<Self>) -> Result<Self> {
+        let mut targets = Vec::new();
+        let mut waveforms = Vec::new();
+        let mut encoded_batches = Vec::with_capacity(batches.len());
+        let mut segment_audio_seconds = 0.0;
+        let mut active_jobs = HashSet::new();
+
+        for mut batch in batches {
+            segment_audio_seconds += batch.inference.segment_audio_seconds;
+            for (job_index, _, _) in &batch.inference.targets {
+                active_jobs.insert(*job_index);
+            }
+            targets.append(&mut batch.inference.targets);
+            waveforms.append(&mut batch.waveforms);
+            encoded_batches.push(batch.encoded);
+        }
+
+        let encoded = EncodedAsrBatch::merge(encoded_batches)?;
+        if encoded.len() != waveforms.len() {
+            bail!(
+                "merged staged ASR batch mismatch: encoded={} waveforms={}",
+                encoded.len(),
+                waveforms.len()
+            );
+        }
+
+        Ok(Self {
+            inference: SegmentAsrInference {
+                targets,
+                segment_audio_seconds,
+                active_job_count: active_jobs.len(),
+            },
+            waveforms,
+            encoded,
+        })
+    }
+}
+
 fn run_segment_asr_inference(
     offline: &OfflinePipeline,
     segments: &[AsrSegmentJob],
     asr_options: &AsrOptions,
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
+    if offline.asr.as_any().is::<Qwen3AsrModel>() {
+        let encoded = run_segment_asr_encode(offline, segments, asr_options)?;
+        return run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options);
+    }
     let slices: Vec<Waveform> = segments
         .iter()
         .map(|segment| segment.waveform.clone())
@@ -1189,6 +1464,59 @@ fn run_segment_asr_inference(
         },
         timelines,
     ))
+}
+
+fn run_segment_asr_encode(
+    offline: &OfflinePipeline,
+    segments: &[AsrSegmentJob],
+    asr_options: &AsrOptions,
+) -> Result<SegmentEncodedAsrBatch> {
+    let qwen3 = offline
+        .asr
+        .as_any()
+        .downcast_ref::<Qwen3AsrModel>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3AsrModel"))?;
+    let waveforms: Vec<Waveform> = segments
+        .iter()
+        .map(|segment| segment.waveform.clone())
+        .collect();
+    let targets: Vec<(usize, usize, DurationMs)> = segments
+        .iter()
+        .map(|segment| (segment.job_index, segment.segment_index, segment.offset))
+        .collect();
+    let active_job_count = segments
+        .iter()
+        .map(|segment| segment.job_index)
+        .collect::<HashSet<_>>()
+        .len();
+    let segment_audio_seconds: f64 = waveforms.iter().map(Waveform::duration_seconds).sum();
+    let encoded = qwen3.encode_audio_features_to_cpu(waveforms.as_slice(), asr_options)?;
+    Ok(SegmentEncodedAsrBatch {
+        inference: SegmentAsrInference {
+            targets,
+            segment_audio_seconds,
+            active_job_count,
+        },
+        waveforms,
+        encoded,
+    })
+}
+
+fn run_segment_asr_decode(
+    asr: &dyn crate::runtime::model::AsrModel,
+    encoded: SegmentEncodedAsrBatch,
+    asr_options: &AsrOptions,
+) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
+    let qwen3 = asr
+        .as_any()
+        .downcast_ref::<Qwen3AsrModel>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3AsrModel"))?;
+    let timelines = qwen3.decode_cpu_audio_features(
+        encoded.encoded,
+        encoded.waveforms.as_slice(),
+        asr_options,
+    )?;
+    Ok((encoded.inference, timelines))
 }
 
 fn finish_segment_asr_batch(
@@ -1589,6 +1917,10 @@ mod tests {
     }
 
     impl AsrModel for BatchRecordingAsr {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
             let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
             timelines

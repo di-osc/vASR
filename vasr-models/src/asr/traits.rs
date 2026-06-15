@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::Result;
 use vasr_data::{Annotation, AudioChunk, Timeline, Waveform};
 
@@ -26,7 +28,9 @@ impl Default for AsrOptions {
     }
 }
 
-pub trait OfflineAsrModel: Send + Sync {
+pub trait OfflineAsrModel: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline>;
 
     fn transcribe_batch(

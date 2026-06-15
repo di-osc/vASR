@@ -17,6 +17,7 @@ pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
 pub use inference::streaming::AsrStream;
+pub use inference::transcribe::EncodedAsrBatch;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
@@ -155,6 +156,38 @@ impl Qwen3Asr {
             #[cfg(feature = "paged-attn")]
             self.paged_cache.as_ref(),
             &audio,
+            &opts,
+        )
+    }
+
+    pub fn encode_audio_features_to_cpu(
+        &self,
+        audio: Vec<AudioInput<'_>>,
+        opts: TranscribeOptions,
+    ) -> Result<EncodedAsrBatch> {
+        inference::transcribe::encode_audio_features_to_cpu(
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
+            #[cfg(feature = "paged-attn")]
+            self.paged_cache.as_ref(),
+            &audio,
+            &opts,
+        )
+    }
+
+    pub fn decode_cpu_audio_features(
+        &self,
+        encoded: EncodedAsrBatch,
+        opts: TranscribeOptions,
+    ) -> Result<Vec<AsrTranscription>> {
+        inference::transcribe::decode_cpu_audio_features(
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
+            #[cfg(feature = "paged-attn")]
+            self.paged_cache.as_ref(),
+            encoded,
             &opts,
         )
     }

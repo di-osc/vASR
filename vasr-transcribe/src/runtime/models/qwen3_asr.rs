@@ -3,7 +3,7 @@ use candle_core::Device;
 use vasr_data::{Timeline, Waveform};
 #[cfg(feature = "timing")]
 use vasr_models::asr::qwen3asr::TranscribeTimings;
-use vasr_models::asr::qwen3asr::{AudioInput, LoadOptions, Qwen3Asr};
+use vasr_models::asr::qwen3asr::{AudioInput, EncodedAsrBatch, LoadOptions, Qwen3Asr};
 use vasr_models::{qwen_outputs_to_timelines, qwen_transcribe_options};
 
 use crate::runtime::model::{AsrModel, AsrOptions};
@@ -26,9 +26,43 @@ impl Qwen3AsrModel {
     pub fn inner(&self) -> &Qwen3Asr {
         &self.inner
     }
+
+    pub fn encode_audio_features_to_cpu(
+        &self,
+        waveforms: &[Waveform],
+        options: &AsrOptions,
+    ) -> Result<EncodedAsrBatch> {
+        let runtime_options = qwen_transcribe_options(options);
+        let audio = waveforms
+            .iter()
+            .map(|waveform| AudioInput::Waveform {
+                samples: &waveform.samples,
+                sample_rate: waveform.sample_rate,
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .encode_audio_features_to_cpu(audio, runtime_options)
+    }
+
+    pub fn decode_cpu_audio_features(
+        &self,
+        encoded: EncodedAsrBatch,
+        waveforms: &[Waveform],
+        options: &AsrOptions,
+    ) -> Result<Vec<Timeline>> {
+        let runtime_options = qwen_transcribe_options(options);
+        let outputs = self
+            .inner
+            .decode_cpu_audio_features(encoded, runtime_options)?;
+        qwen_outputs_to_timelines(outputs, waveforms)
+    }
 }
 
 impl AsrModel for Qwen3AsrModel {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
         let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
         timelines
