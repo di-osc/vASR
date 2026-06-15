@@ -5,8 +5,7 @@
 
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
@@ -16,10 +15,6 @@ use crate::model::thinker::get_rope_index;
 #[cfg(feature = "paged-attn")]
 use vasr_paged_attn::PagedKvCache;
 use vasr_quant::isq_linear::set_linear_is_prefill;
-
-thread_local! {
-    static PREFIX_KV_CACHE_TEMPLATES: RefCell<HashMap<Vec<u32>, KVCache>> = RefCell::new(HashMap::new());
-}
 
 #[cfg(feature = "paged-attn")]
 const PAGED_CACHE_BLOCK_SIZE: usize = 32;
@@ -106,65 +101,6 @@ fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     }
 
     Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
-}
-
-fn common_audio_prefix_len(
-    input_ids: &[&[u32]],
-    attention_mask: &[&[u32]],
-    audio_token_id: u32,
-) -> usize {
-    if input_ids.len() <= 1 || input_ids.len() != attention_mask.len() {
-        return 0;
-    }
-    let first = match input_ids.first() {
-        Some(row) => *row,
-        None => return 0,
-    };
-    let first_attn = match attention_mask.first() {
-        Some(row) => *row,
-        None => return 0,
-    };
-    let Some(prefix_len) = first
-        .iter()
-        .zip(first_attn.iter())
-        .position(|(&id, &attn)| attn != 0 && id == audio_token_id)
-    else {
-        return 0;
-    };
-    if prefix_len < 8 {
-        return 0;
-    }
-    for (ids, attn) in input_ids.iter().zip(attention_mask.iter()).skip(1) {
-        let Some(row_prefix_len) = ids
-            .iter()
-            .zip(attn.iter())
-            .position(|(&id, &mask)| mask != 0 && id == audio_token_id)
-        else {
-            return 0;
-        };
-        if row_prefix_len != prefix_len
-            || ids.len() < prefix_len
-            || attn.len() < prefix_len
-            || ids[..prefix_len] != first[..prefix_len]
-            || attn[..prefix_len].iter().any(|&mask| mask == 0)
-        {
-            return 0;
-        }
-    }
-    if first_attn[..prefix_len].iter().any(|&mask| mask == 0) {
-        return 0;
-    }
-    prefix_len
-}
-
-fn cached_prefix_kv_template(prefix_ids: &[u32]) -> Option<KVCache> {
-    PREFIX_KV_CACHE_TEMPLATES.with(|cache| cache.borrow().get(prefix_ids).cloned())
-}
-
-fn store_prefix_kv_template(prefix_ids: Vec<u32>, kv_cache: KVCache) {
-    PREFIX_KV_CACHE_TEMPLATES.with(|cache| {
-        cache.borrow_mut().insert(prefix_ids, kv_cache);
-    });
 }
 
 #[cfg(feature = "metal-paged-attn")]
@@ -876,7 +812,8 @@ fn greedy_generate_cached_batch_impl(
             eos_token_ids: opts.eos_token_ids.to_vec(),
             request_id_base: 0,
         };
-        let state = paged_batch_prefill(
+        let request_ids = (0..batch).collect::<Vec<_>>();
+        let state = match paged_batch_prefill(
             thinker,
             device,
             &mut runtime_guard,
@@ -884,7 +821,13 @@ fn greedy_generate_cached_batch_impl(
             attention_mask,
             opts.audio_features,
             &config,
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
+                return Err(error);
+            }
+        };
         let request_ids = state.request_ids.clone();
         let rebuilt = rebuild_kv_cache_from_paged_prefill(
             thinker,
@@ -909,186 +852,52 @@ fn greedy_generate_cached_batch_impl(
             t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_token_count);
         }
     }
-    let prefix_len = if opts.audio_features.is_some() {
-        common_audio_prefix_len(input_ids, attention_mask, thinker.audio_token_id())
-    } else {
-        0
-    };
     if next_ids.is_none() {
-        let prefix_ids = (prefix_len > 0).then(|| input_ids[0][..prefix_len].to_vec());
-        let mut used_cached_prefix = false;
-        let logits = if let Some(prefix_ids) = prefix_ids.as_ref() {
-            if let Some(prefix_cache) = cached_prefix_kv_template(prefix_ids.as_slice()) {
-                used_cached_prefix = true;
-                kv_cache = prefix_cache.replicate_batch(batch)?;
-                let rem_len = seq_len - prefix_len;
-                let mut rem_ids_flat = Vec::with_capacity(batch.saturating_mul(rem_len));
-                for row in input_ids {
-                    rem_ids_flat.extend_from_slice(&row[prefix_len..]);
-                }
-                let rem_input_ids_t = Tensor::from_vec(rem_ids_flat, (batch, rem_len), device)?;
-
-                let rem_audio_placeholder_count = if opts.audio_features.is_some() {
-                    count_audio_placeholders_batch(
-                        &input_ids
-                            .iter()
-                            .map(|row| &row[prefix_len..])
-                            .collect::<Vec<_>>(),
-                        thinker.audio_token_id(),
-                    )?
-                } else {
-                    0
-                };
-                #[cfg(feature = "timing")]
-                let start_inputs = std::time::Instant::now();
-                let rem_inputs_embeds = thinker.inputs_embeds_with_audio_features(
-                    &rem_input_ids_t,
-                    opts.audio_features,
-                    rem_audio_placeholder_count,
-                )?;
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_inputs_us = t
-                        .prefill_inputs_us
-                        .saturating_add(duration_to_us(start_inputs.elapsed()));
-                }
-                #[cfg(feature = "timing")]
-                let start_rope = std::time::Instant::now();
-                let (full_position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-                let rem_position_ids = full_position_ids.narrow(2, prefix_len, rem_len)?;
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_rope_us = t
-                        .prefill_rope_us
-                        .saturating_add(duration_to_us(start_rope.elapsed()));
-                }
-                #[cfg(feature = "timing")]
-                let start_forward = std::time::Instant::now();
-                let logits = {
-                    let _linear_prefill_guard = set_linear_is_prefill(true);
-                    thinker.forward_embeds_with_kv_cache(
-                        &attention_mask_t,
-                        &rem_position_ids,
-                        &rem_inputs_embeds,
-                        &mut kv_cache,
-                    )?
-                };
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_forward_us = t
-                        .prefill_forward_us
-                        .saturating_add(duration_to_us(start_forward.elapsed()));
-                }
-                logits
-            } else {
-                let audio_placeholder_count =
-                    count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?;
-                #[cfg(feature = "timing")]
-                let start_inputs = std::time::Instant::now();
-                let inputs_embeds = thinker.inputs_embeds_with_audio_features(
-                    &input_ids_t,
-                    opts.audio_features,
-                    audio_placeholder_count,
-                )?;
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_inputs_us = t
-                        .prefill_inputs_us
-                        .saturating_add(duration_to_us(start_inputs.elapsed()));
-                }
-                #[cfg(feature = "timing")]
-                let start_rope = std::time::Instant::now();
-                let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_rope_us = t
-                        .prefill_rope_us
-                        .saturating_add(duration_to_us(start_rope.elapsed()));
-                }
-                #[cfg(feature = "timing")]
-                let start_forward = std::time::Instant::now();
-                let logits = {
-                    let _linear_prefill_guard = set_linear_is_prefill(true);
-                    thinker.forward_embeds_with_kv_cache(
-                        &attention_mask_t,
-                        &position_ids,
-                        &inputs_embeds,
-                        &mut kv_cache,
-                    )?
-                };
-                #[cfg(feature = "timing")]
-                if let Some(t) = timings.as_mut() {
-                    t.prefill_forward_us = t
-                        .prefill_forward_us
-                        .saturating_add(duration_to_us(start_forward.elapsed()));
-                }
-                logits
-            }
+        let audio_placeholder_count = if opts.audio_features.is_some() {
+            count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?
         } else {
-            let audio_placeholder_count = if opts.audio_features.is_some() {
-                count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?
-            } else {
-                0
-            };
-            #[cfg(feature = "timing")]
-            let start_inputs = std::time::Instant::now();
-            let inputs_embeds = thinker.inputs_embeds_with_audio_features(
-                &input_ids_t,
-                opts.audio_features,
-                audio_placeholder_count,
-            )?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.prefill_inputs_us = t
-                    .prefill_inputs_us
-                    .saturating_add(duration_to_us(start_inputs.elapsed()));
-            }
-            #[cfg(feature = "timing")]
-            let start_rope = std::time::Instant::now();
-            let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.prefill_rope_us = t
-                    .prefill_rope_us
-                    .saturating_add(duration_to_us(start_rope.elapsed()));
-            }
-            #[cfg(feature = "timing")]
-            let start_forward = std::time::Instant::now();
-            let logits = {
-                let _linear_prefill_guard = set_linear_is_prefill(true);
-                thinker.forward_embeds_with_kv_cache(
-                    &attention_mask_t,
-                    &position_ids,
-                    &inputs_embeds,
-                    &mut kv_cache,
-                )?
-            };
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.prefill_forward_us = t
-                    .prefill_forward_us
-                    .saturating_add(duration_to_us(start_forward.elapsed()));
-            }
-            logits
+            0
         };
-        if prefix_len > 0 && !used_cached_prefix {
-            if let Some(prefix_ids) = prefix_ids {
-                let prefix_cache = kv_cache.row0_prefix_template(prefix_len)?;
-                store_prefix_kv_template(prefix_ids, prefix_cache);
-            }
+        #[cfg(feature = "timing")]
+        let start_inputs = std::time::Instant::now();
+        let inputs_embeds = thinker.inputs_embeds_with_audio_features(
+            &input_ids_t,
+            opts.audio_features,
+            audio_placeholder_count,
+        )?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_inputs_us = t
+                .prefill_inputs_us
+                .saturating_add(duration_to_us(start_inputs.elapsed()));
         }
-        let effective_prefix_len = if used_cached_prefix { prefix_len } else { 0 };
-        let prefix_len_i64 = i64::try_from(effective_prefix_len).map_err(|_| {
-            anyhow::anyhow!("effective prefix_len overflows i64: {effective_prefix_len}")
-        })?;
-        let prefill_prompt_lens = if effective_prefix_len > 0 {
-            prompt_lens
-                .iter()
-                .map(|&len| len.saturating_sub(prefix_len_i64))
-                .collect::<Vec<_>>()
-        } else {
-            prompt_lens.clone()
+        #[cfg(feature = "timing")]
+        let start_rope = std::time::Instant::now();
+        let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_rope_us = t
+                .prefill_rope_us
+                .saturating_add(duration_to_us(start_rope.elapsed()));
+        }
+        #[cfg(feature = "timing")]
+        let start_forward = std::time::Instant::now();
+        let logits = {
+            let _linear_prefill_guard = set_linear_is_prefill(true);
+            thinker.forward_embeds_with_kv_cache(
+                &attention_mask_t,
+                &position_ids,
+                &inputs_embeds,
+                &mut kv_cache,
+            )?
         };
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_forward_us = t
+                .prefill_forward_us
+                .saturating_add(duration_to_us(start_forward.elapsed()));
+        }
+        let prefill_prompt_lens = prompt_lens.clone();
         let last_logits =
             gather_last_logits_for_prompt_lens(&logits, prefill_prompt_lens.as_slice())?;
         next_ids = Some(argmax_token_ids_from_logits(&last_logits, batch)?);

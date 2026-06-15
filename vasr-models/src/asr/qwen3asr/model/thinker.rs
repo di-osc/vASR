@@ -161,8 +161,28 @@ impl ThinkerForConditionalGeneration {
             cfg.text_config.vocab_size
         };
 
-        let audio_tower =
-            AudioTower::load(&cfg.audio_config, vb.pp("audio_tower"), use_flash_attn)?;
+        let audio_use_flash_attn = match std::env::var("VASR_QWEN3_ASR_AUDIO_FLASH_ATTN").as_deref()
+        {
+            Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF") => false,
+            Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("on") | Ok("ON") => use_flash_attn,
+            Ok(other) => {
+                tracing::warn!(
+                    target: "vasr_models::asr::qwen3asr",
+                    "ignoring invalid VASR_QWEN3_ASR_AUDIO_FLASH_ATTN={other:?}; expected 0/1"
+                );
+                use_flash_attn
+            }
+            Err(_) => use_flash_attn,
+        };
+        tracing::debug!(
+            target: "vasr_models::asr::qwen3asr",
+            "audio_tower_flash_attn={audio_use_flash_attn} text_flash_attn={use_flash_attn}"
+        );
+        let audio_tower = AudioTower::load(
+            &cfg.audio_config,
+            vb.pp("audio_tower"),
+            audio_use_flash_attn,
+        )?;
         let text_model = ThinkerTextModel::load(
             &cfg.text_config,
             vb.pp("model"),
@@ -301,6 +321,27 @@ impl ThinkerForConditionalGeneration {
     }
 
     #[cfg(feature = "paged-attn")]
+    pub fn forward_last_logits_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+        last_token_flat_indices: &[usize],
+    ) -> Result<Tensor> {
+        let hidden_states = self.text_model.forward_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        let last_hidden =
+            gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
+        drop(hidden_states);
+        Ok(self.lm_head.forward(&last_hidden)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
     pub fn forward_packed_prefill_embeds_with_paged_cache(
         &self,
         position_ids: &Tensor,
@@ -315,6 +356,27 @@ impl ThinkerForConditionalGeneration {
             input_metadata,
         )?;
         Ok(self.lm_head.forward(&hidden_states)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_last_logits_packed_prefill_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+        last_token_flat_indices: &[usize],
+    ) -> Result<Tensor> {
+        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        let last_hidden =
+            gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
+        drop(hidden_states);
+        Ok(self.lm_head.forward(&last_hidden)?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -375,6 +437,29 @@ impl ThinkerForConditionalGeneration {
             audio_placeholder_count,
         )
     }
+}
+
+#[cfg(feature = "paged-attn")]
+fn gather_hidden_states_at_flat_indices(
+    hidden_states: &Tensor,
+    flat_indices: &[usize],
+) -> Result<Tensor> {
+    let (batch, seq_len, hidden) = hidden_states.dims3()?;
+    let total = batch
+        .checked_mul(seq_len)
+        .ok_or_else(|| anyhow::anyhow!("hidden state token count overflow"))?;
+    let mut gather_idx = Vec::with_capacity(flat_indices.len());
+    for (row, &idx) in flat_indices.iter().enumerate() {
+        if idx >= total {
+            bail!("last token flat index out of range at batch {row}: idx={idx} total={total}");
+        }
+        gather_idx.push(u32::try_from(idx).map_err(|_| {
+            anyhow::anyhow!("last hidden gather index overflows u32 at batch {row}: {idx}")
+        })?);
+    }
+    let flat_hidden = hidden_states.reshape((total, hidden))?;
+    let idx = Tensor::from_vec(gather_idx, (flat_indices.len(),), hidden_states.device())?;
+    Ok(flat_hidden.index_select(&idx, 0)?)
 }
 
 #[cfg(test)]

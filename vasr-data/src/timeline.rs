@@ -47,6 +47,7 @@ pub enum AnnotationPayload {
     Speech,
     Silence,
     Token(Token),
+    #[serde(alias = "Segment")]
     Transcription(TextSpan),
     Sentence(TextSpan),
     Speaker(SpeakerId),

@@ -16,6 +16,7 @@ use candle_nn::{
 };
 
 use crate::config::AudioEncoderConfig;
+use crate::model::cuda_mem_debug::log_cuda_mem;
 use crate::processor::feat_lengths::feat_extract_output_length;
 
 #[cfg(feature = "flash-attn")]
@@ -221,6 +222,40 @@ fn gelu(xs: &Tensor) -> Result<Tensor> {
     xs.gelu_erf()
 }
 
+fn audio_seq_bucket_size() -> Option<usize> {
+    match std::env::var("VASR_QWEN3_ASR_AUDIO_SEQ_BUCKET") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+        Ok(v) => v.parse::<usize>().ok().filter(|&n| n > 1),
+        Err(_) => None,
+    }
+}
+
+fn round_up_to_multiple(value: usize, multiple: usize) -> Result<usize> {
+    if multiple == 0 {
+        candle_core::bail!("round_up_to_multiple requires multiple > 0");
+    }
+    if value == 0 {
+        return Ok(0);
+    }
+    let rem = value % multiple;
+    if rem == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(multiple - rem)
+        .ok_or_else(|| candle_core::Error::Msg("bucket size overflow".to_string()))
+}
+
+fn log_audio_layer_stage(device: &Device, layer_idx: usize, stage: &str, seq_len: usize) {
+    if std::env::var_os("VASR_DEBUG_AUDIO_ENCODER_LAYER_STAGES").is_none() {
+        return;
+    }
+    log_cuda_mem(
+        device,
+        &format!("audio_encoder_layer_{layer_idx}_after_{stage}(seq={seq_len})"),
+    );
+}
+
 #[derive(Debug, Clone)]
 struct AudioAttention {
     use_flash_attn: bool,
@@ -260,7 +295,12 @@ impl AudioAttention {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, cu_seqlens: &[usize]) -> Result<Tensor> {
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        cu_seqlens: &[usize],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
         let (seq_len, embed_dim) = hidden_states.dims2()?;
         if seq_len == 0 {
             return Tensor::zeros(
@@ -271,13 +311,22 @@ impl AudioAttention {
         }
 
         let q = self.q_proj.forward(hidden_states)?;
-        let q = q.reshape((seq_len, self.num_heads, self.head_dim))?;
+        let q = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .detach();
+        log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_q_proj", seq_len);
 
         let k = self.k_proj.forward(hidden_states)?;
-        let k = k.reshape((seq_len, self.num_heads, self.head_dim))?;
+        let k = k
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .detach();
+        log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_k_proj", seq_len);
 
         let v = self.v_proj.forward(hidden_states)?;
-        let v = v.reshape((seq_len, self.num_heads, self.head_dim))?;
+        let v = v
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .detach();
+        log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_v_proj", seq_len);
 
         if self.use_flash_attn {
             #[cfg(not(feature = "flash-attn"))]
@@ -354,30 +403,88 @@ impl AudioAttention {
                     softmax_scale,
                     false,
                 )?;
+                drop(q);
+                drop(k);
+                drop(v);
+                log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_flash", seq_len);
 
                 let attn = out.reshape((seq_len, embed_dim))?;
-                return self.out_proj.forward(&attn);
+                drop(out);
+                let out = self.out_proj.forward(&attn)?.detach();
+                drop(attn);
+                log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_out_proj", seq_len);
+                return Ok(out);
             }
         }
 
-        let q = q.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
-        let k = k.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
-        let v = v.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
+        if cu_seqlens.len() < 2 {
+            candle_core::bail!(
+                "cu_seqlens must have at least 2 elements, got {}",
+                cu_seqlens.len()
+            );
+        }
+        if cu_seqlens.first().copied().unwrap_or(1) != 0
+            || cu_seqlens.last().copied().unwrap_or_default() != seq_len
+        {
+            candle_core::bail!("invalid cu_seqlens={cu_seqlens:?} for seq_len={seq_len}");
+        }
 
-        // GPU GEMM kernels only support contiguous (or simple transposed) layouts.
-        // These tensors are produced via reshapes/transposes that yield strided views,
-        // so materialize contiguous buffers when running on Metal or CUDA.
-        let q = maybe_contiguous_for_metal(q)?;
-        let v = maybe_contiguous_for_metal(v)?;
+        let mut outs: Vec<Tensor> = Vec::with_capacity(cu_seqlens.len().saturating_sub(1));
+        for w in cu_seqlens.windows(2) {
+            let (start, end) = (w[0], w[1]);
+            if end < start {
+                candle_core::bail!("cu_seqlens must be non-decreasing: {cu_seqlens:?}");
+            }
+            let len = end.saturating_sub(start);
+            if len == 0 {
+                continue;
+            }
+            let q_seg = q.narrow(0, start, len)?;
+            let k_seg = k.narrow(0, start, len)?;
+            let v_seg = v.narrow(0, start, len)?;
 
-        let k_t = maybe_contiguous_for_metal(k.transpose(2, 3)?)?; // (1, h, d, s)
-        let attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let q_seg = q_seg.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
+            let k_seg = k_seg.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
+            let v_seg = v_seg.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
 
-        let attn = attn_weights.matmul(&v)?; // (1, h, s, d)
-        let attn = attn.squeeze(0)?.transpose(0, 1)?; // (s, h, d)
-        let attn = attn.reshape((seq_len, embed_dim))?;
-        self.out_proj.forward(&attn)
+            // GPU GEMM kernels only support contiguous (or simple transposed) layouts.
+            // These tensors are produced via reshapes/transposes that yield strided views,
+            // so materialize contiguous buffers when running on Metal or CUDA.
+            let q_seg = maybe_contiguous_for_metal(q_seg)?;
+            let v_seg = maybe_contiguous_for_metal(v_seg)?;
+
+            let k_t = maybe_contiguous_for_metal(k_seg.transpose(2, 3)?)?; // (1, h, d, s)
+            let attn_weights = q_seg.matmul(&k_t)?.affine(self.scaling, 0.0)?;
+            drop(q_seg);
+            drop(k_t);
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+
+            let attn = attn_weights.matmul(&v_seg)?; // (1, h, s, d)
+            drop(attn_weights);
+            drop(v_seg);
+            let attn = attn.squeeze(0)?.transpose(0, 1)?; // (s, h, d)
+            let attn = attn.reshape((len, embed_dim))?.detach();
+            let out = self.out_proj.forward(&attn)?.detach();
+            drop(attn);
+            outs.push(out);
+        }
+        drop(q);
+        drop(k);
+        drop(v);
+        log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_segments", seq_len);
+        if outs.is_empty() {
+            return Tensor::zeros(
+                (0usize, embed_dim),
+                hidden_states.dtype(),
+                hidden_states.device(),
+            );
+        }
+        let attn_refs: Vec<&Tensor> = outs.iter().collect();
+        let out = Tensor::cat(&attn_refs, 0)?.detach();
+        drop(attn_refs);
+        drop(outs);
+        log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_cat", seq_len);
+        Ok(out)
     }
 }
 
@@ -415,26 +522,62 @@ impl AudioEncoderLayer {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, cu_seqlens: &[usize]) -> Result<Tensor> {
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        cu_seqlens: &[usize],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let device = hidden_states.device();
+        let seq_len = hidden_states.dim(0)?;
+
         let residual = hidden_states.clone();
-        let x = self.self_attn_layer_norm.forward(hidden_states)?;
-        let x = self.self_attn.forward(&x, cu_seqlens)?;
-        let x = (&residual + &x)?;
+        let normed = self.self_attn_layer_norm.forward(hidden_states)?.detach();
+        log_audio_layer_stage(device, layer_idx, "self_attn_layer_norm", seq_len);
+
+        let attn = self
+            .self_attn
+            .forward(&normed, cu_seqlens, layer_idx)?
+            .detach();
+        drop(normed);
+        log_audio_layer_stage(device, layer_idx, "self_attn", seq_len);
+
+        let x = (&residual + &attn)?.detach();
+        drop(residual);
+        drop(attn);
+        log_audio_layer_stage(device, layer_idx, "self_attn_residual", seq_len);
 
         let residual = x.clone();
-        let x = self.final_layer_norm.forward(&x)?;
-        let x = self.fc1.forward(&x)?;
-        let x = gelu(&x)?;
-        let x = self.fc2.forward(&x)?;
-        let x = (&residual + &x)?;
+        let normed = self.final_layer_norm.forward(&x)?.detach();
+        drop(x);
+        log_audio_layer_stage(device, layer_idx, "final_layer_norm", seq_len);
 
-        if x.dtype() == DType::F16 {
+        let fc1 = self.fc1.forward(&normed)?.detach();
+        drop(normed);
+        log_audio_layer_stage(device, layer_idx, "fc1", seq_len);
+
+        let activated = gelu(&fc1)?.detach();
+        drop(fc1);
+        log_audio_layer_stage(device, layer_idx, "gelu", seq_len);
+
+        let fc2 = self.fc2.forward(&activated)?.detach();
+        drop(activated);
+        log_audio_layer_stage(device, layer_idx, "fc2", seq_len);
+
+        let x = (&residual + &fc2)?.detach();
+        drop(residual);
+        drop(fc2);
+        log_audio_layer_stage(device, layer_idx, "ffn_residual", seq_len);
+
+        let x = if x.dtype() == DType::F16 {
             // Match the official float16 clamp to prevent infs.
             let clamp = 65_504.0f32 - 1000.0;
-            x.clamp(-clamp, clamp)
+            x.clamp(-clamp, clamp)?
         } else {
-            Ok(x)
-        }
+            x
+        };
+        log_audio_layer_stage(device, layer_idx, "clamp", seq_len);
+        Ok(x.detach())
     }
 }
 
@@ -585,13 +728,17 @@ impl AudioTower {
                 continue;
             }
             let x = x.narrow(1, 0, len)?;
-            outs.push(self.forward_one(&x)?);
+            outs.push(self.forward_one(&x)?.detach());
         }
-        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0).map(|x| x.detach())
     }
 
     fn forward_one(&self, input_feature: &Tensor) -> Result<Tensor> {
         let (mel, frames) = input_feature.dims2()?;
+        log_cuda_mem(
+            input_feature.device(),
+            &format!("audio_encoder_one_start(frames={frames})"),
+        );
         if mel != self.config.num_mel_bins {
             candle_core::bail!(
                 "input_feature mel bins mismatch: expected={}, got={mel}",
@@ -652,6 +799,11 @@ impl AudioTower {
 
         // (chunk_num, max_chunk_len, mel) -> (chunk_num, mel, max_chunk_len)
         let padded_feature = stack_audio_chunks(&padded_chunks)?.transpose(1, 2)?;
+        log_cuda_mem(
+            input_feature.device(),
+            &format!("audio_encoder_after_stack_chunks(frames={frames},chunks={chunk_num})"),
+        );
+        drop(padded_chunks);
         let padded_feature = padded_feature.unsqueeze(1)?; // (chunk_num, 1, mel, max_chunk_len)
 
         // Convolution stack (split along chunk dimension to avoid OOM).
@@ -663,9 +815,14 @@ impl AudioTower {
             let x = gelu(&self.conv2d1.forward(&x)?)?;
             let x = gelu(&self.conv2d2.forward(&x)?)?;
             let x = gelu(&self.conv2d3.forward(&x)?)?;
-            conv_outs.push(x);
+            conv_outs.push(x.detach());
             start = start.saturating_add(len);
         }
+        log_cuda_mem(
+            input_feature.device(),
+            &format!("audio_encoder_after_conv_chunks(frames={frames},chunks={chunk_num})"),
+        );
+        drop(padded_feature);
 
         let mut x = if conv_outs.len() == 1 {
             conv_outs
@@ -675,11 +832,20 @@ impl AudioTower {
         } else {
             Tensor::cat(&conv_outs.iter().collect::<Vec<_>>(), 0)?
         };
+        drop(conv_outs);
+        log_cuda_mem(
+            input_feature.device(),
+            &format!("audio_encoder_after_conv_cat(frames={frames},chunks={chunk_num})"),
+        );
 
         let (b, c, f, t) = x.dims4()?;
         x = x.transpose(1, 3)?.transpose(2, 3)?.contiguous()?; // (b, t, c, f)
         x = x.reshape((b, t, c * f))?;
         x = self.conv_out.forward(&x)?; // (b, t, d_model)
+        log_cuda_mem(
+            input_feature.device(),
+            &format!("audio_encoder_after_conv_out(frames={frames},chunks={chunk_num},max_t={t})"),
+        );
 
         // Add sinusoidal positional embedding (no learned weights in checkpoint).
         let pe = self.positional_embedding.narrow(0, 0, t)?.unsqueeze(0)?;
@@ -709,29 +875,71 @@ impl AudioTower {
         let idx_len = idxs.len();
         let idx = Tensor::from_vec(idxs, (idx_len,), input_feature.device())?;
         let mut hidden_states = flat.index_select(&idx, 0)?;
+        let padded_idx_len = match audio_seq_bucket_size() {
+            Some(bucket) => round_up_to_multiple(idx_len, bucket)?,
+            None => idx_len,
+        };
+        hidden_states = if padded_idx_len > idx_len {
+            hidden_states.pad_with_zeros(0, 0, padded_idx_len - idx_len)?
+        } else {
+            hidden_states
+        };
+        drop(idx);
+        drop(flat);
+        drop(x);
+        log_cuda_mem(
+            input_feature.device(),
+            &format!(
+                "audio_encoder_after_flatten_valid(frames={frames},chunks={chunk_num},seq={idx_len},padded_seq={padded_idx_len})"
+            ),
+        );
 
         // Encoder transformer layers.
-        let cu_seqlens = if self.use_flash_attn {
-            let aftercnn_total = feat_extract_output_length(frames);
-            if aftercnn_total != idx_len {
-                candle_core::bail!(
-                    "aftercnn length mismatch: expected={aftercnn_total}, got={idx_len}"
+        let aftercnn_total = feat_extract_output_length(frames);
+        if aftercnn_total != idx_len {
+            candle_core::bail!(
+                "aftercnn length mismatch: expected={aftercnn_total}, got={idx_len}"
+            );
+        }
+        let mut cu_seqlens = cu_seqlens_from_aftercnn_len(
+            aftercnn_total,
+            max_t,
+            window,
+            self.config.n_window_infer,
+        )?;
+        if padded_idx_len > idx_len {
+            cu_seqlens.push(padded_idx_len);
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer
+                .forward(&hidden_states, cu_seqlens.as_slice(), layer_idx)?
+                .detach();
+            if std::env::var_os("VASR_DEBUG_AUDIO_ENCODER_LAYERS").is_some() {
+                log_cuda_mem(
+                    input_feature.device(),
+                    &format!("audio_encoder_after_layer_{layer_idx}"),
                 );
             }
-            cu_seqlens_from_aftercnn_len(aftercnn_total, max_t, window, self.config.n_window_infer)?
-        } else {
-            vec![0usize, idx_len]
-        };
-
-        for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, cu_seqlens.as_slice())?;
         }
+        log_cuda_mem(
+            input_feature.device(),
+            &format!(
+                "audio_encoder_after_layers(frames={frames},seq={idx_len},padded_seq={padded_idx_len})"
+            ),
+        );
 
         hidden_states = self.ln_post.forward(&hidden_states)?;
         hidden_states = self.proj1.forward(&hidden_states)?;
         hidden_states = gelu(&hidden_states)?;
         hidden_states = self.proj2.forward(&hidden_states)?;
-        Ok(hidden_states)
+        log_cuda_mem(
+            input_feature.device(),
+            &format!(
+                "audio_encoder_after_proj(frames={frames},seq={idx_len},padded_seq={padded_idx_len})"
+            ),
+        );
+        Ok(hidden_states.narrow(0, 0, idx_len)?.detach())
     }
 }
 
@@ -933,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_attention_ignores_cu_seqlens_when_eager() -> anyhow::Result<()> {
+    fn test_audio_attention_respects_cu_seqlens_when_eager() -> anyhow::Result<()> {
         let device = candle_core::Device::Cpu;
         let embed_dim = 4usize;
         let seq_len = 5usize;
@@ -962,8 +1170,8 @@ mod tests {
         let xs: Vec<f32> = (0..seq_len * embed_dim).map(|i| i as f32).collect();
         let hidden_states = candle_core::Tensor::from_vec(xs, (seq_len, embed_dim), &device)?;
 
-        let out_blocked = attn.forward(&hidden_states, &[0usize, 2, 5])?;
-        let out_full = attn.forward(&hidden_states, &[0usize, 5])?;
+        let out_blocked = attn.forward(&hidden_states, &[0usize, 2, 5], 0)?;
+        let out_full = attn.forward(&hidden_states, &[0usize, 5], 0)?;
 
         let got = out_blocked.to_vec2::<f32>()?;
         let exp = out_full.to_vec2::<f32>()?;
@@ -973,8 +1181,8 @@ mod tests {
                 max_abs = max_abs.max((a - b).abs());
             }
         }
-        if max_abs > 1e-4 {
-            anyhow::bail!("segmented attention mismatch: max_abs={max_abs}");
+        if max_abs <= 1e-4 {
+            anyhow::bail!("segmented attention unexpectedly matched full attention");
         }
         Ok(())
     }

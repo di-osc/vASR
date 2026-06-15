@@ -10,16 +10,13 @@ use crate::inference::utils::{
     MAX_ASR_INPUT_SECONDS, merge_languages, normalize_language_name, parse_asr_output,
     validate_language,
 };
+use crate::model::cuda_mem_debug::log_cuda_mem;
 #[cfg(feature = "timing")]
 use crate::model::generation::GenerationTimings;
 #[cfg(not(feature = "paged-attn"))]
 use crate::model::generation::greedy_generate_cached_batch;
 #[cfg(all(feature = "timing", not(feature = "paged-attn")))]
 use crate::model::generation::greedy_generate_cached_batch_timed;
-#[cfg(all(feature = "timing", feature = "paged-attn"))]
-use crate::model::generation::greedy_generate_cached_batch_timed;
-#[cfg(feature = "paged-attn")]
-use crate::model::generation::greedy_generate_cached_batch_with_paged_runtime;
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_cache_runtime::SharedPagedCacheRuntime;
 use crate::model::{AsrModel, thinker::ThinkerForConditionalGeneration};
@@ -213,27 +210,6 @@ fn rebatch_prepared_inputs(
         return Vec::new();
     }
 
-    if continuous_paged {
-        return vec![
-            prepared
-                .iter()
-                .enumerate()
-                .map(|(idx, src)| {
-                    let len = prepared_prompt_len(src);
-                    (
-                        idx,
-                        PreparedInputs {
-                            input_ids: src.input_ids[..len].to_vec(),
-                            attention_mask: vec![1u32; len],
-                            input_features: src.input_features.clone(),
-                            feature_attention_mask: src.feature_attention_mask.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        ];
-    }
-
     let count_cap = if decode_max_seqs == 0 {
         prepared.len().max(1)
     } else {
@@ -293,7 +269,7 @@ fn rebatch_prepared_inputs(
                         input_features: src.input_features.clone(),
                         feature_attention_mask: src.feature_attention_mask.clone(),
                     };
-                    if len < group_max {
+                    if !continuous_paged && len < group_max {
                         item.input_ids
                             .extend(std::iter::repeat_n(pad_id, group_max - len));
                         item.attention_mask
@@ -426,6 +402,7 @@ pub(crate) fn generate_raw_prepared_batch(
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
+        log_cuda_mem(device, "asr_microbatch_start");
         let ids_rows: Vec<&[u32]> = batch_prepared
             .iter()
             .map(|p| p.input_ids.as_slice())
@@ -439,8 +416,11 @@ pub(crate) fn generate_raw_prepared_batch(
         } else {
             stack_features(batch_prepared.as_slice(), device)?
         };
+        log_cuda_mem(device, "after_stack_features");
         let audio_features =
             thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        log_cuda_mem(device, "after_audio_encoder");
+        drop(input_features);
         #[cfg(feature = "paged-attn")]
         let gen_ids = if let Some(runtime) = paged_runtime {
             use crate::inference::batch_scheduler::run_paged_prepared_batch;
@@ -456,16 +436,8 @@ pub(crate) fn generate_raw_prepared_batch(
                 pad_id,
             )?
         } else {
-            greedy_generate_cached_batch_with_paged_runtime(
-                thinker,
-                device,
-                ids_rows.as_slice(),
-                attn_rows.as_slice(),
-                Some(&audio_features),
-                max_new_tokens,
-                eos_token_ids,
-                None,
-            )?
+            let _ = (ids_rows.as_slice(), attn_rows.as_slice());
+            bail!("paged-attn build requires a shared paged runtime for offline ASR generation")
         };
         #[cfg(not(feature = "paged-attn"))]
         let gen_ids = greedy_generate_cached_batch(
@@ -477,6 +449,7 @@ pub(crate) fn generate_raw_prepared_batch(
             max_new_tokens,
             eos_token_ids,
         )?;
+        drop(audio_features);
 
         if gen_ids.len() != batch_prepared.len() {
             bail!(
@@ -949,6 +922,7 @@ fn generate_raw_prepared_batch_timed(
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
+        log_cuda_mem(device, "asr_microbatch_start");
         let ids_rows: Vec<&[u32]> = batch_prepared
             .iter()
             .map(|p| p.input_ids.as_slice())
@@ -964,6 +938,7 @@ fn generate_raw_prepared_batch_timed(
         } else {
             stack_features(batch_prepared.as_slice(), device)?
         };
+        log_cuda_mem(device, "after_stack_features");
         timings.stack_features_us = timings
             .stack_features_us
             .saturating_add(duration_to_us(start_stack.elapsed()));
@@ -971,11 +946,18 @@ fn generate_raw_prepared_batch_timed(
         let start_audio = std::time::Instant::now();
         let audio_features =
             thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        log_cuda_mem(device, "after_audio_encoder");
+        let input_features_shape = if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+            Some(input_features.dims().to_vec())
+        } else {
+            None
+        };
+        drop(input_features);
         if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
             tracing::debug!(
                 target: "vasr_models::inference::transcribe",
                 batch_items = batch_prepared.len(),
-                input_features_shape = ?input_features.dims(),
+                input_features_shape = ?input_features_shape,
                 feature_lens = ?feature_lens,
                 audio_features_shape = ?audio_features.dims(),
                 prompt_lens = ?batch_prepared
@@ -1008,15 +990,10 @@ fn generate_raw_prepared_batch_timed(
                 pad_id,
             )?
         } else {
-            greedy_generate_cached_batch_timed(
-                thinker,
-                device,
-                ids_rows.as_slice(),
-                attn_rows.as_slice(),
-                Some(&audio_features),
-                max_new_tokens,
-                eos_token_ids,
-            )?
+            let _ = (ids_rows.as_slice(), attn_rows.as_slice());
+            bail!(
+                "paged-attn build requires a shared paged runtime for timed offline ASR generation"
+            )
         };
         #[cfg(not(feature = "paged-attn"))]
         let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
@@ -1028,6 +1005,7 @@ fn generate_raw_prepared_batch_timed(
             max_new_tokens,
             eos_token_ids,
         )?;
+        drop(audio_features);
 
         merge_generation_timings(timings, &gen_timings);
 

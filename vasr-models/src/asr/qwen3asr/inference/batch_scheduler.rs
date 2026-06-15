@@ -590,9 +590,12 @@ impl AsrBatchScheduler {
                         eos_token_ids: eos_token_ids.to_vec(),
                         request_id_base,
                     };
+                    let request_ids: Vec<usize> = (0..wave)
+                        .map(|i| request_id_base.saturating_add(i))
+                        .collect();
                     #[cfg(feature = "timing")]
                     let start_prefill = std::time::Instant::now();
-                    let state = paged_batch_prefill(
+                    let state = match paged_batch_prefill(
                         thinker,
                         device,
                         &mut runtime_guard,
@@ -600,7 +603,13 @@ impl AsrBatchScheduler {
                         attn_rows.as_slice(),
                         Some(&wave_audio),
                         &engine_config,
-                    )?;
+                    ) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
+                            return Err(error);
+                        }
+                    };
                     #[cfg(feature = "timing")]
                     if let Some(t) = timings.as_deref_mut() {
                         let elapsed = duration_to_us(start_prefill.elapsed());

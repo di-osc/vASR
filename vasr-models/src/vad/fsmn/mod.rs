@@ -548,8 +548,10 @@ impl FsmnVadBlock {
         let x_per = x.unsqueeze(1)?.permute((0, 3, 2, 1))?;
         let y_left = Tensor::cat(&[cache, &x_per], 2)?;
         let y_left_t = y_left.dim(2)?;
-        let new_cache =
-            y_left.narrow(2, y_left_t - FSMN_VAD_CACHE_FRAMES, FSMN_VAD_CACHE_FRAMES)?;
+        let new_cache = y_left
+            .narrow(2, y_left_t - FSMN_VAD_CACHE_FRAMES, FSMN_VAD_CACHE_FRAMES)?
+            .contiguous()?
+            .detach();
         let y_left = fsmn_depthwise_conv_left(&y_left, &self.conv_left_weight)?;
         let out = x_per.add(&y_left)?;
         let out = out.permute((0, 3, 2, 1))?.squeeze(1)?;

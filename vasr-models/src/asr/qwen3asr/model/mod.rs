@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub mod attention;
 pub mod audio_encoder;
+pub(crate) mod cuda_mem_debug;
 pub mod generation;
 pub mod kv_cache;
 pub mod name_map;

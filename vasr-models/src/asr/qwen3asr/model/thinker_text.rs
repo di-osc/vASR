@@ -1082,7 +1082,8 @@ impl ThinkerTextAttention {
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
-        };
+        }
+        .detach();
         let v_flat = if seq_len == 1 {
             maybe_contiguous_for_accelerator(v.reshape((
                 flat_tokens,
@@ -1095,7 +1096,8 @@ impl ThinkerTextAttention {
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
-        };
+        }
+        .detach();
         #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
         {
             mistralrs_paged_attn::reshape_and_cache(
@@ -1313,12 +1315,14 @@ impl ThinkerTextAttention {
             total_tokens,
             self.num_key_value_heads,
             self.head_dim,
-        ))?)?;
+        ))?)?
+        .detach();
         let v_flat = maybe_contiguous_for_accelerator(v.transpose(1, 2)?.reshape((
             total_tokens,
             self.num_key_value_heads,
             self.head_dim,
-        ))?)?;
+        ))?)?
+        .detach();
         #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
         {
             mistralrs_paged_attn::reshape_and_cache(

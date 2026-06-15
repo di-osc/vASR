@@ -58,14 +58,14 @@ impl KVCacheEntry {
         max_seq_len: Option<usize>,
     ) -> Result<()> {
         let new_key = if new_key.is_contiguous() {
-            new_key.clone()
+            new_key.detach()
         } else {
-            new_key.contiguous()?
+            new_key.contiguous()?.detach()
         };
         let new_value = if new_value.is_contiguous() {
-            new_value.clone()
+            new_value.detach()
         } else {
-            new_value.contiguous()?
+            new_value.contiguous()?.detach()
         };
         let new_len = new_key.dim(2)?;
         let needed = self.seq_len.saturating_add(new_len);
@@ -112,12 +112,12 @@ impl KVCacheEntry {
 }
 
 fn backing_tensor(src: &Tensor, capacity_seq_len: usize) -> Result<Tensor> {
-    let src = src.contiguous()?;
+    let src = src.contiguous()?.detach();
     let mut shape = src.dims().to_vec();
     shape[2] = capacity_seq_len;
     let backing = Tensor::zeros(shape, src.dtype(), src.device())?;
     backing.slice_set(&src, 2, 0)?;
-    Ok(backing)
+    Ok(backing.detach())
 }
 
 /// Dynamic KV-cache that grows as generation progresses.
