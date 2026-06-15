@@ -1063,6 +1063,11 @@ async fn handle_dynamic_segment_encoded_message(
         ),
         Err(error) => (segments, Err(error), Vec::new()),
     };
+    prepare_segment_job_state(segment_state, consumed_segments.as_slice());
+    let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
+    for outcome in outcomes {
+        let _ = result_tx.send(outcome).await;
+    }
     for failure in encoded_failures {
         prepare_segment_job_state(segment_state, failure.segments.as_slice());
         let outcomes = finish_segment_asr_batch(
@@ -1074,11 +1079,6 @@ async fn handle_dynamic_segment_encoded_message(
         for outcome in outcomes {
             let _ = result_tx.send(outcome).await;
         }
-    }
-    prepare_segment_job_state(segment_state, consumed_segments.as_slice());
-    let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
-    for outcome in outcomes {
-        let _ = result_tx.send(outcome).await;
     }
 }
 
@@ -2210,6 +2210,72 @@ mod tests {
                 .expect("seen batch sizes poisoned"),
             vec![3]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn segment_batch_error_after_partial_success_returns_job_error() -> Result<()> {
+        let mut state = SegmentAsrState::default();
+        let segments = vec![
+            AsrSegmentJob {
+                job_index: 7,
+                job_audio_seconds: 1.0,
+                speech_annotations: Vec::new(),
+                segment_index: 0,
+                segment_count: 2,
+                offset: DurationMs(0),
+                waveform: Waveform::new(vec![0.1; 160], 16_000),
+            },
+            AsrSegmentJob {
+                job_index: 7,
+                job_audio_seconds: 1.0,
+                speech_annotations: Vec::new(),
+                segment_index: 1,
+                segment_count: 2,
+                offset: DurationMs(100),
+                waveform: Waveform::new(vec![0.2; 160], 16_000),
+            },
+        ];
+        prepare_segment_job_state(&mut state, segments.as_slice());
+
+        let mut ok_timeline = Timeline::new("fake_batch_asr");
+        ok_timeline.push(Annotation::new(
+            Default::default(),
+            AnnotationPayload::Transcription(TextSpan::new("ok")),
+            AnnotationSource::Model("fake_batch_asr".to_string()),
+            AnnotationStatus::Final,
+        ));
+        let ok = finish_segment_asr_batch(
+            &mut state,
+            &segments[..1],
+            Instant::now(),
+            Ok((
+                SegmentAsrInference {
+                    targets: vec![(7, 0, DurationMs(0))],
+                    segment_audio_seconds: 0.01,
+                    active_job_count: 1,
+                },
+                vec![ok_timeline],
+            )),
+        );
+        assert!(ok.is_empty());
+
+        let failed = finish_segment_asr_batch(
+            &mut state,
+            &segments[1..],
+            Instant::now(),
+            Err(anyhow::anyhow!("encoded feature failed")),
+        );
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].index, 7);
+        let err = failed[0]
+            .result
+            .as_ref()
+            .expect_err("partial segment failure should fail the whole job")
+            .to_string();
+        assert!(err.contains("encoded feature failed"));
+        assert!(!state.jobs.contains_key(&7));
         Ok(())
     }
 
