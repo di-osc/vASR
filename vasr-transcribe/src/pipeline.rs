@@ -15,10 +15,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
 use vasr_models::asr::qwen3asr::EncodedAsrBatch;
+#[cfg(feature = "paged-attn")]
+use vasr_models::asr::qwen3asr::EncodedAsrBatchPoll;
 
 use crate::runtime::models::qwen3_asr::Qwen3AsrModel;
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
+#[cfg(feature = "paged-attn")]
+use vasr_models::qwen_outputs_to_timelines;
 
 const DEFAULT_STAGE_BUFFER: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
@@ -952,6 +956,21 @@ fn spawn_segment_decoder_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
+        #[cfg(feature = "paged-attn")]
+        {
+            if let Some(first) = encoded_rx.recv().await {
+                handle_dynamic_segment_encoded_message(
+                    first,
+                    encoded_rx,
+                    &offline,
+                    &asr_options,
+                    &mut segment_state,
+                    &result_tx,
+                )
+                .await;
+            }
+        }
+        #[cfg(not(feature = "paged-attn"))]
         while let Some(first) = encoded_rx.recv().await {
             handle_ready_segment_encoded_messages(
                 first,
@@ -966,6 +985,72 @@ fn spawn_segment_decoder_worker(
     })
 }
 
+#[cfg(feature = "paged-attn")]
+async fn handle_dynamic_segment_encoded_message(
+    first: SegmentEncodedMessage,
+    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    offline: &OfflinePipeline,
+    asr_options: &AsrOptions,
+    segment_state: &mut SegmentAsrState,
+    result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+) {
+    let SegmentEncodedMessage {
+        segments,
+        stage_start,
+        batch,
+    } = first;
+    let initial = match batch {
+        Ok(batch) => batch,
+        Err(error) => {
+            let outcomes =
+                finish_segment_asr_batch(segment_state, &segments, stage_start, Err(error));
+            for outcome in outcomes {
+                let _ = result_tx.send(outcome).await;
+            }
+            return;
+        }
+    };
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(ASR_ENCODED_FEATURE_QUEUE);
+    let forward_handle = tokio::spawn({
+        let ready_tx = ready_tx.clone();
+        async move {
+            while let Some(message) = encoded_rx.recv().await {
+                if ready_tx.send(message).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    drop(ready_tx);
+
+    let batch = tokio::task::spawn_blocking({
+        let asr = Arc::clone(&offline.asr);
+        let asr_options = asr_options.clone();
+        let segments = segments.clone();
+        move || {
+            run_segment_asr_decode_dynamic(asr.as_ref(), segments, initial, ready_rx, &asr_options)
+        }
+    })
+    .await
+    .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
+    forward_handle.abort();
+    let _ = forward_handle.await;
+
+    let (consumed_segments, batch) = match batch {
+        Ok((consumed_segments, inference, timelines)) => {
+            (consumed_segments, Ok((inference, timelines)))
+        }
+        Err(error) => (segments, Err(error)),
+    };
+    prepare_segment_job_state(segment_state, consumed_segments.as_slice());
+    let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
+    for outcome in outcomes {
+        let _ = result_tx.send(outcome).await;
+    }
+}
+
+#[cfg(not(feature = "paged-attn"))]
 async fn handle_segment_encoded_messages(
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
@@ -1017,6 +1102,7 @@ async fn handle_segment_encoded_messages(
     .await;
 }
 
+#[cfg(not(feature = "paged-attn"))]
 async fn handle_merged_segment_encoded_batch(
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
@@ -1042,6 +1128,7 @@ async fn handle_merged_segment_encoded_batch(
     }
 }
 
+#[cfg(not(feature = "paged-attn"))]
 async fn handle_ready_segment_encoded_messages(
     first: SegmentEncodedMessage,
     segment_encoded_rx: &mut mpsc::Receiver<SegmentEncodedMessage>,
@@ -1392,6 +1479,7 @@ struct SegmentEncodedAsrBatch {
 }
 
 impl SegmentEncodedAsrBatch {
+    #[cfg(not(feature = "paged-attn"))]
     fn merge(batches: Vec<Self>) -> Result<Self> {
         let mut targets = Vec::new();
         let mut waveforms = Vec::new();
@@ -1427,6 +1515,11 @@ impl SegmentEncodedAsrBatch {
             waveforms,
             encoded,
         })
+    }
+
+    #[cfg(feature = "paged-attn")]
+    fn into_parts(self) -> (SegmentAsrInference, Vec<Waveform>, EncodedAsrBatch) {
+        (self.inference, self.waveforms, self.encoded)
     }
 }
 
@@ -1517,6 +1610,93 @@ fn run_segment_asr_decode(
         asr_options,
     )?;
     Ok((encoded.inference, timelines))
+}
+
+#[cfg(feature = "paged-attn")]
+fn run_segment_asr_decode_dynamic(
+    asr: &dyn crate::runtime::model::AsrModel,
+    initial_segments: Vec<AsrSegmentJob>,
+    initial: SegmentEncodedAsrBatch,
+    ready_rx: std::sync::mpsc::Receiver<SegmentEncodedMessage>,
+    asr_options: &AsrOptions,
+) -> Result<(Vec<AsrSegmentJob>, SegmentAsrInference, Vec<Timeline>)> {
+    let qwen3 = asr
+        .as_any()
+        .downcast_ref::<Qwen3AsrModel>()
+        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3AsrModel"))?;
+    let (mut inference, mut waveforms, encoded) = initial.into_parts();
+    let mut consumed_segments = initial_segments;
+    let mut source_closed = false;
+    let mut poll_encoded = |may_block: bool| -> Result<EncodedAsrBatchPoll> {
+        if source_closed {
+            return Ok(EncodedAsrBatchPoll::Closed);
+        }
+        let message = if may_block {
+            match ready_rx.recv() {
+                Ok(message) => Some(message),
+                Err(std::sync::mpsc::RecvError) => {
+                    source_closed = true;
+                    return Ok(EncodedAsrBatchPoll::Closed);
+                }
+            }
+        } else {
+            match ready_rx.try_recv() {
+                Ok(message) => Some(message),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    source_closed = true;
+                    return Ok(EncodedAsrBatchPoll::Closed);
+                }
+            }
+        };
+        let Some(message) = message else {
+            return Ok(EncodedAsrBatchPoll::Empty);
+        };
+        match message.batch {
+            Ok(batch) => {
+                consumed_segments.extend(message.segments);
+                let (next_inference, mut next_waveforms, next_encoded) = batch.into_parts();
+                inference.targets.extend(next_inference.targets);
+                inference.segment_audio_seconds += next_inference.segment_audio_seconds;
+                inference.active_job_count = inference
+                    .targets
+                    .iter()
+                    .map(|(job_index, _, _)| *job_index)
+                    .collect::<HashSet<_>>()
+                    .len();
+                waveforms.append(&mut next_waveforms);
+                Ok(EncodedAsrBatchPoll::Ready(next_encoded))
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let outputs =
+        qwen3.decode_cpu_audio_features_dynamic_outputs(encoded, &mut poll_encoded, asr_options)?;
+    let mut timelines = Vec::with_capacity(waveforms.len());
+    let mut waveform_offset = 0usize;
+    for outputs in outputs {
+        let end = waveform_offset.saturating_add(outputs.len());
+        if end > waveforms.len() {
+            bail!(
+                "dynamic ASR waveform split mismatch: end={} waveforms={}",
+                end,
+                waveforms.len()
+            );
+        }
+        timelines.extend(qwen_outputs_to_timelines(
+            outputs,
+            &waveforms[waveform_offset..end],
+        )?);
+        waveform_offset = end;
+    }
+    if waveform_offset != waveforms.len() {
+        bail!(
+            "dynamic ASR unused waveforms: used={} waveforms={}",
+            waveform_offset,
+            waveforms.len()
+        );
+    }
+    Ok((consumed_segments, inference, timelines))
 }
 
 fn finish_segment_asr_batch(

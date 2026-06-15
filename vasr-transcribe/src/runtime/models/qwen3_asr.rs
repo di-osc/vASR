@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use candle_core::Device;
 use vasr_data::{Timeline, Waveform};
+#[cfg(feature = "paged-attn")]
+use vasr_models::asr::qwen3asr::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
 use vasr_models::asr::qwen3asr::TranscribeTimings;
-use vasr_models::asr::qwen3asr::{AudioInput, EncodedAsrBatch, LoadOptions, Qwen3Asr};
+use vasr_models::asr::qwen3asr::{
+    AsrTranscription, AudioInput, EncodedAsrBatch, LoadOptions, Qwen3Asr,
+};
 use vasr_models::{qwen_outputs_to_timelines, qwen_transcribe_options};
 
 use crate::runtime::model::{AsrModel, AsrOptions};
@@ -55,6 +59,18 @@ impl Qwen3AsrModel {
             .inner
             .decode_cpu_audio_features(encoded, runtime_options)?;
         qwen_outputs_to_timelines(outputs, waveforms)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn decode_cpu_audio_features_dynamic_outputs(
+        &self,
+        encoded: EncodedAsrBatch,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        options: &AsrOptions,
+    ) -> Result<Vec<Vec<AsrTranscription>>> {
+        let runtime_options = qwen_transcribe_options(options);
+        self.inner
+            .decode_cpu_audio_features_dynamic(encoded, &mut poll_encoded, runtime_options)
     }
 }
 

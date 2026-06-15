@@ -7,6 +7,8 @@
 //! prefill with per-row `query_lens` / flash varlen metadata.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
@@ -205,6 +207,21 @@ pub struct AsrBatchScheduler {
     next_request_id: usize,
 }
 
+#[derive(Debug)]
+pub struct PreparedAudioBatch {
+    pub prepared: Vec<PreparedInputs>,
+    pub audio_features: Tensor,
+}
+
+#[derive(Debug)]
+pub enum PreparedAudioBatchPoll {
+    Ready(PreparedAudioBatch),
+    Empty,
+    Closed,
+}
+
+const DYNAMIC_SOURCE_WAIT: Duration = Duration::from_millis(1);
+
 fn free_all_running(runtime: &mut PagedCacheRuntime, running: &mut [Option<RunningSlot>]) {
     for slot in running.iter_mut() {
         if let Some(entry) = slot.take() {
@@ -330,6 +347,59 @@ fn concat_prepared_audio(
         })
         .collect::<candle_core::Result<Vec<_>>>()?;
     Ok(Tensor::cat(parts.as_slice(), 0)?)
+}
+
+fn append_prepared_audio_batch(
+    audio_token_id: u32,
+    prepared: &mut Vec<PreparedInputs>,
+    audio_features: &mut Option<Tensor>,
+    row_audio_lens: &mut Vec<usize>,
+    audio_offsets: &mut Vec<usize>,
+    waiting: &mut VecDeque<usize>,
+    mut batch: PreparedAudioBatch,
+) -> Result<()> {
+    if batch.prepared.is_empty() {
+        return Ok(());
+    }
+    let start_idx = prepared.len();
+    let mut audio_cursor = audio_offsets
+        .last()
+        .zip(row_audio_lens.last())
+        .map(|(offset, len)| offset.saturating_add(*len))
+        .unwrap_or(0);
+    let mut batch_audio_tokens = 0usize;
+
+    for row in &batch.prepared {
+        let len = row
+            .input_ids
+            .iter()
+            .filter(|&&id| id == audio_token_id)
+            .count();
+        audio_offsets.push(audio_cursor);
+        row_audio_lens.push(len);
+        audio_cursor = audio_cursor.saturating_add(len);
+        batch_audio_tokens = batch_audio_tokens.saturating_add(len);
+    }
+
+    let feature_tokens = batch.audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
+    if batch_audio_tokens != feature_tokens {
+        bail!(
+            "continuous batch audio token mismatch: prepared placeholders={batch_audio_tokens} audio_features={feature_tokens}"
+        );
+    }
+
+    match audio_features.take() {
+        Some(existing) => {
+            *audio_features = Some(Tensor::cat(&[existing, batch.audio_features], 0)?);
+        }
+        None => {
+            *audio_features = Some(batch.audio_features);
+        }
+    }
+    let count = batch.prepared.len();
+    prepared.append(&mut batch.prepared);
+    waiting.extend(start_idx..start_idx.saturating_add(count));
+    Ok(())
 }
 
 impl AsrBatchScheduler {
@@ -631,6 +701,287 @@ impl AsrBatchScheduler {
                 let has_running = running.iter().any(|entry| entry.is_some());
                 if waiting.is_empty() && !has_running {
                     break;
+                }
+                if !admitted && active_steps.is_empty() && !has_running && !waiting.is_empty() {
+                    bail!(
+                        "paged KV cache exhausted: {} sequence(s) waiting, free_blocks={}",
+                        waiting.len(),
+                        runtime_guard.manager().free_blocks()
+                    );
+                }
+            }
+
+            decode_debug.log_summary(max_slots);
+            Ok(outputs)
+        })();
+
+        free_all_running(&mut runtime_guard, running.as_mut_slice());
+        result
+    }
+
+    pub fn run_continuous_prepared_dynamic(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        initial: PreparedAudioBatch,
+        poll_source: &mut dyn FnMut(bool) -> Result<PreparedAudioBatchPoll>,
+        max_new_tokens: usize,
+        eos_token_ids: &[u32],
+        pad_id: u32,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        if max_new_tokens == 0 {
+            return Ok(vec![vec![]; initial.prepared.len()]);
+        }
+
+        let mut runtime_guard = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        let max_num_seqs = self.config.continuous_max_num_seqs(&runtime_guard);
+        let max_slots = max_num_seqs.max(1);
+        let mut prepared = Vec::new();
+        let mut audio_features: Option<Tensor> = None;
+        let mut row_audio_lens = Vec::new();
+        let mut audio_offsets = Vec::new();
+        let mut waiting = VecDeque::new();
+        let mut running: Vec<Option<RunningSlot>> = (0..max_slots).map(|_| None).collect();
+        let mut outputs: Vec<Vec<u32>> = Vec::new();
+        let audio_token_id = thinker.audio_token_id();
+        let mut source_closed = false;
+
+        append_prepared_audio_batch(
+            audio_token_id,
+            &mut prepared,
+            &mut audio_features,
+            &mut row_audio_lens,
+            &mut audio_offsets,
+            &mut waiting,
+            initial,
+        )?;
+        outputs.resize(prepared.len(), Vec::new());
+
+        let kv_block_capacity =
+            PagedBlockManager::allocatable_block_capacity(runtime_guard.stats().num_blocks);
+
+        let result = (|| -> Result<Vec<Vec<u32>>> {
+            let mut decode_debug = ContinuousDecodeDebug::default();
+            loop {
+                decode_debug.record_finished(running.as_slice());
+                free_finished_running(
+                    running.as_mut_slice(),
+                    outputs.as_mut_slice(),
+                    &mut runtime_guard,
+                );
+
+                let mut active_steps: Vec<(usize, usize)> = Vec::new();
+                for (slot_idx, entry) in running.iter().enumerate() {
+                    if let Some(entry) = entry {
+                        if !entry.slot.finished {
+                            active_steps.push((slot_idx, entry.slot.decode_step));
+                        }
+                    }
+                }
+
+                if !active_steps.is_empty() {
+                    let step_groups = group_running_by_decode_step(active_steps.as_slice());
+                    for (step, slot_indices) in step_groups {
+                        decode_debug.record_active(step, slot_indices.len());
+                        let mut batch_slots: Vec<PagedDecodeSlot> = slot_indices
+                            .iter()
+                            .map(|&slot_idx| {
+                                running[slot_idx]
+                                    .as_ref()
+                                    .map(|entry| entry.slot.clone())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("missing running slot {slot_idx}")
+                                    })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        #[cfg(feature = "timing")]
+                        let start_decode = std::time::Instant::now();
+                        paged_batch_decode_slots_at_step(
+                            thinker,
+                            device,
+                            &mut runtime_guard,
+                            batch_slots.as_mut_slice(),
+                            step,
+                            max_new_tokens,
+                            eos_token_ids,
+                        )?;
+                        #[cfg(feature = "timing")]
+                        if let Some(t) = timings.as_deref_mut() {
+                            t.decode_us = t
+                                .decode_us
+                                .saturating_add(duration_to_us(start_decode.elapsed()));
+                            t.steps = t.steps.saturating_add(1);
+                        }
+
+                        for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
+                            if let Some(entry) = running[slot_idx].as_mut() {
+                                entry.slot = slot.clone();
+                            }
+                        }
+                    }
+                }
+
+                for entry in running.iter_mut() {
+                    let Some(entry) = entry.as_mut() else {
+                        continue;
+                    };
+                    if !entry.slot.finished && entry.slot.decode_step >= max_new_tokens {
+                        entry.slot.finished = true;
+                    }
+                }
+
+                decode_debug.record_finished(running.as_slice());
+                free_finished_running(
+                    running.as_mut_slice(),
+                    outputs.as_mut_slice(),
+                    &mut runtime_guard,
+                );
+
+                let has_running_before_poll = running.iter().any(|entry| entry.is_some());
+                if !source_closed {
+                    loop {
+                        match poll_source(!has_running_before_poll && waiting.is_empty())? {
+                            PreparedAudioBatchPoll::Ready(batch) => {
+                                append_prepared_audio_batch(
+                                    audio_token_id,
+                                    &mut prepared,
+                                    &mut audio_features,
+                                    &mut row_audio_lens,
+                                    &mut audio_offsets,
+                                    &mut waiting,
+                                    batch,
+                                )?;
+                                outputs.resize(prepared.len(), Vec::new());
+                            }
+                            PreparedAudioBatchPoll::Empty => break,
+                            PreparedAudioBatchPoll::Closed => {
+                                source_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let mut admitted = false;
+                let manager = runtime_guard.manager();
+                let mut wave_client_indices: Vec<usize> = Vec::new();
+                let mut wave_slot_indices: Vec<usize> = Vec::new();
+                let mut projected_used = running_kv_blocks(running.as_slice(), manager);
+                let mut projected_running = running.iter().filter(|entry| entry.is_some()).count();
+                for slot_idx in 0..max_slots {
+                    if running[slot_idx].is_some() {
+                        continue;
+                    }
+                    if projected_running >= max_slots {
+                        break;
+                    }
+                    let Some(client_index) = waiting.pop_front() else {
+                        break;
+                    };
+                    let prompt_len = prepared_prompt_len(&prepared[client_index]);
+                    let next_running = projected_running.saturating_add(1);
+                    if !can_admit_with_projected_kv(
+                        manager,
+                        kv_block_capacity,
+                        prompt_len,
+                        projected_used,
+                        next_running,
+                    ) {
+                        waiting.push_front(client_index);
+                        break;
+                    }
+                    projected_used =
+                        projected_used.saturating_add(prompt_len.div_ceil(manager.block_size()));
+                    projected_running = next_running;
+                    wave_client_indices.push(client_index);
+                    wave_slot_indices.push(slot_idx);
+                }
+
+                if !wave_client_indices.is_empty() {
+                    let wave = wave_client_indices.len();
+                    let request_id_base = self.next_request_id;
+                    self.next_request_id = self.next_request_id.saturating_add(wave);
+                    let (wave_ids, wave_masks) = pad_prepared_wave_for_prefill(
+                        prepared.as_slice(),
+                        wave_client_indices.as_slice(),
+                        pad_id,
+                    )?;
+                    let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
+                    let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
+                    let features = audio_features
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing dynamic audio features"))?;
+                    let wave_audio = concat_prepared_audio(
+                        features,
+                        audio_offsets.as_slice(),
+                        row_audio_lens.as_slice(),
+                        wave_client_indices.as_slice(),
+                    )?
+                    .to_device(device)?;
+                    let engine_config = PagedBatchConfig {
+                        max_new_tokens,
+                        eos_token_ids: eos_token_ids.to_vec(),
+                        request_id_base,
+                    };
+                    let request_ids: Vec<usize> = (0..wave)
+                        .map(|i| request_id_base.saturating_add(i))
+                        .collect();
+                    #[cfg(feature = "timing")]
+                    let start_prefill = std::time::Instant::now();
+                    let state = match paged_batch_prefill(
+                        thinker,
+                        device,
+                        &mut runtime_guard,
+                        ids_rows.as_slice(),
+                        attn_rows.as_slice(),
+                        Some(&wave_audio),
+                        &engine_config,
+                    ) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
+                            return Err(error);
+                        }
+                    };
+                    #[cfg(feature = "timing")]
+                    if let Some(t) = timings.as_deref_mut() {
+                        let elapsed = duration_to_us(start_prefill.elapsed());
+                        t.prefill_us = t.prefill_us.saturating_add(elapsed);
+                        t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
+                        t.prefill_tokens = t
+                            .prefill_tokens
+                            .saturating_add(state.prompt_lens_usize.iter().copied().sum::<usize>());
+                    }
+                    for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
+                        .iter()
+                        .zip(wave_slot_indices.iter())
+                        .enumerate()
+                    {
+                        running[slot_idx] = Some(RunningSlot {
+                            client_index,
+                            slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
+                        });
+                    }
+                    let running_count = running.iter().filter(|s| s.is_some()).count();
+                    let waiting_count = waiting.len();
+                    tracing::debug!(
+                        target: "vasr_transcribe::pipeline",
+                        "continuous | admit wave={wave} running={running_count}/{max_slots} waiting={waiting_count}",
+                    );
+                    admitted = true;
+                }
+
+                let has_running = running.iter().any(|entry| entry.is_some());
+                if waiting.is_empty() && !has_running && source_closed {
+                    break;
+                }
+                if waiting.is_empty() && !has_running && !source_closed {
+                    thread::sleep(DYNAMIC_SOURCE_WAIT);
                 }
                 if !admitted && active_steps.is_empty() && !has_running && !waiting.is_empty() {
                     bail!(
