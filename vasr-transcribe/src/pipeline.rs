@@ -1009,6 +1009,23 @@ fn spawn_segment_decoder_worker(
 }
 
 #[cfg(feature = "paged-attn")]
+#[derive(Debug)]
+struct SegmentEncodedFailure {
+    segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+    error: anyhow::Error,
+}
+
+#[cfg(feature = "paged-attn")]
+#[derive(Debug)]
+struct DynamicSegmentAsrDecode {
+    consumed_segments: Vec<AsrSegmentJob>,
+    inference: SegmentAsrInference,
+    timelines: Vec<Timeline>,
+    encoded_failures: Vec<SegmentEncodedFailure>,
+}
+
+#[cfg(feature = "paged-attn")]
 async fn handle_dynamic_segment_encoded_message(
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
@@ -1038,12 +1055,26 @@ async fn handle_dynamic_segment_encoded_message(
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
 
-    let (consumed_segments, batch) = match batch {
-        Ok((consumed_segments, inference, timelines)) => {
-            (consumed_segments, Ok((inference, timelines)))
-        }
-        Err(error) => (segments, Err(error)),
+    let (consumed_segments, batch, encoded_failures) = match batch {
+        Ok(decoded) => (
+            decoded.consumed_segments,
+            Ok((decoded.inference, decoded.timelines)),
+            decoded.encoded_failures,
+        ),
+        Err(error) => (segments, Err(error), Vec::new()),
     };
+    for failure in encoded_failures {
+        prepare_segment_job_state(segment_state, failure.segments.as_slice());
+        let outcomes = finish_segment_asr_batch(
+            segment_state,
+            failure.segments.as_slice(),
+            failure.stage_start,
+            Err(failure.error),
+        );
+        for outcome in outcomes {
+            let _ = result_tx.send(outcome).await;
+        }
+    }
     prepare_segment_job_state(segment_state, consumed_segments.as_slice());
     let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
     for outcome in outcomes {
@@ -1621,55 +1652,64 @@ fn run_segment_asr_decode_dynamic(
     mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
     runtime_handle: tokio::runtime::Handle,
     asr_options: &AsrOptions,
-) -> Result<(Vec<AsrSegmentJob>, SegmentAsrInference, Vec<Timeline>)> {
+) -> Result<DynamicSegmentAsrDecode> {
     let qwen3 = asr
         .as_any()
         .downcast_ref::<Qwen3AsrModel>()
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3AsrModel"))?;
     let (mut inference, mut waveforms, encoded) = initial.into_parts();
     let mut consumed_segments = initial_segments;
+    let mut encoded_failures = Vec::new();
     let mut source_closed = false;
     let mut poll_encoded = |may_block: bool| -> Result<EncodedAsrBatchPoll> {
-        if source_closed {
-            return Ok(EncodedAsrBatchPoll::Closed);
-        }
-        let message = if may_block {
-            match runtime_handle.block_on(encoded_rx.recv()) {
-                Some(message) => Some(message),
-                None => {
-                    source_closed = true;
-                    return Ok(EncodedAsrBatchPoll::Closed);
+        loop {
+            if source_closed {
+                return Ok(EncodedAsrBatchPoll::Closed);
+            }
+            let message = if may_block {
+                match runtime_handle.block_on(encoded_rx.recv()) {
+                    Some(message) => Some(message),
+                    None => {
+                        source_closed = true;
+                        return Ok(EncodedAsrBatchPoll::Closed);
+                    }
+                }
+            } else {
+                match encoded_rx.try_recv() {
+                    Ok(message) => Some(message),
+                    Err(mpsc::error::TryRecvError::Empty) => None,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        source_closed = true;
+                        return Ok(EncodedAsrBatchPoll::Closed);
+                    }
+                }
+            };
+            let Some(message) = message else {
+                return Ok(EncodedAsrBatchPoll::Empty);
+            };
+            match message.batch {
+                Ok(batch) => {
+                    consumed_segments.extend(message.segments);
+                    let (next_inference, mut next_waveforms, next_encoded) = batch.into_parts();
+                    inference.targets.extend(next_inference.targets);
+                    inference.segment_audio_seconds += next_inference.segment_audio_seconds;
+                    inference.active_job_count = inference
+                        .targets
+                        .iter()
+                        .map(|(job_index, _, _)| *job_index)
+                        .collect::<HashSet<_>>()
+                        .len();
+                    waveforms.append(&mut next_waveforms);
+                    return Ok(EncodedAsrBatchPoll::Ready(next_encoded));
+                }
+                Err(error) => {
+                    encoded_failures.push(SegmentEncodedFailure {
+                        segments: message.segments,
+                        stage_start: message.stage_start,
+                        error,
+                    });
                 }
             }
-        } else {
-            match encoded_rx.try_recv() {
-                Ok(message) => Some(message),
-                Err(mpsc::error::TryRecvError::Empty) => None,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    source_closed = true;
-                    return Ok(EncodedAsrBatchPoll::Closed);
-                }
-            }
-        };
-        let Some(message) = message else {
-            return Ok(EncodedAsrBatchPoll::Empty);
-        };
-        match message.batch {
-            Ok(batch) => {
-                consumed_segments.extend(message.segments);
-                let (next_inference, mut next_waveforms, next_encoded) = batch.into_parts();
-                inference.targets.extend(next_inference.targets);
-                inference.segment_audio_seconds += next_inference.segment_audio_seconds;
-                inference.active_job_count = inference
-                    .targets
-                    .iter()
-                    .map(|(job_index, _, _)| *job_index)
-                    .collect::<HashSet<_>>()
-                    .len();
-                waveforms.append(&mut next_waveforms);
-                Ok(EncodedAsrBatchPoll::Ready(next_encoded))
-            }
-            Err(error) => Err(error),
         }
     };
     let outputs =
@@ -1698,7 +1738,12 @@ fn run_segment_asr_decode_dynamic(
             waveforms.len()
         );
     }
-    Ok((consumed_segments, inference, timelines))
+    Ok(DynamicSegmentAsrDecode {
+        consumed_segments,
+        inference,
+        timelines,
+        encoded_failures,
+    })
 }
 
 fn finish_segment_asr_batch(
