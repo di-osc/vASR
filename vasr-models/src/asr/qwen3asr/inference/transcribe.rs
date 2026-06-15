@@ -301,6 +301,40 @@ pub struct EncodedAsrBatch {
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug)]
+struct EncodedAsrBatchMeta {
+    audio_len: usize,
+    chunks: Vec<ChunkItem>,
+    forced_langs_norm: Vec<Option<String>>,
+}
+
+#[cfg(feature = "paged-attn")]
+impl EncodedAsrBatchMeta {
+    fn merge(metas: Vec<Self>) -> Self {
+        let audio_len = metas.iter().map(|meta| meta.audio_len).sum();
+        let chunk_count = metas.iter().map(|meta| meta.chunks.len()).sum();
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut forced_langs_norm = Vec::with_capacity(audio_len);
+        let mut audio_offset = 0usize;
+
+        for mut meta in metas {
+            for chunk in &mut meta.chunks {
+                chunk.orig_index = chunk.orig_index.saturating_add(audio_offset);
+            }
+            audio_offset = audio_offset.saturating_add(meta.audio_len);
+            chunks.extend(meta.chunks);
+            forced_langs_norm.extend(meta.forced_langs_norm);
+        }
+
+        Self {
+            audio_len,
+            chunks,
+            forced_langs_norm,
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+#[derive(Debug)]
 pub enum EncodedAsrBatchPoll {
     Ready(EncodedAsrBatch),
     Empty,
@@ -318,6 +352,18 @@ impl EncodedAsrBatch {
 
     pub fn audio_len(&self) -> usize {
         self.audio_len
+    }
+
+    #[cfg(feature = "paged-attn")]
+    fn into_meta_and_groups(self) -> (EncodedAsrBatchMeta, Vec<EncodedPreparedGroup>) {
+        (
+            EncodedAsrBatchMeta {
+                audio_len: self.audio_len,
+                chunks: self.chunks,
+                forced_langs_norm: self.forced_langs_norm,
+            },
+            self.groups,
+        )
     }
 
     pub fn merge(batches: Vec<Self>) -> Result<Self> {
@@ -355,10 +401,12 @@ impl EncodedAsrBatch {
     }
 
     #[cfg(feature = "paged-attn")]
-    pub fn into_prepared_audio_batch(self) -> Result<PreparedAudioBatch> {
+    fn groups_into_prepared_audio_batch(
+        groups: Vec<EncodedPreparedGroup>,
+    ) -> Result<PreparedAudioBatch> {
         let mut prepared = Vec::new();
         let mut audio_feature_parts = Vec::new();
-        for group in self.groups {
+        for group in groups {
             prepared.extend(group.prepared);
             audio_feature_parts.push(group.audio_features_cpu);
         }
@@ -375,6 +423,20 @@ impl EncodedAsrBatch {
             prepared,
             audio_features,
         })
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn into_prepared_audio_batch(self) -> Result<PreparedAudioBatch> {
+        Self::groups_into_prepared_audio_batch(self.groups)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    fn into_prepared_audio_batch_and_meta(
+        self,
+    ) -> Result<(PreparedAudioBatch, EncodedAsrBatchMeta)> {
+        let (meta, groups) = self.into_meta_and_groups();
+        let prepared = Self::groups_into_prepared_audio_batch(groups)?;
+        Ok((prepared, meta))
     }
 
     #[cfg(feature = "paged-attn")]
@@ -2090,17 +2152,17 @@ pub fn decode_cpu_audio_features_dynamic(
         bail!("paged-attn build requires a shared paged runtime for dynamic staged ASR generation");
     };
     let eos_token_ids = build_eos_token_ids(processor)?;
-    let mut batches = Vec::new();
+    let mut metas = Vec::new();
     let mut batch_lens = Vec::new();
-    batch_lens.push(encoded.audio_len());
-    let initial = encoded.to_prepared_audio_batch()?;
-    batches.push(encoded);
+    let (initial, initial_meta) = encoded.into_prepared_audio_batch_and_meta()?;
+    batch_lens.push(initial_meta.audio_len);
+    metas.push(initial_meta);
     let mut poll_prepared = |may_block| -> Result<PreparedAudioBatchPoll> {
         match poll_encoded(may_block)? {
             EncodedAsrBatchPoll::Ready(encoded) => {
-                batch_lens.push(encoded.audio_len());
-                let prepared = encoded.to_prepared_audio_batch()?;
-                batches.push(encoded);
+                let (prepared, meta) = encoded.into_prepared_audio_batch_and_meta()?;
+                batch_lens.push(meta.audio_len);
+                metas.push(meta);
                 Ok(PreparedAudioBatchPoll::Ready(prepared))
             }
             EncodedAsrBatchPoll::Empty => Ok(PreparedAudioBatchPoll::Empty),
@@ -2125,7 +2187,7 @@ pub fn decode_cpu_audio_features_dynamic(
         None,
     )?;
 
-    let merged = EncodedAsrBatch::merge(batches)?;
+    let merged = EncodedAsrBatchMeta::merge(metas);
     if ids.len() != merged.chunks.len() {
         bail!(
             "dynamic staged ASR output size mismatch: expected={}, got={}",
