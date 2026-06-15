@@ -1013,37 +1013,30 @@ async fn handle_dynamic_segment_encoded_message(
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     initial: SegmentEncodedAsrBatch,
-    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
     result_tx: &mpsc::Sender<TranscribeItemOutcome>,
 ) {
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(ASR_ENCODED_FEATURE_QUEUE);
-    let forward_handle = tokio::spawn({
-        let ready_tx = ready_tx.clone();
-        async move {
-            while let Some(message) = encoded_rx.recv().await {
-                if ready_tx.send(message).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-    drop(ready_tx);
-
     let batch = tokio::task::spawn_blocking({
         let asr = Arc::clone(&offline.asr);
         let asr_options = asr_options.clone();
         let segments = segments.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
         move || {
-            run_segment_asr_decode_dynamic(asr.as_ref(), segments, initial, ready_rx, &asr_options)
+            run_segment_asr_decode_dynamic(
+                asr.as_ref(),
+                segments,
+                initial,
+                encoded_rx,
+                runtime_handle,
+                &asr_options,
+            )
         }
     })
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
-    forward_handle.abort();
-    let _ = forward_handle.await;
 
     let (consumed_segments, batch) = match batch {
         Ok((consumed_segments, inference, timelines)) => {
@@ -1625,7 +1618,8 @@ fn run_segment_asr_decode_dynamic(
     asr: &dyn crate::runtime::model::AsrModel,
     initial_segments: Vec<AsrSegmentJob>,
     initial: SegmentEncodedAsrBatch,
-    ready_rx: std::sync::mpsc::Receiver<SegmentEncodedMessage>,
+    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    runtime_handle: tokio::runtime::Handle,
     asr_options: &AsrOptions,
 ) -> Result<(Vec<AsrSegmentJob>, SegmentAsrInference, Vec<Timeline>)> {
     let qwen3 = asr
@@ -1640,18 +1634,18 @@ fn run_segment_asr_decode_dynamic(
             return Ok(EncodedAsrBatchPoll::Closed);
         }
         let message = if may_block {
-            match ready_rx.recv() {
-                Ok(message) => Some(message),
-                Err(std::sync::mpsc::RecvError) => {
+            match runtime_handle.block_on(encoded_rx.recv()) {
+                Some(message) => Some(message),
+                None => {
                     source_closed = true;
                     return Ok(EncodedAsrBatchPoll::Closed);
                 }
             }
         } else {
-            match ready_rx.try_recv() {
+            match encoded_rx.try_recv() {
                 Ok(message) => Some(message),
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
                     source_closed = true;
                     return Ok(EncodedAsrBatchPoll::Closed);
                 }
