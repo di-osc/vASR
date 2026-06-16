@@ -710,27 +710,12 @@ fn spawn_vad_task(
             move || offline.prepare_vad_stage(&waveform, &vad_options)
         })
         .await;
-
-        let send_message = |message: Result<AsrPipelineMessage, TranscribeItemOutcome>| {
-            let asr_tx = asr_tx.clone();
-            async move {
-                asr_tx
-                    .send(message)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("ASR stage channel closed"))
-            }
-        };
+        let compute_seconds = stage_start.elapsed().as_secs_f64();
+        let mut send_wait_seconds = 0.0;
 
         match prepared {
             Ok(Ok(prepared)) => {
                 let (segments, speech_seconds) = vad_preparation_stats(&prepared);
-                log_vad(
-                    job_index,
-                    audio_seconds,
-                    segments,
-                    speech_seconds,
-                    stage_start.elapsed().as_secs_f64(),
-                );
                 let asr_job = AsrJob {
                     index: job_index,
                     prepared,
@@ -741,12 +726,16 @@ fn spawn_vad_task(
                         let segments = match speech_job_to_segments(asr_job) {
                             Ok(segments) => segments,
                             Err(error) => {
-                                send_message(Err(TranscribeItemOutcome {
-                                    index: job_index,
-                                    result: Err(error),
-                                    audio_seconds,
-                                    bad_component: Some("vad"),
-                                }))
+                                send_timed(
+                                    &asr_tx,
+                                    Err(TranscribeItemOutcome {
+                                        index: job_index,
+                                        result: Err(error),
+                                        audio_seconds,
+                                        bad_component: Some("vad"),
+                                    }),
+                                    &mut send_wait_seconds,
+                                )
                                 .await
                                 .map_err(|error| {
                                     TranscribeItemOutcome {
@@ -756,40 +745,72 @@ fn spawn_vad_task(
                                         bad_component: Some("vad"),
                                     }
                                 })?;
+                                log_vad(
+                                    job_index,
+                                    audio_seconds,
+                                    segments,
+                                    speech_seconds,
+                                    compute_seconds,
+                                    send_wait_seconds,
+                                    stage_start.elapsed().as_secs_f64(),
+                                );
                                 return Ok(());
                             }
                         };
                         for segment in segments {
-                            send_message(Ok(AsrPipelineMessage::Segment(segment)))
-                                .await
-                                .map_err(|error| TranscribeItemOutcome {
+                            send_timed(
+                                &asr_tx,
+                                Ok(AsrPipelineMessage::Segment(segment)),
+                                &mut send_wait_seconds,
+                            )
+                            .await
+                            .map_err(|error| {
+                                TranscribeItemOutcome {
                                     index: job_index,
                                     result: Err(error),
                                     audio_seconds,
                                     bad_component: Some("asr"),
-                                })?;
+                                }
+                            })?;
                         }
                     }
                     _ => {
-                        send_message(Ok(AsrPipelineMessage::Job(asr_job)))
-                            .await
-                            .map_err(|error| TranscribeItemOutcome {
-                                index: job_index,
-                                result: Err(error),
-                                audio_seconds,
-                                bad_component: Some("asr"),
-                            })?;
+                        send_timed(
+                            &asr_tx,
+                            Ok(AsrPipelineMessage::Job(asr_job)),
+                            &mut send_wait_seconds,
+                        )
+                        .await
+                        .map_err(|error| TranscribeItemOutcome {
+                            index: job_index,
+                            result: Err(error),
+                            audio_seconds,
+                            bad_component: Some("asr"),
+                        })?;
                     }
                 }
+                log_vad(
+                    job_index,
+                    audio_seconds,
+                    segments,
+                    speech_seconds,
+                    compute_seconds,
+                    send_wait_seconds,
+                    stage_start.elapsed().as_secs_f64(),
+                );
                 Ok(())
             }
             Ok(Err(error)) => {
-                send_message(Err(TranscribeItemOutcome {
-                    index: job_index,
-                    result: Err(error),
-                    audio_seconds,
-                    bad_component: Some("vad"),
-                }))
+                send_timed(
+                    &asr_tx,
+                    Err(TranscribeItemOutcome {
+                        index: job_index,
+                        result: Err(error),
+                        audio_seconds,
+                        bad_component: Some("vad"),
+                    }),
+                    &mut send_wait_seconds,
+                )
                 .await
                 .map_err(|error| TranscribeItemOutcome {
                     index: job_index,
@@ -797,15 +818,28 @@ fn spawn_vad_task(
                     audio_seconds,
                     bad_component: Some("vad"),
                 })?;
+                log_vad(
+                    job_index,
+                    audio_seconds,
+                    0,
+                    0.0,
+                    compute_seconds,
+                    send_wait_seconds,
+                    stage_start.elapsed().as_secs_f64(),
+                );
                 Ok(())
             }
             Err(error) => {
-                send_message(Err(TranscribeItemOutcome {
-                    index: job_index,
-                    result: Err(anyhow::anyhow!("VAD join error: {error}")),
-                    audio_seconds,
-                    bad_component: Some("vad"),
-                }))
+                send_timed(
+                    &asr_tx,
+                    Err(TranscribeItemOutcome {
+                        index: job_index,
+                        result: Err(anyhow::anyhow!("VAD join error: {error}")),
+                        audio_seconds,
+                        bad_component: Some("vad"),
+                    }),
+                    &mut send_wait_seconds,
+                )
                 .await
                 .map_err(|error| TranscribeItemOutcome {
                     index: job_index,
@@ -813,10 +847,29 @@ fn spawn_vad_task(
                     audio_seconds,
                     bad_component: Some("vad"),
                 })?;
+                log_vad(
+                    job_index,
+                    audio_seconds,
+                    0,
+                    0.0,
+                    compute_seconds,
+                    send_wait_seconds,
+                    stage_start.elapsed().as_secs_f64(),
+                );
                 Ok(())
             }
         }
     });
+}
+
+async fn send_timed<T>(tx: &mpsc::Sender<T>, message: T, wait_seconds: &mut f64) -> Result<()> {
+    let send_start = Instant::now();
+    let result = tx
+        .send(message)
+        .await
+        .map_err(|_| anyhow::anyhow!("ASR stage channel closed"));
+    *wait_seconds += send_start.elapsed().as_secs_f64();
+    result
 }
 
 async fn send_next_vad_task(
@@ -1935,12 +1988,14 @@ fn log_vad(
     audio_seconds: f64,
     segments: usize,
     speech_seconds: f64,
+    compute_seconds: f64,
+    send_wait_seconds: f64,
     wall_seconds: f64,
 ) {
     let metrics = stage_metrics(audio_seconds, wall_seconds);
     tracing::info!(
         target: "vasr_transcribe::pipeline",
-        "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | spent={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
+        "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | compute={compute_seconds:.2}s | send_wait={send_wait_seconds:.2}s | wall={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
         metrics.rtf
     );
