@@ -347,31 +347,6 @@ async fn acquire_vad_to_asr_message_memory(
     Ok(Some(permit))
 }
 
-fn log_loaded_queue_backpressure(
-    job: &LoadedJob,
-    loader_to_vad_tx: &mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
-    memory_permits_needed: usize,
-    loaded_queue_memory: &LoadedQueueMemoryBudget,
-) {
-    let queue_full = loader_to_vad_tx.capacity() == 0;
-    let memory_full = loaded_queue_memory.semaphore.available_permits() < memory_permits_needed;
-    if !queue_full && !memory_full {
-        return;
-    }
-    tracing::info!(
-        target: "vasr_transcribe::pipeline",
-        "loader backpressure | job={} queue_full={} memory_wait={} audio={:.2}s queued_capacity={} memory_needed={}MiB memory_available={}MiB memory_budget={}MiB",
-        job.index,
-        queue_full,
-        memory_full,
-        job.waveform.duration_seconds(),
-        loader_to_vad_tx.capacity(),
-        memory_permits_needed,
-        loaded_queue_memory.semaphore.available_permits(),
-        loaded_queue_memory.capacity_permits,
-    );
-}
-
 fn total_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -712,14 +687,6 @@ async fn send_next_loaded(
         None => return Ok(()),
     };
     if let Ok(job) = &mut message {
-        let memory_permits_needed =
-            loaded_job_memory_permits(job).min(loaded_queue_memory.capacity_permits);
-        log_loaded_queue_backpressure(
-            job,
-            loader_to_vad_tx,
-            memory_permits_needed,
-            loaded_queue_memory,
-        );
         job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
     }
     loader_to_vad_tx
@@ -2126,7 +2093,7 @@ fn log_vad(
     wall_seconds: f64,
 ) {
     let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
         "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | compute={compute_seconds:.2}s | send_wait={send_wait_seconds:.2}s | wall={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
