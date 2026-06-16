@@ -6,15 +6,16 @@ use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use clap::Args;
-use vasr_data::AudioSource;
+use vasr_data::{AudioAsset, AudioSource, VasrRecord, VasrRecordList};
 
 #[derive(Debug, Clone, Args)]
 pub struct RunTranscribeArgs {
     #[command(flatten)]
     pub pipeline: TranscribePipelineArgs,
 
-    /// Audio file or directory containing audio files.
+    /// Audio file, directory containing audio files, or vASR MessagePack data file.
     #[arg(short = 'i', long, value_name = "PATH")]
     pub input: PathBuf,
 
@@ -41,32 +42,32 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         bail!("input path does not exist: {}", args.input.display());
     }
 
-    let files = collect_audio_inputs(&args.input, args.recursive)?;
-    if files.is_empty() {
-        bail!("no audio files found under {}", args.input.display());
+    let items = collect_run_inputs(&args.input, args.recursive)?;
+    if items.is_empty() {
+        bail!("no inputs found under {}", args.input.display());
     }
-    let mut files = files;
+    let mut items = items;
     if let Some(limit) = args.limit {
-        files.truncate(limit);
+        items.truncate(limit);
     }
 
-    let multiple_inputs = files.len() > 1 || args.input.is_dir();
+    let multiple_inputs = items.len() > 1 || args.input.is_dir();
     validate_output_target(args.output.as_deref(), multiple_inputs)?;
 
     let pipeline = build_async_transcribe_pipeline(&args.pipeline, args.language.clone())?;
-    let inputs = files
+    let inputs = items
         .iter()
         .enumerate()
-        .map(|(index, path)| TranscribeInput {
+        .map(|(index, item)| TranscribeInput {
             index,
-            source: AudioSource::Path(path.clone()),
+            source: item.source.clone(),
         })
         .collect::<Vec<_>>();
 
     tracing::info!(
         target: "vasr_transcribe::run",
-        "Transcribing {} audio file(s) from `{}`.",
-        files.len(),
+        "Transcribing {} input item(s) from `{}`.",
+        items.len(),
         args.input.display()
     );
 
@@ -80,9 +81,10 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     let mut response_seconds = 0.0;
     let mut write_seconds = 0.0;
 
-    for (path, outcome) in files.iter().zip(outcomes.iter()) {
+    for (item, outcome) in items.iter().zip(outcomes.iter()) {
         total_audio_seconds += outcome.audio_seconds;
-        let output_path = resolve_output_json_path(args.output.as_deref(), path, multiple_inputs)?;
+        let output_path =
+            resolve_output_json_path(args.output.as_deref(), &item.output_path, multiple_inputs)?;
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create output directory {}", parent.display())
@@ -90,7 +92,8 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         }
 
         let response_start = Instant::now();
-        let response = transcribe_response_for_outcome(path, outcome, batch_wall, files.len());
+        let response =
+            transcribe_response_for_outcome(&item.service_path, outcome, batch_wall, items.len());
         response_seconds += response_start.elapsed().as_secs_f64();
         if response.data.first().is_some_and(|item| item.is_bad) {
             bad_count += 1;
@@ -103,7 +106,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
             let component = outcome.bad_component.unwrap_or("unknown");
             tracing::error!(
                 target: "vasr_transcribe::run",
-                path = %path.display(),
+                path = %item.service_path.display(),
                 component,
                 error = %reason,
                 "Transcription failed"
@@ -129,7 +132,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     tracing::info!(
         target: "vasr_transcribe::run",
         "Postprocess: files={} response={:.3}s write={:.3}s total={:.3}s.",
-        files.len(),
+        items.len(),
         response_seconds,
         write_seconds,
         postprocess_start.elapsed().as_secs_f64(),
@@ -137,7 +140,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     tracing::info!(
         target: "vasr_transcribe::run",
         "Done: files={} bad={} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4}",
-        files.len(),
+        items.len(),
         bad_count,
         total_audio_seconds,
         batch_wall,
@@ -146,9 +149,16 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     );
 
     if bad_count > 0 {
-        bail!("{bad_count} of {} transcription(s) failed", files.len());
+        bail!("{bad_count} of {} transcription(s) failed", items.len());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RunInputItem {
+    source: AudioSource,
+    output_path: PathBuf,
+    service_path: PathBuf,
 }
 
 fn transcribe_response_for_outcome(
@@ -210,6 +220,77 @@ pub fn collect_audio_inputs(input: &Path, recursive: bool) -> Result<Vec<PathBuf
     Ok(files)
 }
 
+fn collect_run_inputs(input: &Path, recursive: bool) -> Result<Vec<RunInputItem>> {
+    if input.is_file() && is_vasr_data_file(input) {
+        return collect_vasr_inputs(input);
+    }
+    let files = collect_audio_inputs(input, recursive)?;
+    Ok(files
+        .into_iter()
+        .map(|path| RunInputItem {
+            source: AudioSource::Path(path.clone()),
+            output_path: path.clone(),
+            service_path: path,
+        })
+        .collect())
+}
+
+fn collect_vasr_inputs(input: &Path) -> Result<Vec<RunInputItem>> {
+    let records = read_vasr_records(input)?;
+    if records.is_empty() {
+        bail!("vASR record list is empty: {}", input.display());
+    }
+    let base_dir = input.parent().unwrap_or_else(|| Path::new("."));
+    records
+        .into_iter()
+        .map(|record| {
+            let record_id = record.record_id();
+            let source = audio_source_from_record(&record)?;
+            let record_path = base_dir.join(record_id);
+            Ok(RunInputItem {
+                source,
+                output_path: record_path.clone(),
+                service_path: record_path,
+            })
+        })
+        .collect()
+}
+
+fn read_vasr_records(input: &Path) -> Result<Vec<VasrRecord>> {
+    match VasrRecordList::read_msgpack(input) {
+        Ok(list) => Ok(list.records),
+        Err(list_error) => match VasrRecord::read_msgpack(input) {
+            Ok(record) => Ok(vec![record]),
+            Err(record_error) => Err(anyhow::anyhow!(
+                "failed to read vASR MessagePack from {} as record list ({list_error}) or single record ({record_error})",
+                input.display()
+            )),
+        },
+    }
+}
+
+fn audio_source_from_record(record: &VasrRecord) -> Result<AudioSource> {
+    if let Some(cache) = &record.waveform_cache {
+        return Ok(AudioSource::Waveform(cache.waveform.clone()));
+    }
+
+    match &record.media {
+        AudioAsset::Uri { uri, .. } => {
+            if uri.starts_with("http://") || uri.starts_with("https://") {
+                Ok(AudioSource::Url(uri.clone()))
+            } else if let Some(path) = local_path_from_uri(uri) {
+                Ok(AudioSource::Path(path))
+            } else {
+                Ok(AudioSource::Url(uri.clone()))
+            }
+        }
+        AudioAsset::Embedded { bytes, .. } => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            Ok(AudioSource::Base64(encoded))
+        }
+    }
+}
+
 fn collect_audio_in_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -237,6 +318,58 @@ fn is_audio_file(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn is_vasr_data_file(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.ends_with(".vasr.msgpack") {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "vasr" | "msgpack"))
+        .unwrap_or(false)
+}
+
+fn local_path_from_uri(uri: &str) -> Option<PathBuf> {
+    if let Some(rest) = uri.strip_prefix("file://") {
+        return Some(PathBuf::from(percent_decode_path(rest)));
+    }
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return None;
+    }
+    Some(PathBuf::from(uri))
+}
+
+fn percent_decode_path(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_output_target(output: Option<&Path>, multiple_inputs: bool) -> Result<()> {
@@ -281,8 +414,12 @@ pub fn resolve_output_json_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_audio_inputs, resolve_output_json_path};
+    use super::{collect_audio_inputs, collect_run_inputs, resolve_output_json_path};
     use std::path::Path;
+    use vasr_data::{
+        AudioAsset, AudioEncoding, AudioSource, PersistedAudioFormat, Timeline, VasrRecord,
+        VasrRecordList,
+    };
 
     #[test]
     fn resolve_output_json_path_uses_stem_for_directory_output() {
@@ -322,6 +459,39 @@ mod tests {
 
         let files = collect_audio_inputs(&wav, false).expect("collect file");
         assert_eq!(files, vec![wav]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_run_inputs_accepts_vasr_record_list() {
+        let dir =
+            std::env::temp_dir().join(format!("vasr-run-record-list-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let audio = dir.join("audio one.wav");
+        let input = dir.join("records.vasr.msgpack");
+
+        let records = VasrRecordList::new(vec![VasrRecord::new(
+            AudioAsset::Uri {
+                uri: format!("file://{}", audio.display()).replace(' ', "%20"),
+                format: PersistedAudioFormat {
+                    sample_rate: Some(16_000),
+                    channels: Some(1),
+                    encoding: AudioEncoding::Wav,
+                },
+                duration: None,
+                sha256: None,
+            },
+            Timeline::new("call-1"),
+        )]);
+        records.write_msgpack(&input).expect("write records");
+
+        let items = collect_run_inputs(&input, false).expect("collect vasr records");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].service_path, dir.join("call-1"));
+        assert_eq!(items[0].output_path, dir.join("call-1"));
+        assert_eq!(items[0].source, AudioSource::Path(audio));
 
         std::fs::remove_dir_all(&dir).ok();
     }
