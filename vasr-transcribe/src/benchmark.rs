@@ -107,9 +107,9 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
 
     tracing::info!(
         target: "vasr_transcribe::benchmark",
-        "Benchmarking {} record(s) from `{}`.",
+        "transcribe | mode=benchmark | records={} | input={}",
         records.len(),
-        args.input.display()
+        args.input.display(),
     );
 
     let batch_start = Instant::now();
@@ -242,17 +242,17 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
     tracing::info!(
         target: "vasr_transcribe::benchmark",
-        "Done: records={} evaluated={} failed={} skipped_empty_ref={} macro_cer={:.4} micro_cer={:.4} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4}",
+        "done | mode=benchmark | records={} | evaluated={} | failed={} | audio={:.3}s | wall={:.3}s | speed={:.3}x | rtf={:.4} | skipped_empty_ref={} | macro_cer={:.4} | micro_cer={:.4}",
         report.summary.num_records,
         report.summary.num_evaluated,
         report.summary.num_failed,
-        report.summary.num_skipped_empty_reference,
-        report.summary.macro_cer,
-        report.summary.micro_cer,
         total_audio_seconds,
         batch_wall,
         speedup,
-        rtf
+        rtf,
+        report.summary.num_skipped_empty_reference,
+        report.summary.macro_cer,
+        report.summary.micro_cer
     );
 
     if num_failed > 0 {

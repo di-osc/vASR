@@ -111,18 +111,6 @@ impl AsyncTranscribePipeline {
             duplicate_indices,
         } = deduplicate_transcribe_inputs(inputs);
         let unique_count = unique_inputs.len();
-        if unique_inputs.len() == 1 {
-            let input = unique_inputs
-                .into_iter()
-                .next()
-                .expect("checked single input above");
-            let outcomes = expand_duplicate_outcomes(
-                vec![self.transcribe_single(input).await],
-                &duplicate_indices,
-            );
-            log_pipeline(job_count, &outcomes, pipeline_start.elapsed().as_secs_f64());
-            return outcomes;
-        }
 
         let buffer = self.stage_buffer;
         let loaded_queue_memory = loaded_queue_memory_budget();
@@ -177,61 +165,6 @@ impl AsyncTranscribePipeline {
         let outcomes = expand_duplicate_outcomes(outcomes, &duplicate_indices);
         log_pipeline(job_count, &outcomes, pipeline_start.elapsed().as_secs_f64());
         outcomes
-    }
-
-    async fn transcribe_single(&self, input: TranscribeInput) -> TranscribeItemOutcome {
-        let loaded = match tokio::task::spawn_blocking({
-            let loader = self.loader.clone();
-            let load_options = self.load_options.clone();
-            let source = input.source.clone();
-            move || loader.load(&source, &load_options)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                return TranscribeItemOutcome {
-                    index: input.index,
-                    result: Err(anyhow::anyhow!("loader join error: {error}")),
-                    audio_seconds: 0.0,
-                    bad_component: Some("loader"),
-                };
-            }
-        };
-
-        let waveform = match loaded {
-            Ok(waveform) => waveform,
-            Err(error) => {
-                return TranscribeItemOutcome {
-                    index: input.index,
-                    result: Err(error),
-                    audio_seconds: 0.0,
-                    bad_component: Some("loader"),
-                };
-            }
-        };
-
-        let audio_seconds = waveform.duration_seconds();
-        let result = tokio::task::spawn_blocking({
-            let offline = Arc::clone(&self.offline);
-            let asr_options = self.parallel_options.asr_options.clone();
-            let vad_options = self.parallel_options.vad_options.clone();
-            move || offline.transcribe_with_vad_options(&waveform, &asr_options, &vad_options)
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("transcribe join error: {error}")));
-
-        let bad_component = if result.is_err() {
-            Some("recognizer")
-        } else {
-            None
-        };
-        TranscribeItemOutcome {
-            index: input.index,
-            result,
-            audio_seconds,
-            bad_component,
-        }
     }
 }
 
