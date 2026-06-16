@@ -5,7 +5,6 @@ pub use vasr_models::{AsrOptions, OfflineAsrModel as AsrModel, StreamingAsrSessi
 pub struct ParallelTranscribeOptions {
     pub asr_options: AsrOptions,
     pub vad_options: VadOptions,
-    pub stage_buffer: usize,
 }
 
 impl Default for ParallelTranscribeOptions {
@@ -13,7 +12,6 @@ impl Default for ParallelTranscribeOptions {
         Self {
             asr_options: AsrOptions::default(),
             vad_options: VadOptions::default(),
-            stage_buffer: 4,
         }
     }
 }

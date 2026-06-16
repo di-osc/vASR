@@ -24,7 +24,7 @@ use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 #[cfg(feature = "paged-attn")]
 use vasr_models::qwen_outputs_to_timelines;
 
-const FALLBACK_STAGE_BUFFER: usize = 20;
+const FALLBACK_STAGE_PARALLELISM: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
@@ -36,7 +36,6 @@ pub struct AsyncTranscribePipeline {
     load_options: AudioLoadOptions,
     offline: Arc<OfflinePipeline>,
     parallel_options: ParallelTranscribeOptions,
-    stage_buffer: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -64,13 +63,7 @@ impl AsyncTranscribePipeline {
             load_options: AudioLoadOptions::default(),
             offline,
             parallel_options: ParallelTranscribeOptions::from(asr_options),
-            stage_buffer: default_stage_buffer(),
         }
-    }
-
-    pub fn with_stage_buffer(mut self, stage_buffer: usize) -> Self {
-        self.stage_buffer = stage_buffer.max(1);
-        self
     }
 
     pub fn with_vad_options(mut self, vad_options: VadOptions) -> Self {
@@ -112,19 +105,19 @@ impl AsyncTranscribePipeline {
         } = deduplicate_transcribe_inputs(inputs);
         let unique_count = unique_inputs.len();
 
-        let buffer = self.stage_buffer;
+        let stage_parallelism = default_stage_parallelism();
         let loaded_queue_memory = loaded_queue_memory_budget();
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline queues | stage_buffer={} loaded_queue_memory={}MiB vad_to_asr_queue_memory={}MiB queue_memory_source={} permit_size={}MiB",
-            buffer,
+            "pipeline queues | stage_parallelism={} loaded_queue_memory={}MiB vad_to_asr_queue_memory={}MiB queue_memory_source={} permit_size={}MiB",
+            stage_parallelism,
             loaded_queue_memory.capacity_permits,
             vad_to_asr_queue_memory.capacity_permits,
             loaded_queue_memory.source,
             BYTES_PER_MEMORY_PERMIT / (1024 * 1024)
         );
-        let (loader_to_vad_tx, loader_to_vad_rx) = mpsc::channel(buffer);
+        let (loader_to_vad_tx, loader_to_vad_rx) = mpsc::unbounded_channel();
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(unique_inputs.len());
 
@@ -134,7 +127,7 @@ impl AsyncTranscribePipeline {
             unique_inputs,
             loader,
             load_options,
-            buffer,
+            stage_parallelism,
             loaded_queue_memory,
             loader_to_vad_tx,
         );
@@ -144,7 +137,7 @@ impl AsyncTranscribePipeline {
         let vad_handle = spawn_vad_worker(
             offline,
             vad_options,
-            buffer,
+            stage_parallelism,
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
@@ -182,10 +175,10 @@ impl AsyncTranscribePipeline {
     }
 }
 
-pub fn default_stage_buffer() -> usize {
+fn default_stage_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
-        .unwrap_or(FALLBACK_STAGE_BUFFER)
+        .unwrap_or(FALLBACK_STAGE_PARALLELISM)
 }
 
 #[derive(Clone)]
@@ -262,7 +255,7 @@ fn loaded_queue_memory_budget_permits(
             }
         })
         .filter(|&permits: &usize| permits > 0)
-        .unwrap_or_else(default_stage_buffer)
+        .unwrap_or_else(default_stage_parallelism)
         .max(MIN_LOADED_QUEUE_MEMORY_PERMITS);
     let source = if total_memory_bytes.is_some() {
         if fraction_from_env {
@@ -271,7 +264,7 @@ fn loaded_queue_memory_budget_permits(
             "system-memory-fraction"
         }
     } else {
-        "fallback:stage_buffer"
+        "fallback:stage_parallelism"
     };
     LoadedQueueMemoryBudgetConfig { permits, source }
 }
@@ -618,7 +611,7 @@ fn spawn_loader_worker(
     load_options: AudioLoadOptions,
     max_in_flight: usize,
     loaded_queue_memory: LoadedQueueMemoryBudget,
-    loader_to_vad_tx: mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
+    loader_to_vad_tx: mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let max_in_flight = max_in_flight.max(1);
@@ -674,7 +667,7 @@ fn spawn_loader_task(
 async fn send_next_loaded(
     tasks: &mut JoinSet<Result<LoadedJob, TranscribeItemOutcome>>,
     loaded_queue_memory: &LoadedQueueMemoryBudget,
-    loader_to_vad_tx: &mpsc::Sender<Result<LoadedJob, TranscribeItemOutcome>>,
+    loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
 ) -> Result<()> {
     let mut message = match tasks.join_next().await {
         Some(Ok(message)) => message,
@@ -691,7 +684,6 @@ async fn send_next_loaded(
     }
     loader_to_vad_tx
         .send(message)
-        .await
         .map_err(|_| anyhow::anyhow!("loaded channel closed"))
 }
 
@@ -699,7 +691,7 @@ fn spawn_vad_worker(
     offline: Arc<OfflinePipeline>,
     vad_options: VadOptions,
     max_in_flight: usize,
-    mut loader_to_vad_rx: mpsc::Receiver<Result<LoadedJob, TranscribeItemOutcome>>,
+    mut loader_to_vad_rx: mpsc::UnboundedReceiver<Result<LoadedJob, TranscribeItemOutcome>>,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
 ) -> JoinHandle<()> {
@@ -2170,8 +2162,8 @@ mod tests {
     };
 
     #[test]
-    fn default_stage_buffer_is_nonzero() {
-        assert!(default_stage_buffer() >= 1);
+    fn default_stage_parallelism_is_nonzero() {
+        assert!(default_stage_parallelism() >= 1);
     }
 
     #[test]
