@@ -114,16 +114,18 @@ impl AsyncTranscribePipeline {
 
         let buffer = self.stage_buffer;
         let loaded_queue_memory = loaded_queue_memory_budget();
+        let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline queues | stage_buffer={} loaded_queue_memory={}MiB loaded_queue_memory_source={} permit_size={}MiB",
+            "pipeline queues | stage_buffer={} loaded_queue_memory={}MiB vad_to_asr_queue_memory={}MiB queue_memory_source={} permit_size={}MiB",
             buffer,
             loaded_queue_memory.capacity_permits,
+            vad_to_asr_queue_memory.capacity_permits,
             loaded_queue_memory.source,
             BYTES_PER_MEMORY_PERMIT / (1024 * 1024)
         );
         let (loader_to_vad_tx, loader_to_vad_rx) = mpsc::channel(buffer);
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::channel(buffer);
+        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(unique_inputs.len());
 
         let loader = self.loader.clone();
@@ -145,6 +147,7 @@ impl AsyncTranscribePipeline {
             buffer,
             loader_to_vad_rx,
             vad_to_asr_tx,
+            vad_to_asr_queue_memory,
         );
 
         let offline = Arc::clone(&self.offline);
@@ -285,6 +288,31 @@ fn loaded_job_memory_permits(job: &LoadedJob) -> usize {
         .max(1)
 }
 
+fn vad_to_asr_message_memory_permits(
+    message: &Result<AsrPipelineMessage, TranscribeItemOutcome>,
+) -> usize {
+    let bytes = match message {
+        Ok(AsrPipelineMessage::Job(job)) => job
+            .waveform
+            .samples
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>()),
+        Ok(AsrPipelineMessage::Segment(segment)) => segment
+            .waveform
+            .samples
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>()),
+        Err(_) => 0,
+    };
+    if bytes == 0 {
+        return 0;
+    }
+    bytes
+        .saturating_add(BYTES_PER_MEMORY_PERMIT - 1)
+        .saturating_div(BYTES_PER_MEMORY_PERMIT)
+        .max(1)
+}
+
 async fn acquire_loaded_job_memory(
     budget: &LoadedQueueMemoryBudget,
     job: &LoadedJob,
@@ -298,6 +326,25 @@ async fn acquire_loaded_job_memory(
         .acquire_many_owned(permits)
         .await
         .map_err(|_| anyhow::anyhow!("loaded queue memory limiter closed"))
+}
+
+async fn acquire_vad_to_asr_message_memory(
+    budget: &LoadedQueueMemoryBudget,
+    message: &Result<AsrPipelineMessage, TranscribeItemOutcome>,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let permits = vad_to_asr_message_memory_permits(message).min(budget.capacity_permits);
+    if permits == 0 {
+        return Ok(None);
+    }
+    let permits = u32::try_from(permits)
+        .map_err(|_| anyhow::anyhow!("VAD to ASR queue memory permit count overflows u32"))?;
+    let permit = budget
+        .semaphore
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| anyhow::anyhow!("VAD to ASR queue memory limiter closed"))?;
+    Ok(Some(permit))
 }
 
 fn log_loaded_queue_backpressure(
@@ -533,6 +580,12 @@ enum AsrPipelineMessage {
 }
 
 #[derive(Debug)]
+struct VadToAsrMessage {
+    message: Result<AsrPipelineMessage, TranscribeItemOutcome>,
+    _queue_memory_permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
 struct SegmentJobState {
     index: usize,
     audio_seconds: f64,
@@ -680,7 +733,8 @@ fn spawn_vad_worker(
     vad_options: VadOptions,
     max_in_flight: usize,
     mut loader_to_vad_rx: mpsc::Receiver<Result<LoadedJob, TranscribeItemOutcome>>,
-    vad_to_asr_tx: mpsc::Sender<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+    vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
+    vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let max_in_flight = max_in_flight.max(1);
@@ -693,6 +747,7 @@ fn spawn_vad_worker(
                         Arc::clone(&offline),
                         vad_options.clone(),
                         vad_to_asr_tx.clone(),
+                        vad_to_asr_queue_memory.clone(),
                         job,
                     );
                     if tasks.len() >= max_in_flight {
@@ -700,7 +755,14 @@ fn spawn_vad_worker(
                     }
                 }
                 Err(outcome) => {
-                    let _ = vad_to_asr_tx.send(Err(outcome)).await;
+                    let mut send_wait_seconds = 0.0;
+                    let _ = send_vad_to_asr_timed(
+                        &vad_to_asr_tx,
+                        &vad_to_asr_queue_memory,
+                        Err(outcome),
+                        &mut send_wait_seconds,
+                    )
+                    .await;
                 }
             }
         }
@@ -714,7 +776,8 @@ fn spawn_vad_task(
     tasks: &mut JoinSet<Result<(), TranscribeItemOutcome>>,
     offline: Arc<OfflinePipeline>,
     vad_options: VadOptions,
-    vad_to_asr_tx: mpsc::Sender<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+    vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
+    vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
     job: LoadedJob,
 ) {
     tasks.spawn(async move {
@@ -744,8 +807,9 @@ fn spawn_vad_task(
                         let segments = match speech_job_to_segments(asr_job) {
                             Ok(segments) => segments,
                             Err(error) => {
-                                send_timed(
+                                send_vad_to_asr_timed(
                                     &vad_to_asr_tx,
+                                    &vad_to_asr_queue_memory,
                                     Err(TranscribeItemOutcome {
                                         index: job_index,
                                         result: Err(error),
@@ -776,8 +840,9 @@ fn spawn_vad_task(
                             }
                         };
                         for segment in segments {
-                            send_timed(
+                            send_vad_to_asr_timed(
                                 &vad_to_asr_tx,
+                                &vad_to_asr_queue_memory,
                                 Ok(AsrPipelineMessage::Segment(segment)),
                                 &mut send_wait_seconds,
                             )
@@ -793,8 +858,9 @@ fn spawn_vad_task(
                         }
                     }
                     _ => {
-                        send_timed(
+                        send_vad_to_asr_timed(
                             &vad_to_asr_tx,
+                            &vad_to_asr_queue_memory,
                             Ok(AsrPipelineMessage::Job(asr_job)),
                             &mut send_wait_seconds,
                         )
@@ -819,8 +885,9 @@ fn spawn_vad_task(
                 Ok(())
             }
             Ok(Err(error)) => {
-                send_timed(
+                send_vad_to_asr_timed(
                     &vad_to_asr_tx,
+                    &vad_to_asr_queue_memory,
                     Err(TranscribeItemOutcome {
                         index: job_index,
                         result: Err(error),
@@ -848,8 +915,9 @@ fn spawn_vad_task(
                 Ok(())
             }
             Err(error) => {
-                send_timed(
+                send_vad_to_asr_timed(
                     &vad_to_asr_tx,
+                    &vad_to_asr_queue_memory,
                     Err(TranscribeItemOutcome {
                         index: job_index,
                         result: Err(anyhow::anyhow!("VAD join error: {error}")),
@@ -880,11 +948,19 @@ fn spawn_vad_task(
     });
 }
 
-async fn send_timed<T>(tx: &mpsc::Sender<T>, message: T, wait_seconds: &mut f64) -> Result<()> {
+async fn send_vad_to_asr_timed(
+    tx: &mpsc::UnboundedSender<VadToAsrMessage>,
+    budget: &LoadedQueueMemoryBudget,
+    message: Result<AsrPipelineMessage, TranscribeItemOutcome>,
+    wait_seconds: &mut f64,
+) -> Result<()> {
     let send_start = Instant::now();
+    let permit = acquire_vad_to_asr_message_memory(budget, &message).await?;
     let result = tx
-        .send(message)
-        .await
+        .send(VadToAsrMessage {
+            message,
+            _queue_memory_permit: permit,
+        })
         .map_err(|_| anyhow::anyhow!("ASR stage channel closed"));
     *wait_seconds += send_start.elapsed().as_secs_f64();
     result
@@ -1221,7 +1297,7 @@ fn spawn_asr_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
     max_batch_audio_sec: f32,
-    mut vad_to_asr_rx: mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+    mut vad_to_asr_rx: mpsc::UnboundedReceiver<VadToAsrMessage>,
     asr_to_result_tx: mpsc::Sender<TranscribeItemOutcome>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1243,10 +1319,11 @@ fn spawn_asr_worker(
             asr_to_result_tx.clone(),
         );
 
-        while let Some(message) = match pending.pop_front() {
-            Some(message) => Some(message),
+        while let Some(envelope) = match pending.pop_front() {
+            Some(envelope) => Some(envelope),
             None => vad_to_asr_rx.recv().await,
         } {
+            let message = envelope.message;
             match message {
                 Err(outcome) => {
                     let _ = asr_to_result_tx.send(outcome).await;
@@ -1347,28 +1424,33 @@ fn spawn_asr_worker(
 async fn collect_job_microbatch(
     first: AsrJob,
     max_batch_audio_sec: f32,
-    vad_to_asr_rx: &mut mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
-    pending: &mut VecDeque<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+    vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
+    pending: &mut VecDeque<VadToAsrMessage>,
 ) -> Vec<Result<AsrPipelineMessage, TranscribeItemOutcome>> {
     let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut messages = vec![Ok(AsrPipelineMessage::Job(first))];
     while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
         match vad_to_asr_rx.try_recv() {
-            Ok(Ok(AsrPipelineMessage::Segment(segment))) => {
-                pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
-            }
-            Ok(Ok(AsrPipelineMessage::Job(job))) => {
-                let next_audio_sec = job.waveform.duration_seconds() as f32;
-                if max_batch_audio_sec > 0.0
-                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                {
-                    pending.push_back(Ok(AsrPipelineMessage::Job(job)));
-                    break;
+            Ok(envelope) => match envelope.message {
+                Ok(AsrPipelineMessage::Segment(_)) => {
+                    pending.push_back(envelope);
                 }
-                audio_sec += next_audio_sec;
-                messages.push(Ok(AsrPipelineMessage::Job(job)));
-            }
-            Ok(message) => messages.push(message),
+                Ok(AsrPipelineMessage::Job(job)) => {
+                    let next_audio_sec = job.waveform.duration_seconds() as f32;
+                    if max_batch_audio_sec > 0.0
+                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                    {
+                        pending.push_back(VadToAsrMessage {
+                            message: Ok(AsrPipelineMessage::Job(job)),
+                            _queue_memory_permit: envelope._queue_memory_permit,
+                        });
+                        break;
+                    }
+                    audio_sec += next_audio_sec;
+                    messages.push(Ok(AsrPipelineMessage::Job(job)));
+                }
+                message => messages.push(message),
+            },
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return messages,
         }
@@ -1380,21 +1462,26 @@ async fn collect_job_microbatch(
         )
         .await
         {
-            Ok(Some(Ok(AsrPipelineMessage::Segment(segment)))) => {
-                pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
-            }
-            Ok(Some(Ok(AsrPipelineMessage::Job(job)))) => {
-                let next_audio_sec = job.waveform.duration_seconds() as f32;
-                if max_batch_audio_sec > 0.0
-                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                {
-                    pending.push_back(Ok(AsrPipelineMessage::Job(job)));
-                    break;
+            Ok(Some(envelope)) => match envelope.message {
+                Ok(AsrPipelineMessage::Segment(_)) => {
+                    pending.push_back(envelope);
                 }
-                audio_sec += next_audio_sec;
-                messages.push(Ok(AsrPipelineMessage::Job(job)));
-            }
-            Ok(Some(message)) => messages.push(message),
+                Ok(AsrPipelineMessage::Job(job)) => {
+                    let next_audio_sec = job.waveform.duration_seconds() as f32;
+                    if max_batch_audio_sec > 0.0
+                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                    {
+                        pending.push_back(VadToAsrMessage {
+                            message: Ok(AsrPipelineMessage::Job(job)),
+                            _queue_memory_permit: envelope._queue_memory_permit,
+                        });
+                        break;
+                    }
+                    audio_sec += next_audio_sec;
+                    messages.push(Ok(AsrPipelineMessage::Job(job)));
+                }
+                message => messages.push(message),
+            },
             Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
@@ -1404,30 +1491,38 @@ async fn collect_job_microbatch(
 async fn collect_segment_microbatch(
     first: AsrSegmentJob,
     max_batch_audio_sec: f32,
-    vad_to_asr_rx: &mut mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
-    pending: &mut VecDeque<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+    vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
+    pending: &mut VecDeque<VadToAsrMessage>,
 ) -> Vec<AsrSegmentJob> {
     let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut segments = vec![first];
     // Phase 1: non-blocking drain of everything already in the channel.
     while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
         match vad_to_asr_rx.try_recv() {
-            Ok(Ok(AsrPipelineMessage::Segment(segment))) => {
-                let next_audio_sec = segment.waveform.duration_seconds() as f32;
-                if max_batch_audio_sec > 0.0
-                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                {
-                    pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
-                    break;
+            Ok(envelope) => match envelope.message {
+                Ok(AsrPipelineMessage::Segment(segment)) => {
+                    let next_audio_sec = segment.waveform.duration_seconds() as f32;
+                    if max_batch_audio_sec > 0.0
+                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                    {
+                        pending.push_back(VadToAsrMessage {
+                            message: Ok(AsrPipelineMessage::Segment(segment)),
+                            _queue_memory_permit: envelope._queue_memory_permit,
+                        });
+                        break;
+                    }
+                    audio_sec += next_audio_sec;
+                    segments.push(segment);
                 }
-                audio_sec += next_audio_sec;
-                segments.push(segment);
-            }
-            Ok(message) => {
-                // Stash non-segment messages (e.g. Job) so we can
-                // keep collecting segments behind them.
-                pending.push_back(message);
-            }
+                message => {
+                    // Stash non-segment messages (e.g. Job) so we can
+                    // keep collecting segments behind them.
+                    pending.push_back(VadToAsrMessage {
+                        message,
+                        _queue_memory_permit: envelope._queue_memory_permit,
+                    });
+                }
+            },
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return segments,
         }
@@ -1441,21 +1536,29 @@ async fn collect_segment_microbatch(
         )
         .await
         {
-            Ok(Some(Ok(AsrPipelineMessage::Segment(segment)))) => {
-                let next_audio_sec = segment.waveform.duration_seconds() as f32;
-                if max_batch_audio_sec > 0.0
-                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                {
-                    pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
-                    break;
+            Ok(Some(envelope)) => match envelope.message {
+                Ok(AsrPipelineMessage::Segment(segment)) => {
+                    let next_audio_sec = segment.waveform.duration_seconds() as f32;
+                    if max_batch_audio_sec > 0.0
+                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                    {
+                        pending.push_back(VadToAsrMessage {
+                            message: Ok(AsrPipelineMessage::Segment(segment)),
+                            _queue_memory_permit: envelope._queue_memory_permit,
+                        });
+                        break;
+                    }
+                    audio_sec += next_audio_sec;
+                    segments.push(segment);
                 }
-                audio_sec += next_audio_sec;
-                segments.push(segment);
-            }
-            Ok(Some(message)) => {
-                // Same as Phase 1: stash non-segment, keep looking.
-                pending.push_back(message);
-            }
+                message => {
+                    // Same as Phase 1: stash non-segment, keep looking.
+                    pending.push_back(VadToAsrMessage {
+                        message,
+                        _queue_memory_permit: envelope._queue_memory_permit,
+                    });
+                }
+            },
             Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
@@ -2151,6 +2254,31 @@ mod tests {
         assert_eq!(loaded_job_memory_permits(&job), 5);
     }
 
+    #[test]
+    fn vad_to_asr_segment_memory_permits_rounds_up_to_megabytes() {
+        let message = Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
+            job_index: 0,
+            job_audio_seconds: 1.0,
+            speech_annotations: Vec::new(),
+            segment_index: 0,
+            segment_count: 1,
+            offset: DurationMs(0),
+            waveform: Waveform::new(vec![0.0; 1024 * 1024 + 1], 16_000),
+        }));
+        assert_eq!(vad_to_asr_message_memory_permits(&message), 5);
+    }
+
+    #[test]
+    fn vad_to_asr_error_messages_do_not_need_memory_permits() {
+        let message = Err(TranscribeItemOutcome {
+            index: 0,
+            result: Err(anyhow::anyhow!("failed")),
+            audio_seconds: 0.0,
+            bad_component: Some("vad"),
+        });
+        assert_eq!(vad_to_asr_message_memory_permits(&message), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_mem_total_from_proc_meminfo() {
@@ -2370,7 +2498,7 @@ mod tests {
             vad: None,
             asr: asr.clone(),
         });
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::channel(4);
+        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
         let handle = spawn_asr_worker(
             pipeline,
@@ -2381,13 +2509,13 @@ mod tests {
         );
 
         for index in 0..3usize {
-            vad_to_asr_tx
-                .send(Ok(AsrPipelineMessage::Job(AsrJob {
+            vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
+                AsrJob {
                     index,
                     prepared: VadPreparation::Disabled,
                     waveform: Waveform::new(vec![index as f32; 160], 16_000),
-                })))
-                .await?;
+                },
+            ))))?;
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         drop(vad_to_asr_tx);
@@ -2415,7 +2543,7 @@ mod tests {
             vad: None,
             asr: asr.clone(),
         });
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::channel(4);
+        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
         let handle = spawn_asr_worker(
             pipeline,
@@ -2425,8 +2553,8 @@ mod tests {
             asr_to_result_tx,
         );
 
-        vad_to_asr_tx
-            .send(Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
+        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
+            AsrSegmentJob {
                 job_index: 0,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
@@ -2434,16 +2562,16 @@ mod tests {
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),
-            })))
-            .await?;
+            },
+        ))))?;
         tokio::task::yield_now().await;
-        vad_to_asr_tx
-            .send(Ok(AsrPipelineMessage::Job(AsrJob {
+        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
+            AsrJob {
                 index: 1,
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
-            })))
-            .await?;
+            },
+        ))))?;
         drop(vad_to_asr_tx);
 
         let mut outcomes = Vec::new();
@@ -2471,7 +2599,7 @@ mod tests {
             vad: None,
             asr: asr.clone(),
         });
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::channel(4);
+        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
         let handle = spawn_asr_worker(
             pipeline,
@@ -2481,16 +2609,16 @@ mod tests {
             asr_to_result_tx,
         );
 
-        vad_to_asr_tx
-            .send(Ok(AsrPipelineMessage::Job(AsrJob {
+        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
+            AsrJob {
                 index: 0,
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
-            })))
-            .await?;
+            },
+        ))))?;
         tokio::task::yield_now().await;
-        vad_to_asr_tx
-            .send(Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
+        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
+            AsrSegmentJob {
                 job_index: 1,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
@@ -2498,8 +2626,8 @@ mod tests {
                 segment_count: 1,
                 offset: DurationMs(0),
                 waveform: Waveform::new(vec![0.1; 160], 16_000),
-            })))
-            .await?;
+            },
+        ))))?;
         drop(vad_to_asr_tx);
 
         let mut outcomes = Vec::new();
@@ -2658,6 +2786,15 @@ mod tests {
             speech_annotations,
             segments,
             slices,
+        }
+    }
+
+    fn test_vad_to_asr_message(
+        message: Result<AsrPipelineMessage, TranscribeItemOutcome>,
+    ) -> VadToAsrMessage {
+        VadToAsrMessage {
+            message,
+            _queue_memory_permit: None,
         }
     }
 }
