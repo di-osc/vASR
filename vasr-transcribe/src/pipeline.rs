@@ -24,7 +24,7 @@ use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 #[cfg(feature = "paged-attn")]
 use vasr_models::qwen_outputs_to_timelines;
 
-const DEFAULT_STAGE_BUFFER: usize = 20;
+const FALLBACK_STAGE_BUFFER: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
@@ -64,7 +64,7 @@ impl AsyncTranscribePipeline {
             load_options: AudioLoadOptions::default(),
             offline,
             parallel_options: ParallelTranscribeOptions::from(asr_options),
-            stage_buffer: DEFAULT_STAGE_BUFFER,
+            stage_buffer: default_stage_buffer(),
         }
     }
 
@@ -180,7 +180,9 @@ impl AsyncTranscribePipeline {
 }
 
 pub fn default_stage_buffer() -> usize {
-    DEFAULT_STAGE_BUFFER
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(FALLBACK_STAGE_BUFFER)
 }
 
 #[derive(Clone)]
@@ -257,7 +259,7 @@ fn loaded_queue_memory_budget_permits(
             }
         })
         .filter(|&permits: &usize| permits > 0)
-        .unwrap_or(DEFAULT_STAGE_BUFFER)
+        .unwrap_or_else(default_stage_buffer)
         .max(MIN_LOADED_QUEUE_MEMORY_PERMITS);
     let source = if total_memory_bytes.is_some() {
         if fraction_from_env {
@@ -2096,6 +2098,11 @@ mod tests {
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
         TimeRange,
     };
+
+    #[test]
+    fn default_stage_buffer_is_nonzero() {
+        assert!(default_stage_buffer() >= 1);
+    }
 
     #[test]
     fn loaded_queue_memory_budget_defaults_to_twenty_percent_of_total_memory() {
