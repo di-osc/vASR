@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::TranscribeInput;
@@ -22,7 +22,7 @@ pub struct BenchmarkTranscribeArgs {
     #[arg(short, long, value_name = "PATH")]
     pub input: PathBuf,
 
-    /// Optional JSON report output path.
+    /// Optional JSONL report output path.
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
@@ -221,22 +221,13 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         },
     };
 
-    if let Some(output) = &args.output {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create output directory {}", parent.display())
-            })?;
-        }
-        let json = serde_json::to_vec_pretty(&report)
-            .with_context(|| format!("failed to encode JSON for {}", output.display()))?;
-        fs::write(output, json)
-            .with_context(|| format!("failed to write JSON to {}", output.display()))?;
-        tracing::info!(
-            target: "vasr_transcribe::benchmark",
-            "Wrote benchmark report to `{}`.",
-            output.display()
-        );
-    }
+    let output = resolve_benchmark_output_jsonl_path(args.output.as_deref(), &args.input);
+    write_benchmark_jsonl_report(&output, &report)?;
+    tracing::info!(
+        target: "vasr_transcribe::benchmark",
+        "wrote benchmark jsonl report | output={}",
+        output.display()
+    );
 
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
@@ -258,6 +249,67 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
     if num_failed > 0 {
         bail!("{num_failed} of {} transcription(s) failed", records.len());
     }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum BenchmarkJsonlRow<'a> {
+    Summary {
+        summary: &'a BenchmarkCerSummary,
+        inference_performance: &'a InferencePerformance,
+    },
+    Item {
+        #[serde(flatten)]
+        item: &'a BenchmarkCerItem,
+    },
+}
+
+fn resolve_benchmark_output_jsonl_path(output: Option<&Path>, input: &Path) -> PathBuf {
+    if let Some(output) = output {
+        return output.to_path_buf();
+    }
+    let file_name = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(default_benchmark_jsonl_file_name)
+        .unwrap_or_else(|| "benchmark.jsonl".to_string());
+    input.with_file_name(file_name)
+}
+
+fn default_benchmark_jsonl_file_name(input_file_name: &str) -> String {
+    if let Some(stem) = input_file_name.strip_suffix(".vasr.msgpack") {
+        return format!("{stem}.jsonl");
+    }
+    if let Some(stem) = input_file_name.strip_suffix(".msgpack") {
+        return format!("{stem}.jsonl");
+    }
+    format!("{input_file_name}.jsonl")
+}
+
+fn write_benchmark_jsonl_report(output: &Path, report: &BenchmarkCerReport) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+
+    let mut jsonl = Vec::new();
+    serde_json::to_writer(
+        &mut jsonl,
+        &BenchmarkJsonlRow::Summary {
+            summary: &report.summary,
+            inference_performance: &report.inference_performance,
+        },
+    )
+    .with_context(|| format!("failed to encode JSONL summary for {}", output.display()))?;
+    jsonl.push(b'\n');
+    for item in &report.items {
+        serde_json::to_writer(&mut jsonl, &BenchmarkJsonlRow::Item { item })
+            .with_context(|| format!("failed to encode JSONL item for {}", output.display()))?;
+        jsonl.push(b'\n');
+    }
+    fs::write(output, jsonl)
+        .with_context(|| format!("failed to write JSONL to {}", output.display()))?;
     Ok(())
 }
 
@@ -327,7 +379,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_source_from_record, local_path_from_uri, reference_text};
+    use super::{
+        audio_source_from_record, local_path_from_uri, reference_text,
+        resolve_benchmark_output_jsonl_path,
+    };
+    use std::path::Path;
     use vasr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioAsset,
         AudioEncoding, PersistedAudioFormat, TextSpan, TimeRange, Timeline, VasrRecord, Waveform,
@@ -389,5 +445,27 @@ mod tests {
             local_path_from_uri("file:///tmp/audio.wav").as_deref(),
             Some(std::path::Path::new("/tmp/audio.wav"))
         );
+    }
+
+    #[test]
+    fn benchmark_output_defaults_to_jsonl_next_to_vasr_msgpack() {
+        let output =
+            resolve_benchmark_output_jsonl_path(None, Path::new("/data/calls.vasr.msgpack"));
+        assert_eq!(output, Path::new("/data/calls.jsonl"));
+    }
+
+    #[test]
+    fn benchmark_output_defaults_to_jsonl_next_to_msgpack() {
+        let output = resolve_benchmark_output_jsonl_path(None, Path::new("/data/calls.msgpack"));
+        assert_eq!(output, Path::new("/data/calls.jsonl"));
+    }
+
+    #[test]
+    fn benchmark_output_honors_explicit_path() {
+        let output = resolve_benchmark_output_jsonl_path(
+            Some(Path::new("/tmp/custom.jsonl")),
+            Path::new("/data/calls.vasr.msgpack"),
+        );
+        assert_eq!(output, Path::new("/tmp/custom.jsonl"));
     }
 }
