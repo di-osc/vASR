@@ -2075,10 +2075,6 @@ fn spawn_asr_worker(
                 Ok(AsrPipelineMessage::Segment(segment)) => {
                     let stage_start = Instant::now();
                     if offline.asr.as_any().is::<Qwen3ASR>() {
-                        tracing::debug!(
-                            target: "vasr_transcribe::pipeline",
-                            "asr audio_features encode enqueue | segs=1",
-                        );
                         let request = SegmentEncodeRequest {
                             segment,
                             stage_start,
