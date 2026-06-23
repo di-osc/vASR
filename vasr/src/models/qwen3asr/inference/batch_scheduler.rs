@@ -579,6 +579,8 @@ impl AsrBatchScheduler {
                                 .decode_us
                                 .saturating_add(duration_to_us(start_decode.elapsed()));
                             t.steps = t.steps.saturating_add(1);
+                            t.tokens_generated =
+                                t.tokens_generated.saturating_add(slot_indices.len());
                         }
 
                         for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
@@ -832,6 +834,8 @@ impl AsrBatchScheduler {
                                 .decode_us
                                 .saturating_add(duration_to_us(start_decode.elapsed()));
                             t.steps = t.steps.saturating_add(1);
+                            t.tokens_generated =
+                                t.tokens_generated.saturating_add(slot_indices.len());
                         }
 
                         for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
