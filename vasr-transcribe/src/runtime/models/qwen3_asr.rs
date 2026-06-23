@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use candle_core::Device;
-use vasr_data::{Timeline, Waveform};
 #[cfg(feature = "paged-attn")]
-use vasr_models::asr::qwen3asr::EncodedAsrBatchPoll;
+use vasr::models::qwen3asr::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
-use vasr_models::asr::qwen3asr::TranscribeTimings;
-use vasr_models::asr::qwen3asr::{
+use vasr::models::qwen3asr::TranscribeTimings;
+use vasr::models::qwen3asr::{
     AsrTranscription, AudioInput, EncodedAsrBatch, LoadOptions, Qwen3Asr,
 };
-use vasr_models::{qwen_outputs_to_timelines, qwen_transcribe_options};
+use vasr::{qwen_outputs_to_timelines, qwen_transcribe_options};
+use vasr_data::{Timeline, Waveform};
 
 use crate::runtime::model::{AsrModel, AsrOptions};
 

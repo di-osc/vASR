@@ -66,13 +66,13 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
 
     tracing::info!(
         target: "vasr_transcribe::run",
-        "transcribe | mode=run | records={} | input={}",
+        "run | inputs={} input={}",
         items.len(),
         args.input.display(),
     );
 
     let batch_start = Instant::now();
-    let outcomes = pipeline.transcribe_many(inputs).await;
+    let outcomes = pipeline.run(inputs).await;
     let batch_wall = batch_start.elapsed().as_secs_f64();
 
     let mut total_audio_seconds = 0.0;
@@ -129,7 +129,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
 
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::run",
         "postprocess | mode=run | records={} | response={:.3}s | write={:.3}s | total={:.3}s",
         items.len(),
@@ -139,8 +139,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     );
     tracing::info!(
         target: "vasr_transcribe::run",
-        "done | mode=run | records={} | evaluated={} | failed={} | audio={:.3}s | wall={:.3}s | speed={:.3}x | rtf={:.4}",
-        items.len(),
+        "run done | inputs={} failed={} audio={:.1}s wall={:.1}s speed={:.1}x rtf={:.4}",
         items.len(),
         bad_count,
         total_audio_seconds,

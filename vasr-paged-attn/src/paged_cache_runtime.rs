@@ -9,8 +9,8 @@ use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::cuda_graph::{
-    CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS, CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats,
-    DecodeCudaGraph, bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
+    CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats, DecodeCudaGraph, bytes_to_mib,
+    cuda_graph_batch_bucket, cuda_graph_batch_buckets, cuda_graph_default_block_table_cols,
     cuda_graph_prewarm_batch_limit, cuda_memory_snapshot, pad_decode_batch_to_max,
 };
 #[cfg(feature = "cuda-graph")]
@@ -23,8 +23,11 @@ use crate::paged_kv_cache::PagedKvCache;
 pub enum PagedCacheMemory {
     ContextSize(usize),
     Blocks(usize),
-    /// KV pool budget = `fraction * total_vram - already_used - margin` at allocation time (CUDA only).
-    GpuMemoryFraction(f32),
+    /// KV pool budget = `fraction * total_vram - reserved_bytes - already_used` at allocation time (CUDA only).
+    GpuMemoryFraction {
+        fraction: f32,
+        reserved_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,7 +40,10 @@ impl Default for PagedCacheConfig {
     fn default() -> Self {
         Self {
             block_size: 32,
-            memory: PagedCacheMemory::GpuMemoryFraction(0.8),
+            memory: PagedCacheMemory::GpuMemoryFraction {
+                fraction: 0.8,
+                reserved_bytes: 0,
+            },
         }
     }
 }
@@ -133,14 +139,14 @@ fn cuda_memory_mib(gpu_id: usize) -> Result<(u64, u64)> {
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_kv_byte_budget(gpu_id: usize, fraction: f32) -> Result<usize> {
+fn cuda_kv_byte_budget(gpu_id: usize, fraction: f32, reserved_bytes: usize) -> Result<usize> {
     let (total_mib, used_mib) = cuda_memory_mib(gpu_id)?;
     let target_mib = ((total_mib as f64) * f64::from(fraction)).floor() as u64;
-    let margin_mib = std::cmp::max(512u64, ((total_mib as f64) * 0.02).ceil() as u64);
-    let budget_mib = target_mib.saturating_sub(used_mib.saturating_add(margin_mib));
+    let reserved_mib = reserved_bytes.div_ceil(1024 * 1024) as u64;
+    let budget_mib = target_mib.saturating_sub(used_mib.saturating_add(reserved_mib));
     if budget_mib == 0 {
         candle_core::bail!(
-            "GPU KV budget exhausted: total_mib={total_mib} used_mib={used_mib} margin_mib={margin_mib} fraction={fraction}"
+            "GPU KV budget exhausted: total_mib={total_mib} used_mib={used_mib} reserved_mib={reserved_mib} fraction={fraction}"
         );
     }
     usize::try_from(budget_mib)
@@ -161,11 +167,15 @@ fn resolve_num_blocks(
     match memory {
         PagedCacheMemory::ContextSize(tokens) => Ok(tokens.div_ceil(block_size) + 1),
         PagedCacheMemory::Blocks(blocks) => Ok(blocks),
-        PagedCacheMemory::GpuMemoryFraction(fraction) => {
+        PagedCacheMemory::GpuMemoryFraction {
+            fraction,
+            reserved_bytes,
+        } => {
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = (
                     fraction,
+                    reserved_bytes,
                     device,
                     num_layers,
                     num_kv_heads,
@@ -192,7 +202,7 @@ fn resolve_num_blocks(
                         "GpuMemoryFraction paged cache sizing requires a CUDA device"
                     );
                 };
-                let byte_budget = cuda_kv_byte_budget(gpu_id, fraction)?;
+                let byte_budget = cuda_kv_byte_budget(gpu_id, fraction, reserved_bytes)?;
                 let bytes_per_block =
                     bytes_per_paged_block(num_layers, num_kv_heads, head_dim, block_size, dtype)?;
                 blocks_for_byte_budget(byte_budget, bytes_per_block)
@@ -493,6 +503,9 @@ impl PagedCacheRuntime {
     #[cfg(feature = "cuda-graph")]
     pub fn disable_cuda_decode_graphs(&mut self) {
         self.cuda_decode_graphs_disabled = true;
+        self.cuda_graph_max_batch = 0;
+        self.cuda_decode_graphs.clear();
+        self.cuda_decode_graph_disabled_keys.clear();
     }
 
     #[cfg(all(feature = "cuda-graph", test))]
@@ -538,7 +551,8 @@ impl PagedCacheRuntime {
             return Ok(false);
         }
         let meta_cols = metadata.block_tables.dim(1)?;
-        if meta_cols > CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS {
+        let graph_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
+        if meta_cols > graph_cols {
             return Ok(false);
         }
         let key = self.cuda_decode_graph_key(input_ids, metadata)?;
@@ -588,7 +602,7 @@ impl PagedCacheRuntime {
             candle_core::bail!("CUDA decode graph disabled for key={key:?}");
         }
         let graph_batch = key.batch;
-        let graph_cols = CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS;
+        let graph_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
         let device = input_ids.device();
 
         let run_graph = |graph: &DecodeCudaGraph| -> Result<Tensor> {
@@ -686,19 +700,13 @@ impl PagedCacheRuntime {
             return Ok(CudaGraphPrewarmStats::empty());
         }
 
-        let graph_block_table_cols = CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS;
+        let graph_block_table_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
+        let graph_context_tokens = graph_block_table_cols.saturating_mul(self.cache.block_size());
         let requested_limit = cuda_graph_prewarm_batch_limit(max_batch);
-        let capacity_limit = self
-            .cache
-            .num_blocks()
-            .saturating_sub(1)
-            .checked_div(graph_block_table_cols)
-            .unwrap_or(0);
-        let limit = requested_limit.min(capacity_limit);
-        if limit == 0 {
+        let limit = requested_limit;
+        if limit == 0 || self.cache.num_blocks() <= 1 {
             candle_core::bail!(
-                "CUDA decode graph prewarm requires at least {} KV blocks, got {}",
-                graph_block_table_cols.saturating_add(1),
+                "CUDA decode graph prewarm requires at least one usable KV block, got {}",
                 self.cache.num_blocks()
             );
         }
@@ -709,7 +717,13 @@ impl PagedCacheRuntime {
 
         let mem_before = cuda_memory_snapshot(device);
         let mut captured = 0usize;
-        for batch in cuda_graph_batch_buckets(limit) {
+        // Capture the widest graph first. mistralrs paged-attn v2 uses a
+        // process-global workspace that grows with batch size; growing it after
+        // a smaller graph has been captured would invalidate the pointer stored
+        // in that CUDA graph.
+        let mut prewarm_batches = cuda_graph_batch_buckets(limit);
+        prewarm_batches.reverse();
+        for batch in prewarm_batches {
             let graph = DecodeCudaGraph::capture_batch_warmup(
                 thinker,
                 &self.cache,
@@ -748,6 +762,8 @@ impl PagedCacheRuntime {
         }
         Ok(CudaGraphPrewarmStats {
             graphs: captured,
+            max_batch: limit,
+            context_tokens: graph_context_tokens,
             memory_before: mem_before,
             memory_after: mem_after,
         })

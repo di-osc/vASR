@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use vasr_data::Waveform;
-use vasr_models::vad as model_vad;
+use vasr_vad as model_vad;
 
 use crate::runtime::model::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 

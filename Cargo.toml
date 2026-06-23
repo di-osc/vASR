@@ -1,6 +1,9 @@
 [workspace]
 members = [
-  "vasr-models",
+  "vasr",
+  "vasr-hub",
+  "vasr-vad",
+  "vasr-aligner",
   "vasr-data",
   "vasr-transcribe",
   "vasr-realtime",

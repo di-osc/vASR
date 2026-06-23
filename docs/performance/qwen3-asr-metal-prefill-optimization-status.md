@@ -20,7 +20,7 @@ Use this command for the current complete-recognition Metal baseline on
 `raw_audios`:
 
 ```bash
-VASR_LOG='info,vasr_models::inference::transcribe=info' \
+VASR_LOG='info,vasr::inference::transcribe=info' \
 ./target/release/vasr-transcribe run \
   --device metal \
   --input raw_audios \

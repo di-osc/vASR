@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use candle_core::Device;
+use vasr::models::qwen3asr::{
+    AudioInput, LoadOptions, Qwen3Asr, StreamOptions as RuntimeStreamOptions,
+};
 use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange, Token,
-};
-use vasr_models::asr::qwen3asr::{
-    AudioInput, LoadOptions, Qwen3Asr, StreamOptions as RuntimeStreamOptions,
 };
 
 use crate::runtime::model::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
@@ -44,7 +44,7 @@ impl StreamingAsrModel for Qwen3AsrModel {
 }
 
 struct Qwen3AsrStreamModel {
-    inner: Option<vasr_models::asr::qwen3asr::AsrStream>,
+    inner: Option<vasr::models::qwen3asr::AsrStream>,
 }
 
 impl StreamingAsrSession for Qwen3AsrStreamModel {

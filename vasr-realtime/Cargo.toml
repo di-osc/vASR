@@ -23,15 +23,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 vasr-data = { path = "../vasr-data", features = ["audio-loading"] }
-vasr-models = { path = "../vasr-models" }
+vasr = { path = "../vasr" }
+vasr-vad = { path = "../vasr-vad" }
 
 [features]
 default = []
-accelerate = ["vasr-models/accelerate"]
-cuda = ["cuda-vad", "vasr-models/cuda", "vasr-models/cuda-graph", "vasr-models/flash-attn", "vasr-models/cuda-quant", "paged-attn"]
-cuda-vad = ["vasr-models/cuda-vad"]
-metal = ["vasr-models/metal-paged-attn", "paged-attn"]
-paged-attn = ["vasr-models/paged-attn"]
+accelerate = ["vasr/accelerate"]
+cuda = ["cuda-vad", "vasr/cuda", "vasr/cuda-graph", "vasr/flash-attn", "vasr/cuda-quant", "paged-attn"]
+cuda-vad = ["vasr-vad/cuda"]
+metal = ["vasr/metal-paged-attn", "paged-attn"]
+paged-attn = ["vasr/paged-attn"]
 cuda-graph = ["cuda"]
 
 [lints]

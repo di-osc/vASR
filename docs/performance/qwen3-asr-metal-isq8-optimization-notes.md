@@ -26,7 +26,7 @@ The minimal ASR correctness repro for the mRoPE/AFQ8 path is:
 
 ```bash
 VASR_DEBUG_RAW_ASR=1 \
-VASR_LOG='warn,vasr_transcribe=info,vasr_models::inference::transcribe=debug,vasr_quant::isq_linear=warn' \
+VASR_LOG='warn,vasr_transcribe=info,vasr::inference::transcribe=debug,vasr_quant::isq_linear=warn' \
 cargo run -q -p vasr-transcribe --features metal -- run \
   --input asr_example.wav \
   --output /tmp/vasr-metal-accel-rope \
@@ -51,7 +51,7 @@ ISQ selected is afq8 (requested=8, backend=metal).
 Single-sequence text decode command:
 
 ```bash
-cargo run --release -p vasr-models --example bench_text_decode \
+cargo run --release -p vasr --example bench_text_decode \
   --features "metal,metal-paged-attn,paged-attn,timing" \
   -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
 ```
@@ -67,7 +67,7 @@ Most recent clean reference from this optimization series:
 Batch decode command:
 
 ```bash
-cargo run --release -p vasr-models --example bench_text_decode \
+cargo run --release -p vasr --example bench_text_decode \
   --features "metal,metal-paged-attn,paged-attn,timing" \
   -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --batch 2 --warmup 1
 ```
@@ -113,7 +113,7 @@ Metal now defaults to the eager KV-cache decode route. Forced paged attention is
 kept as an opt-in regression path:
 
 ```bash
-VASR_FORCE_PAGED_ATTN=1 cargo run --release -p vasr-models --example bench_text_decode \
+VASR_FORCE_PAGED_ATTN=1 cargo run --release -p vasr --example bench_text_decode \
   --features "metal,metal-paged-attn,paged-attn,timing" \
   -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
 ```
@@ -135,8 +135,8 @@ for end-to-end ASR, not the main speed lever.
 ## Verification
 
 ```bash
-cargo test -p vasr-models --features metal-paged-attn test_metal_accelerated_seq_one -- --nocapture
-cargo test -p vasr-models test_seq_one_first_modality_matches_standard_when_positions_match -- --nocapture
+cargo test -p vasr --features metal-paged-attn test_metal_accelerated_seq_one -- --nocapture
+cargo test -p vasr test_seq_one_first_modality_matches_standard_when_positions_match -- --nocapture
 cargo check -p vasr-transcribe --features metal
 ```
 

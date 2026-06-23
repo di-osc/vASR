@@ -1,5 +1,5 @@
-pub use vasr_models::vad::{StreamingVadSession, VadModel, VadOptions, VadSegment};
-pub use vasr_models::{AsrOptions, OfflineAsrModel as AsrModel, StreamingAsrSession};
+pub use vasr::{AsrOptions, OfflineAsrModel as AsrModel, StreamingAsrSession};
+pub use vasr_vad::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
 #[derive(Debug, Clone)]
 pub struct ParallelTranscribeOptions {

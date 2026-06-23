@@ -5,24 +5,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
+use vasr::models::qwen3asr::EncodedAsrBatch;
+#[cfg(feature = "paged-attn")]
+use vasr::models::qwen3asr::EncodedAsrBatchPoll;
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
-use vasr_models::asr::qwen3asr::EncodedAsrBatch;
-#[cfg(feature = "paged-attn")]
-use vasr_models::asr::qwen3asr::EncodedAsrBatchPoll;
 
 use crate::runtime::models::qwen3_asr::Qwen3AsrModel;
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 #[cfg(feature = "paged-attn")]
-use vasr_models::qwen_outputs_to_timelines;
+use vasr::qwen_outputs_to_timelines;
 
 const FALLBACK_STAGE_PARALLELISM: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
@@ -30,6 +33,67 @@ const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
 const ASR_ENCODED_FEATURE_QUEUE: usize = 1;
+const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
+
+#[derive(Debug, Default)]
+struct LoaderStageStats {
+    jobs: usize,
+    failed: usize,
+    audio_seconds: f64,
+    compute_seconds: f64,
+    wall_seconds: f64,
+}
+
+#[derive(Debug, Default)]
+struct LoaderTaskStats {
+    jobs: usize,
+    failed: usize,
+    audio_seconds: f64,
+    compute_seconds: f64,
+}
+
+#[derive(Debug, Default)]
+struct VadStageStats {
+    jobs: usize,
+    failed: usize,
+    no_speech: usize,
+    segments: usize,
+    audio_seconds: f64,
+    speech_seconds: f64,
+    compute_seconds: f64,
+    send_wait_seconds: f64,
+    wall_seconds: f64,
+}
+
+#[derive(Debug, Default)]
+struct VadTaskStats {
+    jobs: usize,
+    failed: usize,
+    no_speech: usize,
+    segments: usize,
+    audio_seconds: f64,
+    speech_seconds: f64,
+    compute_seconds: f64,
+    send_wait_seconds: f64,
+    wall_seconds: f64,
+}
+
+#[derive(Debug, Default)]
+struct AsrStageStats {
+    batches: usize,
+    jobs: usize,
+    segments: usize,
+    audio_seconds: f64,
+    wall_seconds: f64,
+    encode_batches: usize,
+    encode_segments: usize,
+    encode_audio_seconds: f64,
+    encode_seconds: f64,
+    decode_batches: usize,
+    decode_segments: usize,
+    decode_audio_seconds: f64,
+    decode_seconds: f64,
+}
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
     loader: AudioLoader,
@@ -52,6 +116,54 @@ pub struct TranscribeItemOutcome {
     pub bad_component: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PipelineRequestId(u64);
+
+#[derive(Debug, Clone, Copy)]
+struct RequestItemRef {
+    request_id: PipelineRequestId,
+    item_index: usize,
+}
+
+#[derive(Debug)]
+struct RoutedTranscribeItemOutcome {
+    request_item: Option<RequestItemRef>,
+    outcome: TranscribeItemOutcome,
+}
+
+impl From<TranscribeItemOutcome> for RoutedTranscribeItemOutcome {
+    fn from(outcome: TranscribeItemOutcome) -> Self {
+        Self {
+            request_item: None,
+            outcome,
+        }
+    }
+}
+
+impl RoutedTranscribeItemOutcome {
+    fn into_public_outcome(self) -> TranscribeItemOutcome {
+        self.outcome
+    }
+
+    fn for_request(request_item: RequestItemRef, mut outcome: TranscribeItemOutcome) -> Self {
+        outcome.index = request_item.item_index;
+        Self {
+            request_item: Some(request_item),
+            outcome,
+        }
+    }
+}
+
+fn route_outcome(
+    request_item: Option<RequestItemRef>,
+    outcome: TranscribeItemOutcome,
+) -> RoutedTranscribeItemOutcome {
+    match request_item {
+        Some(request_item) => RoutedTranscribeItemOutcome::for_request(request_item, outcome),
+        None => outcome.into(),
+    }
+}
+
 impl AsyncTranscribePipeline {
     pub fn new(
         loader: AudioLoader,
@@ -71,29 +183,20 @@ impl AsyncTranscribePipeline {
         self
     }
 
-    pub async fn transcribe_source(
-        &self,
-        index: usize,
-        source: AudioSource,
-    ) -> TranscribeItemOutcome {
-        let outcomes = self
-            .transcribe_many(vec![TranscribeInput { index, source }])
-            .await;
+    pub async fn run_source(&self, index: usize, source: AudioSource) -> TranscribeItemOutcome {
+        let outcomes = self.run(vec![TranscribeInput { index, source }]).await;
         outcomes
             .into_iter()
             .next()
             .unwrap_or(TranscribeItemOutcome {
                 index,
-                result: Err(anyhow::anyhow!("transcribe returned no outcome")),
+                result: Err(anyhow::anyhow!("run returned no outcome")),
                 audio_seconds: 0.0,
                 bad_component: Some("recognizer"),
             })
     }
 
-    pub async fn transcribe_many(
-        &self,
-        inputs: Vec<TranscribeInput>,
-    ) -> Vec<TranscribeItemOutcome> {
+    pub async fn run(&self, inputs: Vec<TranscribeInput>) -> Vec<TranscribeItemOutcome> {
         if inputs.is_empty() {
             return Vec::new();
         }
@@ -110,8 +213,16 @@ impl AsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline queues | stage_parallelism={} loaded_queue_memory={}MiB vad_to_asr_queue_memory={}MiB queue_memory_source={} permit_size={}MiB",
+            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue_batches={}",
             stage_parallelism,
+            stage_parallelism,
+            permits_to_gib(loaded_queue_memory.capacity_permits),
+            permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
+            ASR_ENCODED_FEATURE_QUEUE
+        );
+        tracing::debug!(
+            target: "vasr_transcribe::pipeline",
+            "pipeline queues | loaded_queue_memory={}MiB vad_to_asr_queue_memory={}MiB queue_memory_source={} permit_size={}MiB",
             loaded_queue_memory.capacity_permits,
             vad_to_asr_queue_memory.capacity_permits,
             loaded_queue_memory.source,
@@ -120,6 +231,9 @@ impl AsyncTranscribePipeline {
         let (loader_to_vad_tx, loader_to_vad_rx) = mpsc::unbounded_channel();
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(unique_inputs.len());
+        let loader_stats = Arc::new(Mutex::new(LoaderStageStats::default()));
+        let vad_stats = Arc::new(Mutex::new(VadStageStats::default()));
+        let asr_stats = Arc::new(Mutex::new(AsrStageStats::default()));
 
         let loader = self.loader.clone();
         let load_options = self.load_options.clone();
@@ -130,6 +244,7 @@ impl AsyncTranscribePipeline {
             stage_parallelism,
             loaded_queue_memory,
             loader_to_vad_tx,
+            Arc::clone(&loader_stats),
         );
 
         let offline = Arc::clone(&self.offline);
@@ -141,6 +256,7 @@ impl AsyncTranscribePipeline {
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
+            Arc::clone(&vad_stats),
         );
 
         let offline = Arc::clone(&self.offline);
@@ -152,11 +268,13 @@ impl AsyncTranscribePipeline {
             max_batch_audio_sec,
             vad_to_asr_rx,
             asr_to_result_tx,
+            Arc::clone(&asr_stats),
+            None,
         );
 
         let mut outcomes = Vec::with_capacity(job_count);
         while let Some(outcome) = asr_to_result_rx.recv().await {
-            outcomes.push(outcome);
+            outcomes.push(outcome.into_public_outcome());
             if outcomes.len() >= unique_count {
                 break;
             }
@@ -175,10 +293,377 @@ impl AsyncTranscribePipeline {
     }
 }
 
+#[derive(Clone)]
+pub struct GlobalAsyncTranscribePipeline {
+    submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
+}
+
+struct GlobalTranscribeRequest {
+    inputs: Vec<TranscribeInput>,
+    response_tx: oneshot::Sender<Vec<TranscribeItemOutcome>>,
+}
+
+#[derive(Debug)]
+struct GlobalLoadJob {
+    internal_index: usize,
+    request_item: RequestItemRef,
+    source: AudioSource,
+}
+
+struct PendingGlobalRequest {
+    remaining: usize,
+    duplicate_indices: Vec<(usize, usize)>,
+    internal_indices: Vec<usize>,
+    outcomes: Vec<TranscribeItemOutcome>,
+    response_tx: oneshot::Sender<Vec<TranscribeItemOutcome>>,
+}
+
+impl GlobalAsyncTranscribePipeline {
+    pub fn start(
+        loader: AudioLoader,
+        offline: Arc<OfflinePipeline>,
+        asr_options: AsrOptions,
+        vad_options: VadOptions,
+    ) -> Self {
+        let parallel_options = ParallelTranscribeOptions {
+            asr_options,
+            vad_options,
+        };
+        let load_options = AudioLoadOptions::default();
+        let stage_parallelism = default_stage_parallelism();
+        let loaded_queue_memory = loaded_queue_memory_budget();
+        let vad_to_asr_queue_memory = loaded_queue_memory_budget();
+        tracing::info!(
+            target: "vasr_transcribe::pipeline",
+            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue_batches={} decode_idle_flush={}ms",
+            stage_parallelism,
+            stage_parallelism,
+            permits_to_gib(loaded_queue_memory.capacity_permits),
+            permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
+            ASR_ENCODED_FEATURE_QUEUE,
+            GLOBAL_DECODE_IDLE_FLUSH_MS
+        );
+
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (load_job_tx, load_job_rx) = mpsc::unbounded_channel();
+        let (loader_to_vad_tx, loader_to_vad_rx) = mpsc::unbounded_channel();
+        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
+        let (asr_to_result_tx, asr_to_result_rx) = mpsc::channel(1024);
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let job_routes = Arc::new(Mutex::new(HashMap::new()));
+        let next_request_id = Arc::new(AtomicU64::new(1));
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let loader_stats = Arc::new(Mutex::new(LoaderStageStats::default()));
+        let vad_stats = Arc::new(Mutex::new(VadStageStats::default()));
+        let asr_stats = Arc::new(Mutex::new(AsrStageStats::default()));
+
+        spawn_global_submit_worker(
+            submit_rx,
+            load_job_tx,
+            Arc::clone(&pending_requests),
+            Arc::clone(&job_routes),
+            Arc::clone(&next_request_id),
+            Arc::clone(&next_job_id),
+        );
+        spawn_global_loader_worker(
+            loader,
+            load_options,
+            stage_parallelism,
+            loaded_queue_memory,
+            load_job_rx,
+            loader_to_vad_tx,
+            loader_stats,
+        );
+        spawn_vad_worker(
+            Arc::clone(&offline),
+            parallel_options.vad_options.clone(),
+            stage_parallelism,
+            loader_to_vad_rx,
+            vad_to_asr_tx,
+            vad_to_asr_queue_memory,
+            vad_stats,
+        );
+        spawn_asr_worker(
+            offline,
+            parallel_options.asr_options.clone(),
+            parallel_options.asr_options.max_batch_audio_sec,
+            vad_to_asr_rx,
+            asr_to_result_tx,
+            asr_stats,
+            Some(std::time::Duration::from_millis(GLOBAL_DECODE_IDLE_FLUSH_MS)),
+        );
+        spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
+
+        Self { submit_tx }
+    }
+
+    pub async fn run(&self, inputs: Vec<TranscribeInput>) -> Vec<TranscribeItemOutcome> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .submit_tx
+            .send(GlobalTranscribeRequest {
+                inputs,
+                response_tx,
+            })
+            .is_err()
+        {
+            return vec![TranscribeItemOutcome {
+                index: 0,
+                result: Err(anyhow::anyhow!("global transcribe pipeline stopped")),
+                audio_seconds: 0.0,
+                bad_component: Some("recognizer"),
+            }];
+        }
+        response_rx.await.unwrap_or_else(|_| {
+            vec![TranscribeItemOutcome {
+                index: 0,
+                result: Err(anyhow::anyhow!("global transcribe pipeline response dropped")),
+                audio_seconds: 0.0,
+                bad_component: Some("recognizer"),
+            }]
+        })
+    }
+
+}
+
+fn spawn_global_submit_worker(
+    mut submit_rx: mpsc::UnboundedReceiver<GlobalTranscribeRequest>,
+    load_job_tx: mpsc::UnboundedSender<GlobalLoadJob>,
+    pending_requests: Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    job_routes: Arc<Mutex<HashMap<usize, RequestItemRef>>>,
+    next_request_id: Arc<AtomicU64>,
+    next_job_id: Arc<AtomicU64>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(request) = submit_rx.recv().await {
+            let request_id = PipelineRequestId(next_request_id.fetch_add(1, Ordering::Relaxed));
+            let DeduplicatedTranscribeInputs {
+                unique_inputs,
+                duplicate_indices,
+            } = deduplicate_transcribe_inputs(request.inputs);
+            let unique_count = unique_inputs.len();
+            if unique_count == 0 {
+                let _ = request.response_tx.send(Vec::new());
+                continue;
+            }
+            let mut load_jobs = Vec::with_capacity(unique_count);
+            let mut internal_indices = Vec::with_capacity(unique_count);
+            for input in unique_inputs {
+                let internal_index = next_job_id.fetch_add(1, Ordering::Relaxed) as usize;
+                let request_item = RequestItemRef {
+                    request_id,
+                    item_index: input.index,
+                };
+                internal_indices.push(internal_index);
+                load_jobs.push(GlobalLoadJob {
+                    internal_index,
+                    request_item,
+                    source: input.source,
+                });
+            }
+            if let Ok(mut routes) = job_routes.lock() {
+                for job in &load_jobs {
+                    routes.insert(job.internal_index, job.request_item);
+                }
+            }
+            if let Ok(mut pending) = pending_requests.lock() {
+                pending.insert(
+                    request_id,
+                    PendingGlobalRequest {
+                        remaining: unique_count,
+                        duplicate_indices,
+                        internal_indices,
+                        outcomes: Vec::with_capacity(unique_count),
+                        response_tx: request.response_tx,
+                    },
+                );
+            }
+            for job in load_jobs {
+                if load_job_tx.send(job).is_err() {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_global_loader_worker(
+    loader: AudioLoader,
+    load_options: AudioLoadOptions,
+    max_in_flight: usize,
+    loaded_queue_memory: LoadedQueueMemoryBudget,
+    mut load_job_rx: mpsc::UnboundedReceiver<GlobalLoadJob>,
+    loader_to_vad_tx: mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    stats: Arc<Mutex<LoaderStageStats>>,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let max_in_flight = max_in_flight.max(1);
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                job = load_job_rx.recv(), if tasks.len() < max_in_flight => {
+                    match job {
+                        Some(job) => spawn_global_loader_task(&mut tasks, loader.clone(), load_options.clone(), job),
+                        None => break,
+                    }
+                }
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(result) = result {
+                        send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &stats).await?;
+                    }
+                }
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &stats)
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+fn spawn_global_loader_task(
+    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
+    loader: AudioLoader,
+    load_options: AudioLoadOptions,
+    job: GlobalLoadJob,
+) {
+    tasks.spawn(async move {
+        let start = Instant::now();
+        let loaded = tokio::task::spawn_blocking({
+            let source = job.source.clone();
+            move || loader.load(&source, &load_options)
+        })
+        .await;
+        let compute_seconds = start.elapsed().as_secs_f64();
+        let mut stats = LoaderTaskStats {
+            compute_seconds,
+            ..Default::default()
+        };
+        let message = match loaded {
+            Ok(Ok(waveform)) => {
+                stats.jobs = 1;
+                stats.audio_seconds = waveform.duration_seconds();
+                Ok(LoadedJob {
+                    index: job.internal_index,
+                    request_item: Some(job.request_item),
+                    waveform,
+                    _queue_memory_permit: None,
+                })
+            }
+            Ok(Err(error)) => {
+                stats.failed = 1;
+                Err(TranscribeItemOutcome {
+                    index: job.internal_index,
+                    result: Err(error),
+                    audio_seconds: 0.0,
+                    bad_component: Some("loader"),
+                })
+            }
+            Err(error) => {
+                stats.failed = 1;
+                Err(TranscribeItemOutcome {
+                    index: job.internal_index,
+                    result: Err(anyhow::anyhow!("loader join error: {error}")),
+                    audio_seconds: 0.0,
+                    bad_component: Some("loader"),
+                })
+            }
+        };
+        (message, stats)
+    });
+}
+
+async fn send_global_loaded_result(
+    result: std::result::Result<
+        (Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats),
+        tokio::task::JoinError,
+    >,
+    loaded_queue_memory: &LoadedQueueMemoryBudget,
+    loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    stats: &Arc<Mutex<LoaderStageStats>>,
+) -> Result<()> {
+    let (mut message, task_stats) = result.unwrap_or_else(|error| {
+        (
+            Err(TranscribeItemOutcome {
+                index: 0,
+                result: Err(anyhow::anyhow!("loader task join error: {error}")),
+                audio_seconds: 0.0,
+                bad_component: Some("loader"),
+            }),
+            LoaderTaskStats {
+                failed: 1,
+                ..Default::default()
+            },
+        )
+    });
+    record_loader_task_stats(stats, &task_stats);
+    if let Ok(job) = &mut message {
+        job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+    }
+    loader_to_vad_tx
+        .send(message)
+        .map_err(|_| anyhow::anyhow!("loaded channel closed"))
+}
+
+fn spawn_global_result_router(
+    mut asr_to_result_rx: mpsc::Receiver<RoutedTranscribeItemOutcome>,
+    pending_requests: Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    job_routes: Arc<Mutex<HashMap<usize, RequestItemRef>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(routed) = asr_to_result_rx.recv().await {
+            let request_item = match routed.request_item {
+                Some(request_item) => request_item,
+                None => {
+                    let Ok(routes) = job_routes.lock() else {
+                        continue;
+                    };
+                    let Some(request_item) = routes.get(&routed.outcome.index).copied() else {
+                        continue;
+                    };
+                    request_item
+                }
+            };
+            let routed = route_outcome(Some(request_item), routed.outcome);
+            let Some(request_item) = routed.request_item else {
+                continue;
+            };
+            let mut completed = None;
+            if let Ok(mut pending) = pending_requests.lock() {
+                if let Some(request) = pending.get_mut(&request_item.request_id) {
+                    request.outcomes.push(routed.outcome);
+                    request.remaining = request.remaining.saturating_sub(1);
+                    if request.remaining == 0 {
+                        completed = pending.remove(&request_item.request_id);
+                    }
+                }
+            }
+            if let Some(request) = completed {
+                if let Ok(mut routes) = job_routes.lock() {
+                    for internal_index in &request.internal_indices {
+                        routes.remove(internal_index);
+                    }
+                }
+                let outcomes =
+                    expand_duplicate_outcomes(request.outcomes, &request.duplicate_indices);
+                let _ = request.response_tx.send(outcomes);
+            }
+        }
+    })
+}
+
 fn default_stage_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(FALLBACK_STAGE_PARALLELISM)
+}
+
+fn permits_to_gib(permits: usize) -> f64 {
+    permits as f64 * BYTES_PER_MEMORY_PERMIT as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 #[derive(Clone)]
@@ -518,6 +1003,7 @@ fn duplicate_outcome_from(
 #[derive(Debug)]
 struct LoadedJob {
     index: usize,
+    request_item: Option<RequestItemRef>,
     waveform: Waveform,
     _queue_memory_permit: Option<OwnedSemaphorePermit>,
 }
@@ -525,6 +1011,7 @@ struct LoadedJob {
 #[derive(Debug)]
 struct AsrJob {
     index: usize,
+    request_item: Option<RequestItemRef>,
     prepared: VadPreparation,
     waveform: Waveform,
 }
@@ -533,6 +1020,7 @@ struct AsrJob {
 #[derive(Debug, Clone)]
 struct AsrSegmentJob {
     job_index: usize,
+    request_item: Option<RequestItemRef>,
     job_audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
     segment_index: usize,
@@ -556,6 +1044,7 @@ struct VadToAsrMessage {
 #[derive(Debug)]
 struct SegmentJobState {
     index: usize,
+    request_item: Option<RequestItemRef>,
     audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
     segment_annotations: Vec<Option<Vec<Annotation>>>,
@@ -591,6 +1080,7 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
         .enumerate()
         .map(|(segment_index, (segment, waveform))| AsrSegmentJob {
             job_index: job.index,
+            request_item: job.request_item,
             job_audio_seconds: job.waveform.duration_seconds(),
             speech_annotations: if segment_index == 0 {
                 speech_annotations.clone()
@@ -612,73 +1102,106 @@ fn spawn_loader_worker(
     max_in_flight: usize,
     loaded_queue_memory: LoadedQueueMemoryBudget,
     loader_to_vad_tx: mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    stats: Arc<Mutex<LoaderStageStats>>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
+        let wall_start = Instant::now();
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
         for input in inputs {
             spawn_loader_task(&mut tasks, loader.clone(), load_options.clone(), input);
             if tasks.len() >= max_in_flight {
-                send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx).await?;
+                send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
+                    .await?;
             }
         }
         while !tasks.is_empty() {
-            send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx).await?;
+            send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats).await?;
+        }
+        if let Ok(mut stats) = stats.lock() {
+            stats.wall_seconds = wall_start.elapsed().as_secs_f64();
+            log_loader_summary(&stats);
         }
         Ok(())
     })
 }
 
 fn spawn_loader_task(
-    tasks: &mut JoinSet<Result<LoadedJob, TranscribeItemOutcome>>,
+    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
     loader: AudioLoader,
     load_options: AudioLoadOptions,
     input: TranscribeInput,
 ) {
     tasks.spawn(async move {
+        let start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = input.source.clone();
             move || loader.load(&source, &load_options)
         })
         .await;
 
-        match loaded {
-            Ok(Ok(waveform)) => Ok(LoadedJob {
-                index: input.index,
-                waveform,
-                _queue_memory_permit: None,
-            }),
-            Ok(Err(error)) => Err(TranscribeItemOutcome {
-                index: input.index,
-                result: Err(error),
-                audio_seconds: 0.0,
-                bad_component: Some("loader"),
-            }),
-            Err(error) => Err(TranscribeItemOutcome {
-                index: input.index,
-                result: Err(anyhow::anyhow!("loader join error: {error}")),
-                audio_seconds: 0.0,
-                bad_component: Some("loader"),
-            }),
-        }
+        let compute_seconds = start.elapsed().as_secs_f64();
+        let mut stats = LoaderTaskStats {
+            compute_seconds,
+            ..Default::default()
+        };
+        let message = match loaded {
+            Ok(Ok(waveform)) => {
+                stats.jobs = 1;
+                stats.audio_seconds = waveform.duration_seconds();
+                Ok(LoadedJob {
+                    index: input.index,
+                    request_item: None,
+                    waveform,
+                    _queue_memory_permit: None,
+                })
+            }
+            Ok(Err(error)) => {
+                stats.failed = 1;
+                Err(TranscribeItemOutcome {
+                    index: input.index,
+                    result: Err(error),
+                    audio_seconds: 0.0,
+                    bad_component: Some("loader"),
+                })
+            }
+            Err(error) => {
+                stats.failed = 1;
+                Err(TranscribeItemOutcome {
+                    index: input.index,
+                    result: Err(anyhow::anyhow!("loader join error: {error}")),
+                    audio_seconds: 0.0,
+                    bad_component: Some("loader"),
+                })
+            }
+        };
+        (message, stats)
     });
 }
 
 async fn send_next_loaded(
-    tasks: &mut JoinSet<Result<LoadedJob, TranscribeItemOutcome>>,
+    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
     loaded_queue_memory: &LoadedQueueMemoryBudget,
     loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    stats: &Arc<Mutex<LoaderStageStats>>,
 ) -> Result<()> {
-    let mut message = match tasks.join_next().await {
-        Some(Ok(message)) => message,
-        Some(Err(error)) => Err(TranscribeItemOutcome {
-            index: 0,
-            result: Err(anyhow::anyhow!("loader task join error: {error}")),
-            audio_seconds: 0.0,
-            bad_component: Some("loader"),
-        }),
+    let (mut message, task_stats) = match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => (
+            Err(TranscribeItemOutcome {
+                index: 0,
+                result: Err(anyhow::anyhow!("loader task join error: {error}")),
+                audio_seconds: 0.0,
+                bad_component: Some("loader"),
+            }),
+            LoaderTaskStats {
+                failed: 1,
+                ..Default::default()
+            },
+        ),
         None => return Ok(()),
     };
+    record_loader_task_stats(stats, &task_stats);
     if let Ok(job) = &mut message {
         job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
     }
@@ -694,8 +1217,10 @@ fn spawn_vad_worker(
     mut loader_to_vad_rx: mpsc::UnboundedReceiver<Result<LoadedJob, TranscribeItemOutcome>>,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
+    stats: Arc<Mutex<VadStageStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let wall_start = Instant::now();
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
         while let Some(message) = loader_to_vad_rx.recv().await {
@@ -710,7 +1235,7 @@ fn spawn_vad_worker(
                         job,
                     );
                     if tasks.len() >= max_in_flight {
-                        let _ = send_next_vad_task(&mut tasks).await;
+                        let _ = send_next_vad_task(&mut tasks, &stats).await;
                     }
                 }
                 Err(outcome) => {
@@ -726,13 +1251,17 @@ fn spawn_vad_worker(
             }
         }
         while !tasks.is_empty() {
-            let _ = send_next_vad_task(&mut tasks).await;
+            let _ = send_next_vad_task(&mut tasks, &stats).await;
+        }
+        if let Ok(mut stats) = stats.lock() {
+            stats.wall_seconds = wall_start.elapsed().as_secs_f64();
+            log_vad_summary(&stats);
         }
     })
 }
 
 fn spawn_vad_task(
-    tasks: &mut JoinSet<Result<(), TranscribeItemOutcome>>,
+    tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
     offline: Arc<OfflinePipeline>,
     vad_options: VadOptions,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
@@ -742,6 +1271,7 @@ fn spawn_vad_task(
     tasks.spawn(async move {
         let stage_start = Instant::now();
         let job_index = job.index;
+        let request_item = job.request_item;
         let audio_seconds = job.waveform.duration_seconds();
         let prepared = tokio::task::spawn_blocking({
             let offline = Arc::clone(&offline);
@@ -756,8 +1286,10 @@ fn spawn_vad_task(
         match prepared {
             Ok(Ok(prepared)) => {
                 let (segments, speech_seconds) = vad_preparation_stats(&prepared);
+                let no_speech = matches!(prepared, VadPreparation::NoSpeech);
                 let asr_job = AsrJob {
                     index: job_index,
+                    request_item,
                     prepared,
                     waveform: job.waveform,
                 };
@@ -795,7 +1327,17 @@ fn spawn_vad_task(
                                     send_wait_seconds,
                                     stage_start.elapsed().as_secs_f64(),
                                 );
-                                return Ok(());
+                                return Ok(VadTaskStats {
+                                    jobs: 1,
+                                    failed: 1,
+                                    segments,
+                                    audio_seconds,
+                                    speech_seconds,
+                                    compute_seconds,
+                                    send_wait_seconds,
+                                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                                    ..Default::default()
+                                });
                             }
                         };
                         for segment in segments {
@@ -841,7 +1383,17 @@ fn spawn_vad_task(
                     send_wait_seconds,
                     stage_start.elapsed().as_secs_f64(),
                 );
-                Ok(())
+                Ok(VadTaskStats {
+                    jobs: 1,
+                    no_speech: usize::from(no_speech),
+                    segments,
+                    audio_seconds,
+                    speech_seconds,
+                    compute_seconds,
+                    send_wait_seconds,
+                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    ..Default::default()
+                })
             }
             Ok(Err(error)) => {
                 send_vad_to_asr_timed(
@@ -871,7 +1423,15 @@ fn spawn_vad_task(
                     send_wait_seconds,
                     stage_start.elapsed().as_secs_f64(),
                 );
-                Ok(())
+                Ok(VadTaskStats {
+                    jobs: 1,
+                    failed: 1,
+                    audio_seconds,
+                    compute_seconds,
+                    send_wait_seconds,
+                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    ..Default::default()
+                })
             }
             Err(error) => {
                 send_vad_to_asr_timed(
@@ -901,7 +1461,15 @@ fn spawn_vad_task(
                     send_wait_seconds,
                     stage_start.elapsed().as_secs_f64(),
                 );
-                Ok(())
+                Ok(VadTaskStats {
+                    jobs: 1,
+                    failed: 1,
+                    audio_seconds,
+                    compute_seconds,
+                    send_wait_seconds,
+                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    ..Default::default()
+                })
             }
         }
     });
@@ -926,10 +1494,16 @@ async fn send_vad_to_asr_timed(
 }
 
 async fn send_next_vad_task(
-    tasks: &mut JoinSet<Result<(), TranscribeItemOutcome>>,
+    tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
+    stats: &Arc<Mutex<VadStageStats>>,
 ) -> Result<(), TranscribeItemOutcome> {
     match tasks.join_next().await {
-        Some(Ok(result)) => result,
+        Some(Ok(result)) => {
+            if let Ok(task_stats) = &result {
+                record_vad_task_stats(stats, task_stats);
+            }
+            result.map(|_| ())
+        }
         Some(Err(error)) => Err(TranscribeItemOutcome {
             index: 0,
             result: Err(anyhow::anyhow!("VAD task join error: {error}")),
@@ -958,15 +1532,21 @@ fn spawn_segment_encoder_worker(
     asr_options: AsrOptions,
     mut request_rx: mpsc::Receiver<SegmentEncodeRequest>,
     encoded_tx: mpsc::Sender<SegmentEncodedMessage>,
+    stats: Arc<Mutex<AsrStageStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tracing::info!(
+        tracing::debug!(
             target: "vasr_transcribe::pipeline",
             "asr audio_features queue | capacity={}",
             ASR_ENCODED_FEATURE_QUEUE,
         );
         while let Some(request) = request_rx.recv().await {
+            let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
+            let segment_audio_seconds = segments_for_result
+                .iter()
+                .map(|segment| segment.waveform.duration_seconds())
+                .sum::<f64>();
             let batch = tokio::task::spawn_blocking({
                 let offline = Arc::clone(&offline);
                 let asr_options = asr_options.clone();
@@ -975,6 +1555,12 @@ fn spawn_segment_encoder_worker(
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
+            record_asr_encode_stats(
+                &stats,
+                segments_for_result.len(),
+                segment_audio_seconds,
+                encode_start.elapsed().as_secs_f64(),
+            );
             let message = SegmentEncodedMessage {
                 segments: segments_for_result,
                 stage_start: request.stage_start,
@@ -990,14 +1576,26 @@ fn spawn_segment_encoder_worker(
 fn spawn_segment_decoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
+    #[cfg_attr(feature = "paged-attn", allow(unused_mut))]
     mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
-    asr_to_result_tx: mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: Arc<Mutex<AsrStageStats>>,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))]
+    decode_idle_flush: Option<std::time::Duration>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
         #[cfg(feature = "paged-attn")]
         {
-            while let Some(first) = encoded_rx.recv().await {
+            let encoded_rx = Arc::new(tokio::sync::Mutex::new(encoded_rx));
+            loop {
+                let first = {
+                    let mut encoded_rx = encoded_rx.lock().await;
+                    encoded_rx.recv().await
+                };
+                let Some(first) = first else {
+                    break;
+                };
                 let SegmentEncodedMessage {
                     segments,
                     stage_start,
@@ -1011,9 +1609,10 @@ fn spawn_segment_decoder_worker(
                             &segments,
                             stage_start,
                             Err(error),
+                            Some(&stats),
                         );
                         for outcome in outcomes {
-                            let _ = asr_to_result_tx.send(outcome).await;
+                            let _ = asr_to_result_tx.send(outcome.into()).await;
                         }
                         continue;
                     }
@@ -1022,14 +1621,18 @@ fn spawn_segment_decoder_worker(
                     segments,
                     stage_start,
                     initial,
-                    encoded_rx,
+                    Arc::clone(&encoded_rx),
                     &offline,
                     &asr_options,
                     &mut segment_state,
                     &asr_to_result_tx,
+                    &stats,
+                    decode_idle_flush,
                 )
                 .await;
-                break;
+                if decode_idle_flush.is_none() {
+                    break;
+                }
             }
         }
         #[cfg(not(feature = "paged-attn"))]
@@ -1041,6 +1644,7 @@ fn spawn_segment_decoder_worker(
                 &asr_options,
                 &mut segment_state,
                 &asr_to_result_tx,
+                &stats,
             )
             .await;
         }
@@ -1069,12 +1673,15 @@ async fn handle_dynamic_segment_encoded_message(
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     initial: SegmentEncodedAsrBatch,
-    encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<SegmentEncodedMessage>>>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
-    asr_to_result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
+    decode_idle_flush: Option<std::time::Duration>,
 ) {
+    let decode_start = Instant::now();
     let batch = tokio::task::spawn_blocking({
         let asr = Arc::clone(&offline.asr);
         let asr_options = asr_options.clone();
@@ -1088,6 +1695,7 @@ async fn handle_dynamic_segment_encoded_message(
                 encoded_rx,
                 runtime_handle,
                 &asr_options,
+                decode_idle_flush,
             )
         }
     })
@@ -1102,9 +1710,24 @@ async fn handle_dynamic_segment_encoded_message(
         ),
         Err(error) => (segments, Err(error), Vec::new()),
     };
-    let outcomes = finish_segment_asr_batch(segment_state, &consumed_segments, stage_start, batch);
+    record_asr_decode_stats(
+        stats,
+        consumed_segments.len(),
+        consumed_segments
+            .iter()
+            .map(|segment| segment.waveform.duration_seconds())
+            .sum(),
+        decode_start.elapsed().as_secs_f64(),
+    );
+    let outcomes = finish_segment_asr_batch(
+        segment_state,
+        &consumed_segments,
+        stage_start,
+        batch,
+        Some(stats),
+    );
     for outcome in outcomes {
-        let _ = asr_to_result_tx.send(outcome).await;
+        let _ = asr_to_result_tx.send(outcome.into()).await;
     }
     for failure in encoded_failures {
         let outcomes = finish_segment_asr_batch(
@@ -1112,9 +1735,10 @@ async fn handle_dynamic_segment_encoded_message(
             failure.segments.as_slice(),
             failure.stage_start,
             Err(failure.error),
+            Some(stats),
         );
         for outcome in outcomes {
-            let _ = asr_to_result_tx.send(outcome).await;
+            let _ = asr_to_result_tx.send(outcome.into()).await;
         }
     }
 }
@@ -1125,7 +1749,8 @@ async fn handle_segment_encoded_messages(
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
     encoded_messages: Vec<SegmentEncodedMessage>,
-    asr_to_result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
 ) {
     let mut ok_batches = Vec::new();
     for encoded in encoded_messages {
@@ -1137,9 +1762,10 @@ async fn handle_segment_encoded_messages(
                     &encoded.segments,
                     encoded.stage_start,
                     Err(error),
+                    Some(stats),
                 );
                 for outcome in outcomes {
-                    let _ = asr_to_result_tx.send(outcome).await;
+                    let _ = asr_to_result_tx.send(outcome.into()).await;
                 }
             }
         }
@@ -1167,6 +1793,7 @@ async fn handle_segment_encoded_messages(
         stage_start,
         batch,
         asr_to_result_tx,
+        stats,
     )
     .await;
 }
@@ -1179,8 +1806,10 @@ async fn handle_merged_segment_encoded_batch(
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     batch: Result<SegmentEncodedAsrBatch>,
-    asr_to_result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
 ) {
+    let decode_start = Instant::now();
     let batch = match batch {
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
@@ -1191,9 +1820,19 @@ async fn handle_merged_segment_encoded_batch(
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
         Err(error) => Err(error),
     };
-    let outcomes = finish_segment_asr_batch(segment_state, &segments, stage_start, batch);
+    record_asr_decode_stats(
+        stats,
+        segments.len(),
+        segments
+            .iter()
+            .map(|segment| segment.waveform.duration_seconds())
+            .sum(),
+        decode_start.elapsed().as_secs_f64(),
+    );
+    let outcomes =
+        finish_segment_asr_batch(segment_state, &segments, stage_start, batch, Some(stats));
     for outcome in outcomes {
-        let _ = asr_to_result_tx.send(outcome).await;
+        let _ = asr_to_result_tx.send(outcome.into()).await;
     }
 }
 
@@ -1204,7 +1843,8 @@ async fn handle_ready_segment_encoded_messages(
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
-    asr_to_result_tx: &mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
 ) {
     let mut messages = vec![first];
     while let Ok(message) = encoder_to_decoder_rx.try_recv() {
@@ -1225,6 +1865,7 @@ async fn handle_ready_segment_encoded_messages(
         segment_state,
         messages,
         asr_to_result_tx,
+        stats,
     )
     .await;
 }
@@ -1257,7 +1898,9 @@ fn spawn_asr_worker(
     asr_options: AsrOptions,
     max_batch_audio_sec: f32,
     mut vad_to_asr_rx: mpsc::UnboundedReceiver<VadToAsrMessage>,
-    asr_to_result_tx: mpsc::Sender<TranscribeItemOutcome>,
+    asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: Arc<Mutex<AsrStageStats>>,
+    decode_idle_flush: Option<std::time::Duration>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut fallback_segment_state = SegmentAsrState::default();
@@ -1270,12 +1913,15 @@ fn spawn_asr_worker(
             asr_options.clone(),
             asr_to_encoder_rx,
             encoder_to_decoder_tx,
+            Arc::clone(&stats),
         );
         let segment_decoder_handle = spawn_segment_decoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
             encoder_to_decoder_rx,
             asr_to_result_tx.clone(),
+            Arc::clone(&stats),
+            decode_idle_flush,
         );
 
         while let Some(envelope) = match pending.pop_front() {
@@ -1285,7 +1931,7 @@ fn spawn_asr_worker(
             let message = envelope.message;
             match message {
                 Err(outcome) => {
-                    let _ = asr_to_result_tx.send(outcome).await;
+                    let _ = asr_to_result_tx.send(outcome.into()).await;
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
                     let messages = collect_job_microbatch(
@@ -1299,7 +1945,7 @@ fn spawn_asr_worker(
                     for message in messages {
                         match message {
                             Err(outcome) => {
-                                let _ = asr_to_result_tx.send(outcome).await;
+                                let _ = asr_to_result_tx.send(outcome.into()).await;
                             }
                             Ok(AsrPipelineMessage::Job(job)) => jobs.push(job),
                             Ok(AsrPipelineMessage::Segment(_)) => {
@@ -1315,7 +1961,8 @@ fn spawn_asr_worker(
                     let outcomes = tokio::task::spawn_blocking({
                         let offline = Arc::clone(&offline);
                         let asr_options = asr_options.clone();
-                        move || run_asr_jobs_batch(&offline, jobs, &asr_options)
+                        let stats = Arc::clone(&stats);
+                        move || run_asr_jobs_batch(&offline, jobs, &asr_options, Some(&stats))
                     })
                     .await
                     .unwrap_or_else(|error| {
@@ -1324,7 +1971,8 @@ fn spawn_asr_worker(
                             result: Err(anyhow::anyhow!("ASR join error: {error}")),
                             audio_seconds: 0.0,
                             bad_component: Some("recognizer"),
-                        }]
+                        }
+                        .into()]
                     });
                     for outcome in outcomes {
                         let _ = asr_to_result_tx.send(outcome).await;
@@ -1355,8 +2003,23 @@ fn spawn_asr_worker(
                         let batch = tokio::task::spawn_blocking({
                             let offline = Arc::clone(&offline);
                             let asr_options = asr_options.clone();
+                            let stats = Arc::clone(&stats);
                             let segments = segments.clone();
-                            move || run_segment_asr_inference(&offline, &segments, &asr_options)
+                            move || {
+                                let stage_start = Instant::now();
+                                let result =
+                                    run_segment_asr_inference(&offline, &segments, &asr_options);
+                                if let Ok((inference, _)) = &result {
+                                    record_asr_batch_stats(
+                                        &stats,
+                                        inference.active_job_count,
+                                        segments.len(),
+                                        inference.segment_audio_seconds,
+                                        stage_start.elapsed().as_secs_f64(),
+                                    );
+                                }
+                                result
+                            }
                         })
                         .await
                         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR join error: {error}")));
@@ -1365,9 +2028,10 @@ fn spawn_asr_worker(
                             &segments,
                             stage_start,
                             batch,
+                            None,
                         );
                         for outcome in outcomes {
-                            let _ = asr_to_result_tx.send(outcome).await;
+                            let _ = asr_to_result_tx.send(outcome.into()).await;
                         }
                     }
                 }
@@ -1532,6 +2196,7 @@ fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegment
             .entry(segment.job_index)
             .or_insert_with(|| SegmentJobState {
                 index: segment.job_index,
+                request_item: segment.request_item,
                 audio_seconds: segment.job_audio_seconds,
                 speech_annotations: segment.speech_annotations.clone(),
                 segment_annotations: vec![None; segment.segment_count],
@@ -1568,6 +2233,15 @@ fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
         result: Ok(timeline),
         audio_seconds: job.audio_seconds,
         bad_component: None,
+    }
+}
+
+fn routed_segment_job_outcome(job: SegmentJobState) -> RoutedTranscribeItemOutcome {
+    let request_item = job.request_item;
+    let outcome = finish_segment_job(job);
+    match request_item {
+        Some(request_item) => RoutedTranscribeItemOutcome::for_request(request_item, outcome),
+        None => outcome.into(),
     }
 }
 
@@ -1724,9 +2398,10 @@ fn run_segment_asr_decode_dynamic(
     asr: &dyn crate::runtime::model::AsrModel,
     initial_segments: Vec<AsrSegmentJob>,
     initial: SegmentEncodedAsrBatch,
-    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<SegmentEncodedMessage>>>,
     runtime_handle: tokio::runtime::Handle,
     asr_options: &AsrOptions,
+    decode_idle_flush: Option<std::time::Duration>,
 ) -> Result<DynamicSegmentAsrDecode> {
     let qwen3 = asr
         .as_any()
@@ -1737,20 +2412,46 @@ fn run_segment_asr_decode_dynamic(
     let mut encoded_failures = Vec::new();
     let mut source_closed = false;
     let mut poll_encoded = |may_block: bool| -> Result<EncodedAsrBatchPoll> {
+        if decode_idle_flush.is_some() && !may_block {
+            return Ok(EncodedAsrBatchPoll::Empty);
+        }
         loop {
             if source_closed {
                 return Ok(EncodedAsrBatchPoll::Closed);
             }
             let message = if may_block {
-                match runtime_handle.block_on(encoded_rx.recv()) {
-                    Some(message) => Some(message),
-                    None => {
-                        source_closed = true;
-                        return Ok(EncodedAsrBatchPoll::Closed);
+                if let Some(timeout) = decode_idle_flush {
+                    match runtime_handle.block_on(async {
+                        let mut encoded_rx = encoded_rx.lock().await;
+                        tokio::time::timeout(timeout, encoded_rx.recv()).await
+                    }) {
+                        Ok(Some(message)) => Some(message),
+                        Ok(None) => {
+                            source_closed = true;
+                            return Ok(EncodedAsrBatchPoll::Closed);
+                        }
+                        Err(tokio::time::error::Elapsed { .. }) => {
+                            source_closed = true;
+                            return Ok(EncodedAsrBatchPoll::Closed);
+                        }
+                    }
+                } else {
+                    match runtime_handle.block_on(async {
+                        let mut encoded_rx = encoded_rx.lock().await;
+                        encoded_rx.recv().await
+                    }) {
+                        Some(message) => Some(message),
+                        None => {
+                            source_closed = true;
+                            return Ok(EncodedAsrBatchPoll::Closed);
+                        }
                     }
                 }
             } else {
-                match encoded_rx.try_recv() {
+                match runtime_handle.block_on(async {
+                    let mut encoded_rx = encoded_rx.lock().await;
+                    encoded_rx.try_recv()
+                }) {
                     Ok(message) => Some(message),
                     Err(mpsc::error::TryRecvError::Empty) => None,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1789,6 +2490,10 @@ fn run_segment_asr_decode_dynamic(
     };
     let outputs =
         qwen3.decode_cpu_audio_features_dynamic_outputs(encoded, &mut poll_encoded, asr_options)?;
+    #[cfg(all(feature = "cuda", feature = "paged-attn"))]
+    if decode_idle_flush.is_some() {
+        vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.inner().device());
+    }
     let mut timelines = Vec::with_capacity(waveforms.len());
     let mut waveform_offset = 0usize;
     for outputs in outputs {
@@ -1826,7 +2531,8 @@ fn finish_segment_asr_batch(
     segments: &[AsrSegmentJob],
     stage_start: Instant,
     batch: Result<(SegmentAsrInference, Vec<Timeline>)>,
-) -> Vec<TranscribeItemOutcome> {
+    stats: Option<&Arc<Mutex<AsrStageStats>>>,
+) -> Vec<RoutedTranscribeItemOutcome> {
     if segments.is_empty() {
         return Vec::new();
     }
@@ -1842,6 +2548,15 @@ fn finish_segment_asr_batch(
                 inference.segment_audio_seconds,
                 stage_start.elapsed().as_secs_f64(),
             );
+            if let Some(stats) = stats {
+                record_asr_batch_stats(
+                    stats,
+                    inference.active_job_count,
+                    segments.len(),
+                    inference.segment_audio_seconds,
+                    stage_start.elapsed().as_secs_f64(),
+                );
+            }
             if timelines.len() == inference.targets.len() {
                 for ((job_index, segment_index, offset), asr_timeline) in
                     inference.targets.into_iter().zip(timelines)
@@ -1864,7 +2579,7 @@ fn finish_segment_asr_batch(
                             Some(offset_annotations(asr_timeline.annotations, offset));
                         if job.segments_done >= job.segment_count {
                             if let Some(job) = state.jobs.remove(&job_index) {
-                                completed.push(finish_segment_job(job));
+                                completed.push(routed_segment_job_outcome(job));
                             }
                         }
                     }
@@ -1879,11 +2594,13 @@ fn finish_segment_asr_batch(
                     segments.iter().map(|segment| segment.job_index).collect();
                 for job_index in affected {
                     if let Some(job) = state.jobs.remove(&job_index) {
-                        completed.push(outcome_from_result(
+                        let request_item = job.request_item;
+                        let outcome = outcome_from_result(
                             job.index,
                             job.audio_seconds,
                             Err(anyhow::anyhow!(err.clone())),
-                        ));
+                        );
+                        completed.push(route_outcome(request_item, outcome));
                     }
                 }
             }
@@ -1894,11 +2611,13 @@ fn finish_segment_asr_batch(
                 segments.iter().map(|segment| segment.job_index).collect();
             for job_index in affected {
                 if let Some(job) = state.jobs.remove(&job_index) {
-                    completed.push(outcome_from_result(
+                    let request_item = job.request_item;
+                    let outcome = outcome_from_result(
                         job.index,
                         job.audio_seconds,
                         Err(anyhow::anyhow!(reason.clone())),
-                    ));
+                    );
+                    completed.push(route_outcome(request_item, outcome));
                 }
             }
         }
@@ -1919,14 +2638,18 @@ fn run_segment_microbatch(
 
     let stage_start = Instant::now();
     let batch = run_segment_asr_inference(offline, &segments, asr_options);
-    finish_segment_asr_batch(state, &segments, stage_start, batch)
+    finish_segment_asr_batch(state, &segments, stage_start, batch, None)
+        .into_iter()
+        .map(RoutedTranscribeItemOutcome::into_public_outcome)
+        .collect()
 }
 
 fn run_asr_jobs_batch(
     offline: &OfflinePipeline,
     jobs: Vec<AsrJob>,
     asr_options: &AsrOptions,
-) -> Vec<TranscribeItemOutcome> {
+    stats: Option<&Arc<Mutex<AsrStageStats>>>,
+) -> Vec<RoutedTranscribeItemOutcome> {
     let mut outcomes = Vec::with_capacity(jobs.len());
     let mut raw_jobs: Vec<(AsrJob, Vec<Annotation>)> = Vec::new();
     let mut prepared_jobs = Vec::new();
@@ -1938,18 +2661,24 @@ fn run_asr_jobs_batch(
                 job.prepared = VadPreparation::Speech(prepared);
                 prepared_jobs.push(job);
             }
-            VadPreparation::NoSpeech => outcomes.push(TranscribeItemOutcome {
-                index: job.index,
-                result: Ok(Timeline::new("offline_audio")),
-                audio_seconds: job.waveform.duration_seconds(),
-                bad_component: None,
-            }),
+            VadPreparation::NoSpeech => {
+                let request_item = job.request_item;
+                let outcome = TranscribeItemOutcome {
+                    index: job.index,
+                    result: Ok(Timeline::new("offline_audio")),
+                    audio_seconds: job.waveform.duration_seconds(),
+                    bad_component: None,
+                };
+                outcomes.push(route_outcome(request_item, outcome));
+            }
             VadPreparation::Disabled => raw_jobs.push((job, Vec::new())),
         }
     }
 
     if !raw_jobs.is_empty() {
         let indices: Vec<usize> = raw_jobs.iter().map(|(job, _)| job.index).collect();
+        let request_items: Vec<Option<RequestItemRef>> =
+            raw_jobs.iter().map(|(job, _)| job.request_item).collect();
         let audio_seconds: Vec<f64> = raw_jobs
             .iter()
             .map(|(job, _)| job.waveform.duration_seconds())
@@ -1969,10 +2698,20 @@ fn run_asr_jobs_batch(
             total_audio_seconds,
             stage_start.elapsed().as_secs_f64(),
         );
+        if let Some(stats) = stats {
+            record_asr_batch_stats(
+                stats,
+                indices.len(),
+                waveforms.len(),
+                total_audio_seconds,
+                stage_start.elapsed().as_secs_f64(),
+            );
+        }
         match result {
             Ok(timelines) if timelines.len() == indices.len() => {
-                for (((index, audio_seconds), mut timeline), mut annotations) in indices
+                for ((((index, request_item), audio_seconds), mut timeline), mut annotations) in indices
                     .into_iter()
+                    .zip(request_items)
                     .zip(audio_seconds)
                     .zip(timelines)
                     .zip(speech_annotations)
@@ -1981,12 +2720,12 @@ fn run_asr_jobs_batch(
                         annotations.extend(timeline.annotations);
                         timeline.annotations = annotations;
                     }
-                    outcomes.push(TranscribeItemOutcome {
+                    outcomes.push(route_outcome(request_item, TranscribeItemOutcome {
                         index,
                         result: Ok(timeline),
                         audio_seconds,
                         bad_component: None,
-                    });
+                    }));
                 }
             }
             Ok(timelines) => {
@@ -1995,22 +2734,28 @@ fn run_asr_jobs_batch(
                     timelines.len(),
                     indices.len()
                 );
-                for (index, audio_seconds) in indices.into_iter().zip(audio_seconds) {
-                    outcomes.push(outcome_from_result(
+                for ((index, request_item), audio_seconds) in
+                    indices.into_iter().zip(request_items).zip(audio_seconds)
+                {
+                    let outcome = outcome_from_result(
                         index,
                         audio_seconds,
                         Err(anyhow::anyhow!("{err}")),
-                    ));
+                    );
+                    outcomes.push(route_outcome(request_item, outcome));
                 }
             }
             Err(error) => {
                 let reason = error.to_string();
-                for (index, audio_seconds) in indices.into_iter().zip(audio_seconds) {
-                    outcomes.push(outcome_from_result(
+                for ((index, request_item), audio_seconds) in
+                    indices.into_iter().zip(request_items).zip(audio_seconds)
+                {
+                    let outcome = outcome_from_result(
                         index,
                         audio_seconds,
                         Err(anyhow::anyhow!("{reason}")),
-                    ));
+                    );
+                    outcomes.push(route_outcome(request_item, outcome));
                 }
             }
         }
@@ -2027,18 +2772,18 @@ fn run_asr_jobs_batch(
                     result: Err(error),
                     audio_seconds: 0.0,
                     bad_component: Some("vad"),
-                }),
+                }
+                .into()),
             }
         }
-        outcomes.extend(run_segment_microbatch(
-            offline,
-            segment_jobs,
-            asr_options,
-            &mut segment_state,
-        ));
+        outcomes.extend(
+            run_segment_microbatch(offline, segment_jobs, asr_options, &mut segment_state)
+                .into_iter()
+                .map(Into::into),
+        );
     }
 
-    outcomes.sort_unstable_by_key(|outcome| outcome.index);
+    outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
     outcomes
 }
 
@@ -2090,6 +2835,105 @@ fn log_vad(
         "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | compute={compute_seconds:.2}s | send_wait={send_wait_seconds:.2}s | wall={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
         metrics.rtf
+    );
+}
+
+fn record_loader_task_stats(stats: &Arc<Mutex<LoaderStageStats>>, task: &LoaderTaskStats) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.jobs += task.jobs;
+        stats.failed += task.failed;
+        stats.audio_seconds += task.audio_seconds;
+        stats.compute_seconds += task.compute_seconds;
+    }
+}
+
+fn record_vad_task_stats(stats: &Arc<Mutex<VadStageStats>>, task: &VadTaskStats) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.jobs += task.jobs;
+        stats.failed += task.failed;
+        stats.no_speech += task.no_speech;
+        stats.segments += task.segments;
+        stats.audio_seconds += task.audio_seconds;
+        stats.speech_seconds += task.speech_seconds;
+        stats.compute_seconds += task.compute_seconds;
+        stats.send_wait_seconds += task.send_wait_seconds;
+        stats.wall_seconds += task.wall_seconds;
+    }
+}
+
+fn record_asr_encode_stats(
+    stats: &Arc<Mutex<AsrStageStats>>,
+    segments: usize,
+    audio_seconds: f64,
+    wall_seconds: f64,
+) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.encode_batches += 1;
+        stats.encode_segments += segments;
+        stats.encode_audio_seconds += audio_seconds;
+        stats.encode_seconds += wall_seconds;
+    }
+}
+
+fn record_asr_decode_stats(
+    stats: &Arc<Mutex<AsrStageStats>>,
+    segments: usize,
+    audio_seconds: f64,
+    wall_seconds: f64,
+) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.decode_batches += 1;
+        stats.decode_segments += segments;
+        stats.decode_audio_seconds += audio_seconds;
+        stats.decode_seconds += wall_seconds;
+    }
+}
+
+fn record_asr_batch_stats(
+    stats: &Arc<Mutex<AsrStageStats>>,
+    jobs: usize,
+    segments: usize,
+    audio_seconds: f64,
+    wall_seconds: f64,
+) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.batches += 1;
+        stats.jobs += jobs;
+        stats.segments += segments;
+        stats.audio_seconds += audio_seconds;
+        stats.wall_seconds += wall_seconds;
+    }
+}
+
+fn log_loader_summary(stats: &LoaderStageStats) {
+    let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "loader | jobs={} failed={} audio={:.1}s wall={:.1}s compute={:.1}s speed={:.1}x",
+        stats.jobs,
+        stats.failed,
+        stats.audio_seconds,
+        stats.wall_seconds,
+        stats.compute_seconds,
+        metrics.speedup
+    );
+}
+
+fn log_vad_summary(stats: &VadStageStats) {
+    let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "vad | jobs={} failed={} no_speech={} segments={} speech={:.1}s audio={:.1}s wall={:.1}s compute={:.1}s send_wait={:.1}s speed={:.1}x",
+        stats.jobs,
+        stats.failed,
+        stats.no_speech,
+        stats.segments,
+        stats.speech_seconds,
+        stats.audio_seconds,
+        stats.wall_seconds,
+        stats.compute_seconds,
+        stats.send_wait_seconds,
+        metrics.speedup
     );
 }
 
@@ -2307,7 +3151,7 @@ mod tests {
             },
         ];
 
-        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default());
+        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default(), None);
 
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
@@ -2364,6 +3208,7 @@ mod tests {
                 },
                 vec![ok_timeline],
             )),
+            None,
         );
         assert!(ok.is_empty());
 
@@ -2372,6 +3217,7 @@ mod tests {
             &segments[1..],
             Instant::now(),
             Err(anyhow::anyhow!("encoded feature failed")),
+            None,
         );
 
         assert_eq!(failed.len(), 1);
@@ -2404,6 +3250,7 @@ mod tests {
             segments.as_slice(),
             Instant::now(),
             Err(anyhow::anyhow!("first encoded batch failed")),
+            None,
         );
 
         assert_eq!(failed.len(), 1);
@@ -2432,7 +3279,7 @@ mod tests {
             waveform: Waveform::new(vec![0.1; 160], 16_000),
         }];
 
-        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default());
+        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default(), None);
 
         assert_eq!(outcomes.len(), 1);
         assert!(
@@ -2459,12 +3306,14 @@ mod tests {
         });
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
+        let stats = Arc::new(Mutex::new(AsrStageStats::default()));
         let handle = spawn_asr_worker(
             pipeline,
             AsrOptions::default(),
             60.0,
             vad_to_asr_rx,
             asr_to_result_tx,
+            stats,
         );
 
         for index in 0..3usize {
@@ -2504,12 +3353,14 @@ mod tests {
         });
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
+        let stats = Arc::new(Mutex::new(AsrStageStats::default()));
         let handle = spawn_asr_worker(
             pipeline,
             AsrOptions::default(),
             60.0,
             vad_to_asr_rx,
             asr_to_result_tx,
+            stats,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
@@ -2560,12 +3411,14 @@ mod tests {
         });
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
+        let stats = Arc::new(Mutex::new(AsrStageStats::default()));
         let handle = spawn_asr_worker(
             pipeline,
             AsrOptions::default(),
             60.0,
             vad_to_asr_rx,
             asr_to_result_tx,
+            stats,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(

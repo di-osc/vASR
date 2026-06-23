@@ -130,7 +130,7 @@ Interpretation:
 
 Files:
 
-- `vasr_models/src/model/cuda_graph.rs`
+- `vasr/src/model/cuda_graph.rs`
 
 Change:
 
@@ -163,8 +163,8 @@ Verification:
 
 ```bash
 source ./setup.sh
-cargo test -p vasr-models cuda_graph::tests --features cuda
-cargo check -p vasr-models --features cuda
+cargo test -p vasr cuda_graph::tests --features cuda
+cargo check -p vasr --features cuda
 cargo fmt --check
 ```
 
@@ -172,9 +172,9 @@ cargo fmt --check
 
 Files:
 
-- `vasr_models/src/processor/feature_extractor.rs`
-- `vasr_models/src/processor/asr_processor.rs`
-- `vasr_models/src/inference/transcribe.rs`
+- `vasr/src/processor/feature_extractor.rs`
+- `vasr/src/processor/asr_processor.rs`
+- `vasr/src/inference/transcribe.rs`
 - `vasr_runtime/src/models/qwen3_asr.rs`
 
 Change:
@@ -245,10 +245,10 @@ Verification:
 
 ```bash
 source ./setup.sh
-cargo test -p vasr-models feature_extractor::tests --features cuda,timing
-cargo test -p vasr-models asr_processor::tests --features cuda,timing
-cargo test -p vasr-models generation::tests --features cuda,timing
-cargo test -p vasr-models cuda_graph::tests --features cuda,timing
+cargo test -p vasr feature_extractor::tests --features cuda,timing
+cargo test -p vasr asr_processor::tests --features cuda,timing
+cargo test -p vasr generation::tests --features cuda,timing
+cargo test -p vasr cuda_graph::tests --features cuda,timing
 cargo check -p vasr-runtime --features cuda,timing
 cargo build --release -p vasr-cli --bin vasr --features cuda,timing
 python3 scripts/bench_transcribe_http.py \
@@ -267,8 +267,8 @@ starting `vasr serve transcribe`.
 
 Files:
 
-- `vasr_models/src/model/generation.rs`
-- `vasr_models/src/inference/transcribe.rs`
+- `vasr/src/model/generation.rs`
+- `vasr/src/inference/transcribe.rs`
 - `vasr_runtime/src/models/qwen3_asr.rs`
 
 Change:
@@ -642,7 +642,7 @@ Interpretation:
 Change:
 
 - Added Cargo feature passthroughs:
-  - `vasr-runtime/flash-attn = ["cuda", "vasr-models/flash-attn"]`
+  - `vasr-runtime/flash-attn = ["cuda", "vasr/flash-attn"]`
   - `vasr-cli/flash-attn = ["cuda", "vasr-runtime/flash-attn"]`
 - This aligns the existing `vasr serve --flash-attn` runtime flag with an
   actually buildable CLI feature.

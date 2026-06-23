@@ -11,14 +11,19 @@ use axum::{Json, Router, routing::get};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use candle_core::Device;
 use clap::Args;
-use vasr_models::asr::qwen3asr::LoadOptions;
-use vasr_models::asr::qwen3asr::model::isq_linear::resolve_isq_display;
+use vasr::models::qwen3asr::LoadOptions;
+use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use vasr_models::asr::qwen3asr::model::paged_cache_runtime::{
+use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
 
 use crate::server::{RealtimeService, RealtimeSession};
+
+#[cfg(feature = "cuda-graph")]
+const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
+#[cfg(not(feature = "cuda-graph"))]
+const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = 512;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -38,13 +43,21 @@ pub struct CommonModelArgs {
     #[arg(long, default_value_t = 512, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
-    /// Target GPU memory utilization for model weights plus PagedAttention KV cache (CUDA).
+    /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
     #[arg(
         long = "gpu-memory-utilization",
         default_value_t = 0.65,
         env = "VASR_GPU_MEMORY_UTILIZATION"
     )]
     pub gpu_memory_utilization: f32,
+
+    /// Maximum CUDA decode graph batch width. Use 0 to disable CUDA graph prewarm/replay.
+    #[arg(
+        long = "cuda-graph-max-seqs",
+        default_value_t = DEFAULT_CUDA_GRAPH_MAX_SEQS,
+        env = "VASR_CUDA_GRAPH_MAX_SEQS"
+    )]
+    pub cuda_graph_max_seqs: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -111,7 +124,7 @@ fn vad_options_from_args(vad: &VadCliArgs) -> VadOptions {
 pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
     validate_model_args(&args.model)?;
     validate_vad_args(&args.vad)?;
-    let asr = load_asr_model(&args.model, Some(1))?;
+    let asr = load_asr_model(&args.model, cuda_graph_max_batch(&args.model))?;
 
     let realtime_asr = Arc::clone(&asr);
     let max_new_tokens = args.model.max_new_tokens;
@@ -151,7 +164,37 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
     }
+    if args.cuda_graph_max_seqs > DEFAULT_CUDA_GRAPH_MAX_SEQS {
+        bail!(
+            "--cuda-graph-max-seqs must be <= {} (use 0 to disable)",
+            DEFAULT_CUDA_GRAPH_MAX_SEQS
+        );
+    }
     Ok(())
+}
+
+#[cfg(feature = "cuda-graph")]
+fn cuda_graph_max_batch(args: &CommonModelArgs) -> Option<usize> {
+    if std::env::var_os("VASR_DISABLE_CUDA_GRAPH").is_some() {
+        tracing::info!(
+            target: "vasr_realtime::serve",
+            "CUDA decode graph disabled by VASR_DISABLE_CUDA_GRAPH."
+        );
+        return None;
+    }
+    if args.cuda_graph_max_seqs == 0 {
+        tracing::info!(
+            target: "vasr_realtime::serve",
+            "CUDA decode graph disabled by --cuda-graph-max-seqs=0."
+        );
+        return None;
+    }
+    Some(args.cuda_graph_max_seqs)
+}
+
+#[cfg(not(feature = "cuda-graph"))]
+fn cuda_graph_max_batch(_args: &CommonModelArgs) -> Option<usize> {
+    None
 }
 
 #[cfg(any(feature = "metal", feature = "cuda"))]
@@ -160,7 +203,10 @@ fn build_paged_cache_config(
     gpu_memory_utilization: f32,
 ) -> Result<PagedCacheConfig> {
     let memory = if device.is_cuda() {
-        PagedCacheMemory::GpuMemoryFraction(gpu_memory_utilization)
+        PagedCacheMemory::GpuMemoryFraction {
+            fraction: gpu_memory_utilization,
+            reserved_bytes: 0,
+        }
     } else {
         PagedCacheMemory::ContextSize(4096)
     };
@@ -175,19 +221,25 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
     let sizing = match config.memory {
         PagedCacheMemory::ContextSize(tokens) => format!("context_tokens={tokens}"),
         PagedCacheMemory::Blocks(blocks) => format!("blocks={blocks}"),
-        PagedCacheMemory::GpuMemoryFraction(fraction) => {
-            format!("gpu_memory_utilization={fraction}")
-        }
+        PagedCacheMemory::GpuMemoryFraction {
+            fraction,
+            reserved_bytes: _,
+        } => format!("gpu_memory_utilization={fraction}"),
     };
     tracing::info!(
         target: "vasr_realtime::serve",
-        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, bytes={:.2} MiB.",
+        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, memory={:.2}GiB.",
         stats.block_size,
         stats.num_blocks,
         stats.free_blocks,
         stats.max_context_tokens,
-        stats.bytes as f64 / (1024.0 * 1024.0)
+        bytes_to_gib(stats.bytes)
     );
+}
+
+#[cfg(any(feature = "metal", feature = "cuda"))]
+fn bytes_to_gib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
@@ -276,8 +328,9 @@ fn load_asr_model(
             let used_after = after.used();
             tracing::info!(
                 target: "vasr_realtime::serve",
-                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB.",
+                "CUDA decode graph prewarm: graphs={} max_batch={} requested_max_batch={max_batch} elapsed={:.3}s mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB.",
                 stats.graphs,
+                stats.max_batch,
                 prewarm_start.elapsed().as_secs_f64(),
                 bytes_to_mib(used_after.saturating_sub(used_before)),
                 bytes_to_mib(used_before),
@@ -288,8 +341,9 @@ fn load_asr_model(
         } else {
             tracing::info!(
                 target: "vasr_realtime::serve",
-                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s.",
+                "CUDA decode graph prewarm: graphs={} max_batch={} requested_max_batch={max_batch} elapsed={:.3}s.",
                 stats.graphs,
+                stats.max_batch,
                 prewarm_start.elapsed().as_secs_f64()
             );
         }

@@ -4897,25 +4897,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vasr-data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "reqwest 0.13.4",
- "rmp-serde",
- "rubato",
- "serde",
- "serde_bytes",
- "serde_json",
- "symphonia",
- "thiserror 2.0.18",
- "unicode-general-category",
- "uuid",
-]
-
-[[package]]
-name = "vasr-models"
+name = "vasr"
 version = "0.1.0"
 dependencies = [
  "accelerate-src",
@@ -4949,8 +4931,58 @@ dependencies = [
  "unicode-general-category",
  "unicode-normalization",
  "vasr-data",
+ "vasr-hub",
  "vasr-paged-attn",
  "vasr-quant",
+ "vasr-vad",
+]
+
+[[package]]
+name = "vasr-aligner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "lindera",
+ "lindera-ipadic",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "unicode-normalization",
+ "vasr",
+ "vasr-data",
+]
+
+[[package]]
+name = "vasr-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest 0.13.4",
+ "rmp-serde",
+ "rubato",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "symphonia",
+ "thiserror 2.0.18",
+ "unicode-general-category",
+ "uuid",
+]
+
+[[package]]
+name = "vasr-hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "indicatif 0.18.4",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4999,8 +5031,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vasr",
  "vasr-data",
- "vasr-models",
+ "vasr-vad",
 ]
 
 [[package]]
@@ -5018,8 +5051,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vasr",
  "vasr-data",
- "vasr-models",
+ "vasr-vad",
+]
+
+[[package]]
+name = "vasr-vad"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "kaldi-fbank-rust-kautism",
+ "ndarray",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "vasr-data",
+ "vasr-hub",
 ]
 
 [[package]]

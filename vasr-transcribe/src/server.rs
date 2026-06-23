@@ -4,12 +4,12 @@ use std::time::Instant;
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
 
-use crate::pipeline::{AsyncTranscribePipeline, TranscribeInput};
+use crate::pipeline::{GlobalAsyncTranscribePipeline, TranscribeInput};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
 use crate::runtime::{AsrOptions, VadOptions};
 
 pub struct TranscribeService {
-    pub pipeline: Arc<AsyncTranscribePipeline>,
+    pub pipeline: Arc<GlobalAsyncTranscribePipeline>,
 }
 
 pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
@@ -48,7 +48,7 @@ async fn handle_transcribe(
         inputs.push(TranscribeInput { index, source });
     }
 
-    let outcomes = service.pipeline.transcribe_many(inputs).await;
+    let outcomes = service.pipeline.run(inputs).await;
     let mut data = validation_errors;
     let mut total_audio_duration_seconds = 0.0;
 
@@ -105,7 +105,9 @@ fn error_data(component: &str, reason: String) -> InferenceData {
     }
 }
 
-pub fn build_transcribe_service(pipeline: Arc<AsyncTranscribePipeline>) -> Arc<TranscribeService> {
+pub fn build_transcribe_service(
+    pipeline: Arc<GlobalAsyncTranscribePipeline>,
+) -> Arc<TranscribeService> {
     Arc::new(TranscribeService { pipeline })
 }
 
@@ -115,7 +117,11 @@ pub fn build_transcribe_service_from_parts(
     vad_options: VadOptions,
 ) -> Arc<TranscribeService> {
     build_transcribe_service(Arc::new(
-        AsyncTranscribePipeline::new(vasr_data::AudioLoader, offline, asr_options)
-            .with_vad_options(vad_options),
+        GlobalAsyncTranscribePipeline::start(
+            vasr_data::AudioLoader,
+            offline,
+            asr_options,
+            vad_options,
+        ),
     ))
 }

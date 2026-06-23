@@ -21,18 +21,19 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
 vasr-data = { path = "../vasr-data", features = ["audio-loading"] }
-vasr-models = { path = "../vasr-models" }
+vasr = { path = "../vasr" }
+vasr-vad = { path = "../vasr-vad" }
 uuid = "1"
 
 [features]
 default = []
-accelerate = ["vasr-models/accelerate"]
-cuda = ["cuda-vad", "vasr-models/cuda", "vasr-models/cuda-graph", "vasr-models/flash-attn", "vasr-models/cuda-quant", "timing", "paged-attn", "cuda-graph"]
+accelerate = ["vasr/accelerate"]
+cuda = ["cuda-vad", "vasr/cuda", "vasr/cuda-graph", "vasr/flash-attn", "vasr/cuda-quant", "timing", "paged-attn", "cuda-graph"]
 cuda-graph = []
-cuda-vad = ["vasr-models/cuda-vad"]
-metal = ["vasr-models/metal-paged-attn", "timing", "paged-attn"]
-paged-attn = ["vasr-models/paged-attn"]
-timing = ["vasr-models/timing"]
+cuda-vad = ["vasr-vad/cuda"]
+metal = ["vasr/metal-paged-attn", "timing", "paged-attn"]
+paged-attn = ["vasr/paged-attn"]
+timing = ["vasr/timing"]
 
 [lints]
 workspace = true

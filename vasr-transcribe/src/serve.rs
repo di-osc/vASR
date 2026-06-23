@@ -8,19 +8,23 @@ use crate::runtime::{
 };
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
-#[cfg(any(feature = "metal", feature = "cuda"))]
 use candle_core::Device;
 use clap::Args;
-use vasr_data::AudioLoader;
-use vasr_models::asr::qwen3asr::LoadOptions;
-use vasr_models::asr::qwen3asr::model::isq_linear::resolve_isq_display;
+use vasr::models::qwen3asr::LoadOptions;
+use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use vasr_models::asr::qwen3asr::model::paged_cache_runtime::{
+use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
+use vasr_data::AudioLoader;
 
 use crate::pipeline::AsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
+
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
+#[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
+const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = 512;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -40,13 +44,21 @@ pub struct CommonModelArgs {
     #[arg(long, default_value_t = 128, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
-    /// Target fraction of total GPU memory usable by the process. PagedAttention KV cache uses the remaining budget after loaded model memory and an internal margin.
+    /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
     #[arg(
         long = "gpu-memory-utilization",
         default_value_t = 0.65,
         env = "VASR_GPU_MEMORY_UTILIZATION"
     )]
     pub gpu_memory_utilization: f32,
+
+    /// Maximum CUDA decode graph batch width. Use 0 to disable CUDA graph prewarm/replay.
+    #[arg(
+        long = "cuda-graph-max-seqs",
+        default_value_t = DEFAULT_CUDA_GRAPH_MAX_SEQS,
+        env = "VASR_CUDA_GRAPH_MAX_SEQS"
+    )]
+    pub cuda_graph_max_seqs: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -108,7 +120,7 @@ pub type TranscribeArgs = ServeTranscribeArgs;
 
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_transcribe=debug,vasr_models=debug"
+        "warn,vasr_transcribe=debug,vasr=debug"
     } else {
         "warn,vasr_transcribe=info"
     };
@@ -124,7 +136,11 @@ pub fn init_logging(verbose: bool) {
 
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
-    let asr = load_asr_model(&args.pipeline.model, default_cuda_graph_max_batch(), true)?;
+    let asr = load_asr_model(
+        &args.pipeline.model,
+        cuda_graph_max_batch(&args.pipeline.model),
+        false,
+    )?;
     let offline = build_offline_pipeline(&args.pipeline, asr)?;
     let transcribe_service = build_transcribe_service_from_parts(
         offline,
@@ -144,7 +160,11 @@ pub fn build_async_transcribe_pipeline(
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
     validate_pipeline(pipeline)?;
-    let asr = load_asr_model(&pipeline.model, default_cuda_graph_max_batch(), false)?;
+    let asr = load_asr_model(
+        &pipeline.model,
+        cuda_graph_max_batch(&pipeline.model),
+        false,
+    )?;
     let offline = build_offline_pipeline(pipeline, asr)?;
     Ok(AsyncTranscribePipeline::new(
         AudioLoader,
@@ -203,6 +223,7 @@ mod tests {
                 isq: None,
                 max_new_tokens: 128,
                 gpu_memory_utilization: 0.65,
+                cuda_graph_max_seqs: DEFAULT_CUDA_GRAPH_MAX_SEQS,
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
@@ -243,6 +264,12 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
     }
+    if args.cuda_graph_max_seqs > DEFAULT_CUDA_GRAPH_MAX_SEQS {
+        bail!(
+            "--cuda-graph-max-seqs must be <= {} (use 0 to disable)",
+            DEFAULT_CUDA_GRAPH_MAX_SEQS
+        );
+    }
     Ok(())
 }
 
@@ -252,7 +279,10 @@ fn build_paged_cache_config(
     gpu_memory_utilization: f32,
 ) -> Result<PagedCacheConfig> {
     let memory = if device.is_cuda() {
-        PagedCacheMemory::GpuMemoryFraction(gpu_memory_utilization)
+        PagedCacheMemory::GpuMemoryFraction {
+            fraction: gpu_memory_utilization,
+            reserved_bytes: 0,
+        }
     } else {
         PagedCacheMemory::ContextSize(4096)
     };
@@ -267,24 +297,94 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
     let sizing = match config.memory {
         PagedCacheMemory::ContextSize(tokens) => format!("context_tokens={tokens}"),
         PagedCacheMemory::Blocks(blocks) => format!("blocks={blocks}"),
-        PagedCacheMemory::GpuMemoryFraction(fraction) => {
-            format!("gpu_memory_utilization={fraction}")
-        }
+        PagedCacheMemory::GpuMemoryFraction {
+            fraction,
+            reserved_bytes: _,
+        } => format!("gpu_memory_utilization={fraction}"),
     };
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::serve",
-        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, bytes={:.2} MiB.",
+        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, memory={:.2}GiB.",
         stats.block_size,
         stats.num_blocks,
         stats.free_blocks,
         stats.max_context_tokens,
-        stats.bytes as f64 / (1024.0 * 1024.0)
+        bytes_to_gib(stats.bytes)
     );
 }
 
-#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-fn bytes_to_mib(bytes: usize) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0)
+fn bytes_to_gib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn log_model_loaded(
+    elapsed_seconds: f64,
+    params_bytes: Option<usize>,
+    kv_cache_bytes: Option<usize>,
+    kv_cache_tokens: Option<usize>,
+    cuda_graph_bytes: Option<usize>,
+    cuda_graph_seqs: Option<usize>,
+    cuda_graph_context_tokens: Option<usize>,
+    #[allow(unused_variables)] device: &Device,
+) {
+    let params = params_bytes
+        .map(|bytes| format!("{:.2}GiB", bytes_to_gib(bytes)))
+        .unwrap_or_else(|| "unknown".to_string());
+    let kv_cache = kv_cache_bytes
+        .map(|bytes| {
+            format!(
+                "{:.2}GiB/{}tok",
+                bytes_to_gib(bytes),
+                kv_cache_tokens.unwrap_or(0)
+            )
+        })
+        .unwrap_or_else(|| "0.00GiB/0tok".to_string());
+    let cuda_graph = cuda_graph_bytes
+        .map(|bytes| {
+            format!(
+                "{:.2}GiB/{}seqs/{}tok",
+                bytes_to_gib(bytes),
+                cuda_graph_seqs.unwrap_or(0),
+                cuda_graph_context_tokens.unwrap_or(0)
+            )
+        })
+        .unwrap_or_else(|| "0.00GiB/0seqs/0tok".to_string());
+    let fixed_bytes = params_bytes
+        .unwrap_or(0)
+        .saturating_add(kv_cache_bytes.unwrap_or(0))
+        .saturating_add(cuda_graph_bytes.unwrap_or(0));
+
+    #[cfg(all(feature = "cuda", feature = "paged-attn"))]
+    if device.is_cuda() {
+        if let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device) {
+            let fixed_pct = percentage(fixed_bytes, memory.total);
+            let gpu_used = memory.used();
+            let gpu_used_pct = percentage(gpu_used, memory.total);
+            tracing::info!(
+                target: "vasr_transcribe::serve",
+                "Model loaded in {elapsed_seconds:.3}s | params={params} kv_cache={kv_cache} cuda_graph={cuda_graph} fixed={:.2}GiB/{fixed_pct:.1}% gpu_used={:.2}GiB/{gpu_used_pct:.1}% free={:.2}GiB total={:.2}GiB.",
+                bytes_to_gib(fixed_bytes),
+                bytes_to_gib(gpu_used),
+                bytes_to_gib(memory.free),
+                bytes_to_gib(memory.total),
+            );
+            return;
+        }
+    }
+
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "Model loaded in {elapsed_seconds:.3}s | params={params} kv_cache={kv_cache} cuda_graph={cuda_graph} fixed={:.2}GiB.",
+        bytes_to_gib(fixed_bytes)
+    );
+}
+
+#[cfg(all(feature = "cuda", feature = "paged-attn"))]
+fn percentage(bytes: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    bytes as f64 * 100.0 / total as f64
 }
 
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
@@ -304,7 +404,7 @@ fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
 }
 
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-fn default_cuda_graph_max_batch() -> Option<usize> {
+fn cuda_graph_max_batch(args: &CommonModelArgs) -> Option<usize> {
     if std::env::var_os("VASR_DISABLE_CUDA_GRAPH").is_some() {
         tracing::info!(
             target: "vasr_transcribe::serve",
@@ -312,11 +412,18 @@ fn default_cuda_graph_max_batch() -> Option<usize> {
         );
         return None;
     }
-    Some(vasr_models::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH)
+    if args.cuda_graph_max_seqs == 0 {
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "CUDA decode graph disabled by --cuda-graph-max-seqs=0."
+        );
+        return None;
+    }
+    Some(args.cuda_graph_max_seqs)
 }
 
 #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
-fn default_cuda_graph_max_batch() -> Option<usize> {
+fn cuda_graph_max_batch(_args: &CommonModelArgs) -> Option<usize> {
     None
 }
 
@@ -339,9 +446,9 @@ fn load_asr_model(
         }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
         {
-            vasr_models::PagedCacheConfig {
+            vasr::PagedCacheConfig {
                 block_size: 32,
-                memory: vasr_models::PagedCacheMemory::ContextSize(100_000),
+                memory: vasr::PagedCacheMemory::ContextSize(100_000),
             }
         }
     };
@@ -389,42 +496,99 @@ fn load_asr_model(
     );
     let model_load_start = Instant::now();
     let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
+    let params_bytes = match qwen3_asr.inner().weights_memory_stats(dtype) {
+        Ok(stats) => Some(stats.parameter_bytes),
+        Err(err) => {
+            tracing::debug!(
+                target: "vasr_transcribe::serve",
+                "model parameter memory stats unavailable: {err}"
+            );
+            None
+        }
+    };
     log_model_config(&qwen3_asr);
+    #[cfg(feature = "paged-attn")]
+    let paged_cache_stats = qwen3_asr.inner().paged_cache_stats();
+    #[cfg(feature = "paged-attn")]
+    let kv_cache_bytes = paged_cache_stats.as_ref().map(|stats| stats.bytes);
+    #[cfg(feature = "paged-attn")]
+    let kv_cache_tokens = paged_cache_stats
+        .as_ref()
+        .map(|stats| stats.max_context_tokens);
+    #[cfg(not(feature = "paged-attn"))]
+    let kv_cache_bytes = None;
+    #[cfg(not(feature = "paged-attn"))]
+    let kv_cache_tokens = None;
     #[cfg(any(feature = "metal", feature = "cuda"))]
-    if let Some(stats) = qwen3_asr.inner().paged_cache_stats() {
-        log_paged_cache_stats(&stats, &paged_cache_config);
+    if let Some(stats) = paged_cache_stats.as_ref() {
+        log_paged_cache_stats(stats, &paged_cache_config);
     }
+    #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+    let mut cuda_graph_bytes = None;
+    #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+    let mut cuda_graph_seqs = None;
+    #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+    let mut cuda_graph_context_tokens = None;
+    #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
+    let cuda_graph_bytes = None;
+    #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
+    let cuda_graph_seqs = None;
+    #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
+    let cuda_graph_context_tokens = None;
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     if let Some(max_batch) = cuda_graph_max_batch.filter(|&n| n > 0) {
         let prewarm_start = Instant::now();
         let stats = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
-        if let (Some(before), Some(after)) = (stats.memory_before, stats.memory_after) {
-            let used_before = before.used();
-            let used_after = after.used();
-            tracing::info!(
-                target: "vasr_transcribe::serve",
-                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB.",
-                stats.graphs,
-                prewarm_start.elapsed().as_secs_f64(),
-                bytes_to_mib(used_after.saturating_sub(used_before)),
-                bytes_to_mib(used_before),
-                bytes_to_mib(used_after),
-                bytes_to_mib(after.free),
-                bytes_to_mib(after.total),
-            );
+        if stats.graphs > 0 {
+            cuda_graph_seqs = Some(stats.max_batch);
+            cuda_graph_context_tokens = Some(stats.context_tokens);
+        }
+        if stats.graphs > 0 {
+            if let (Some(before), Some(after)) = (stats.memory_before, stats.memory_after) {
+                let used_before = before.used();
+                let used_after = after.used();
+                let mem_delta = used_after.saturating_sub(used_before);
+                cuda_graph_bytes = Some(mem_delta);
+                tracing::debug!(
+                    target: "vasr_transcribe::serve",
+                    "CUDA decode graph prewarm: graphs={} max_batch={} context_tokens={} requested_max_batch={max_batch} elapsed={:.3}s mem_delta={:.2}GiB used_before={:.2}GiB used_after={:.2}GiB free_after={:.2}GiB total={:.2}GiB.",
+                    stats.graphs,
+                    stats.max_batch,
+                    stats.context_tokens,
+                    prewarm_start.elapsed().as_secs_f64(),
+                    bytes_to_gib(mem_delta),
+                    bytes_to_gib(used_before),
+                    bytes_to_gib(used_after),
+                    bytes_to_gib(after.free),
+                    bytes_to_gib(after.total),
+                );
+            } else {
+                tracing::debug!(
+                    target: "vasr_transcribe::serve",
+                    "CUDA decode graph prewarm: graphs={} max_batch={} context_tokens={} requested_max_batch={max_batch} elapsed={:.3}s.",
+                    stats.graphs,
+                    stats.max_batch,
+                    stats.context_tokens,
+                    prewarm_start.elapsed().as_secs_f64()
+                );
+            }
         } else {
-            tracing::info!(
+            tracing::debug!(
                 target: "vasr_transcribe::serve",
-                "CUDA decode graph prewarm: graphs={} max_batch={max_batch} elapsed={:.3}s.",
-                stats.graphs,
+                "CUDA decode graph prewarm disabled after failed capture; requested_max_batch={max_batch} elapsed={:.3}s.",
                 prewarm_start.elapsed().as_secs_f64()
             );
         }
     }
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "Model loaded in {:.3}s.",
-        model_load_start.elapsed().as_secs_f64()
+    log_model_loaded(
+        model_load_start.elapsed().as_secs_f64(),
+        params_bytes,
+        kv_cache_bytes,
+        kv_cache_tokens,
+        cuda_graph_bytes,
+        cuda_graph_seqs,
+        cuda_graph_context_tokens,
+        &device,
     );
     let base_asr: Arc<dyn AsrModel> = Arc::new(qwen3_asr);
     if scheduled {

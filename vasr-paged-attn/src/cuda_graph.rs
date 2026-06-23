@@ -13,12 +13,12 @@ use std::ptr;
 use std::sync::Arc;
 use vasr_quant::isq_linear::set_linear_is_prefill;
 
-/// Context-length bucket for stable CUDA graph keys (matches mistral.rs).
+/// Context-length bucket for dynamic CUDA graph block-table padding.
 pub const CUDA_GRAPH_CONTEXT_BUCKET_TOKENS: usize = 256;
 /// Maximum decode batch width for vLLM-style padded CUDA graph capture/replay.
-pub const CUDA_DECODE_GRAPH_MAX_BATCH: usize = 256;
-/// Fixed block-table width for CUDA graph decode replay.
-pub const CUDA_DECODE_GRAPH_BLOCK_TABLE_COLS: usize = 16;
+pub const CUDA_DECODE_GRAPH_MAX_BATCH: usize = 512;
+/// Default context length covered by prewarmed CUDA decode graphs.
+pub const CUDA_DECODE_GRAPH_CONTEXT_TOKENS: usize = 4096;
 /// Maximum cached decode graphs.
 pub const CUDA_DECODE_GRAPH_MAX_GRAPHS: usize = 256;
 
@@ -45,6 +45,45 @@ pub fn cuda_memory_snapshot(device: &Device) -> Option<CudaMemorySnapshot> {
     }
 }
 
+pub fn cuda_trim_device_mem_pools(device: &Device) {
+    let Some(cuda) = device.as_cuda_device().ok() else {
+        return;
+    };
+    let _ = device.synchronize();
+    let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return;
+    };
+    let Ok(dev) = candle_core::cuda_backend::cudarc::driver::result::device::get(gpu_id as i32)
+    else {
+        return;
+    };
+    unsafe {
+        if let Ok(pool) =
+            candle_core::cuda_backend::cudarc::driver::result::device::get_mem_pool(dev)
+        {
+            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(pool, 0);
+        }
+        if let Ok(pool) =
+            candle_core::cuda_backend::cudarc::driver::result::device::get_default_mem_pool(dev)
+        {
+            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(pool, 0);
+        }
+    }
+    if let Ok((free, total)) = cuda.cuda_stream().context().mem_get_info() {
+        tracing::debug!(
+            target: "vasr_transcribe::serve",
+            "CUDA mempools trimmed | used={:.2}GiB free={:.2}GiB total={:.2}GiB",
+            (total.saturating_sub(free)) as f64 / (1024.0 * 1024.0 * 1024.0),
+            free as f64 / (1024.0 * 1024.0 * 1024.0),
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
+}
+
+pub fn cuda_trim_default_mem_pool(device: &Device) {
+    cuda_trim_device_mem_pools(device);
+}
+
 pub fn bytes_to_mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -52,6 +91,8 @@ pub fn bytes_to_mib(bytes: usize) -> f64 {
 #[derive(Debug, Clone, Copy)]
 pub struct CudaGraphPrewarmStats {
     pub graphs: usize,
+    pub max_batch: usize,
+    pub context_tokens: usize,
     pub memory_before: Option<CudaMemorySnapshot>,
     pub memory_after: Option<CudaMemorySnapshot>,
 }
@@ -60,6 +101,8 @@ impl CudaGraphPrewarmStats {
     pub fn empty() -> Self {
         Self {
             graphs: 0,
+            max_batch: 0,
+            context_tokens: 0,
             memory_before: None,
             memory_after: None,
         }
@@ -110,6 +153,10 @@ pub fn cuda_graph_batch_buckets(max_batch: usize) -> Vec<usize> {
 /// Blocks per 256-token CUDA graph bucket.
 pub fn cuda_graph_block_bucket(block_size: usize) -> usize {
     CUDA_GRAPH_CONTEXT_BUCKET_TOKENS.div_ceil(block_size).max(1)
+}
+
+pub fn cuda_graph_default_block_table_cols(block_size: usize) -> usize {
+    CUDA_DECODE_GRAPH_CONTEXT_TOKENS.div_ceil(block_size).max(1)
 }
 
 /// Pad block-table width to kernel-friendly power-of-two buckets.
@@ -185,12 +232,23 @@ impl DecodeCudaGraph {
             bail!("CUDA graph prewarm requires non-zero batch and block table width");
         }
         let max_context_len = block_table_cols.saturating_mul(paged_cache.block_size());
+        let shared_prefix_blocks = block_table_cols.saturating_sub(1);
+        let needed_blocks = shared_prefix_blocks
+            .checked_add(batch)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| anyhow!("CUDA graph dummy block table size overflow"))?;
+        if paged_cache.num_blocks() < needed_blocks {
+            bail!(
+                "CUDA graph prewarm needs {needed_blocks} KV blocks for batch={batch} cols={block_table_cols}, got {}",
+                paged_cache.num_blocks()
+            );
+        }
         let mut block_tables = Vec::with_capacity(batch);
         for row in 0..batch {
-            let start = 1usize.saturating_add(row.saturating_mul(block_table_cols));
-            let table = (0..block_table_cols)
-                .map(|col| start.saturating_add(col))
+            let mut table = (0..shared_prefix_blocks)
+                .map(|col| 1usize.saturating_add(col))
                 .collect::<Vec<_>>();
+            table.push(1usize + shared_prefix_blocks + row);
             block_tables.push(table);
         }
         let starts = vec![max_context_len.saturating_sub(1); batch];

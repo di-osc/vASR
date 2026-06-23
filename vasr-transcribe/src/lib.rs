@@ -7,7 +7,9 @@ pub mod serve;
 pub mod server;
 
 pub use benchmark::{BenchmarkTranscribeArgs, run_benchmark};
-pub use pipeline::{AsyncTranscribePipeline, TranscribeInput, TranscribeItemOutcome};
+pub use pipeline::{
+    AsyncTranscribePipeline, GlobalAsyncTranscribePipeline, TranscribeInput, TranscribeItemOutcome,
+};
 pub use protocol::*;
 pub use run::{RunTranscribeArgs, run_local};
 pub use serve::{

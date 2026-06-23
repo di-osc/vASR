@@ -1,7 +1,7 @@
-pub use vasr_models::vad::{StreamingVadSession, VadModel, VadOptions, VadSegment};
-pub use vasr_models::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
+pub use vasr::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
+pub use vasr_vad::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
-pub use vasr_models::StreamingAsrModel as AsrModel;
+pub use vasr::StreamingAsrModel as AsrModel;
 
 #[cfg(test)]
 mod tests {

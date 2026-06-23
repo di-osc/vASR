@@ -105,15 +105,18 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         inputs.push(TranscribeInput { index, source });
     }
 
+    let output = resolve_benchmark_output_jsonl_path(args.output.as_deref(), &args.input);
+
     tracing::info!(
         target: "vasr_transcribe::benchmark",
-        "transcribe | mode=benchmark | records={} | input={}",
+        "benchmark | records={} input={} output={}",
         records.len(),
         args.input.display(),
+        output.display(),
     );
 
     let batch_start = Instant::now();
-    let outcomes = pipeline.transcribe_many(inputs).await;
+    let outcomes = pipeline.run(inputs).await;
     let batch_wall = batch_start.elapsed().as_secs_f64();
 
     let mut items = Vec::with_capacity(records.len());
@@ -221,9 +224,8 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         },
     };
 
-    let output = resolve_benchmark_output_jsonl_path(args.output.as_deref(), &args.input);
     write_benchmark_jsonl_report(&output, &report)?;
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::benchmark",
         "wrote benchmark jsonl report | output={}",
         output.display()
@@ -233,7 +235,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
     tracing::info!(
         target: "vasr_transcribe::benchmark",
-        "done | mode=benchmark | records={} | evaluated={} | failed={} | audio={:.3}s | wall={:.3}s | speed={:.3}x | rtf={:.4} | skipped_empty_ref={} | macro_cer={:.4} | micro_cer={:.4}",
+        "benchmark done | records={} evaluated={} failed={} audio={:.1}s wall={:.1}s speed={:.1}x rtf={:.4} skipped_empty_ref={} macro_cer={:.4} micro_cer={:.4} output={}",
         report.summary.num_records,
         report.summary.num_evaluated,
         report.summary.num_failed,
@@ -243,7 +245,8 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         rtf,
         report.summary.num_skipped_empty_reference,
         report.summary.macro_cer,
-        report.summary.micro_cer
+        report.summary.micro_cer,
+        output.display()
     );
 
     if num_failed > 0 {
