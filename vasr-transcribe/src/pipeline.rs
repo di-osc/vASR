@@ -1526,6 +1526,12 @@ async fn send_next_vad_task(
 
 #[derive(Debug)]
 struct SegmentEncodeRequest {
+    segment: AsrSegmentJob,
+    stage_start: Instant,
+}
+
+#[derive(Debug)]
+struct SegmentEncodeBatch {
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
 }
@@ -1540,12 +1546,26 @@ struct SegmentEncodedMessage {
 fn spawn_segment_encoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
+    max_batch_audio_sec: f32,
     mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeRequest>,
     encoded_tx: mpsc::UnboundedSender<SegmentEncodedMessage>,
     stats: Arc<Mutex<AsrStageStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(request) = request_rx.recv().await {
+        let mut pending = VecDeque::new();
+        loop {
+            let Some(request) = (match pending.pop_front() {
+                Some(request) => Some(request),
+                None => request_rx.recv().await,
+            }) else {
+                break;
+            };
+            let request = collect_encoder_segment_batch(
+                request,
+                max_batch_audio_sec,
+                &mut request_rx,
+                &mut pending,
+            );
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
             let segment_audio_seconds = segments_for_result
@@ -1582,6 +1602,41 @@ fn spawn_segment_encoder_worker(
             }
         }
     })
+}
+
+fn collect_encoder_segment_batch(
+    first: SegmentEncodeRequest,
+    max_batch_audio_sec: f32,
+    request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeRequest>,
+    pending: &mut VecDeque<SegmentEncodeRequest>,
+) -> SegmentEncodeBatch {
+    let mut audio_sec = first.segment.waveform.duration_seconds() as f32;
+    let mut stage_start = first.stage_start;
+    let mut segments = vec![first.segment];
+    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+        match request_rx.try_recv() {
+            Ok(request) => {
+                let next_audio_sec = request.segment.waveform.duration_seconds() as f32;
+                if max_batch_audio_sec > 0.0
+                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
+                {
+                    pending.push_back(request);
+                    break;
+                }
+                audio_sec += next_audio_sec;
+                stage_start = stage_start.min(request.stage_start);
+                segments.push(request.segment);
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    segments.sort_by_key(|segment| (segment.job_index, segment.offset.0));
+    SegmentEncodeBatch {
+        segments,
+        stage_start,
+    }
 }
 
 fn spawn_segment_decoder_worker(
@@ -1947,6 +2002,7 @@ fn spawn_asr_worker(
         let segment_encoder_handle = spawn_segment_encoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
+            max_batch_audio_sec,
             asr_to_encoder_rx,
             encoder_to_decoder_tx,
             Arc::clone(&stats),
@@ -2017,26 +2073,25 @@ fn spawn_asr_worker(
                     }
                 }
                 Ok(AsrPipelineMessage::Segment(segment)) => {
-                    let segments = collect_segment_microbatch(
-                        segment,
-                        max_batch_audio_sec,
-                        &mut vad_to_asr_rx,
-                        &mut pending,
-                    )
-                    .await;
                     let stage_start = Instant::now();
                     if offline.asr.as_any().is::<Qwen3ASR>() {
                         tracing::debug!(
                             target: "vasr_transcribe::pipeline",
-                            "asr audio_features encode enqueue | segs={}",
-                            segments.len(),
+                            "asr audio_features encode enqueue | segs=1",
                         );
                         let request = SegmentEncodeRequest {
-                            segments,
+                            segment,
                             stage_start,
                         };
                         send_segment_encode_request(&asr_to_encoder_tx, request);
                     } else {
+                        let segments = collect_segment_microbatch(
+                            segment,
+                            max_batch_audio_sec,
+                            &mut vad_to_asr_rx,
+                            &mut pending,
+                        )
+                        .await;
                         let batch = tokio::task::spawn_blocking({
                             let offline = Arc::clone(&offline);
                             let asr_options = asr_options.clone();
