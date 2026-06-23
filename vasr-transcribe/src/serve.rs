@@ -40,7 +40,7 @@ pub struct CommonModelArgs {
     pub isq: Option<String>,
 
     /// Maximum decode tokens per request.
-    #[arg(long, default_value_t = 128, env = "VASR_MAX_NEW_TOKENS")]
+    #[arg(long, default_value_t = 4096, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
     /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
@@ -212,7 +212,7 @@ mod tests {
                 cache_dir: vasr::modelscope_cache_dir(),
                 device: "auto".to_string(),
                 isq: None,
-                max_new_tokens: 128,
+                max_new_tokens: 4096,
                 gpu_memory_utilization: 0.65,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             },
