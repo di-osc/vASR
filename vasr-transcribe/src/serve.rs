@@ -21,10 +21,6 @@ use vasr_data::AudioLoader;
 use crate::pipeline::AsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
 
-#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-const MAX_NUM_SEQS_LIMIT: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
-#[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
-const MAX_NUM_SEQS_LIMIT: usize = 512;
 const DEFAULT_MAX_NUM_SEQS: usize = 256;
 
 #[derive(Debug, Clone, Args)]
@@ -263,12 +259,6 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     }
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
-    }
-    if args.max_num_seqs > MAX_NUM_SEQS_LIMIT {
-        bail!(
-            "--max-num-seqs must be <= {} (use 0 to disable CUDA graph)",
-            MAX_NUM_SEQS_LIMIT
-        );
     }
     Ok(())
 }
