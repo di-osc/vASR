@@ -33,6 +33,15 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
     }
 }
 
+fn log_prefill_speed(wave: usize, tokens: usize, elapsed_us: u64) {
+    let elapsed_s = elapsed_us as f64 / 1_000_000.0;
+    let tok_s = tokens as f64 / elapsed_s.max(f64::EPSILON);
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "continuous prefill | seqs={wave} tokens={tokens} wall={elapsed_s:.3}s tok/s={tok_s:.1}",
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
@@ -675,13 +684,16 @@ impl AsrBatchScheduler {
                         }
                     };
                     #[cfg(feature = "timing")]
+                    let elapsed = duration_to_us(start_prefill.elapsed());
+                    #[cfg(feature = "timing")]
+                    let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
+                    #[cfg(feature = "timing")]
+                    log_prefill_speed(wave, prefill_tokens, elapsed);
+                    #[cfg(feature = "timing")]
                     if let Some(t) = timings.as_deref_mut() {
-                        let elapsed = duration_to_us(start_prefill.elapsed());
                         t.prefill_us = t.prefill_us.saturating_add(elapsed);
                         t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
-                        t.prefill_tokens = t
-                            .prefill_tokens
-                            .saturating_add(state.prompt_lens_usize.iter().copied().sum::<usize>());
+                        t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
                     }
                     for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
                         .iter()
@@ -956,13 +968,16 @@ impl AsrBatchScheduler {
                         }
                     };
                     #[cfg(feature = "timing")]
+                    let elapsed = duration_to_us(start_prefill.elapsed());
+                    #[cfg(feature = "timing")]
+                    let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
+                    #[cfg(feature = "timing")]
+                    log_prefill_speed(wave, prefill_tokens, elapsed);
+                    #[cfg(feature = "timing")]
                     if let Some(t) = timings.as_deref_mut() {
-                        let elapsed = duration_to_us(start_prefill.elapsed());
                         t.prefill_us = t.prefill_us.saturating_add(elapsed);
                         t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
-                        t.prefill_tokens = t
-                            .prefill_tokens
-                            .saturating_add(state.prompt_lens_usize.iter().copied().sum::<usize>());
+                        t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
                     }
                     for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
                         .iter()
