@@ -33,7 +33,7 @@ const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
-const ASR_ENCODED_FEATURE_QUEUE: usize = 1;
+const ASR_ENCODER_REQUEST_QUEUE: usize = 1;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
 
 #[derive(Debug, Default)]
@@ -220,12 +220,11 @@ impl AsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue_batches={}",
+            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue=unbounded",
             stage_parallelism,
             stage_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
-            permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
-            ASR_ENCODED_FEATURE_QUEUE
+            permits_to_gib(vad_to_asr_queue_memory.capacity_permits)
         );
         tracing::debug!(
             target: "vasr_transcribe::pipeline",
@@ -345,12 +344,11 @@ impl GlobalAsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue_batches={} decode_idle_flush={}ms",
+            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue=unbounded decode_idle_flush={}ms",
             stage_parallelism,
             stage_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
-            ASR_ENCODED_FEATURE_QUEUE,
             GLOBAL_DECODE_IDLE_FLUSH_MS
         );
 
@@ -1544,15 +1542,10 @@ fn spawn_segment_encoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
     mut request_rx: mpsc::Receiver<SegmentEncodeRequest>,
-    encoded_tx: mpsc::Sender<SegmentEncodedMessage>,
+    encoded_tx: mpsc::UnboundedSender<SegmentEncodedMessage>,
     stats: Arc<Mutex<AsrStageStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tracing::debug!(
-            target: "vasr_transcribe::pipeline",
-            "asr audio_features queue | capacity={}",
-            ASR_ENCODED_FEATURE_QUEUE,
-        );
         while let Some(request) = request_rx.recv().await {
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
@@ -1579,7 +1572,7 @@ fn spawn_segment_encoder_worker(
                 stage_start: request.stage_start,
                 batch,
             };
-            if encoded_tx.send(message).await.is_err() {
+            if encoded_tx.send(message).is_err() {
                 break;
             }
         }
@@ -1589,7 +1582,7 @@ fn spawn_segment_encoder_worker(
 fn spawn_segment_decoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut encoded_rx: mpsc::Receiver<
+    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut encoded_rx: mpsc::UnboundedReceiver<
         SegmentEncodedMessage,
     >,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
@@ -1690,7 +1683,7 @@ async fn handle_dynamic_segment_encoded_message(
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     initial: SegmentEncodedAsrBatch,
-    encoded_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<SegmentEncodedMessage>>>,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncodedMessage>>>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
@@ -1889,7 +1882,7 @@ async fn handle_merged_segment_encoded_batch(
 #[cfg(not(feature = "paged-attn"))]
 async fn handle_ready_segment_encoded_messages(
     first: SegmentEncodedMessage,
-    encoder_to_decoder_rx: &mut mpsc::Receiver<SegmentEncodedMessage>,
+    encoder_to_decoder_rx: &mut mpsc::UnboundedReceiver<SegmentEncodedMessage>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
@@ -1955,9 +1948,8 @@ fn spawn_asr_worker(
     tokio::spawn(async move {
         let mut fallback_segment_state = SegmentAsrState::default();
         let mut pending = VecDeque::new();
-        let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::channel(ASR_ENCODED_FEATURE_QUEUE);
-        let (encoder_to_decoder_tx, encoder_to_decoder_rx) =
-            mpsc::channel(ASR_ENCODED_FEATURE_QUEUE);
+        let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::channel(ASR_ENCODER_REQUEST_QUEUE);
+        let (encoder_to_decoder_tx, encoder_to_decoder_rx) = mpsc::unbounded_channel();
         let segment_encoder_handle = spawn_segment_encoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
@@ -2042,7 +2034,7 @@ fn spawn_asr_worker(
                     if offline.asr.as_any().is::<Qwen3ASR>() {
                         tracing::debug!(
                             target: "vasr_transcribe::pipeline",
-                            "asr audio_features encode enqueue | segs={} queue_capacity={}",
+                            "asr audio_features encode enqueue | segs={} request_queue_capacity={}",
                             segments.len(),
                             asr_to_encoder_tx.capacity(),
                         );
@@ -2475,7 +2467,7 @@ fn run_segment_asr_decode_dynamic(
     asr: &dyn crate::runtime::model::AsrModel,
     initial_segments: Vec<AsrSegmentJob>,
     initial: SegmentEncodedAsrBatch,
-    encoded_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<SegmentEncodedMessage>>>,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncodedMessage>>>,
     runtime_handle: tokio::runtime::Handle,
     asr_options: &AsrOptions,
     decode_idle_flush: Option<std::time::Duration>,
