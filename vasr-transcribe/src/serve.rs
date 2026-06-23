@@ -27,6 +27,10 @@ const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
+    /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B`, `Qwen/Qwen3-ASR-1.7B`, or a local directory.
+    #[arg(long, default_value = DEFAULT_ASR_MODEL, env = "VASR_MODEL")]
+    pub model: String,
+
     /// vASR model cache directory.
     #[arg(long = "cache-dir", default_value_os_t = vasr::modelscope_cache_dir())]
     pub cache_dir: PathBuf,
@@ -209,6 +213,7 @@ mod tests {
     fn pipeline_defaults_match_validated_vad_batch_bounds() {
         let pipeline = TranscribePipelineArgs {
             model: CommonModelArgs {
+                model: DEFAULT_ASR_MODEL.to_string(),
                 cache_dir: vasr::modelscope_cache_dir(),
                 device: "auto".to_string(),
                 isq: None,
@@ -245,6 +250,9 @@ fn vad_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> VadOptions {
 }
 
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
+    if args.model.trim().is_empty() {
+        bail!("--model must not be empty");
+    }
     if args.cache_dir.as_os_str().is_empty() {
         bail!("--cache-dir must not be empty");
     }
@@ -475,13 +483,13 @@ fn load_asr_model(
     tracing::info!(
         target: "vasr_transcribe::serve",
         "Loading Qwen3-ASR model `{}` from cache `{}` on {} (isq={:?}).",
-        DEFAULT_ASR_MODEL,
+        args.model,
         args.cache_dir.display(),
         device_label(&device),
         args.isq
     );
     let model_load_start = Instant::now();
-    let qwen3_asr = Qwen3AsrModel::from_pretrained(DEFAULT_ASR_MODEL, &device, &load_options)?;
+    let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
     let params_bytes = match qwen3_asr.inner().weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
