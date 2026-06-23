@@ -19,7 +19,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use vasr::models::qwen3asr::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
-use vasr::models::qwen3asr::{EncodedAsrBatch, Qwen3ASR};
+use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
 
@@ -1581,10 +1581,15 @@ fn spawn_segment_encoder_worker(
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
             let encode_wall_seconds = encode_start.elapsed().as_secs_f64();
+            let encode_timings = batch
+                .as_ref()
+                .map(|batch| batch.timings)
+                .unwrap_or_default();
             log_asr_audio_encoder_batch(
                 segments_for_result.len(),
                 segment_audio_seconds,
                 encode_wall_seconds,
+                encode_timings,
             );
             record_asr_encode_stats(
                 &stats,
@@ -2345,6 +2350,7 @@ struct SegmentEncodedAsrBatch {
     inference: SegmentAsrInference,
     waveforms: Vec<Waveform>,
     encoded: EncodedAsrBatch,
+    timings: AudioFeatureEncodeTimings,
 }
 
 impl SegmentEncodedAsrBatch {
@@ -2382,6 +2388,7 @@ impl SegmentEncodedAsrBatch {
                 active_job_count: active_jobs.len(),
             },
             waveforms,
+            timings: encoded.audio_feature_encode_timings(),
             encoded,
         })
     }
@@ -2459,6 +2466,7 @@ fn run_segment_asr_encode(
     let segment_audio_seconds: f64 = waveforms.iter().map(Waveform::duration_seconds).sum();
     let encoded =
         qwen3.encode_waveforms_audio_features_to_cpu(waveforms.as_slice(), asr_options)?;
+    let timings = encoded.audio_feature_encode_timings();
     Ok(SegmentEncodedAsrBatch {
         inference: SegmentAsrInference {
             targets,
@@ -2467,6 +2475,7 @@ fn run_segment_asr_encode(
         },
         waveforms,
         encoded,
+        timings,
     })
 }
 
@@ -3097,12 +3106,25 @@ fn log_vad_summary(stats: &VadStageStats) {
     );
 }
 
-fn log_asr_audio_encoder_batch(segments: usize, audio_s: f64, wall_s: f64) {
+fn log_asr_audio_encoder_batch(
+    segments: usize,
+    audio_s: f64,
+    wall_s: f64,
+    timings: AudioFeatureEncodeTimings,
+) {
     let speedup = audio_s / wall_s.max(f64::EPSILON);
+    let prepare_s = timing_us_to_seconds(timings.prepare_us);
+    let stack_s = timing_us_to_seconds(timings.stack_us);
+    let forward_s = timing_us_to_seconds(timings.forward_us);
+    let d2h_s = timing_us_to_seconds(timings.d2h_us);
     tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "asr audio_encoder | segs={segments} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x"
+        "asr audio_encoder | segs={segments} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x prepare={prepare_s:.3}s stack={stack_s:.3}s forward={forward_s:.3}s d2h={d2h_s:.3}s"
     );
+}
+
+fn timing_us_to_seconds(us: u64) -> f64 {
+    us as f64 / 1_000_000.0
 }
 
 fn log_asr_summary(stats: &AsrStageStats) {

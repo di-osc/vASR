@@ -25,7 +25,6 @@ use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::chat_template;
 use crate::processor::{AsrProcessor, asr_processor::PreparedInputs};
 
-#[cfg(feature = "timing")]
 fn duration_to_us(d: std::time::Duration) -> u64 {
     let us = d.as_micros();
     if us > u128::from(u64::MAX) {
@@ -291,12 +290,30 @@ struct EncodedPreparedGroup {
     audio_features_cpu: Tensor,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioFeatureEncodeTimings {
+    pub prepare_us: u64,
+    pub stack_us: u64,
+    pub forward_us: u64,
+    pub d2h_us: u64,
+}
+
+impl AudioFeatureEncodeTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.prepare_us = self.prepare_us.saturating_add(other.prepare_us);
+        self.stack_us = self.stack_us.saturating_add(other.stack_us);
+        self.forward_us = self.forward_us.saturating_add(other.forward_us);
+        self.d2h_us = self.d2h_us.saturating_add(other.d2h_us);
+    }
+}
+
 #[derive(Debug)]
 pub struct EncodedAsrBatch {
     audio_len: usize,
     chunks: Vec<ChunkItem>,
     forced_langs_norm: Vec<Option<String>>,
     groups: Vec<EncodedPreparedGroup>,
+    timings: AudioFeatureEncodeTimings,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -354,6 +371,10 @@ impl EncodedAsrBatch {
         self.audio_len
     }
 
+    pub fn audio_feature_encode_timings(&self) -> AudioFeatureEncodeTimings {
+        self.timings
+    }
+
     #[cfg(feature = "paged-attn")]
     fn into_meta_and_groups(self) -> (EncodedAsrBatchMeta, Vec<EncodedPreparedGroup>) {
         (
@@ -373,10 +394,12 @@ impl EncodedAsrBatch {
         let mut chunks = Vec::with_capacity(chunk_count);
         let mut forced_langs_norm = Vec::with_capacity(audio_len);
         let mut groups = Vec::with_capacity(group_count);
+        let mut timings = AudioFeatureEncodeTimings::default();
         let mut audio_offset = 0usize;
         let mut chunk_offset = 0usize;
 
         for mut batch in batches {
+            timings.add_assign(batch.timings);
             for chunk in &mut batch.chunks {
                 chunk.orig_index = chunk.orig_index.saturating_add(audio_offset);
             }
@@ -397,6 +420,7 @@ impl EncodedAsrBatch {
             chunks,
             forced_langs_norm,
             groups,
+            timings,
         })
     }
 
@@ -781,19 +805,27 @@ fn encode_prepared_audio_features_cpu(
     device: &Device,
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
-) -> Result<Tensor> {
+) -> Result<(Tensor, AudioFeatureEncodeTimings)> {
+    let mut timings = AudioFeatureEncodeTimings::default();
     #[cfg(feature = "paged-attn")]
     let varlen_stack = use_varlen_paged_prepare(paged_runtime);
     #[cfg(not(feature = "paged-attn"))]
     let varlen_stack = false;
+    let start_stack = std::time::Instant::now();
     let (input_features, feature_lens) = if varlen_stack {
         stack_features_varlen(prepared, device)?
     } else {
         stack_features(prepared, device)?
     };
+    timings.stack_us = duration_to_us(start_stack.elapsed());
+    let start_forward = std::time::Instant::now();
     let audio_features =
         thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
-    Ok(audio_features.to_device(&Device::Cpu)?)
+    timings.forward_us = duration_to_us(start_forward.elapsed());
+    let start_d2h = std::time::Instant::now();
+    let audio_features_cpu = audio_features.to_device(&Device::Cpu)?;
+    timings.d2h_us = duration_to_us(start_d2h.elapsed());
+    Ok((audio_features_cpu, timings))
 }
 
 fn generate_raw_prepared_batch_with_audio_features(
@@ -1973,6 +2005,7 @@ pub fn encode_audio_features_to_cpu(
             chunks,
             forced_langs_norm,
             groups: Vec::new(),
+            timings: AudioFeatureEncodeTimings::default(),
         });
     }
 
@@ -1990,6 +2023,7 @@ pub fn encode_audio_features_to_cpu(
         opts.max_batch_audio_sec,
     )?;
     let mut groups = Vec::with_capacity(index_groups.len());
+    let mut timings = AudioFeatureEncodeTimings::default();
     for chunk_indices in index_groups {
         let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(chunk_indices.len());
         for &chunk_idx in &chunk_indices {
@@ -2013,12 +2047,14 @@ pub fn encode_audio_features_to_cpu(
             items.push((prompt.as_str(), audio_input));
         }
 
+        let start_prepare = std::time::Instant::now();
         let prepared = prepare_items_for_runtime(
             processor,
             #[cfg(feature = "paged-attn")]
             paged_runtime,
             items.as_slice(),
         )?;
+        let prepare_us = duration_to_us(start_prepare.elapsed());
         if prepared.len() != chunk_indices.len() {
             bail!(
                 "internal error: staged prepare size mismatch: expected={}, got={}",
@@ -2026,13 +2062,15 @@ pub fn encode_audio_features_to_cpu(
                 prepared.len()
             );
         }
-        let audio_features_cpu = encode_prepared_audio_features_cpu(
+        let (audio_features_cpu, mut group_timings) = encode_prepared_audio_features_cpu(
             thinker,
             device,
             #[cfg(feature = "paged-attn")]
             paged_runtime,
             prepared.as_slice(),
         )?;
+        group_timings.prepare_us = group_timings.prepare_us.saturating_add(prepare_us);
+        timings.add_assign(group_timings);
         groups.push(EncodedPreparedGroup {
             chunk_indices,
             prepared,
@@ -2045,6 +2083,7 @@ pub fn encode_audio_features_to_cpu(
         chunks,
         forced_langs_norm,
         groups,
+        timings,
     })
 }
 

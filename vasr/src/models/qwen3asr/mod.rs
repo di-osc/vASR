@@ -18,11 +18,11 @@ pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
 pub use inference::streaming::AsrStream;
-pub use inference::transcribe::EncodedAsrBatch;
 #[cfg(feature = "paged-attn")]
 pub use inference::transcribe::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
+pub use inference::transcribe::{AudioFeatureEncodeTimings, EncodedAsrBatch};
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
 #[cfg(feature = "timing")]
 pub use model::generation::GenerationTimings;
