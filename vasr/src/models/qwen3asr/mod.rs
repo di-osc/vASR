@@ -10,6 +10,7 @@ pub use vasr_hub::modelscope::download;
 
 use anyhow::Result;
 use candle_core::Device;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
@@ -35,16 +36,20 @@ pub use vasr_data::audio::input::AudioInput;
 pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheMemory, PagedCacheStats};
 
 #[derive(Debug)]
-pub struct Qwen3Asr {
+pub struct Qwen3ASR {
     device: Arc<Device>,
     config: config::AsrConfig,
     processor: Arc<AsrProcessor>,
-    _model: Arc<model::AsrModel>,
+    model_dir: PathBuf,
+    weights_paths: Vec<PathBuf>,
+    thinker: Arc<model::thinker::ThinkerForConditionalGeneration>,
     #[cfg(feature = "paged-attn")]
     paged_cache: Option<vasr_paged_attn::SharedPagedCacheRuntime>,
 }
 
-impl Qwen3Asr {
+pub type Qwen3Asr = Qwen3ASR;
+
+impl Qwen3ASR {
     /// Canonical language names supported by the official Qwen3-ASR stack.
     pub fn supported_languages(&self) -> &'static [&'static str] {
         inference::utils::SUPPORTED_LANGUAGES
@@ -98,11 +103,16 @@ impl Qwen3Asr {
         } else {
             None
         };
+        let model_dir = model.model_dir;
+        let weights_paths = model.weights_paths;
+        let thinker = Arc::new(model.thinker);
         Ok(Self {
             device: Arc::new(device.clone()),
             config,
             processor: Arc::new(processor),
-            _model: Arc::new(model),
+            model_dir,
+            weights_paths,
+            thinker,
             #[cfg(feature = "paged-attn")]
             paged_cache,
         })
@@ -120,15 +130,23 @@ impl Qwen3Asr {
         self.processor.as_ref()
     }
 
-    pub fn inner_model(&self) -> &model::AsrModel {
-        &self._model
+    pub fn model_dir(&self) -> &PathBuf {
+        &self.model_dir
+    }
+
+    pub fn weights_paths(&self) -> &[PathBuf] {
+        self.weights_paths.as_slice()
+    }
+
+    pub fn thinker(&self) -> &model::thinker::ThinkerForConditionalGeneration {
+        self.thinker.as_ref()
     }
 
     pub fn weights_memory_stats(
         &self,
         load_dtype: candle_core::DType,
     ) -> Result<WeightsMemoryStats> {
-        model::weights::weights_memory_stats(&self._model.weights_paths, load_dtype)
+        model::weights::weights_memory_stats(&self.weights_paths, load_dtype)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -151,7 +169,7 @@ impl Qwen3Asr {
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
         Ok(guard.prewarm_cuda_decode_graphs(
-            &self._model.thinker,
+            self.thinker.as_ref(),
             self.device.as_ref(),
             max_batch,
         )?)
@@ -163,7 +181,7 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<Vec<AsrTranscription>> {
         inference::transcribe::transcribe(
-            self._model.as_ref(),
+            self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
             #[cfg(feature = "paged-attn")]
@@ -179,7 +197,7 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<EncodedAsrBatch> {
         inference::transcribe::encode_audio_features_to_cpu(
-            self._model.as_ref(),
+            self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
             #[cfg(feature = "paged-attn")]
@@ -195,7 +213,7 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<Vec<AsrTranscription>> {
         inference::transcribe::decode_cpu_audio_features(
-            self._model.as_ref(),
+            self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
             #[cfg(feature = "paged-attn")]
@@ -213,7 +231,7 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<Vec<Vec<AsrTranscription>>> {
         inference::transcribe::decode_cpu_audio_features_dynamic(
-            self._model.as_ref(),
+            self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
             self.paged_cache.as_ref(),
@@ -230,7 +248,7 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<(Vec<AsrTranscription>, TranscribeTimings)> {
         inference::transcribe::transcribe_timed(
-            self._model.as_ref(),
+            self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
             #[cfg(feature = "paged-attn")]
@@ -302,7 +320,7 @@ impl Qwen3Asr {
             #[cfg(feature = "paged-attn")]
             {
                 model::generation::greedy_generate_cached_batch_timed_with_paged_runtime(
-                    &self._model.thinker,
+                    self.thinker.as_ref(),
                     self.device.as_ref(),
                     input_rows.as_slice(),
                     attention_rows.as_slice(),
@@ -315,7 +333,7 @@ impl Qwen3Asr {
             #[cfg(not(feature = "paged-attn"))]
             {
                 model::generation::greedy_generate_cached_batch_timed(
-                    &self._model.thinker,
+                    self.thinker.as_ref(),
                     self.device.as_ref(),
                     input_rows.as_slice(),
                     attention_rows.as_slice(),
@@ -333,7 +351,7 @@ impl Qwen3Asr {
 
     pub fn new_stream(&self, opts: StreamOptions) -> Result<AsrStream> {
         inference::streaming::new_stream(
-            Arc::clone(&self._model),
+            Arc::clone(&self.thinker),
             Arc::clone(&self.processor),
             Arc::clone(&self.device),
             &opts,

@@ -7,8 +7,7 @@ pub mod traits;
 
 pub use vasr_data::audio;
 
-pub use models::qwen3asr::Qwen3Asr;
-pub use models::qwen3asr::Qwen3Asr as Qwen3ASR;
+pub use models::qwen3asr::{Qwen3ASR, Qwen3Asr};
 pub use models::qwen3asr::{qwen_outputs_to_timelines, qwen_transcribe_options};
 pub use traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
 pub use vasr_hub::{download, modelscope, modelscope_cache_dir, set_cache_dir};

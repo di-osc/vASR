@@ -127,7 +127,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "paged-attn")]
         {
             vasr::qwen3_asr::model::generation::greedy_generate_cached_batch_timed_with_paged_runtime(
-                &model.inner_model().thinker,
+                model.thinker(),
                 model.device(),
                 input_rows.as_slice(),
                 attn_rows.as_slice(),
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "paged-attn"))]
         {
             vasr::qwen3_asr::model::generation::greedy_generate_cached_batch_timed(
-                &model.inner_model().thinker,
+                model.thinker(),
                 model.device(),
                 input_rows.as_slice(),
                 attn_rows.as_slice(),
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
         let attn_rows: Vec<&[u32]> = attention_list.iter().map(|v| v.as_slice()).collect();
         #[cfg(feature = "paged-attn")]
         let (gen_seqs, timings) = vasr::qwen3_asr::model::generation::greedy_generate_cached_batch_timed_with_paged_runtime(
-            &model.inner_model().thinker,
+            model.thinker(),
             model.device(),
             input_rows.as_slice(),
             attn_rows.as_slice(),
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "paged-attn"))]
         let (gen_seqs, timings) =
             vasr::qwen3_asr::model::generation::greedy_generate_cached_batch_timed(
-                &model.inner_model().thinker,
+                model.thinker(),
                 model.device(),
                 input_rows.as_slice(),
                 attn_rows.as_slice(),

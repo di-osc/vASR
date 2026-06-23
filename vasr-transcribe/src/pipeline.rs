@@ -12,8 +12,8 @@ use std::sync::{
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use tokio::sync::{mpsc, oneshot};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use vasr::models::qwen3asr::EncodedAsrBatch;
 #[cfg(feature = "paged-attn")]
@@ -21,7 +21,7 @@ use vasr::models::qwen3asr::EncodedAsrBatchPoll;
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
 
-use crate::runtime::models::qwen3_asr::Qwen3AsrModel;
+use crate::runtime::models::qwen3_asr_adapter::Qwen3AsrAdapter;
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 #[cfg(feature = "paged-attn")]
@@ -390,7 +390,9 @@ impl GlobalAsyncTranscribePipeline {
             vad_to_asr_rx,
             asr_to_result_tx,
             asr_stats,
-            Some(std::time::Duration::from_millis(GLOBAL_DECODE_IDLE_FLUSH_MS)),
+            Some(std::time::Duration::from_millis(
+                GLOBAL_DECODE_IDLE_FLUSH_MS,
+            )),
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
@@ -420,13 +422,14 @@ impl GlobalAsyncTranscribePipeline {
         response_rx.await.unwrap_or_else(|_| {
             vec![TranscribeItemOutcome {
                 index: 0,
-                result: Err(anyhow::anyhow!("global transcribe pipeline response dropped")),
+                result: Err(anyhow::anyhow!(
+                    "global transcribe pipeline response dropped"
+                )),
                 audio_seconds: 0.0,
                 bad_component: Some("recognizer"),
             }]
         })
     }
-
 }
 
 fn spawn_global_submit_worker(
@@ -1576,12 +1579,14 @@ fn spawn_segment_encoder_worker(
 fn spawn_segment_decoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    #[cfg_attr(feature = "paged-attn", allow(unused_mut))]
-    mut encoded_rx: mpsc::Receiver<SegmentEncodedMessage>,
+    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut encoded_rx: mpsc::Receiver<
+        SegmentEncodedMessage,
+    >,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
-    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))]
-    decode_idle_flush: Option<std::time::Duration>,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] decode_idle_flush: Option<
+        std::time::Duration,
+    >,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
@@ -1966,13 +1971,15 @@ fn spawn_asr_worker(
                     })
                     .await
                     .unwrap_or_else(|error| {
-                        vec![TranscribeItemOutcome {
-                            index: 0,
-                            result: Err(anyhow::anyhow!("ASR join error: {error}")),
-                            audio_seconds: 0.0,
-                            bad_component: Some("recognizer"),
-                        }
-                        .into()]
+                        vec![
+                            TranscribeItemOutcome {
+                                index: 0,
+                                result: Err(anyhow::anyhow!("ASR join error: {error}")),
+                                audio_seconds: 0.0,
+                                bad_component: Some("recognizer"),
+                            }
+                            .into(),
+                        ]
                     });
                     for outcome in outcomes {
                         let _ = asr_to_result_tx.send(outcome).await;
@@ -1987,7 +1994,7 @@ fn spawn_asr_worker(
                     )
                     .await;
                     let stage_start = Instant::now();
-                    if offline.asr.as_any().is::<Qwen3AsrModel>() {
+                    if offline.asr.as_any().is::<Qwen3AsrAdapter>() {
                         tracing::debug!(
                             target: "vasr_transcribe::pipeline",
                             "asr audio_features encode enqueue | segs={} queue_capacity={}",
@@ -2309,7 +2316,7 @@ fn run_segment_asr_inference(
     segments: &[AsrSegmentJob],
     asr_options: &AsrOptions,
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
-    if offline.asr.as_any().is::<Qwen3AsrModel>() {
+    if offline.asr.as_any().is::<Qwen3AsrAdapter>() {
         let encoded = run_segment_asr_encode(offline, segments, asr_options)?;
         return run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options);
     }
@@ -2348,8 +2355,8 @@ fn run_segment_asr_encode(
     let qwen3 = offline
         .asr
         .as_any()
-        .downcast_ref::<Qwen3AsrModel>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3AsrModel"))?;
+        .downcast_ref::<Qwen3AsrAdapter>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3AsrAdapter"))?;
     let waveforms: Vec<Waveform> = segments
         .iter()
         .map(|segment| segment.waveform.clone())
@@ -2383,8 +2390,8 @@ fn run_segment_asr_decode(
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
     let qwen3 = asr
         .as_any()
-        .downcast_ref::<Qwen3AsrModel>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3AsrModel"))?;
+        .downcast_ref::<Qwen3AsrAdapter>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3AsrAdapter"))?;
     let timelines = qwen3.decode_cpu_audio_features(
         encoded.encoded,
         encoded.waveforms.as_slice(),
@@ -2405,8 +2412,8 @@ fn run_segment_asr_decode_dynamic(
 ) -> Result<DynamicSegmentAsrDecode> {
     let qwen3 = asr
         .as_any()
-        .downcast_ref::<Qwen3AsrModel>()
-        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3AsrModel"))?;
+        .downcast_ref::<Qwen3AsrAdapter>()
+        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3AsrAdapter"))?;
     let (mut inference, mut waveforms, encoded) = initial.into_parts();
     let mut consumed_segments = initial_segments;
     let mut encoded_failures = Vec::new();
@@ -2731,23 +2738,27 @@ fn run_asr_jobs_batch(
         }
         match result {
             Ok(timelines) if timelines.len() == indices.len() => {
-                for ((((index, request_item), audio_seconds), mut timeline), mut annotations) in indices
-                    .into_iter()
-                    .zip(request_items)
-                    .zip(audio_seconds)
-                    .zip(timelines)
-                    .zip(speech_annotations)
+                for ((((index, request_item), audio_seconds), mut timeline), mut annotations) in
+                    indices
+                        .into_iter()
+                        .zip(request_items)
+                        .zip(audio_seconds)
+                        .zip(timelines)
+                        .zip(speech_annotations)
                 {
                     if !annotations.is_empty() {
                         annotations.extend(timeline.annotations);
                         timeline.annotations = annotations;
                     }
-                    outcomes.push(route_outcome(request_item, TranscribeItemOutcome {
-                        index,
-                        result: Ok(timeline),
-                        audio_seconds,
-                        bad_component: None,
-                    }));
+                    outcomes.push(route_outcome(
+                        request_item,
+                        TranscribeItemOutcome {
+                            index,
+                            result: Ok(timeline),
+                            audio_seconds,
+                            bad_component: None,
+                        },
+                    ));
                 }
             }
             Ok(timelines) => {
@@ -2759,11 +2770,8 @@ fn run_asr_jobs_batch(
                 for ((index, request_item), audio_seconds) in
                     indices.into_iter().zip(request_items).zip(audio_seconds)
                 {
-                    let outcome = outcome_from_result(
-                        index,
-                        audio_seconds,
-                        Err(anyhow::anyhow!("{err}")),
-                    );
+                    let outcome =
+                        outcome_from_result(index, audio_seconds, Err(anyhow::anyhow!("{err}")));
                     outcomes.push(route_outcome(request_item, outcome));
                 }
             }
@@ -2772,11 +2780,8 @@ fn run_asr_jobs_batch(
                 for ((index, request_item), audio_seconds) in
                     indices.into_iter().zip(request_items).zip(audio_seconds)
                 {
-                    let outcome = outcome_from_result(
-                        index,
-                        audio_seconds,
-                        Err(anyhow::anyhow!("{reason}")),
-                    );
+                    let outcome =
+                        outcome_from_result(index, audio_seconds, Err(anyhow::anyhow!("{reason}")));
                     outcomes.push(route_outcome(request_item, outcome));
                 }
             }
@@ -2789,13 +2794,15 @@ fn run_asr_jobs_batch(
         for job in prepared_jobs {
             match speech_job_to_segments(job) {
                 Ok(mut segments) => segment_jobs.append(&mut segments),
-                Err(error) => outcomes.push(TranscribeItemOutcome {
-                    index: 0,
-                    result: Err(error),
-                    audio_seconds: 0.0,
-                    bad_component: Some("vad"),
-                }
-                .into()),
+                Err(error) => outcomes.push(
+                    TranscribeItemOutcome {
+                        index: 0,
+                        result: Err(error),
+                        audio_seconds: 0.0,
+                        bad_component: Some("vad"),
+                    }
+                    .into(),
+                ),
             }
         }
         outcomes.extend(

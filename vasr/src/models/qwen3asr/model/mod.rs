@@ -27,7 +27,7 @@ pub mod paged_cache_runtime {
 }
 
 #[derive(Debug)]
-pub struct AsrModel {
+pub(crate) struct LoadedQwen3Asr {
     pub model_dir: PathBuf,
     pub weights_paths: Vec<PathBuf>,
     pub thinker: thinker::ThinkerForConditionalGeneration,

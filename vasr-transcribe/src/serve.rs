@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrModel,
+    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrAdapter,
     ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
 use anyhow::{Result, bail};
@@ -489,7 +489,7 @@ fn load_asr_model(
         args.isq
     );
     let model_load_start = Instant::now();
-    let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
+    let qwen3_asr = Qwen3AsrAdapter::from_pretrained(&args.model, &device, &load_options)?;
     let params_bytes = match qwen3_asr.inner().weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
@@ -628,7 +628,7 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn log_model_config(model: &Qwen3AsrModel) {
+fn log_model_config(model: &Qwen3AsrAdapter) {
     let config = model.inner().config();
     let text = &config.thinker_config.text_config;
     let audio = &config.thinker_config.audio_config;

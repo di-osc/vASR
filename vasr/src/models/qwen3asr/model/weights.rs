@@ -34,11 +34,11 @@ impl Default for LoadOptions {
     }
 }
 
-pub fn load_model_from_pretrained(
+pub(crate) fn load_model_from_pretrained(
     model_id_or_path: &str,
     device: &Device,
     opts: &LoadOptions,
-) -> Result<(AsrConfig, super::AsrModel)> {
+) -> Result<(AsrConfig, super::LoadedQwen3Asr)> {
     validate_load_options(device, opts)?;
 
     let model_dir = resolve_model_dir(model_id_or_path)?;
@@ -57,7 +57,7 @@ pub fn load_model_from_pretrained(
 
     Ok((
         config,
-        super::AsrModel {
+        super::LoadedQwen3Asr {
             model_dir,
             weights_paths,
             thinker,

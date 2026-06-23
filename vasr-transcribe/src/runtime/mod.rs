@@ -11,6 +11,6 @@ pub use model::{
     AsrModel, AsrOptions, ParallelTranscribeOptions, StreamingAsrSession, StreamingVadSession,
     VadModel, VadOptions, VadSegment,
 };
-pub use models::{qwen3_asr::Qwen3AsrModel, vad::FsmnVadModel};
+pub use models::{qwen3_asr_adapter::Qwen3AsrAdapter, vad::FsmnVadModel};
 pub use pipeline::OfflinePipeline;
 pub use scheduler::{InferenceScheduler, ScheduledAsrModel};

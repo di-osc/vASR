@@ -21,7 +21,7 @@ use crate::model::generation::greedy_generate_cached_batch;
 use crate::model::generation::greedy_generate_cached_batch_timed;
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_cache_runtime::SharedPagedCacheRuntime;
-use crate::model::{AsrModel, thinker::ThinkerForConditionalGeneration};
+use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::chat_template;
 use crate::processor::{AsrProcessor, asr_processor::PreparedInputs};
 
@@ -1809,7 +1809,7 @@ fn run_asr_on_chunks_batched_timed(
 }
 
 pub fn transcribe(
-    model: &AsrModel,
+    thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
@@ -1861,7 +1861,7 @@ pub fn transcribe(
     }
 
     let asr_batch = ChunkAsrBatch {
-        thinker: &model.thinker,
+        thinker: thinker,
         processor,
         device,
         #[cfg(feature = "paged-attn")]
@@ -1924,7 +1924,7 @@ pub fn transcribe(
 }
 
 pub fn encode_audio_features_to_cpu(
-    model: &AsrModel,
+    thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
@@ -2027,7 +2027,7 @@ pub fn encode_audio_features_to_cpu(
             );
         }
         let audio_features_cpu = encode_prepared_audio_features_cpu(
-            &model.thinker,
+            thinker,
             device,
             #[cfg(feature = "paged-attn")]
             paged_runtime,
@@ -2049,7 +2049,7 @@ pub fn encode_audio_features_to_cpu(
 }
 
 pub fn decode_cpu_audio_features(
-    model: &AsrModel,
+    thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
@@ -2078,7 +2078,7 @@ pub fn decode_cpu_audio_features(
             Tensor::cat(audio_feature_parts.as_slice(), 0)?
         };
         let raws = generate_raw_prepared_batch_with_audio_features(
-            &model.thinker,
+            thinker,
             processor,
             device,
             #[cfg(feature = "paged-attn")]
@@ -2140,7 +2140,7 @@ pub fn decode_cpu_audio_features(
 
 #[cfg(feature = "paged-attn")]
 pub fn decode_cpu_audio_features_dynamic(
-    model: &AsrModel,
+    thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
     paged_runtime: Option<&SharedPagedCacheRuntime>,
@@ -2175,7 +2175,7 @@ pub fn decode_cpu_audio_features_dynamic(
     );
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic(
-        &model.thinker,
+        thinker,
         device,
         runtime,
         initial,
@@ -2247,7 +2247,7 @@ pub fn decode_cpu_audio_features_dynamic(
 
 #[cfg(feature = "timing")]
 pub fn transcribe_timed(
-    model: &AsrModel,
+    thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
@@ -2311,7 +2311,7 @@ pub fn transcribe_timed(
     timings.chunks = chunks.len();
 
     let asr_batch = ChunkAsrBatch {
-        thinker: &model.thinker,
+        thinker: thinker,
         processor,
         device,
         #[cfg(feature = "paged-attn")]

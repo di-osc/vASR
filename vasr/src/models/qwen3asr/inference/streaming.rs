@@ -21,8 +21,8 @@ use crate::audio::normalize::normalize_audio_input;
 use crate::inference::transcribe::build_eos_token_ids;
 use crate::inference::types::{AsrTranscription, StreamOptions};
 use crate::inference::utils::{normalize_language_name, parse_asr_output, validate_language};
-use crate::model::AsrModel;
 use crate::model::generation::greedy_generate_cached;
+use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::AsrProcessor;
 use crate::processor::feat_lengths;
 use crate::processor::feature_extractor::StreamingFeatureExtractor;
@@ -52,7 +52,7 @@ fn recompute_from_for_stream_append(cache_frames: usize, segment_frames: usize) 
 
 #[derive(Debug)]
 pub struct AsrStream {
-    model: Arc<AsrModel>,
+    thinker: Arc<ThinkerForConditionalGeneration>,
     processor: Arc<AsrProcessor>,
     device: Arc<Device>,
     opts: StreamOptions,
@@ -195,17 +195,16 @@ impl AsrStream {
 
     fn compute_audio_features(&self, frames_range: std::ops::Range<usize>) -> Result<Tensor> {
         let (input_features, feature_len) = self.build_feature_tensors(frames_range)?;
-        self.model
-            .thinker
+        self.thinker
             .get_audio_features_with_lens(&input_features, std::slice::from_ref(&feature_len))
     }
 
     fn audio_cache_segment_frames(&self) -> Result<Option<usize>> {
-        if !self.model.thinker.audio_uses_flash_attn() {
+        if !self.thinker.audio_uses_flash_attn() {
             return Ok(None);
         }
 
-        let cfg = self.model.thinker.audio_config();
+        let cfg = self.thinker.audio_config();
         let window_frames = cfg
             .n_window
             .checked_mul(2)
@@ -374,7 +373,7 @@ impl AsrStream {
         audio_features: &Tensor,
     ) -> Result<Vec<u32>> {
         greedy_generate_cached(
-            &self.model.thinker,
+            &self.thinker,
             self.device.as_ref(),
             input_ids,
             attention_mask,
@@ -438,7 +437,7 @@ impl AsrStream {
         let base_ids = self.processor.tokenizer.encode(prompt.as_str())?;
         let input_ids = crate::processor::asr_processor::expand_audio_pad_ids_first(
             base_ids.as_slice(),
-            self.model.thinker.audio_token_id(),
+            self.thinker.audio_token_id(),
             placeholder_len,
         );
         let attention_mask = vec![1u32; input_ids.len()];
@@ -564,7 +563,7 @@ impl AsrStream {
         let base_ids = self.processor.tokenizer.encode(prompt.as_str())?;
         let input_ids = crate::processor::asr_processor::expand_audio_pad_ids_first(
             base_ids.as_slice(),
-            self.model.thinker.audio_token_id(),
+            self.thinker.audio_token_id(),
             placeholder_len,
         );
         let attention_mask = vec![1u32; input_ids.len()];
@@ -729,7 +728,7 @@ impl AsrStream {
 }
 
 pub fn new_stream(
-    model: Arc<AsrModel>,
+    thinker: Arc<ThinkerForConditionalGeneration>,
     processor: Arc<AsrProcessor>,
     device: Arc<Device>,
     opts: &StreamOptions,
@@ -778,7 +777,7 @@ pub fn new_stream(
     let eos_token_ids = build_eos_token_ids(processor.as_ref())?;
 
     Ok(AsrStream {
-        model,
+        thinker,
         processor,
         device,
         opts,
