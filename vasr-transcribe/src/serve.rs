@@ -4,19 +4,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrAdapter,
-    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
+    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, ScheduledAsrModel,
+    VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 use candle_core::Device;
 use clap::Args;
-use vasr::models::qwen3asr::LoadOptions;
 use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
+use vasr::models::qwen3asr::{LoadOptions, Qwen3ASR};
 use vasr_data::AudioLoader;
 
 use crate::pipeline::AsyncTranscribePipeline;
@@ -489,8 +489,8 @@ fn load_asr_model(
         args.isq
     );
     let model_load_start = Instant::now();
-    let qwen3_asr = Qwen3AsrAdapter::from_pretrained(&args.model, &device, &load_options)?;
-    let params_bytes = match qwen3_asr.inner().weights_memory_stats(dtype) {
+    let qwen3_asr = Qwen3ASR::from_pretrained(&args.model, &device, &load_options)?;
+    let params_bytes = match qwen3_asr.weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
             tracing::debug!(
@@ -502,7 +502,7 @@ fn load_asr_model(
     };
     log_model_config(&qwen3_asr);
     #[cfg(feature = "paged-attn")]
-    let paged_cache_stats = qwen3_asr.inner().paged_cache_stats();
+    let paged_cache_stats = qwen3_asr.paged_cache_stats();
     #[cfg(feature = "paged-attn")]
     let kv_cache_bytes = paged_cache_stats.as_ref().map(|stats| stats.bytes);
     #[cfg(feature = "paged-attn")]
@@ -532,7 +532,7 @@ fn load_asr_model(
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     if let Some(max_batch) = cuda_graph_max_batch.filter(|&n| n > 0) {
         let prewarm_start = Instant::now();
-        let stats = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
+        let stats = qwen3_asr.prewarm_cuda_decode_graphs(max_batch)?;
         if stats.graphs > 0 {
             cuda_graph_seqs = Some(stats.max_batch);
             cuda_graph_context_tokens = Some(stats.context_tokens);
@@ -628,8 +628,8 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn log_model_config(model: &Qwen3AsrAdapter) {
-    let config = model.inner().config();
+fn log_model_config(model: &Qwen3ASR) {
+    let config = model.config();
     let text = &config.thinker_config.text_config;
     let audio = &config.thinker_config.audio_config;
     tracing::info!(

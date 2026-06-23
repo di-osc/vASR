@@ -47,7 +47,12 @@ impl OfflinePipeline {
             }
             VadPreparation::NoSpeech => {}
             VadPreparation::Disabled => {
-                let asr_timeline = self.asr.transcribe(waveform, options)?;
+                let mut asr_timelines = self
+                    .asr
+                    .transcribe(std::slice::from_ref(waveform), options)?;
+                let asr_timeline = asr_timelines
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("ASR returned no transcription"))?;
                 timeline.annotations.extend(asr_timeline.annotations);
             }
         }
@@ -113,7 +118,7 @@ impl OfflinePipeline {
             segments,
             slices,
         } = prepared;
-        let asr_timelines = self.asr.transcribe_batch(&slices, options)?;
+        let asr_timelines = self.asr.transcribe(&slices, options)?;
         let mut annotations = speech_annotations;
         for (segment, asr_timeline) in segments.into_iter().zip(asr_timelines) {
             annotations.extend(offset_annotations(

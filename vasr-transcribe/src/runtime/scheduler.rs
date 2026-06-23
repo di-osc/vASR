@@ -156,29 +156,14 @@ impl AsrModel for ScheduledAsrModel {
         self.inner.as_any()
     }
 
-    fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
-        let inner = Arc::clone(&self.inner);
-        let waveform = waveform.clone();
-        let options = options.clone();
-        self.scheduler
-            .submit_blocking("asr.transcribe", InferencePriority::Transcribe, move || {
-                inner.transcribe(&waveform, &options)
-            })
-    }
-
-    fn transcribe_batch(
-        &self,
-        waveforms: &[Waveform],
-        options: &AsrOptions,
-    ) -> Result<Vec<Timeline>> {
+    fn transcribe(&self, waveforms: &[Waveform], options: &AsrOptions) -> Result<Vec<Timeline>> {
         let inner = Arc::clone(&self.inner);
         let waveforms = waveforms.to_vec();
         let options = options.clone();
-        self.scheduler.submit_blocking(
-            "asr.transcribe_batch",
-            InferencePriority::Transcribe,
-            move || inner.transcribe_batch(&waveforms, &options),
-        )
+        self.scheduler
+            .submit_blocking("asr.transcribe", InferencePriority::Transcribe, move || {
+                inner.transcribe(&waveforms, &options)
+            })
     }
 }
 
@@ -198,7 +183,6 @@ mod tests {
     fn scheduled_asr_model_preserves_batch_calls() {
         struct BatchOnlyAsr {
             batch_calls: Arc<AtomicUsize>,
-            single_calls: Arc<AtomicUsize>,
         }
 
         impl AsrModel for BatchOnlyAsr {
@@ -206,12 +190,7 @@ mod tests {
                 self
             }
 
-            fn transcribe(&self, _waveform: &Waveform, _options: &AsrOptions) -> Result<Timeline> {
-                self.single_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Timeline::new("single"))
-            }
-
-            fn transcribe_batch(
+            fn transcribe(
                 &self,
                 waveforms: &[Waveform],
                 _options: &AsrOptions,
@@ -222,11 +201,9 @@ mod tests {
         }
 
         let batch_calls = Arc::new(AtomicUsize::new(0));
-        let single_calls = Arc::new(AtomicUsize::new(0));
         let model = ScheduledAsrModel::new(
             Arc::new(BatchOnlyAsr {
                 batch_calls: Arc::clone(&batch_calls),
-                single_calls: Arc::clone(&single_calls),
             }),
             InferenceScheduler::start("batch-test"),
         );
@@ -236,11 +213,10 @@ mod tests {
         ];
 
         let timelines = model
-            .transcribe_batch(&waveforms, &AsrOptions::default())
+            .transcribe(&waveforms, &AsrOptions::default())
             .expect("batch transcribe");
 
         assert_eq!(timelines.len(), 2);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(single_calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -15,13 +15,12 @@ use anyhow::{Result, bail};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-use vasr::models::qwen3asr::EncodedAsrBatch;
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::EncodedAsrBatchPoll;
+use vasr::models::qwen3asr::{EncodedAsrBatch, Qwen3ASR};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
 
-use crate::runtime::models::qwen3_asr_adapter::Qwen3AsrAdapter;
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 #[cfg(feature = "paged-attn")]
@@ -1994,7 +1993,7 @@ fn spawn_asr_worker(
                     )
                     .await;
                     let stage_start = Instant::now();
-                    if offline.asr.as_any().is::<Qwen3AsrAdapter>() {
+                    if offline.asr.as_any().is::<Qwen3ASR>() {
                         tracing::debug!(
                             target: "vasr_transcribe::pipeline",
                             "asr audio_features encode enqueue | segs={} queue_capacity={}",
@@ -2316,7 +2315,7 @@ fn run_segment_asr_inference(
     segments: &[AsrSegmentJob],
     asr_options: &AsrOptions,
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
-    if offline.asr.as_any().is::<Qwen3AsrAdapter>() {
+    if offline.asr.as_any().is::<Qwen3ASR>() {
         let encoded = run_segment_asr_encode(offline, segments, asr_options)?;
         return run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options);
     }
@@ -2334,9 +2333,7 @@ fn run_segment_asr_inference(
         .collect::<HashSet<_>>()
         .len();
     let segment_audio_seconds: f64 = slices.iter().map(Waveform::duration_seconds).sum();
-    let timelines = offline
-        .asr
-        .transcribe_batch(slices.as_slice(), asr_options)?;
+    let timelines = offline.asr.transcribe(slices.as_slice(), asr_options)?;
     Ok((
         SegmentAsrInference {
             targets,
@@ -2355,8 +2352,8 @@ fn run_segment_asr_encode(
     let qwen3 = offline
         .asr
         .as_any()
-        .downcast_ref::<Qwen3AsrAdapter>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3AsrAdapter"))?;
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3ASR"))?;
     let waveforms: Vec<Waveform> = segments
         .iter()
         .map(|segment| segment.waveform.clone())
@@ -2371,7 +2368,8 @@ fn run_segment_asr_encode(
         .collect::<HashSet<_>>()
         .len();
     let segment_audio_seconds: f64 = waveforms.iter().map(Waveform::duration_seconds).sum();
-    let encoded = qwen3.encode_audio_features_to_cpu(waveforms.as_slice(), asr_options)?;
+    let encoded =
+        qwen3.encode_waveforms_audio_features_to_cpu(waveforms.as_slice(), asr_options)?;
     Ok(SegmentEncodedAsrBatch {
         inference: SegmentAsrInference {
             targets,
@@ -2390,9 +2388,9 @@ fn run_segment_asr_decode(
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
     let qwen3 = asr
         .as_any()
-        .downcast_ref::<Qwen3AsrAdapter>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3AsrAdapter"))?;
-    let timelines = qwen3.decode_cpu_audio_features(
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3ASR"))?;
+    let timelines = qwen3.decode_cpu_audio_features_to_timelines(
         encoded.encoded,
         encoded.waveforms.as_slice(),
         asr_options,
@@ -2412,8 +2410,8 @@ fn run_segment_asr_decode_dynamic(
 ) -> Result<DynamicSegmentAsrDecode> {
     let qwen3 = asr
         .as_any()
-        .downcast_ref::<Qwen3AsrAdapter>()
-        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3AsrAdapter"))?;
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3ASR"))?;
     let (mut inference, mut waveforms, encoded) = initial.into_parts();
     let mut consumed_segments = initial_segments;
     let mut encoded_failures = Vec::new();
@@ -2499,7 +2497,7 @@ fn run_segment_asr_decode_dynamic(
         qwen3.decode_cpu_audio_features_dynamic_outputs(encoded, &mut poll_encoded, asr_options)?;
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
     if decode_idle_flush.is_some() {
-        vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.inner().device());
+        vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.device());
     }
     let mut timelines = Vec::with_capacity(waveforms.len());
     let mut waveform_offset = 0usize;
@@ -2708,7 +2706,7 @@ fn run_asr_jobs_batch(
         let total_audio_seconds: f64 = audio_seconds.iter().sum();
         let waveforms: Vec<Waveform> = raw_jobs.into_iter().map(|(job, _)| job.waveform).collect();
         let stage_start = Instant::now();
-        let result = offline.asr.transcribe_batch(&waveforms, asr_options);
+        let result = offline.asr.transcribe(&waveforms, asr_options);
         let elapsed = stage_start.elapsed().as_secs_f64();
         if stats.is_some() {
             log_asr_wave(
@@ -3136,14 +3134,7 @@ mod tests {
             self
         }
 
-        fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
-            let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
-            timelines
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("fake ASR returned no timeline"))
-        }
-
-        fn transcribe_batch(
+        fn transcribe(
             &self,
             waveforms: &[Waveform],
             _options: &AsrOptions,
