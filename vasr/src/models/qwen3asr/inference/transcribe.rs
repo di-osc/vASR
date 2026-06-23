@@ -2485,6 +2485,7 @@ pub fn decode_cpu_audio_features_dynamic_timed(
             ids.len()
         );
     }
+    timings.generation.tokens_generated = ids.iter().map(Vec::len).sum();
     let mut out_langs: Vec<Vec<String>> = vec![Vec::new(); merged.audio_len];
     let mut out_texts: Vec<Vec<String>> = vec![Vec::new(); merged.audio_len];
     let start_decode = std::time::Instant::now();

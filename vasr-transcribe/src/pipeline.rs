@@ -3122,7 +3122,7 @@ fn log_asr_summary(stats: &AsrStageStats) {
         stats.decode_tokens as f64 / stats.decode_model_seconds.max(f64::EPSILON) / 1000.0;
     tracing::info!(
         target: "vasr_transcribe::pipeline",
-        "asr | jobs={} segs={} audio={:.1}s wall={:.1}s speed={:.1}x audio_encoder={:.1}s/{:.1}x prefill={:.1}s/{:.1}ktok/s decode={:.1}s/{:.1}ktok/s decode_steps={}",
+        "asr | jobs={} segs={} audio={:.1}s wall={:.1}s speed={:.1}x audio_encoder_compute={:.1}s/{:.1}x prefill_compute={:.1}s tokens={} {:.1}ktok/s decode_compute={:.1}s tokens={} {:.1}ktok/s decode_calls={}",
         stats.jobs,
         stats.segments,
         stats.audio_seconds,
@@ -3131,8 +3131,10 @@ fn log_asr_summary(stats: &AsrStageStats) {
         audio_encoder_seconds,
         audio_encoder_speed,
         stats.prefill_seconds,
+        stats.prefill_tokens,
         prefill_ktok_s,
         stats.decode_model_seconds,
+        stats.decode_tokens,
         decode_ktok_s,
         stats.decode_steps
     );
