@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::EncodedAsrBatchPoll;
+#[cfg(feature = "timing")]
+use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{EncodedAsrBatch, Qwen3ASR};
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
@@ -92,6 +94,12 @@ struct AsrStageStats {
     decode_segments: usize,
     decode_audio_seconds: f64,
     decode_seconds: f64,
+    audio_encoder_seconds: f64,
+    prefill_seconds: f64,
+    prefill_tokens: usize,
+    decode_model_seconds: f64,
+    decode_tokens: usize,
+    decode_steps: usize,
 }
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
@@ -286,6 +294,9 @@ impl AsyncTranscribePipeline {
         let _ = vad_handle.await;
         let _ = asr_handle.await;
 
+        if let Ok(stats) = asr_stats.lock() {
+            log_asr_summary(&stats);
+        }
         let outcomes = expand_duplicate_outcomes(outcomes, &duplicate_indices);
         log_pipeline(job_count, &outcomes, pipeline_start.elapsed().as_secs_f64());
         outcomes
@@ -1670,6 +1681,8 @@ struct DynamicSegmentAsrDecode {
     inference: SegmentAsrInference,
     timelines: Vec<Timeline>,
     encoded_failures: Vec<SegmentEncodedFailure>,
+    #[cfg(feature = "timing")]
+    timings: TranscribeTimings,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -1706,6 +1719,17 @@ async fn handle_dynamic_segment_encoded_message(
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
 
+    #[cfg(feature = "timing")]
+    let (consumed_segments, batch, encoded_failures, timings) = match batch {
+        Ok(decoded) => (
+            decoded.consumed_segments,
+            Ok((decoded.inference, decoded.timelines)),
+            decoded.encoded_failures,
+            Some(decoded.timings),
+        ),
+        Err(error) => (segments, Err(error), Vec::new(), None),
+    };
+    #[cfg(not(feature = "timing"))]
     let (consumed_segments, batch, encoded_failures) = match batch {
         Ok(decoded) => (
             decoded.consumed_segments,
@@ -1714,6 +1738,10 @@ async fn handle_dynamic_segment_encoded_message(
         ),
         Err(error) => (segments, Err(error), Vec::new()),
     };
+    #[cfg(feature = "timing")]
+    if let Some(timings) = timings.as_ref() {
+        record_asr_timing_stats(stats, timings);
+    }
     record_asr_decode_stats(
         stats,
         consumed_segments.len(),
@@ -1814,6 +1842,22 @@ async fn handle_merged_segment_encoded_batch(
     stats: &Arc<Mutex<AsrStageStats>>,
 ) {
     let decode_start = Instant::now();
+    #[cfg(feature = "timing")]
+    let batch = match batch {
+        Ok(batch) => tokio::task::spawn_blocking({
+            let asr = Arc::clone(&offline.asr);
+            let asr_options = asr_options.clone();
+            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
+        })
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
+        Err(error) => Err(error),
+    };
+    #[cfg(feature = "timing")]
+    if let Ok((_, _, timings)) = &batch {
+        record_asr_timing_stats(stats, timings);
+    }
+    #[cfg(not(feature = "timing"))]
     let batch = match batch {
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
@@ -1833,6 +1877,8 @@ async fn handle_merged_segment_encoded_batch(
             .sum(),
         decode_start.elapsed().as_secs_f64(),
     );
+    #[cfg(feature = "timing")]
+    let batch = batch.map(|(inference, timelines, _timings)| (inference, timelines));
     let outcomes =
         finish_segment_asr_batch(segment_state, &segments, stage_start, batch, Some(stats));
     for outcome in outcomes {
@@ -2317,6 +2363,13 @@ fn run_segment_asr_inference(
 ) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
     if offline.asr.as_any().is::<Qwen3ASR>() {
         let encoded = run_segment_asr_encode(offline, segments, asr_options)?;
+        #[cfg(feature = "timing")]
+        {
+            let (inference, timelines, _timings) =
+                run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options)?;
+            return Ok((inference, timelines));
+        }
+        #[cfg(not(feature = "timing"))]
         return run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options);
     }
     let slices: Vec<Waveform> = segments
@@ -2381,6 +2434,25 @@ fn run_segment_asr_encode(
     })
 }
 
+#[cfg(feature = "timing")]
+fn run_segment_asr_decode(
+    asr: &dyn crate::runtime::model::AsrModel,
+    encoded: SegmentEncodedAsrBatch,
+    asr_options: &AsrOptions,
+) -> Result<(SegmentAsrInference, Vec<Timeline>, TranscribeTimings)> {
+    let qwen3 = asr
+        .as_any()
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3ASR"))?;
+    let (timelines, timings) = qwen3.decode_cpu_audio_features_to_timelines_timed(
+        encoded.encoded,
+        encoded.waveforms.as_slice(),
+        asr_options,
+    )?;
+    Ok((encoded.inference, timelines, timings))
+}
+
+#[cfg(not(feature = "timing"))]
 fn run_segment_asr_decode(
     asr: &dyn crate::runtime::model::AsrModel,
     encoded: SegmentEncodedAsrBatch,
@@ -2493,6 +2565,13 @@ fn run_segment_asr_decode_dynamic(
             }
         }
     };
+    #[cfg(feature = "timing")]
+    let (outputs, timings) = qwen3.decode_cpu_audio_features_dynamic_outputs_timed(
+        encoded,
+        &mut poll_encoded,
+        asr_options,
+    )?;
+    #[cfg(not(feature = "timing"))]
     let outputs =
         qwen3.decode_cpu_audio_features_dynamic_outputs(encoded, &mut poll_encoded, asr_options)?;
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
@@ -2528,6 +2607,8 @@ fn run_segment_asr_decode_dynamic(
         inference,
         timelines,
         encoded_failures,
+        #[cfg(feature = "timing")]
+        timings,
     })
 }
 
@@ -2902,6 +2983,22 @@ fn record_asr_encode_stats(
     }
 }
 
+#[cfg(feature = "timing")]
+fn record_asr_timing_stats(stats: &Arc<Mutex<AsrStageStats>>, timings: &TranscribeTimings) {
+    if let Ok(mut stats) = stats.lock() {
+        stats.audio_encoder_seconds += timings.audio_encoder_us as f64 / 1_000_000.0;
+        stats.prefill_seconds += timings.generation.prefill_us as f64 / 1_000_000.0;
+        stats.prefill_tokens = stats
+            .prefill_tokens
+            .saturating_add(timings.generation.prefill_tokens);
+        stats.decode_model_seconds += timings.generation.decode_us as f64 / 1_000_000.0;
+        stats.decode_tokens = stats
+            .decode_tokens
+            .saturating_add(timings.generation.tokens_generated);
+        stats.decode_steps = stats.decode_steps.saturating_add(timings.generation.steps);
+    }
+}
+
 fn record_asr_decode_stats(
     stats: &Arc<Mutex<AsrStageStats>>,
     segments: usize,
@@ -2964,9 +3061,42 @@ fn log_vad_summary(stats: &VadStageStats) {
     );
 }
 
+fn log_asr_summary(stats: &AsrStageStats) {
+    if stats.jobs == 0 && stats.segments == 0 {
+        return;
+    }
+    let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
+    let audio_encoder_seconds = if stats.audio_encoder_seconds > 0.0 {
+        stats.audio_encoder_seconds
+    } else {
+        stats.encode_seconds
+    };
+    let audio_encoder_speed = stats.encode_audio_seconds / audio_encoder_seconds.max(f64::EPSILON);
+    let prefill_ktok_s =
+        stats.prefill_tokens as f64 / stats.prefill_seconds.max(f64::EPSILON) / 1000.0;
+    let decode_ktok_s =
+        stats.decode_tokens as f64 / stats.decode_model_seconds.max(f64::EPSILON) / 1000.0;
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "asr | jobs={} segs={} audio={:.1}s wall={:.1}s speed={:.1}x audio_encoder={:.1}s/{:.1}x prefill={:.1}s/{:.1}ktok/s decode={:.1}s/{:.1}ktok/s decode_steps={}",
+        stats.jobs,
+        stats.segments,
+        stats.audio_seconds,
+        stats.wall_seconds,
+        metrics.speedup,
+        audio_encoder_seconds,
+        audio_encoder_speed,
+        stats.prefill_seconds,
+        prefill_ktok_s,
+        stats.decode_model_seconds,
+        decode_ktok_s,
+        stats.decode_steps
+    );
+}
+
 fn log_asr(kind: &'static str, jobs: usize, segments: usize, audio_s: f64, wall_s: f64) {
     let speedup = audio_s / wall_s.max(f64::EPSILON);
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
         "asr | {kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
     );

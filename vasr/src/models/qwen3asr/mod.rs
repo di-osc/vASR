@@ -223,6 +223,23 @@ impl Qwen3ASR {
         )
     }
 
+    #[cfg(feature = "timing")]
+    pub fn decode_cpu_audio_features_timed(
+        &self,
+        encoded: EncodedAsrBatch,
+        opts: TranscribeOptions,
+    ) -> Result<(Vec<AsrTranscription>, TranscribeTimings)> {
+        inference::transcribe::decode_cpu_audio_features_timed(
+            self.thinker.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
+            #[cfg(feature = "paged-attn")]
+            self.paged_cache.as_ref(),
+            encoded,
+            &opts,
+        )
+    }
+
     #[cfg(feature = "paged-attn")]
     pub fn decode_cpu_audio_features_dynamic(
         &self,
@@ -231,6 +248,24 @@ impl Qwen3ASR {
         opts: TranscribeOptions,
     ) -> Result<Vec<Vec<AsrTranscription>>> {
         inference::transcribe::decode_cpu_audio_features_dynamic(
+            self.thinker.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
+            self.paged_cache.as_ref(),
+            encoded,
+            &mut poll_encoded,
+            &opts,
+        )
+    }
+
+    #[cfg(all(feature = "paged-attn", feature = "timing"))]
+    pub fn decode_cpu_audio_features_dynamic_timed(
+        &self,
+        encoded: EncodedAsrBatch,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        opts: TranscribeOptions,
+    ) -> Result<(Vec<Vec<AsrTranscription>>, TranscribeTimings)> {
+        inference::transcribe::decode_cpu_audio_features_dynamic_timed(
             self.thinker.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),

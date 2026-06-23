@@ -8,6 +8,8 @@ use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsr
 
 #[cfg(feature = "paged-attn")]
 use super::EncodedAsrBatchPoll;
+#[cfg(feature = "timing")]
+use super::TranscribeTimings;
 use super::{AsrStream, AsrTranscription, AudioInput, Batch, EncodedAsrBatch, Qwen3Asr};
 use super::{StreamOptions, TranscribeOptions};
 
@@ -65,6 +67,18 @@ impl Qwen3Asr {
         qwen_outputs_to_timelines(outputs, waveforms)
     }
 
+    #[cfg(feature = "timing")]
+    pub fn decode_cpu_audio_features_to_timelines_timed(
+        &self,
+        encoded: EncodedAsrBatch,
+        waveforms: &[Waveform],
+        options: &AsrOptions,
+    ) -> Result<(Vec<Timeline>, TranscribeTimings)> {
+        let runtime_options = qwen_transcribe_options(options);
+        let (outputs, timings) = self.decode_cpu_audio_features_timed(encoded, runtime_options)?;
+        Ok((qwen_outputs_to_timelines(outputs, waveforms)?, timings))
+    }
+
     #[cfg(feature = "paged-attn")]
     pub fn decode_cpu_audio_features_dynamic_outputs(
         &self,
@@ -74,6 +88,17 @@ impl Qwen3Asr {
     ) -> Result<Vec<Vec<AsrTranscription>>> {
         let runtime_options = qwen_transcribe_options(options);
         self.decode_cpu_audio_features_dynamic(encoded, &mut poll_encoded, runtime_options)
+    }
+
+    #[cfg(all(feature = "paged-attn", feature = "timing"))]
+    pub fn decode_cpu_audio_features_dynamic_outputs_timed(
+        &self,
+        encoded: EncodedAsrBatch,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        options: &AsrOptions,
+    ) -> Result<(Vec<Vec<AsrTranscription>>, TranscribeTimings)> {
+        let runtime_options = qwen_transcribe_options(options);
+        self.decode_cpu_audio_features_dynamic_timed(encoded, &mut poll_encoded, runtime_options)
     }
 }
 
