@@ -3117,9 +3117,10 @@ fn log_asr_audio_encoder_batch(
     let stack_s = timing_us_to_seconds(timings.stack_us);
     let forward_s = timing_us_to_seconds(timings.forward_us);
     let d2h_s = timing_us_to_seconds(timings.d2h_us);
+    let tokens = timings.audio_tokens;
     tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "asr audio_encoder | segs={segments} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x prepare={prepare_s:.3}s stack={stack_s:.3}s forward={forward_s:.3}s d2h={d2h_s:.3}s"
+        "asr audio_encoder | segs={segments} tokens={tokens} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x prepare={prepare_s:.3}s stack={stack_s:.3}s forward={forward_s:.3}s d2h={d2h_s:.3}s"
     );
 }
 

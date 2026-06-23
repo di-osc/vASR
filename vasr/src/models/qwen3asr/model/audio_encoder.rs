@@ -596,6 +596,13 @@ pub struct AudioTower {
     use_flash_attn: bool,
 }
 
+struct AudioConvSample {
+    hidden_states: Tensor,
+    aftercnn_total: usize,
+    max_t: usize,
+    chunks: usize,
+}
+
 impl AudioTower {
     pub fn load(cfg: &AudioEncoderConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
         let device = vb.device().clone();
@@ -730,57 +737,28 @@ impl AudioTower {
             candle_core::bail!("audio_config.n_window must be > 0");
         }
 
-        let max_chunk_len = window;
-        let mut padded_chunks: Vec<Tensor> = Vec::new();
-        let mut aftercnn_lens: Vec<usize> = Vec::new();
+        let mut sample_hiddens: Vec<Tensor> = Vec::with_capacity(batch);
         let mut sample_aftercnn_totals: Vec<usize> = Vec::with_capacity(batch);
+        let mut sample_max_ts: Vec<usize> = Vec::with_capacity(batch);
+        let mut total_chunks = 0usize;
 
         for (sample_idx, &sample_len) in feature_lens.iter().enumerate() {
             if sample_len == 0 {
                 sample_aftercnn_totals.push(0);
+                sample_max_ts.push(0);
                 continue;
             }
 
             let input_feature = input_features.narrow(0, sample_idx, 1)?.squeeze(0)?;
             let input_feature = input_feature.narrow(1, 0, sample_len)?;
-            let input_t = input_feature.transpose(0, 1)?; // (frames, mel)
-            let chunk_num = sample_len.div_ceil(window);
-            let mut sample_aftercnn_total = 0usize;
-            let mut offset = 0usize;
-
-            for chunk_idx in 0..chunk_num {
-                let remaining = sample_len.saturating_sub(offset);
-                let chunk_len = remaining.min(window);
-                if chunk_len == 0 {
-                    candle_core::bail!(
-                        "invalid zero chunk length: sample={sample_idx} chunk={chunk_idx}"
-                    );
-                }
-                let chunk = input_t.narrow(0, offset, chunk_len)?; // (chunk_len, mel)
-                let pad = max_chunk_len.saturating_sub(chunk_len);
-                padded_chunks.push(pad_audio_chunk(&chunk, 0, 0, pad)?);
-                let aftercnn_len = feat_extract_output_length(chunk_len);
-                aftercnn_lens.push(aftercnn_len);
-                sample_aftercnn_total = sample_aftercnn_total.saturating_add(aftercnn_len);
-                offset = offset.saturating_add(chunk_len);
-            }
-
-            if offset != sample_len {
-                candle_core::bail!(
-                    "chunk split did not consume full sample: sample={sample_idx} offset={offset} len={sample_len}"
-                );
-            }
-
-            let expected_aftercnn_total = feat_extract_output_length(sample_len);
-            if sample_aftercnn_total != expected_aftercnn_total {
-                candle_core::bail!(
-                    "aftercnn length mismatch for sample={sample_idx}: expected={expected_aftercnn_total}, got={sample_aftercnn_total}"
-                );
-            }
-            sample_aftercnn_totals.push(sample_aftercnn_total);
+            let sample = self.forward_conv_sample(&input_feature, window)?;
+            total_chunks = total_chunks.saturating_add(sample.chunks);
+            sample_aftercnn_totals.push(sample.aftercnn_total);
+            sample_max_ts.push(sample.max_t);
+            sample_hiddens.push(sample.hidden_states);
         }
 
-        if padded_chunks.is_empty() {
+        if sample_hiddens.is_empty() {
             return Tensor::zeros(
                 (0usize, self.config.output_dim),
                 input_features.dtype(),
@@ -788,83 +766,11 @@ impl AudioTower {
             );
         }
 
-        let total_chunks = padded_chunks.len();
-        // (total_chunks, max_chunk_len, mel) -> (total_chunks, mel, max_chunk_len)
-        let padded_feature = stack_audio_chunks(&padded_chunks)?.transpose(1, 2)?;
-        log_cuda_mem(
-            input_features.device(),
-            &format!("audio_encoder_after_stack_chunks(batch={batch},chunks={total_chunks})"),
-        );
-        drop(padded_chunks);
-        let padded_feature = padded_feature.unsqueeze(1)?; // (total_chunks, 1, mel, max_chunk_len)
-
-        let mut conv_outs: Vec<Tensor> = Vec::new();
-        let mut start = 0usize;
-        while start < total_chunks {
-            let len = (total_chunks - start).min(self.config.conv_chunksize.max(1));
-            let x = padded_feature.narrow(0, start, len)?;
-            let x = gelu(&self.conv2d1.forward(&x)?)?;
-            let x = gelu(&self.conv2d2.forward(&x)?)?;
-            let x = gelu(&self.conv2d3.forward(&x)?)?;
-            conv_outs.push(x.detach());
-            start = start.saturating_add(len);
-        }
-        log_cuda_mem(
-            input_features.device(),
-            &format!("audio_encoder_after_conv_chunks(batch={batch},chunks={total_chunks})"),
-        );
-        drop(padded_feature);
-
-        let mut x = if conv_outs.len() == 1 {
-            conv_outs
-                .first()
-                .ok_or_else(|| candle_core::Error::Msg("missing conv output".to_string()))?
-                .clone()
-        } else {
-            Tensor::cat(&conv_outs.iter().collect::<Vec<_>>(), 0)?
-        };
-        drop(conv_outs);
-        log_cuda_mem(
-            input_features.device(),
-            &format!("audio_encoder_after_conv_cat(batch={batch},chunks={total_chunks})"),
-        );
-
-        let (b, c, f, t) = x.dims4()?;
-        x = x.transpose(1, 3)?.transpose(2, 3)?.contiguous()?; // (b, t, c, f)
-        x = x.reshape((b, t, c * f))?;
-        x = self.conv_out.forward(&x)?; // (b, t, d_model)
-        log_cuda_mem(
-            input_features.device(),
-            &format!("audio_encoder_after_conv_out(batch={batch},chunks={total_chunks},max_t={t})"),
-        );
-
-        let pe = self.positional_embedding.narrow(0, 0, t)?.unsqueeze(0)?;
-        let pe = pe.to_dtype(x.dtype())?;
-        x = x.broadcast_add(&pe)?;
-
-        let max_t = t;
-        let flat = x.reshape((b * max_t, self.config.d_model))?;
-        let idx_capacity: usize = aftercnn_lens.iter().sum();
-        let mut idxs: Vec<u32> = Vec::with_capacity(idx_capacity);
-        for (chunk_idx, &len) in aftercnn_lens.iter().enumerate() {
-            if len > max_t {
-                candle_core::bail!("aftercnn_len={len} exceeds max_t={max_t}");
-            }
-            let base = chunk_idx
-                .checked_mul(max_t)
-                .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
-            for j in 0..len {
-                let pos = base
-                    .checked_add(j)
-                    .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
-                let pos_u32 = u32::try_from(pos)
-                    .map_err(|_| candle_core::Error::Msg("index overflow".to_string()))?;
-                idxs.push(pos_u32);
-            }
-        }
-        let idx_len = idxs.len();
-        let idx = Tensor::from_vec(idxs, (idx_len,), input_features.device())?;
-        let mut hidden_states = flat.index_select(&idx, 0)?;
+        let idx_len: usize = sample_aftercnn_totals.iter().sum();
+        let sample_refs: Vec<&Tensor> = sample_hiddens.iter().collect();
+        let mut hidden_states = Tensor::cat(sample_refs.as_slice(), 0)?;
+        drop(sample_refs);
+        drop(sample_hiddens);
         let padded_idx_len = match audio_seq_bucket_size() {
             Some(bucket) => round_up_to_multiple(idx_len, bucket)?,
             None => idx_len,
@@ -874,20 +780,21 @@ impl AudioTower {
         } else {
             hidden_states
         };
-        drop(idx);
-        drop(flat);
-        drop(x);
         log_cuda_mem(
             input_features.device(),
             &format!(
-                "audio_encoder_after_flatten_valid(batch={batch},chunks={total_chunks},seq={idx_len},padded_seq={padded_idx_len})"
+                "audio_encoder_after_conv_samples(batch={batch},chunks={total_chunks},seq={idx_len},padded_seq={padded_idx_len})"
             ),
         );
 
         let mut cu_seqlens = Vec::new();
         cu_seqlens.push(0usize);
         let mut seq_offset = 0usize;
-        for (sample_idx, &aftercnn_total) in sample_aftercnn_totals.iter().enumerate() {
+        for (sample_idx, (&aftercnn_total, &max_t)) in sample_aftercnn_totals
+            .iter()
+            .zip(sample_max_ts.iter())
+            .enumerate()
+        {
             if aftercnn_total == 0 {
                 continue;
             }
@@ -950,6 +857,139 @@ impl AudioTower {
             ),
         );
         Ok(hidden_states.narrow(0, 0, idx_len)?.detach())
+    }
+
+    fn forward_conv_sample(
+        &self,
+        input_feature: &Tensor,
+        window: usize,
+    ) -> Result<AudioConvSample> {
+        let (mel, frames) = input_feature.dims2()?;
+        if mel != self.config.num_mel_bins {
+            candle_core::bail!(
+                "input_feature mel bins mismatch: expected={}, got={mel}",
+                self.config.num_mel_bins
+            );
+        }
+        if frames == 0 {
+            return Ok(AudioConvSample {
+                hidden_states: Tensor::zeros(
+                    (0usize, self.config.d_model),
+                    input_feature.dtype(),
+                    input_feature.device(),
+                )?,
+                aftercnn_total: 0,
+                max_t: 0,
+                chunks: 0,
+            });
+        }
+
+        let input_t = input_feature.transpose(0, 1)?; // (frames, mel)
+        let chunk_num = frames.div_ceil(window);
+        let mut padded_chunks: Vec<Tensor> = Vec::with_capacity(chunk_num);
+        let mut aftercnn_lens: Vec<usize> = Vec::with_capacity(chunk_num);
+        let mut aftercnn_total = 0usize;
+        let mut offset = 0usize;
+
+        for chunk_idx in 0..chunk_num {
+            let remaining = frames.saturating_sub(offset);
+            let chunk_len = remaining.min(window);
+            if chunk_len == 0 {
+                candle_core::bail!("invalid zero chunk length: chunk={chunk_idx}");
+            }
+            let chunk = input_t.narrow(0, offset, chunk_len)?;
+            let pad = window.saturating_sub(chunk_len);
+            padded_chunks.push(pad_audio_chunk(&chunk, 0, 0, pad)?);
+            let aftercnn_len = feat_extract_output_length(chunk_len);
+            aftercnn_lens.push(aftercnn_len);
+            aftercnn_total = aftercnn_total.saturating_add(aftercnn_len);
+            offset = offset.saturating_add(chunk_len);
+        }
+        if offset != frames {
+            candle_core::bail!(
+                "chunk split did not consume full sequence: offset={offset} frames={frames}"
+            );
+        }
+        let expected_aftercnn_total = feat_extract_output_length(frames);
+        if aftercnn_total != expected_aftercnn_total {
+            candle_core::bail!(
+                "aftercnn length mismatch: expected={expected_aftercnn_total}, got={aftercnn_total}"
+            );
+        }
+
+        let padded_feature = stack_audio_chunks(&padded_chunks)?.transpose(1, 2)?;
+        drop(padded_chunks);
+        let padded_feature = padded_feature.unsqueeze(1)?;
+
+        let mut conv_outs: Vec<Tensor> = Vec::new();
+        let mut start = 0usize;
+        while start < chunk_num {
+            let len = (chunk_num - start).min(self.config.conv_chunksize.max(1));
+            let x = padded_feature.narrow(0, start, len)?;
+            let x = gelu(&self.conv2d1.forward(&x)?)?;
+            let x = gelu(&self.conv2d2.forward(&x)?)?;
+            let x = gelu(&self.conv2d3.forward(&x)?)?;
+            conv_outs.push(x.detach());
+            start = start.saturating_add(len);
+        }
+        drop(padded_feature);
+
+        let mut x = if conv_outs.len() == 1 {
+            conv_outs
+                .first()
+                .ok_or_else(|| candle_core::Error::Msg("missing conv output".to_string()))?
+                .clone()
+        } else {
+            Tensor::cat(&conv_outs.iter().collect::<Vec<_>>(), 0)?
+        };
+        drop(conv_outs);
+
+        let (b, c, f, t) = x.dims4()?;
+        x = x.transpose(1, 3)?.transpose(2, 3)?.contiguous()?;
+        x = x.reshape((b, t, c * f))?;
+        x = self.conv_out.forward(&x)?;
+
+        let pe = self.positional_embedding.narrow(0, 0, t)?.unsqueeze(0)?;
+        let pe = pe.to_dtype(x.dtype())?;
+        x = x.broadcast_add(&pe)?;
+
+        let max_t = t;
+        let flat = x.reshape((b * max_t, self.config.d_model))?;
+        let mut idxs: Vec<u32> = Vec::with_capacity(aftercnn_total);
+        for (chunk_idx, &len) in aftercnn_lens.iter().enumerate() {
+            if len > max_t {
+                candle_core::bail!("aftercnn_len={len} exceeds max_t={max_t}");
+            }
+            let base = chunk_idx
+                .checked_mul(max_t)
+                .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
+            for j in 0..len {
+                let pos = base
+                    .checked_add(j)
+                    .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
+                let pos_u32 = u32::try_from(pos)
+                    .map_err(|_| candle_core::Error::Msg("index overflow".to_string()))?;
+                idxs.push(pos_u32);
+            }
+        }
+        let idx_len = idxs.len();
+        if idx_len != aftercnn_total {
+            candle_core::bail!(
+                "sample aftercnn length mismatch: expected={aftercnn_total}, got={idx_len}"
+            );
+        }
+        let idx = Tensor::from_vec(idxs, (idx_len,), input_feature.device())?;
+        let hidden_states = flat.index_select(&idx, 0)?.detach();
+        drop(idx);
+        drop(flat);
+        drop(x);
+
+        Ok(AudioConvSample {
+            hidden_states,
+            aftercnn_total,
+            max_t,
+            chunks: chunk_num,
+        })
     }
 
     #[cfg(test)]

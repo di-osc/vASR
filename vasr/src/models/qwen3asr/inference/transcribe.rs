@@ -296,6 +296,7 @@ pub struct AudioFeatureEncodeTimings {
     pub stack_us: u64,
     pub forward_us: u64,
     pub d2h_us: u64,
+    pub audio_tokens: usize,
 }
 
 impl AudioFeatureEncodeTimings {
@@ -304,6 +305,7 @@ impl AudioFeatureEncodeTimings {
         self.stack_us = self.stack_us.saturating_add(other.stack_us);
         self.forward_us = self.forward_us.saturating_add(other.forward_us);
         self.d2h_us = self.d2h_us.saturating_add(other.d2h_us);
+        self.audio_tokens = self.audio_tokens.saturating_add(other.audio_tokens);
     }
 }
 
@@ -822,6 +824,7 @@ fn encode_prepared_audio_features_cpu(
     let audio_features =
         thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
     timings.forward_us = duration_to_us(start_forward.elapsed());
+    timings.audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
     let start_d2h = std::time::Instant::now();
     let audio_features_cpu = audio_features.to_device(&Device::Cpu)?;
     timings.d2h_us = duration_to_us(start_d2h.elapsed());
