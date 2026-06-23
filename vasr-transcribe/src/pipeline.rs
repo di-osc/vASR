@@ -33,7 +33,6 @@ const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
-const ASR_ENCODER_REQUEST_QUEUE: usize = 1;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
 
 #[derive(Debug, Default)]
@@ -220,7 +219,7 @@ impl AsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue=unbounded",
+            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
             stage_parallelism,
             stage_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
@@ -344,7 +343,7 @@ impl GlobalAsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB feature_queue=unbounded decode_idle_flush={}ms",
+            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded decode_idle_flush={}ms",
             stage_parallelism,
             stage_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
@@ -1541,7 +1540,7 @@ struct SegmentEncodedMessage {
 fn spawn_segment_encoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    mut request_rx: mpsc::Receiver<SegmentEncodeRequest>,
+    mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeRequest>,
     encoded_tx: mpsc::UnboundedSender<SegmentEncodedMessage>,
     stats: Arc<Mutex<AsrStageStats>>,
 ) -> JoinHandle<()> {
@@ -1913,26 +1912,15 @@ async fn handle_ready_segment_encoded_messages(
     .await;
 }
 
-async fn send_segment_encode_request(
-    asr_to_encoder_tx: &mpsc::Sender<SegmentEncodeRequest>,
+fn send_segment_encode_request(
+    asr_to_encoder_tx: &mpsc::UnboundedSender<SegmentEncodeRequest>,
     request: SegmentEncodeRequest,
 ) {
-    let mut request = request;
-    loop {
-        match asr_to_encoder_tx.try_send(request) {
-            Ok(()) => return,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!(
-                    target: "vasr_transcribe::pipeline",
-                    "ASR audio feature encoder closed"
-                );
-                return;
-            }
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                request = returned;
-                tokio::task::yield_now().await;
-            }
-        }
+    if asr_to_encoder_tx.send(request).is_err() {
+        tracing::warn!(
+            target: "vasr_transcribe::pipeline",
+            "ASR audio feature encoder closed"
+        );
     }
 }
 
@@ -1948,7 +1936,7 @@ fn spawn_asr_worker(
     tokio::spawn(async move {
         let mut fallback_segment_state = SegmentAsrState::default();
         let mut pending = VecDeque::new();
-        let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::channel(ASR_ENCODER_REQUEST_QUEUE);
+        let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::unbounded_channel();
         let (encoder_to_decoder_tx, encoder_to_decoder_rx) = mpsc::unbounded_channel();
         let segment_encoder_handle = spawn_segment_encoder_worker(
             Arc::clone(&offline),
@@ -2034,15 +2022,14 @@ fn spawn_asr_worker(
                     if offline.asr.as_any().is::<Qwen3ASR>() {
                         tracing::debug!(
                             target: "vasr_transcribe::pipeline",
-                            "asr audio_features encode enqueue | segs={} request_queue_capacity={}",
+                            "asr audio_features encode enqueue | segs={}",
                             segments.len(),
-                            asr_to_encoder_tx.capacity(),
                         );
                         let request = SegmentEncodeRequest {
                             segments,
                             stage_start,
                         };
-                        send_segment_encode_request(&asr_to_encoder_tx, request).await;
+                        send_segment_encode_request(&asr_to_encoder_tx, request);
                     } else {
                         let batch = tokio::task::spawn_blocking({
                             let offline = Arc::clone(&offline);
