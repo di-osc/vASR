@@ -119,8 +119,13 @@ name = "bench_transcribe_batch"
 required-features = ["audio-loading", "timing"]
 
 [[example]]
-name = "bench_asr_stages"
-required-features = ["audio-loading", "timing"]
+name = "bench_audio_encoder"
+
+[[example]]
+name = "bench_prefill"
+
+[[example]]
+name = "bench_decode"
 
 [[example]]
 name = "bench_text_decode"
