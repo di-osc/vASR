@@ -1560,11 +1560,17 @@ fn spawn_segment_encoder_worker(
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
+            let encode_wall_seconds = encode_start.elapsed().as_secs_f64();
+            log_asr_audio_encoder_batch(
+                segments_for_result.len(),
+                segment_audio_seconds,
+                encode_wall_seconds,
+            );
             record_asr_encode_stats(
                 &stats,
                 segments_for_result.len(),
                 segment_audio_seconds,
-                encode_start.elapsed().as_secs_f64(),
+                encode_wall_seconds,
             );
             let message = SegmentEncodedMessage {
                 segments: segments_for_result,
@@ -3037,6 +3043,14 @@ fn log_vad_summary(stats: &VadStageStats) {
         stats.compute_seconds,
         stats.send_wait_seconds,
         metrics.speedup
+    );
+}
+
+fn log_asr_audio_encoder_batch(segments: usize, audio_s: f64, wall_s: f64) {
+    let speedup = audio_s / wall_s.max(f64::EPSILON);
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "asr audio_encoder | segs={segments} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x"
     );
 }
 
