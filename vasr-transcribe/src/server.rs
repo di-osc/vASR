@@ -67,28 +67,40 @@ async fn handle_transcribe(
 
     let wall = start.elapsed().as_secs_f64();
     let num_items = data.len();
+    let bad = data.iter().filter(|item| item.is_bad).count();
+    let performance = InferencePerformance {
+        batch_wall_seconds: wall,
+        num_items,
+        throughput_items_per_second: if wall > 0.0 {
+            num_items as f64 / wall
+        } else {
+            0.0
+        },
+        total_audio_duration_seconds,
+        speedup: if wall > 0.0 {
+            total_audio_duration_seconds / wall
+        } else {
+            0.0
+        },
+        rtf: if total_audio_duration_seconds > 0.0 {
+            wall / total_audio_duration_seconds
+        } else {
+            0.0
+        },
+    };
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "request | items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4}",
+        performance.num_items,
+        bad,
+        performance.total_audio_duration_seconds,
+        performance.batch_wall_seconds,
+        performance.speedup,
+        performance.rtf
+    );
     Json(TranscribeResponse {
         data,
-        inference_performance: InferencePerformance {
-            batch_wall_seconds: wall,
-            num_items,
-            throughput_items_per_second: if wall > 0.0 {
-                num_items as f64 / wall
-            } else {
-                0.0
-            },
-            total_audio_duration_seconds,
-            speedup: if wall > 0.0 {
-                total_audio_duration_seconds / wall
-            } else {
-                0.0
-            },
-            rtf: if total_audio_duration_seconds > 0.0 {
-                wall / total_audio_duration_seconds
-            } else {
-                0.0
-            },
-        },
+        inference_performance: performance,
     })
 }
 

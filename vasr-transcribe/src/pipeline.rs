@@ -2541,20 +2541,31 @@ fn finish_segment_asr_batch(
     let mut completed = Vec::new();
     match batch {
         Ok((inference, timelines)) => {
-            log_asr(
-                "vad-segment",
-                inference.active_job_count,
-                segments.len(),
-                inference.segment_audio_seconds,
-                stage_start.elapsed().as_secs_f64(),
-            );
+            let elapsed = stage_start.elapsed().as_secs_f64();
+            if stats.is_some() {
+                log_asr_wave(
+                    "vad-segment",
+                    inference.active_job_count,
+                    segments.len(),
+                    inference.segment_audio_seconds,
+                    elapsed,
+                );
+            } else {
+                log_asr(
+                    "vad-segment",
+                    inference.active_job_count,
+                    segments.len(),
+                    inference.segment_audio_seconds,
+                    elapsed,
+                );
+            }
             if let Some(stats) = stats {
                 record_asr_batch_stats(
                     stats,
                     inference.active_job_count,
                     segments.len(),
                     inference.segment_audio_seconds,
-                    stage_start.elapsed().as_secs_f64(),
+                    elapsed,
                 );
             }
             if timelines.len() == inference.targets.len() {
@@ -2691,20 +2702,31 @@ fn run_asr_jobs_batch(
         let waveforms: Vec<Waveform> = raw_jobs.into_iter().map(|(job, _)| job.waveform).collect();
         let stage_start = Instant::now();
         let result = offline.asr.transcribe_batch(&waveforms, asr_options);
-        log_asr(
-            "raw",
-            indices.len(),
-            waveforms.len(),
-            total_audio_seconds,
-            stage_start.elapsed().as_secs_f64(),
-        );
+        let elapsed = stage_start.elapsed().as_secs_f64();
+        if stats.is_some() {
+            log_asr_wave(
+                "raw",
+                indices.len(),
+                waveforms.len(),
+                total_audio_seconds,
+                elapsed,
+            );
+        } else {
+            log_asr(
+                "raw",
+                indices.len(),
+                waveforms.len(),
+                total_audio_seconds,
+                elapsed,
+            );
+        }
         if let Some(stats) = stats {
             record_asr_batch_stats(
                 stats,
                 indices.len(),
                 waveforms.len(),
                 total_audio_seconds,
-                stage_start.elapsed().as_secs_f64(),
+                elapsed,
             );
         }
         match result {
@@ -2942,6 +2964,14 @@ fn log_asr(kind: &'static str, jobs: usize, segments: usize, audio_s: f64, wall_
     tracing::info!(
         target: "vasr_transcribe::pipeline",
         "asr | {kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
+    );
+}
+
+fn log_asr_wave(kind: &'static str, jobs: usize, segments: usize, audio_s: f64, wall_s: f64) {
+    let speedup = audio_s / wall_s.max(f64::EPSILON);
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "asr wave | mode=serve | source={kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
     );
 }
 
