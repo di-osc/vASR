@@ -22,9 +22,9 @@ use crate::pipeline::AsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
 
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
+const DEFAULT_MAX_NUM_SEQS: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
 #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
-const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = 512;
+const DEFAULT_MAX_NUM_SEQS: usize = 512;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -52,13 +52,13 @@ pub struct CommonModelArgs {
     )]
     pub gpu_memory_utilization: f32,
 
-    /// Maximum CUDA decode graph batch width. Use 0 to disable CUDA graph prewarm/replay.
+    /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs; use 0 to disable CUDA graph prewarm/replay.
     #[arg(
-        long = "cuda-graph-max-seqs",
-        default_value_t = DEFAULT_CUDA_GRAPH_MAX_SEQS,
-        env = "VASR_CUDA_GRAPH_MAX_SEQS"
+        long = "max-num-seqs",
+        default_value_t = DEFAULT_MAX_NUM_SEQS,
+        env = "VASR_MAX_NUM_SEQS"
     )]
-    pub cuda_graph_max_seqs: usize,
+    pub max_num_seqs: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -223,7 +223,7 @@ mod tests {
                 isq: None,
                 max_new_tokens: 128,
                 gpu_memory_utilization: 0.65,
-                cuda_graph_max_seqs: DEFAULT_CUDA_GRAPH_MAX_SEQS,
+                max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
@@ -264,10 +264,10 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
     }
-    if args.cuda_graph_max_seqs > DEFAULT_CUDA_GRAPH_MAX_SEQS {
+    if args.max_num_seqs > DEFAULT_MAX_NUM_SEQS {
         bail!(
-            "--cuda-graph-max-seqs must be <= {} (use 0 to disable)",
-            DEFAULT_CUDA_GRAPH_MAX_SEQS
+            "--max-num-seqs must be <= {} (use 0 to disable CUDA graph)",
+            DEFAULT_MAX_NUM_SEQS
         );
     }
     Ok(())
@@ -412,14 +412,14 @@ fn cuda_graph_max_batch(args: &CommonModelArgs) -> Option<usize> {
         );
         return None;
     }
-    if args.cuda_graph_max_seqs == 0 {
+    if args.max_num_seqs == 0 {
         tracing::info!(
             target: "vasr_transcribe::serve",
-            "CUDA decode graph disabled by --cuda-graph-max-seqs=0."
+            "CUDA decode graph disabled by --max-num-seqs=0."
         );
         return None;
     }
-    Some(args.cuda_graph_max_seqs)
+    Some(args.max_num_seqs)
 }
 
 #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
