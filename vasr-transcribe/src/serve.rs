@@ -22,9 +22,10 @@ use crate::pipeline::AsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
 
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-const DEFAULT_MAX_NUM_SEQS: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
+const MAX_NUM_SEQS_LIMIT: usize = vasr::vasr_paged_attn::CUDA_DECODE_GRAPH_MAX_BATCH;
 #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
-const DEFAULT_MAX_NUM_SEQS: usize = 512;
+const MAX_NUM_SEQS_LIMIT: usize = 512;
+const DEFAULT_MAX_NUM_SEQS: usize = 256;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -55,8 +56,7 @@ pub struct CommonModelArgs {
     /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs; use 0 to disable CUDA graph prewarm/replay.
     #[arg(
         long = "max-num-seqs",
-        default_value_t = DEFAULT_MAX_NUM_SEQS,
-        env = "VASR_MAX_NUM_SEQS"
+        default_value_t = DEFAULT_MAX_NUM_SEQS
     )]
     pub max_num_seqs: usize,
 }
@@ -264,10 +264,10 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
     }
-    if args.max_num_seqs > DEFAULT_MAX_NUM_SEQS {
+    if args.max_num_seqs > MAX_NUM_SEQS_LIMIT {
         bail!(
             "--max-num-seqs must be <= {} (use 0 to disable CUDA graph)",
-            DEFAULT_MAX_NUM_SEQS
+            MAX_NUM_SEQS_LIMIT
         );
     }
     Ok(())
