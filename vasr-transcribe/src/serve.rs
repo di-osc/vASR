@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,12 +23,13 @@ use crate::pipeline::AsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
 
 const DEFAULT_MAX_NUM_SEQS: usize = 256;
+const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
-    /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B` or `Qwen/Qwen3-ASR-1.7B`, or a local directory.
-    #[arg(long, default_value = "Qwen/Qwen3-ASR-0.6B", env = "VASR_MODEL")]
-    pub model: String,
+    /// vASR model cache directory.
+    #[arg(long = "cache-dir", default_value_os_t = vasr::modelscope_cache_dir())]
+    pub cache_dir: PathBuf,
 
     /// Device: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto", env = "VASR_DEVICE")]
@@ -59,10 +61,6 @@ pub struct CommonModelArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct VadCliArgs {
-    /// FunASR FSMN VAD model directory. If omitted, vASR downloads/uses `funasr/fsmn-vad`.
-    #[arg(long, env = "VASR_VAD_MODEL")]
-    pub vad_model: Option<String>,
-
     /// FSMN VAD speech probability threshold (`speech_noise_thres`).
     #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
     pub vad_threshold: f32,
@@ -137,7 +135,7 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
         cuda_graph_max_batch(&args.pipeline.model),
         false,
     )?;
-    let offline = build_offline_pipeline(&args.pipeline, asr)?;
+    let offline = build_offline_pipeline(asr)?;
     let transcribe_service = build_transcribe_service_from_parts(
         offline,
         asr_options_from_pipeline(&args.pipeline, None),
@@ -161,7 +159,7 @@ pub fn build_async_transcribe_pipeline(
         cuda_graph_max_batch(&pipeline.model),
         false,
     )?;
-    let offline = build_offline_pipeline(pipeline, asr)?;
+    let offline = build_offline_pipeline(asr)?;
     Ok(AsyncTranscribePipeline::new(
         AudioLoader,
         offline,
@@ -175,12 +173,9 @@ pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {
     validate_vad_args(&pipeline.vad)
 }
 
-fn build_offline_pipeline(
-    pipeline: &TranscribePipelineArgs,
-    asr: Arc<dyn AsrModel>,
-) -> Result<Arc<OfflinePipeline>> {
+fn build_offline_pipeline(asr: Arc<dyn AsrModel>) -> Result<Arc<OfflinePipeline>> {
     let vad_load_start = Instant::now();
-    let vad = load_fsmn_vad(&pipeline.vad.vad_model)?;
+    let vad = load_fsmn_vad()?;
     tracing::info!(
         target: "vasr_transcribe::serve",
         "FSMN VAD loaded from `{}` in {:.3}s.",
@@ -214,7 +209,7 @@ mod tests {
     fn pipeline_defaults_match_validated_vad_batch_bounds() {
         let pipeline = TranscribePipelineArgs {
             model: CommonModelArgs {
-                model: "Qwen/Qwen3-ASR-0.6B".to_string(),
+                cache_dir: vasr::modelscope_cache_dir(),
                 device: "auto".to_string(),
                 isq: None,
                 max_new_tokens: 128,
@@ -223,7 +218,6 @@ mod tests {
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
-                vad_model: None,
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 500,
@@ -251,8 +245,8 @@ fn vad_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> VadOptions {
 }
 
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
-    if args.model.trim().is_empty() {
-        bail!("--model must not be empty");
+    if args.cache_dir.as_os_str().is_empty() {
+        bail!("--cache-dir must not be empty");
     }
     if args.max_new_tokens == 0 {
         bail!("--max-new-tokens must be greater than zero");
@@ -426,6 +420,7 @@ fn load_asr_model(
     cuda_graph_max_batch: Option<usize>,
     scheduled: bool,
 ) -> Result<Arc<dyn AsrModel>> {
+    vasr::set_cache_dir(args.cache_dir.clone());
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
     #[cfg(feature = "paged-attn")]
@@ -479,13 +474,14 @@ fn load_asr_model(
     }
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "Loading Qwen3-ASR model `{}` on {} (isq={:?}).",
-        args.model,
+        "Loading Qwen3-ASR model `{}` from cache `{}` on {} (isq={:?}).",
+        DEFAULT_ASR_MODEL,
+        args.cache_dir.display(),
         device_label(&device),
         args.isq
     );
     let model_load_start = Instant::now();
-    let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
+    let qwen3_asr = Qwen3AsrModel::from_pretrained(DEFAULT_ASR_MODEL, &device, &load_options)?;
     let params_bytes = match qwen3_asr.inner().weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
@@ -612,8 +608,8 @@ async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn load_fsmn_vad(path: &Option<String>) -> Result<FsmnVadModel> {
-    FsmnVadModel::from_pretrained(path.as_deref())
+fn load_fsmn_vad() -> Result<FsmnVadModel> {
+    FsmnVadModel::from_pretrained(None::<&std::path::Path>)
 }
 
 async fn health() -> Json<serde_json::Value> {
