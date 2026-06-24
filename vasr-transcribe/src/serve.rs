@@ -109,11 +109,11 @@ pub struct ServeTranscribeArgs {
     pub language: Option<String>,
 
     /// Bind host.
-    #[arg(long, default_value = "127.0.0.1", env = "VASR_HOST")]
+    #[arg(long, default_value = "0.0.0.0", env = "VASR_HOST")]
     pub host: String,
 
     /// Bind port.
-    #[arg(long, default_value_t = 8000, env = "VASR_PORT")]
+    #[arg(long, default_value_t = 8867, env = "VASR_PORT")]
     pub port: u16,
 }
 
