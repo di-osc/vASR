@@ -61,6 +61,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         .map(|(index, item)| TranscribeInput {
             index,
             source: item.source.clone(),
+            channel: vasr_data::AudioChannel::Mono,
         })
         .collect::<Vec<_>>();
 
@@ -195,6 +196,7 @@ fn error_inference_data(service_id: &str, component: &str, reason: String) -> In
         service_id: service_id.to_string(),
         spent_seconds: 0.0,
         spent_details: Default::default(),
+        timings: Default::default(),
         text: Default::default(),
         sentences: Vec::new(),
         is_bad: true,

@@ -9,9 +9,9 @@ use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::cuda_graph::{
-    CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats, DecodeCudaGraph, bytes_to_mib,
-    cuda_graph_batch_bucket, cuda_graph_batch_buckets, cuda_graph_default_block_table_cols,
-    cuda_graph_prewarm_batch_limit, cuda_memory_snapshot, pad_decode_batch_to_max,
+    bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
+    cuda_graph_default_block_table_cols, cuda_graph_prewarm_batch_limit, cuda_memory_snapshot,
+    pad_decode_batch_to_max, CudaGraphPrewarmStats, DecodeCudaGraph, CUDA_DECODE_GRAPH_MAX_GRAPHS,
 };
 #[cfg(feature = "cuda-graph")]
 use crate::decode_forward::PagedCudaDecodeForward;
@@ -467,6 +467,10 @@ impl PagedCacheRuntime {
         &self.cache
     }
 
+    pub fn cache_clone(&self) -> PagedKvCache {
+        self.cache.clone()
+    }
+
     pub fn manager(&self) -> &PagedBlockManager {
         &self.manager
     }
@@ -779,8 +783,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::blocks_for_byte_budget;
     use super::{
-        PagedBlockManager, PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime,
-        bytes_per_paged_block,
+        bytes_per_paged_block, PagedBlockManager, PagedCacheConfig, PagedCacheMemory,
+        PagedCacheRuntime,
     };
 
     #[test]

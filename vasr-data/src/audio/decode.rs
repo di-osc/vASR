@@ -11,6 +11,13 @@ use anyhow::Context;
 
 #[cfg(feature = "audio-loading")]
 pub fn decode_path(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let waveform = decode_path_waveform(path)?;
+    let mono = waveform.to_mono()?;
+    Ok((mono.samples, mono.sample_rate))
+}
+
+#[cfg(feature = "audio-loading")]
+pub fn decode_path_waveform(path: &Path) -> Result<crate::Waveform> {
     use std::fs::File;
 
     use symphonia::core::formats::probe::Hint;
@@ -25,8 +32,11 @@ pub fn decode_path(path: &Path) -> Result<(Vec<f32>, u32)> {
     }
 
     let (samples, sr, channels) = decode_audio_stream(mss, hint)?;
-    let mono = to_mono(&samples, channels)?;
-    Ok((mono, sr))
+    Ok(crate::Waveform::try_new_with_channels(
+        samples,
+        sr,
+        channels as u16,
+    )?)
 }
 
 #[cfg(not(feature = "audio-loading"))]
@@ -34,8 +44,20 @@ pub fn decode_path(_path: &Path) -> Result<(Vec<f32>, u32)> {
     bail!("decode_path requires the `audio-loading` feature")
 }
 
+#[cfg(not(feature = "audio-loading"))]
+pub fn decode_path_waveform(_path: &Path) -> Result<crate::Waveform> {
+    bail!("decode_path_waveform requires the `audio-loading` feature")
+}
+
 #[cfg(feature = "audio-loading")]
 pub fn decode_url(url: &str) -> Result<(Vec<f32>, u32)> {
+    let waveform = decode_url_waveform(url)?;
+    let mono = waveform.to_mono()?;
+    Ok((mono.samples, mono.sample_rate))
+}
+
+#[cfg(feature = "audio-loading")]
+pub fn decode_url_waveform(url: &str) -> Result<crate::Waveform> {
     use std::io::Cursor;
 
     use symphonia::core::formats::probe::Hint;
@@ -62,8 +84,11 @@ pub fn decode_url(url: &str) -> Result<(Vec<f32>, u32)> {
     }
 
     let (samples, sr, channels) = decode_audio_stream(mss, hint)?;
-    let mono = to_mono(&samples, channels)?;
-    Ok((mono, sr))
+    Ok(crate::Waveform::try_new_with_channels(
+        samples,
+        sr,
+        channels as u16,
+    )?)
 }
 
 #[cfg(not(feature = "audio-loading"))]
@@ -71,8 +96,20 @@ pub fn decode_url(_url: &str) -> Result<(Vec<f32>, u32)> {
     bail!("decode_url requires the `audio-loading` feature")
 }
 
+#[cfg(not(feature = "audio-loading"))]
+pub fn decode_url_waveform(_url: &str) -> Result<crate::Waveform> {
+    bail!("decode_url_waveform requires the `audio-loading` feature")
+}
+
 #[cfg(feature = "audio-loading")]
 pub fn decode_base64(b64: &str) -> Result<(Vec<f32>, u32)> {
+    let waveform = decode_base64_waveform(b64)?;
+    let mono = waveform.to_mono()?;
+    Ok((mono.samples, mono.sample_rate))
+}
+
+#[cfg(feature = "audio-loading")]
+pub fn decode_base64_waveform(b64: &str) -> Result<crate::Waveform> {
     use std::io::Cursor;
 
     use base64::Engine;
@@ -94,13 +131,21 @@ pub fn decode_base64(b64: &str) -> Result<(Vec<f32>, u32)> {
     let cursor = Cursor::new(bytes);
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
     let (samples, sr, channels) = decode_audio_stream(mss, Hint::new())?;
-    let mono = to_mono(&samples, channels)?;
-    Ok((mono, sr))
+    Ok(crate::Waveform::try_new_with_channels(
+        samples,
+        sr,
+        channels as u16,
+    )?)
 }
 
 #[cfg(not(feature = "audio-loading"))]
 pub fn decode_base64(_b64: &str) -> Result<(Vec<f32>, u32)> {
     bail!("decode_base64 requires the `audio-loading` feature")
+}
+
+#[cfg(not(feature = "audio-loading"))]
+pub fn decode_base64_waveform(_b64: &str) -> Result<crate::Waveform> {
+    bail!("decode_base64_waveform requires the `audio-loading` feature")
 }
 
 #[cfg(feature = "audio-loading")]
@@ -165,6 +210,14 @@ fn decode_audio_stream(
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(anyhow::anyhow!("failed to decode audio packet: {e}")),
         };
+        let decoded_channels = decoded.spec().channels().count();
+        if decoded_channels != channels {
+            bail!(
+                "decoded channel count changed from {} to {}",
+                channels,
+                decoded_channels
+            );
+        }
 
         let mut chunk = Vec::new();
         decoded.copy_to_vec_interleaved(&mut chunk);
@@ -174,34 +227,11 @@ fn decode_audio_stream(
     Ok((samples, sample_rate, channels))
 }
 
-#[cfg(feature = "audio-loading")]
-fn to_mono(samples: &[f32], channels: usize) -> Result<Vec<f32>> {
-    if channels == 0 {
-        bail!("invalid channel count: 0");
-    }
-    if channels == 1 {
-        return Ok(samples.to_vec());
-    }
-    if !samples.len().is_multiple_of(channels) {
-        bail!(
-            "decoded sample length {} is not divisible by channels {}",
-            samples.len(),
-            channels
-        );
-    }
-
-    let frames = samples.len() / channels;
-    let mut mono: Vec<f32> = Vec::with_capacity(frames);
-    for frame in samples.chunks_exact(channels) {
-        let sum = frame.iter().copied().fold(0.0f32, |acc, x| acc + x);
-        mono.push(sum / channels as f32);
-    }
-    Ok(mono)
-}
-
 #[cfg(all(test, feature = "audio-loading"))]
 mod tests {
-    use super::decode_path;
+    use super::{decode_path, decode_path_waveform};
+    use crate::Waveform;
+    use std::io::Write;
 
     #[test]
     fn test_decode_path_wav() -> anyhow::Result<()> {
@@ -225,6 +255,80 @@ mod tests {
             anyhow::bail!("expected 240_820 samples, got {}", wav_16k.len());
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn stereo_samples_are_downmixed_by_averaging_channels() -> anyhow::Result<()> {
+        let stereo = Waveform::new_with_channels(
+            vec![
+                1.0, 3.0, // frame 0
+                2.0, 4.0, // frame 1
+            ],
+            16_000,
+            2,
+        );
+
+        let mono = stereo.to_mono()?;
+
+        assert_eq!(mono.samples, vec![2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_path_downmixes_stereo_wav_instead_of_dropping_a_channel() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "vasr-stereo-downmix-{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ));
+        write_pcm16_wav(
+            &path,
+            16_000,
+            2,
+            &[
+                8192, 24576, // frame 0 => 0.5
+                16384, -8192, // frame 1 => 0.125
+            ],
+        )?;
+
+        let (samples, sample_rate) = decode_path(&path)?;
+        let waveform = decode_path_waveform(&path)?;
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(samples.len(), 2);
+        assert!((samples[0] - 0.5).abs() < 1e-6, "{:?}", samples);
+        assert!((samples[1] - 0.125).abs() < 1e-6, "{:?}", samples);
+        assert_eq!(waveform.channels, 2);
+        Ok(())
+    }
+
+    fn write_pcm16_wav(
+        path: &std::path::Path,
+        sample_rate: u32,
+        channels: u16,
+        samples: &[i16],
+    ) -> anyhow::Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        let data_len = samples.len() as u32 * 2;
+        let byte_rate = sample_rate * u32::from(channels) * 2;
+        let block_align = channels * 2;
+
+        file.write_all(b"RIFF")?;
+        file.write_all(&(36 + data_len).to_le_bytes())?;
+        file.write_all(b"WAVEfmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&channels.to_le_bytes())?;
+        file.write_all(&sample_rate.to_le_bytes())?;
+        file.write_all(&byte_rate.to_le_bytes())?;
+        file.write_all(&block_align.to_le_bytes())?;
+        file.write_all(&16u16.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&data_len.to_le_bytes())?;
+        for sample in samples {
+            file.write_all(&sample.to_le_bytes())?;
+        }
         Ok(())
     }
 }

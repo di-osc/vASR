@@ -102,7 +102,11 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         let (source, record_id) = audio_source_from_record(record)?;
         references.push(reference_text(record));
         record_ids.push(record_id);
-        inputs.push(TranscribeInput { index, source });
+        inputs.push(TranscribeInput {
+            index,
+            source,
+            channel: vasr_data::AudioChannel::Mono,
+        });
     }
 
     let output = resolve_benchmark_output_jsonl_path(args.output.as_deref(), &args.input);

@@ -1,6 +1,6 @@
 //! Audio input decoding, loading, normalization, and resampling.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::{AudioSource, Waveform};
@@ -38,28 +38,101 @@ impl Default for AudioLoadOptions {
 pub struct AudioLoader;
 
 impl AudioLoader {
-    pub fn load(&self, source: &AudioSource, _options: &AudioLoadOptions) -> Result<Waveform> {
-        let samples = match source {
-            AudioSource::Path(path) => normalize::normalize_audio_input(&AudioInput::Path(path))?,
+    pub fn load(&self, source: &AudioSource, options: &AudioLoadOptions) -> Result<Waveform> {
+        let waveform = match source {
+            AudioSource::Path(path) => decode::decode_path_waveform(path)?,
             AudioSource::Url(url) => {
                 if let Some(path) = local_path_from_urlish(url) {
-                    normalize::normalize_audio_input(&AudioInput::Path(&path))?
+                    decode::decode_path_waveform(&path)?
                 } else {
-                    normalize::normalize_audio_input(&AudioInput::Url(url))?
+                    decode::decode_url_waveform(url)?
                 }
             }
-            AudioSource::Base64(b64) => normalize::normalize_audio_input(&AudioInput::Base64(b64))?,
+            AudioSource::Base64(b64) => decode::decode_base64_waveform(b64)?,
             AudioSource::Bytes(bytes) => {
                 let mut pcm = Vec::with_capacity(bytes.len() / 2);
                 for chunk in bytes.chunks_exact(2) {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
-                return Ok(Waveform::from_i16_pcm(&pcm, SAMPLE_RATE_HZ));
+                Waveform::from_i16_pcm(&pcm, SAMPLE_RATE_HZ)
             }
-            AudioSource::Waveform(waveform) => return Ok(waveform.clone()),
+            AudioSource::Waveform(waveform) => waveform.clone(),
         };
-        Ok(Waveform::new(samples, SAMPLE_RATE_HZ))
+        normalize_loaded_waveform(waveform, options)
     }
+}
+
+fn normalize_loaded_waveform(
+    mut waveform: Waveform,
+    options: &AudioLoadOptions,
+) -> Result<Waveform> {
+    if waveform.channels == 0 {
+        bail!("invalid channel count: 0");
+    }
+    if options.normalize && !waveform.samples.is_empty() {
+        let peak = waveform
+            .samples
+            .iter()
+            .fold(0.0f32, |m, &x| if x.abs() > m { x.abs() } else { m });
+        if peak.is_finite() && peak > 1.0 {
+            for x in &mut waveform.samples {
+                *x /= peak;
+            }
+        }
+        for x in &mut waveform.samples {
+            *x = (*x).clamp(-1.0, 1.0);
+        }
+        waveform.is_normalized = true;
+    }
+    if waveform.sample_rate == options.target_sample_rate {
+        return Ok(waveform);
+    }
+    if waveform.sample_rate == 0 || options.target_sample_rate == 0 {
+        bail!(
+            "invalid sample rate conversion: {} -> {}",
+            waveform.sample_rate,
+            options.target_sample_rate
+        );
+    }
+    resample_waveform(waveform, options.target_sample_rate)
+}
+
+fn resample_waveform(waveform: Waveform, target_sample_rate: u32) -> Result<Waveform> {
+    if waveform.channels == 1 {
+        let samples = resample::resample_mono_f32(
+            &waveform.samples,
+            waveform.sample_rate,
+            target_sample_rate,
+        )?;
+        return Ok(Waveform::new_with_channels(samples, target_sample_rate, 1));
+    }
+
+    let mut channel_samples = Vec::with_capacity(usize::from(waveform.channels));
+    for channel in 0..waveform.channels {
+        let channel_waveform = waveform.channel(channel)?;
+        channel_samples.push(resample::resample_mono_f32(
+            &channel_waveform.samples,
+            waveform.sample_rate,
+            target_sample_rate,
+        )?);
+    }
+    let frames = channel_samples
+        .iter()
+        .map(Vec::len)
+        .min()
+        .unwrap_or_default();
+    let channels = channel_samples.len();
+    let mut samples = Vec::with_capacity(frames * channels);
+    for frame in 0..frames {
+        for channel in &channel_samples {
+            samples.push(channel[frame]);
+        }
+    }
+    Ok(Waveform::new_with_channels(
+        samples,
+        target_sample_rate,
+        waveform.channels,
+    ))
 }
 
 fn local_path_from_urlish(value: &str) -> Option<PathBuf> {

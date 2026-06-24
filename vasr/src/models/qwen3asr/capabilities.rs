@@ -83,7 +83,7 @@ impl Qwen3Asr {
     pub fn decode_cpu_audio_features_dynamic_outputs(
         &self,
         encoded: EncodedAsrBatch,
-        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll> + Send,
         options: &AsrOptions,
     ) -> Result<Vec<Vec<AsrTranscription>>> {
         let runtime_options = qwen_transcribe_options(options);
@@ -94,7 +94,7 @@ impl Qwen3Asr {
     pub fn decode_cpu_audio_features_dynamic_outputs_timed(
         &self,
         encoded: EncodedAsrBatch,
-        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll> + Send,
         options: &AsrOptions,
     ) -> Result<(Vec<Vec<AsrTranscription>>, TranscribeTimings)> {
         let runtime_options = qwen_transcribe_options(options);

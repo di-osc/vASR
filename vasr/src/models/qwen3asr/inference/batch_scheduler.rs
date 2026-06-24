@@ -7,6 +7,11 @@
 //! prefill with per-row `query_lens` / flash varlen metadata.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -16,12 +21,13 @@ use candle_core::{Device, Tensor};
 #[cfg(feature = "timing")]
 use crate::model::generation::GenerationTimings;
 use crate::model::paged_batch_engine::{
-    PagedBatchConfig, PagedDecodeSlot, paged_batch_decode_slots_at_step, paged_batch_free_slots,
-    paged_batch_prefill, paged_batch_run,
+    PagedBatchConfig, PagedDecodeSlot, paged_batch_decode_slots_at_step,
+    paged_batch_decode_slots_at_step_shared, paged_batch_free_slots, paged_batch_prefill,
+    paged_batch_prefill_shared, paged_batch_run,
 };
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
-use vasr_paged_attn::{PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRuntime};
+use vasr_paged_attn::{PagedCacheRuntime, SharedPagedCacheRuntime};
 
 #[cfg(feature = "timing")]
 fn duration_to_us(d: std::time::Duration) -> u64 {
@@ -42,11 +48,80 @@ fn log_prefill_speed(wave: usize, tokens: usize, elapsed_us: u64) {
     );
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct NumericDistribution {
+    min: f64,
+    p50: f64,
+    p90: f64,
+    max: f64,
+}
+
+fn numeric_distribution(mut values: Vec<f64>) -> NumericDistribution {
+    if values.is_empty() {
+        return NumericDistribution::default();
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let len = values.len();
+    let percentile = |pct: usize| -> f64 {
+        let idx = len.saturating_sub(1).saturating_mul(pct).div_ceil(100);
+        values[idx.min(len - 1)]
+    };
+    NumericDistribution {
+        min: values[0],
+        p50: percentile(50),
+        p90: percentile(90),
+        max: values[len - 1],
+    }
+}
+
+fn log_prefill_budget(
+    seqs: usize,
+    audio_seconds: Vec<f64>,
+    prompt_tokens: Vec<usize>,
+    token_capacities: &[usize],
+    block_size: usize,
+    free_blocks: usize,
+) {
+    let audio = numeric_distribution(audio_seconds);
+    let prompts = numeric_distribution(prompt_tokens.iter().map(|&v| v as f64).collect());
+    let capacities = numeric_distribution(token_capacities.iter().map(|&v| v as f64).collect());
+    let blocks = numeric_distribution(
+        token_capacities
+            .iter()
+            .map(|&v| v.div_ceil(block_size) as f64)
+            .collect(),
+    );
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "prefill budget | seqs={} audio_sec={:.2}/{:.2}/{:.2}/{:.2} prompt_tokens={:.0}/{:.0}/{:.0}/{:.0} token_capacity={:.0}/{:.0}/{:.0}/{:.0} blocks={:.0}/{:.0}/{:.0}/{:.0} free_blocks={}",
+        seqs,
+        audio.min,
+        audio.p50,
+        audio.p90,
+        audio.max,
+        prompts.min,
+        prompts.p50,
+        prompts.p90,
+        prompts.max,
+        capacities.min,
+        capacities.p50,
+        capacities.p90,
+        capacities.max,
+        blocks.min,
+        blocks.p50,
+        blocks.p90,
+        blocks.max,
+        free_blocks,
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
     explicit_decode_max_seqs: Option<usize>,
     pub continuous_batch: bool,
+    pub generated_tokens_per_sec: f64,
+    pub min_generated_tokens: usize,
 }
 
 impl Default for AsrBatchSchedulerConfig {
@@ -55,6 +130,8 @@ impl Default for AsrBatchSchedulerConfig {
             max_num_seqs: 8,
             explicit_decode_max_seqs: None,
             continuous_batch: continuous_batch_enabled(),
+            generated_tokens_per_sec: 8.0,
+            min_generated_tokens: 32,
         }
     }
 }
@@ -69,7 +146,7 @@ impl AsrBatchSchedulerConfig {
         config
     }
 
-    fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
+    pub fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
         self.explicit_decode_max_seqs
             .or_else(|| runtime_decode_max_seqs(runtime))
             .unwrap_or(self.max_num_seqs)
@@ -100,6 +177,12 @@ pub(crate) fn continuous_paged_batch_enabled() -> bool {
 struct RunningSlot {
     client_index: usize,
     slot: PagedDecodeSlot,
+}
+
+#[derive(Debug)]
+pub struct PrefilledSequence {
+    pub client_index: usize,
+    pub slot: PagedDecodeSlot,
 }
 
 #[derive(Debug, Default)]
@@ -214,12 +297,14 @@ fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistri
 pub struct AsrBatchScheduler {
     config: AsrBatchSchedulerConfig,
     next_request_id: usize,
+    shared_next_request_id: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Debug)]
 pub struct PreparedAudioBatch {
     pub prepared: Vec<PreparedInputs>,
     pub audio_features: Tensor,
+    pub audio_seconds: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -231,6 +316,231 @@ pub enum PreparedAudioBatchPoll {
 
 const DYNAMIC_SOURCE_WAIT: Duration = Duration::from_millis(1);
 
+#[derive(Debug)]
+pub struct PrefillStageOutput {
+    pub sequences: Vec<PrefilledSequence>,
+    pub total_rows: usize,
+    pub source_closed: bool,
+    pub prefill_wave: usize,
+    #[cfg(feature = "timing")]
+    pub timings: GenerationTimings,
+}
+
+#[derive(Debug, Default)]
+struct AsyncContinuousDebug {
+    received_messages: usize,
+    received_sequences: usize,
+    max_prefilled_queue: usize,
+    empty_recv_waits: usize,
+    timeout_waits: usize,
+}
+
+impl AsyncContinuousDebug {
+    fn record_message(&mut self, sequence_count: usize, prefilled_queue_len: usize) {
+        self.received_messages = self.received_messages.saturating_add(1);
+        self.received_sequences = self.received_sequences.saturating_add(sequence_count);
+        self.max_prefilled_queue = self.max_prefilled_queue.max(prefilled_queue_len);
+    }
+
+    fn record_prefilled_queue(&mut self, prefilled_queue_len: usize) {
+        self.max_prefilled_queue = self.max_prefilled_queue.max(prefilled_queue_len);
+    }
+
+    fn record_empty_recv_wait(&mut self) {
+        self.empty_recv_waits = self.empty_recv_waits.saturating_add(1);
+    }
+
+    fn record_timeout_wait(&mut self) {
+        self.timeout_waits = self.timeout_waits.saturating_add(1);
+    }
+
+    fn log_summary(&self) {
+        tracing::debug!(
+            target: "vasr_transcribe::pipeline",
+            "continuous async summary | messages={} prefilled_seqs={} max_prefilled_queue={} empty_waits={} timeout_waits={}",
+            self.received_messages,
+            self.received_sequences,
+            self.max_prefilled_queue,
+            self.empty_recv_waits,
+            self.timeout_waits,
+        );
+    }
+}
+
+#[cfg(feature = "timing")]
+fn add_generation_timings(dst: &mut GenerationTimings, src: &GenerationTimings) {
+    dst.prefill_us = dst.prefill_us.saturating_add(src.prefill_us);
+    dst.prefill_forward_us = dst
+        .prefill_forward_us
+        .saturating_add(src.prefill_forward_us);
+    dst.prefill_tokens = dst.prefill_tokens.saturating_add(src.prefill_tokens);
+    dst.decode_us = dst.decode_us.saturating_add(src.decode_us);
+    dst.steps = dst.steps.saturating_add(src.steps);
+    dst.tokens_generated = dst.tokens_generated.saturating_add(src.tokens_generated);
+}
+
+#[derive(Debug, Default)]
+struct PrefillInputBuffer {
+    prepared: Vec<PreparedInputs>,
+    audio_features: Option<Tensor>,
+    audio_seconds: Vec<f64>,
+    row_audio_lens: Vec<usize>,
+    audio_offsets: Vec<usize>,
+    waiting: VecDeque<usize>,
+}
+
+impl PrefillInputBuffer {
+    fn append(&mut self, audio_token_id: u32, batch: PreparedAudioBatch) -> Result<()> {
+        append_prepared_audio_batch(
+            audio_token_id,
+            &mut self.prepared,
+            &mut self.audio_features,
+            &mut self.audio_seconds,
+            &mut self.row_audio_lens,
+            &mut self.audio_offsets,
+            &mut self.waiting,
+            batch,
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.prepared.len()
+    }
+
+    fn has_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    fn waiting_len(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+pub struct DynamicPrefillProducer<'a> {
+    scheduler: AsrBatchScheduler,
+    thinker: &'a ThinkerForConditionalGeneration,
+    device: &'a Device,
+    runtime: &'a SharedPagedCacheRuntime,
+    inputs: PrefillInputBuffer,
+    poll_source: &'a mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+    source_closed: bool,
+    audio_token_id: u32,
+    eos_token_ids: Vec<u32>,
+    pad_id: u32,
+}
+
+impl<'a> DynamicPrefillProducer<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: AsrBatchSchedulerConfig,
+        thinker: &'a ThinkerForConditionalGeneration,
+        device: &'a Device,
+        runtime: &'a SharedPagedCacheRuntime,
+        initial: PreparedAudioBatch,
+        poll_source: &'a mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        eos_token_ids: &[u32],
+        pad_id: u32,
+    ) -> Result<Self> {
+        Self::with_scheduler(
+            AsrBatchScheduler::new(config),
+            thinker,
+            device,
+            runtime,
+            initial,
+            poll_source,
+            eos_token_ids,
+            pad_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_shared_request_ids(
+        config: AsrBatchSchedulerConfig,
+        shared_request_ids: Arc<AtomicUsize>,
+        thinker: &'a ThinkerForConditionalGeneration,
+        device: &'a Device,
+        runtime: &'a SharedPagedCacheRuntime,
+        initial: PreparedAudioBatch,
+        poll_source: &'a mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        eos_token_ids: &[u32],
+        pad_id: u32,
+    ) -> Result<Self> {
+        Self::with_scheduler(
+            AsrBatchScheduler::with_shared_request_ids(config, shared_request_ids),
+            thinker,
+            device,
+            runtime,
+            initial,
+            poll_source,
+            eos_token_ids,
+            pad_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_scheduler(
+        scheduler: AsrBatchScheduler,
+        thinker: &'a ThinkerForConditionalGeneration,
+        device: &'a Device,
+        runtime: &'a SharedPagedCacheRuntime,
+        initial: PreparedAudioBatch,
+        poll_source: &'a mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        eos_token_ids: &[u32],
+        pad_id: u32,
+    ) -> Result<Self> {
+        let audio_token_id = thinker.audio_token_id();
+        let mut inputs = PrefillInputBuffer::default();
+        inputs.append(audio_token_id, initial)?;
+        Ok(Self {
+            scheduler,
+            thinker,
+            device,
+            runtime,
+            inputs,
+            poll_source,
+            source_closed: false,
+            audio_token_id,
+            eos_token_ids: eos_token_ids.to_vec(),
+            pad_id,
+        })
+    }
+
+    pub fn run_stage(&mut self, may_block_source: bool) -> Result<PrefillStageOutput> {
+        let mut stage_prefilled = VecDeque::new();
+        #[cfg(feature = "timing")]
+        let mut stage_timings = GenerationTimings::default();
+        #[cfg(feature = "timing")]
+        let mut stage_timings_ref = Some(&mut stage_timings);
+        let wave = self.scheduler.drive_dynamic_prefill_stage(
+            self.thinker,
+            self.device,
+            self.runtime,
+            &mut self.inputs,
+            &mut stage_prefilled,
+            self.poll_source,
+            &mut self.source_closed,
+            self.audio_token_id,
+            self.eos_token_ids.as_slice(),
+            self.pad_id,
+            may_block_source,
+            #[cfg(feature = "timing")]
+            &mut stage_timings_ref,
+        )?;
+        Ok(PrefillStageOutput {
+            sequences: stage_prefilled.into_iter().collect(),
+            total_rows: self.inputs.len(),
+            source_closed: self.source_closed,
+            prefill_wave: wave,
+            #[cfg(feature = "timing")]
+            timings: stage_timings,
+        })
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.source_closed && !self.inputs.has_waiting()
+    }
+}
+
 fn free_all_running(runtime: &mut PagedCacheRuntime, running: &mut [Option<RunningSlot>]) {
     for slot in running.iter_mut() {
         if let Some(entry) = slot.take() {
@@ -239,32 +549,114 @@ fn free_all_running(runtime: &mut PagedCacheRuntime, running: &mut [Option<Runni
     }
 }
 
+fn free_all_prefilled(
+    runtime: &mut PagedCacheRuntime,
+    prefilled: &mut VecDeque<PrefilledSequence>,
+) {
+    while let Some(entry) = prefilled.pop_front() {
+        paged_batch_free_slots(runtime, &[entry.slot.request_id]);
+    }
+}
+
 fn prepared_prompt_len(row: &PreparedInputs) -> usize {
     row.attention_mask.iter().filter(|&&v| v != 0).count()
 }
 
-fn running_kv_blocks(running: &[Option<RunningSlot>], manager: &PagedBlockManager) -> usize {
-    running
-        .iter()
-        .filter_map(|entry| entry.as_ref())
-        .map(|entry| manager.blocks_for_request(entry.slot.request_id))
-        .sum()
+fn generated_token_budget(
+    audio_seconds: f64,
+    generated_tokens_per_sec: f64,
+    min_generated_tokens: usize,
+) -> usize {
+    let estimated = if audio_seconds.is_finite() && audio_seconds > 0.0 {
+        (audio_seconds * generated_tokens_per_sec).ceil() as usize
+    } else {
+        0
+    };
+    estimated.max(min_generated_tokens)
 }
 
-/// Whether admitting one more sequence keeps headroom for running decode growth.
-fn can_admit_with_projected_kv(
-    manager: &PagedBlockManager,
-    kv_block_capacity: usize,
-    prompt_len: usize,
-    projected_used_blocks: usize,
-    projected_running: usize,
+fn prepared_token_capacity(
+    row: &PreparedInputs,
+    audio_seconds: &[f64],
+    row_index: usize,
+    generated_tokens_per_sec: f64,
+    min_generated_tokens: usize,
+) -> Result<usize> {
+    prepared_prompt_len(row)
+        .checked_add(generated_token_budget(
+            audio_seconds.get(row_index).copied().unwrap_or(0.0),
+            generated_tokens_per_sec,
+            min_generated_tokens,
+        ))
+        .ok_or_else(|| anyhow::anyhow!("prepared token capacity overflow"))
+}
+
+fn attach_prefilled_to_running(
+    prefilled: &mut VecDeque<PrefilledSequence>,
+    running: &mut [Option<RunningSlot>],
 ) -> bool {
-    let prompt_blocks = prompt_len.div_ceil(manager.block_size());
-    let decode_headroom = projected_running.max(1);
-    projected_used_blocks
-        .saturating_add(prompt_blocks)
-        .saturating_add(decode_headroom)
-        <= kv_block_capacity
+    let mut attached = false;
+    for slot in running.iter_mut() {
+        if slot.is_some() {
+            continue;
+        }
+        let Some(prefilled) = prefilled.pop_front() else {
+            break;
+        };
+        *slot = Some(RunningSlot {
+            client_index: prefilled.client_index,
+            slot: prefilled.slot,
+        });
+        attached = true;
+    }
+    attached
+}
+
+fn apply_prefill_stage_message(
+    message: PrefillStageOutput,
+    outputs: &mut Vec<Vec<u32>>,
+    prefilled: &mut VecDeque<PrefilledSequence>,
+    source_closed: &mut bool,
+    #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+) {
+    outputs.resize(outputs.len().max(message.total_rows), Vec::new());
+    prefilled.extend(message.sequences);
+    *source_closed = message.source_closed;
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_deref_mut() {
+        add_generation_timings(t, &message.timings);
+    }
+}
+
+fn collect_prefill_wave_by_kv<F>(
+    waiting: &mut VecDeque<usize>,
+    block_size: usize,
+    mut free_blocks: usize,
+    mut token_capacity: F,
+) -> Result<Vec<usize>>
+where
+    F: FnMut(usize) -> Result<usize>,
+{
+    let mut wave = Vec::new();
+    loop {
+        let mut selected = None;
+        for (pos, &client_index) in waiting.iter().enumerate() {
+            let required_blocks = token_capacity(client_index)?.div_ceil(block_size);
+            if required_blocks <= free_blocks {
+                selected = Some((pos, required_blocks));
+                break;
+            }
+        }
+        let Some((pos, required_blocks)) = selected else {
+            break;
+        };
+        let client_index = waiting
+            .remove(pos)
+            .ok_or_else(|| anyhow::anyhow!("waiting queue remove failed at position {pos}"))?;
+        free_blocks = free_blocks.saturating_sub(required_blocks);
+        wave.push(client_index);
+    }
+    Ok(wave)
 }
 
 fn free_finished_running(
@@ -286,6 +678,60 @@ fn free_finished_running(
         freed = true;
     }
     freed
+}
+
+fn decode_running_step_groups(
+    running: &mut [Option<RunningSlot>],
+    active_steps: &[(usize, usize)],
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    runtime: &SharedPagedCacheRuntime,
+    eos_token_ids: &[u32],
+    decode_debug: &mut ContinuousDecodeDebug,
+    #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+) -> Result<()> {
+    if active_steps.is_empty() {
+        return Ok(());
+    }
+    let step_groups = group_running_by_decode_step(active_steps);
+    for (step, slot_indices) in step_groups {
+        decode_debug.record_active(step, slot_indices.len());
+        let mut batch_slots: Vec<PagedDecodeSlot> = slot_indices
+            .iter()
+            .map(|&slot_idx| {
+                running[slot_idx]
+                    .as_ref()
+                    .map(|entry| entry.slot.clone())
+                    .ok_or_else(|| anyhow::anyhow!("missing running slot {slot_idx}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        #[cfg(feature = "timing")]
+        let start_decode = std::time::Instant::now();
+        paged_batch_decode_slots_at_step_shared(
+            thinker,
+            device,
+            runtime,
+            batch_slots.as_mut_slice(),
+            step,
+            eos_token_ids,
+        )?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_deref_mut() {
+            t.decode_us = t
+                .decode_us
+                .saturating_add(duration_to_us(start_decode.elapsed()));
+            t.steps = t.steps.saturating_add(1);
+            t.tokens_generated = t.tokens_generated.saturating_add(slot_indices.len());
+        }
+
+        for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
+            if let Some(entry) = running[slot_idx].as_mut() {
+                entry.slot = slot.clone();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Right-pad selected rows to the max effective prompt length within the admit wave.
@@ -362,6 +808,7 @@ fn append_prepared_audio_batch(
     audio_token_id: u32,
     prepared: &mut Vec<PreparedInputs>,
     audio_features: &mut Option<Tensor>,
+    audio_seconds: &mut Vec<f64>,
     row_audio_lens: &mut Vec<usize>,
     audio_offsets: &mut Vec<usize>,
     waiting: &mut VecDeque<usize>,
@@ -369,6 +816,13 @@ fn append_prepared_audio_batch(
 ) -> Result<()> {
     if batch.prepared.is_empty() {
         return Ok(());
+    }
+    if batch.audio_seconds.len() != batch.prepared.len() {
+        bail!(
+            "prepared audio seconds mismatch: prepared={} audio_seconds={}",
+            batch.prepared.len(),
+            batch.audio_seconds.len()
+        );
     }
     let start_idx = prepared.len();
     let mut audio_cursor = audio_offsets
@@ -406,6 +860,7 @@ fn append_prepared_audio_batch(
         }
     }
     let count = batch.prepared.len();
+    audio_seconds.append(&mut batch.audio_seconds);
     prepared.append(&mut batch.prepared);
     waiting.extend(start_idx..start_idx.saturating_add(count));
     Ok(())
@@ -420,11 +875,31 @@ impl AsrBatchScheduler {
         Self {
             config,
             next_request_id: 0,
+            shared_next_request_id: None,
         }
     }
 
     pub fn config(&self) -> &AsrBatchSchedulerConfig {
         &self.config
+    }
+
+    fn with_shared_request_ids(config: AsrBatchSchedulerConfig, shared: Arc<AtomicUsize>) -> Self {
+        Self {
+            config,
+            next_request_id: 0,
+            shared_next_request_id: Some(shared),
+        }
+    }
+
+    fn allocate_request_id_base(&mut self, count: usize) -> usize {
+        let count = count.max(1);
+        if let Some(shared) = self.shared_next_request_id.as_ref() {
+            shared.fetch_add(count, Ordering::Relaxed)
+        } else {
+            let base = self.next_request_id;
+            self.next_request_id = self.next_request_id.saturating_add(count);
+            base
+        }
     }
 
     /// Run one homogeneous micro-batch (same padded `seq_len` across rows).
@@ -447,8 +922,7 @@ impl AsrBatchScheduler {
             );
         }
 
-        let request_id_base = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(batch.max(1));
+        let request_id_base = self.allocate_request_id_base(batch);
 
         let mut runtime_guard = runtime
             .lock()
@@ -457,6 +931,7 @@ impl AsrBatchScheduler {
             max_new_tokens,
             eos_token_ids: eos_token_ids.to_vec(),
             request_id_base,
+            token_capacities: None,
         };
         paged_batch_run(
             thinker,
@@ -466,6 +941,306 @@ impl AsrBatchScheduler {
             attention_mask,
             audio_features,
             &engine_config,
+        )
+    }
+
+    fn prefill_waiting_wave(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &mut PagedCacheRuntime,
+        prepared: &[PreparedInputs],
+        audio_features: &Tensor,
+        audio_seconds: &[f64],
+        row_audio_lens: &[usize],
+        audio_offsets: &[usize],
+        waiting: &mut VecDeque<usize>,
+        prefilled: &mut VecDeque<PrefilledSequence>,
+        eos_token_ids: &[u32],
+        pad_id: u32,
+        #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+    ) -> Result<usize> {
+        let manager = runtime.manager();
+        let block_size = manager.block_size();
+        let free_blocks = manager.free_blocks();
+        let wave_client_indices =
+            collect_prefill_wave_by_kv(waiting, block_size, free_blocks, |client_index| {
+                prepared_token_capacity(
+                    &prepared[client_index],
+                    audio_seconds,
+                    client_index,
+                    self.config.generated_tokens_per_sec,
+                    self.config.min_generated_tokens,
+                )
+            })?;
+
+        if wave_client_indices.is_empty() {
+            return Ok(0);
+        }
+
+        let wave = wave_client_indices.len();
+        let request_id_base = self.allocate_request_id_base(wave);
+        let (wave_ids, wave_masks) =
+            pad_prepared_wave_for_prefill(prepared, wave_client_indices.as_slice(), pad_id)?;
+        let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
+        let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
+        let token_capacities = wave_client_indices
+            .iter()
+            .map(|&client_index| {
+                prepared_token_capacity(
+                    &prepared[client_index],
+                    audio_seconds,
+                    client_index,
+                    self.config.generated_tokens_per_sec,
+                    self.config.min_generated_tokens,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        log_prefill_budget(
+            wave,
+            wave_client_indices
+                .iter()
+                .map(|&client_index| audio_seconds[client_index])
+                .collect(),
+            wave_client_indices
+                .iter()
+                .map(|&client_index| prepared_prompt_len(&prepared[client_index]))
+                .collect(),
+            token_capacities.as_slice(),
+            block_size,
+            free_blocks,
+        );
+        let wave_audio = concat_prepared_audio(
+            audio_features,
+            audio_offsets,
+            row_audio_lens,
+            wave_client_indices.as_slice(),
+        )?
+        .to_device(device)?;
+        let engine_config = PagedBatchConfig {
+            max_new_tokens: 0,
+            eos_token_ids: eos_token_ids.to_vec(),
+            request_id_base,
+            token_capacities: Some(token_capacities),
+        };
+        let request_ids: Vec<usize> = (0..wave)
+            .map(|i| request_id_base.saturating_add(i))
+            .collect();
+        #[cfg(feature = "timing")]
+        let start_prefill = std::time::Instant::now();
+        let state = match paged_batch_prefill(
+            thinker,
+            device,
+            runtime,
+            ids_rows.as_slice(),
+            attn_rows.as_slice(),
+            Some(&wave_audio),
+            &engine_config,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                paged_batch_free_slots(runtime, request_ids.as_slice());
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "timing")]
+        let elapsed = duration_to_us(start_prefill.elapsed());
+        #[cfg(feature = "timing")]
+        let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
+        #[cfg(feature = "timing")]
+        log_prefill_speed(wave, prefill_tokens, elapsed);
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_deref_mut() {
+            t.prefill_us = t.prefill_us.saturating_add(elapsed);
+            t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
+            t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
+        }
+        for (wave_row, &client_index) in wave_client_indices.iter().enumerate() {
+            prefilled.push_back(PrefilledSequence {
+                client_index,
+                slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
+            });
+        }
+        Ok(wave)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_waiting_wave_shared(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        prepared: &[PreparedInputs],
+        audio_features: &Tensor,
+        audio_seconds: &[f64],
+        row_audio_lens: &[usize],
+        audio_offsets: &[usize],
+        waiting: &mut VecDeque<usize>,
+        prefilled: &mut VecDeque<PrefilledSequence>,
+        eos_token_ids: &[u32],
+        pad_id: u32,
+        #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+    ) -> Result<usize> {
+        let (block_size, free_blocks) = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            (
+                runtime_guard.manager().block_size(),
+                runtime_guard.manager().free_blocks(),
+            )
+        };
+        let wave_client_indices =
+            collect_prefill_wave_by_kv(waiting, block_size, free_blocks, |client_index| {
+                prepared_token_capacity(
+                    &prepared[client_index],
+                    audio_seconds,
+                    client_index,
+                    self.config.generated_tokens_per_sec,
+                    self.config.min_generated_tokens,
+                )
+            })?;
+
+        if wave_client_indices.is_empty() {
+            return Ok(0);
+        }
+
+        let wave = wave_client_indices.len();
+        let request_id_base = self.allocate_request_id_base(wave);
+        let (wave_ids, wave_masks) =
+            pad_prepared_wave_for_prefill(prepared, wave_client_indices.as_slice(), pad_id)?;
+        let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
+        let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
+        let token_capacities = wave_client_indices
+            .iter()
+            .map(|&client_index| {
+                prepared_token_capacity(
+                    &prepared[client_index],
+                    audio_seconds,
+                    client_index,
+                    self.config.generated_tokens_per_sec,
+                    self.config.min_generated_tokens,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        log_prefill_budget(
+            wave,
+            wave_client_indices
+                .iter()
+                .map(|&client_index| audio_seconds[client_index])
+                .collect(),
+            wave_client_indices
+                .iter()
+                .map(|&client_index| prepared_prompt_len(&prepared[client_index]))
+                .collect(),
+            token_capacities.as_slice(),
+            block_size,
+            free_blocks,
+        );
+        let wave_audio = concat_prepared_audio(
+            audio_features,
+            audio_offsets,
+            row_audio_lens,
+            wave_client_indices.as_slice(),
+        )?
+        .to_device(device)?;
+        let engine_config = PagedBatchConfig {
+            max_new_tokens: 0,
+            eos_token_ids: eos_token_ids.to_vec(),
+            request_id_base,
+            token_capacities: Some(token_capacities),
+        };
+        #[cfg(feature = "timing")]
+        let start_prefill = std::time::Instant::now();
+        let state = match paged_batch_prefill_shared(
+            thinker,
+            device,
+            runtime,
+            ids_rows.as_slice(),
+            attn_rows.as_slice(),
+            Some(&wave_audio),
+            &engine_config,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                for client_index in wave_client_indices.into_iter().rev() {
+                    waiting.push_front(client_index);
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "timing")]
+        let elapsed = duration_to_us(start_prefill.elapsed());
+        #[cfg(feature = "timing")]
+        let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
+        #[cfg(feature = "timing")]
+        log_prefill_speed(wave, prefill_tokens, elapsed);
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_deref_mut() {
+            t.prefill_us = t.prefill_us.saturating_add(elapsed);
+            t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
+            t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
+        }
+        for (wave_row, &client_index) in wave_client_indices.iter().enumerate() {
+            prefilled.push_back(PrefilledSequence {
+                client_index,
+                slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
+            });
+        }
+        Ok(wave)
+    }
+
+    fn drive_dynamic_prefill_stage(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        inputs: &mut PrefillInputBuffer,
+        prefilled: &mut VecDeque<PrefilledSequence>,
+        poll_source: &mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        source_closed: &mut bool,
+        audio_token_id: u32,
+        eos_token_ids: &[u32],
+        pad_id: u32,
+        may_block_source: bool,
+        #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+    ) -> Result<usize> {
+        if !*source_closed {
+            loop {
+                match poll_source(may_block_source && !inputs.has_waiting())? {
+                    PreparedAudioBatchPoll::Ready(batch) => {
+                        inputs.append(audio_token_id, batch)?;
+                    }
+                    PreparedAudioBatchPoll::Empty => break,
+                    PreparedAudioBatchPoll::Closed => {
+                        *source_closed = true;
+                        break;
+                    }
+                }
+                if may_block_source {
+                    break;
+                }
+            }
+        }
+
+        let Some(features) = inputs.audio_features.as_ref() else {
+            return Ok(0);
+        };
+        self.prefill_waiting_wave_shared(
+            thinker,
+            device,
+            runtime,
+            inputs.prepared.as_slice(),
+            features,
+            inputs.audio_seconds.as_slice(),
+            inputs.row_audio_lens.as_slice(),
+            inputs.audio_offsets.as_slice(),
+            &mut inputs.waiting,
+            prefilled,
+            eos_token_ids,
+            pad_id,
+            #[cfg(feature = "timing")]
+            timings,
         )
     }
 
@@ -480,7 +1255,7 @@ impl AsrBatchScheduler {
         runtime: &SharedPagedCacheRuntime,
         prepared: &[PreparedInputs],
         audio_features: &Tensor,
-        max_new_tokens: usize,
+        audio_seconds: &[f64],
         eos_token_ids: &[u32],
         pad_id: u32,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
@@ -489,8 +1264,12 @@ impl AsrBatchScheduler {
         if batch == 0 {
             return Ok(vec![]);
         }
-        if max_new_tokens == 0 {
-            return Ok(vec![vec![]; batch]);
+        if audio_seconds.len() != batch {
+            bail!(
+                "continuous prepared audio seconds mismatch: prepared={} audio_seconds={}",
+                batch,
+                audio_seconds.len()
+            );
         }
 
         let mut runtime_guard = runtime
@@ -499,6 +1278,7 @@ impl AsrBatchScheduler {
         let max_num_seqs = self.config.continuous_max_num_seqs(&runtime_guard);
         let max_slots = max_num_seqs.max(1).min(batch);
         let mut waiting: VecDeque<usize> = (0..batch).collect();
+        let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = vec![vec![]; batch];
 
@@ -524,8 +1304,6 @@ impl AsrBatchScheduler {
                 "continuous batch audio token mismatch: prepared placeholders={audio_cursor} audio_features={total_audio_tokens}"
             );
         }
-        let kv_block_capacity =
-            PagedBlockManager::allocatable_block_capacity(runtime_guard.stats().num_blocks);
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
             let mut decode_debug = ContinuousDecodeDebug::default();
@@ -536,6 +1314,7 @@ impl AsrBatchScheduler {
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                 );
+                attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
 
                 let mut active_steps: Vec<(usize, usize)> = Vec::new();
                 for (slot_idx, entry) in running.iter().enumerate() {
@@ -570,7 +1349,6 @@ impl AsrBatchScheduler {
                             &mut runtime_guard,
                             batch_slots.as_mut_slice(),
                             step,
-                            max_new_tokens,
                             eos_token_ids,
                         )?;
                         #[cfg(feature = "timing")]
@@ -591,136 +1369,50 @@ impl AsrBatchScheduler {
                     }
                 }
 
-                for entry in running.iter_mut() {
-                    let Some(entry) = entry.as_mut() else {
-                        continue;
-                    };
-                    if !entry.slot.finished && entry.slot.decode_step >= max_new_tokens {
-                        entry.slot.finished = true;
-                    }
-                }
-
                 decode_debug.record_finished(running.as_slice());
                 free_finished_running(
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                 );
+                attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
 
-                let mut admitted = false;
-                let manager = runtime_guard.manager();
-                let mut wave_client_indices: Vec<usize> = Vec::new();
-                let mut wave_slot_indices: Vec<usize> = Vec::new();
-                let mut projected_used = running_kv_blocks(running.as_slice(), manager);
-                let mut projected_running = running.iter().filter(|entry| entry.is_some()).count();
-                for slot_idx in 0..max_slots {
-                    if running[slot_idx].is_some() {
-                        continue;
-                    }
-                    if projected_running >= max_slots {
-                        break;
-                    }
-                    let Some(client_index) = waiting.pop_front() else {
-                        break;
-                    };
-                    let prompt_len = prepared_prompt_len(&prepared[client_index]);
-                    let next_running = projected_running.saturating_add(1);
-                    if !can_admit_with_projected_kv(
-                        manager,
-                        kv_block_capacity,
-                        prompt_len,
-                        projected_used,
-                        next_running,
-                    ) {
-                        waiting.push_front(client_index);
-                        break;
-                    }
-                    projected_used =
-                        projected_used.saturating_add(prompt_len.div_ceil(manager.block_size()));
-                    projected_running = next_running;
-                    wave_client_indices.push(client_index);
-                    wave_slot_indices.push(slot_idx);
-                }
-
-                if !wave_client_indices.is_empty() {
-                    let wave = wave_client_indices.len();
-                    let request_id_base = self.next_request_id;
-                    self.next_request_id = self.next_request_id.saturating_add(wave);
-                    let (wave_ids, wave_masks) = pad_prepared_wave_for_prefill(
-                        prepared,
-                        wave_client_indices.as_slice(),
-                        pad_id,
-                    )?;
-                    let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
-                    let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
-                    let wave_audio = concat_prepared_audio(
-                        audio_features,
-                        audio_offsets.as_slice(),
-                        row_audio_lens.as_slice(),
-                        wave_client_indices.as_slice(),
-                    )?
-                    .to_device(device)?;
-                    let engine_config = PagedBatchConfig {
-                        max_new_tokens,
-                        eos_token_ids: eos_token_ids.to_vec(),
-                        request_id_base,
-                    };
-                    let request_ids: Vec<usize> = (0..wave)
-                        .map(|i| request_id_base.saturating_add(i))
-                        .collect();
+                let prefill_wave = self.prefill_waiting_wave(
+                    thinker,
+                    device,
+                    &mut runtime_guard,
+                    prepared,
+                    audio_features,
+                    audio_seconds,
+                    row_audio_lens.as_slice(),
+                    audio_offsets.as_slice(),
+                    &mut waiting,
+                    &mut prefilled,
+                    eos_token_ids,
+                    pad_id,
                     #[cfg(feature = "timing")]
-                    let start_prefill = std::time::Instant::now();
-                    let state = match paged_batch_prefill(
-                        thinker,
-                        device,
-                        &mut runtime_guard,
-                        ids_rows.as_slice(),
-                        attn_rows.as_slice(),
-                        Some(&wave_audio),
-                        &engine_config,
-                    ) {
-                        Ok(state) => state,
-                        Err(error) => {
-                            paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
-                            return Err(error);
-                        }
-                    };
-                    #[cfg(feature = "timing")]
-                    let elapsed = duration_to_us(start_prefill.elapsed());
-                    #[cfg(feature = "timing")]
-                    let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-                    #[cfg(feature = "timing")]
-                    log_prefill_speed(wave, prefill_tokens, elapsed);
-                    #[cfg(feature = "timing")]
-                    if let Some(t) = timings.as_deref_mut() {
-                        t.prefill_us = t.prefill_us.saturating_add(elapsed);
-                        t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
-                        t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
-                    }
-                    for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
-                        .iter()
-                        .zip(wave_slot_indices.iter())
-                        .enumerate()
-                    {
-                        running[slot_idx] = Some(RunningSlot {
-                            client_index,
-                            slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
-                        });
-                    }
+                    &mut timings,
+                )?;
+                if prefill_wave > 0 {
+                    attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
                     let running_count = running.iter().filter(|s| s.is_some()).count();
                     let waiting_count = waiting.len();
+                    let prefilled_count = prefilled.len();
                     tracing::debug!(
                         target: "vasr_transcribe::pipeline",
-                        "continuous | admit wave={wave} running={running_count}/{max_slots} waiting={waiting_count}",
+                        "continuous | prefill wave={prefill_wave} running={running_count}/{max_slots} prefilled={prefilled_count} waiting={waiting_count}",
                     );
-                    admitted = true;
                 }
 
                 let has_running = running.iter().any(|entry| entry.is_some());
-                if waiting.is_empty() && !has_running {
+                if waiting.is_empty() && prefilled.is_empty() && !has_running {
                     break;
                 }
-                if !admitted && active_steps.is_empty() && !has_running && !waiting.is_empty() {
+                if active_steps.is_empty()
+                    && !has_running
+                    && prefilled.is_empty()
+                    && !waiting.is_empty()
+                {
                     bail!(
                         "paged KV cache exhausted: {} sequence(s) waiting, free_blocks={}",
                         waiting.len(),
@@ -734,6 +1426,7 @@ impl AsrBatchScheduler {
         })();
 
         free_all_running(&mut runtime_guard, running.as_mut_slice());
+        free_all_prefilled(&mut runtime_guard, &mut prefilled);
         result
     }
 
@@ -743,54 +1436,43 @@ impl AsrBatchScheduler {
         device: &Device,
         runtime: &SharedPagedCacheRuntime,
         initial: PreparedAudioBatch,
-        poll_source: &mut dyn FnMut(bool) -> Result<PreparedAudioBatchPoll>,
-        max_new_tokens: usize,
+        poll_source: &mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
         eos_token_ids: &[u32],
         pad_id: u32,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
-        if max_new_tokens == 0 {
-            return Ok(vec![vec![]; initial.prepared.len()]);
-        }
-
-        let mut runtime_guard = runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-        let max_num_seqs = self.config.continuous_max_num_seqs(&runtime_guard);
+        let max_num_seqs = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            self.config.continuous_max_num_seqs(&runtime_guard)
+        };
         let max_slots = max_num_seqs.max(1);
-        let mut prepared = Vec::new();
-        let mut audio_features: Option<Tensor> = None;
-        let mut row_audio_lens = Vec::new();
-        let mut audio_offsets = Vec::new();
-        let mut waiting = VecDeque::new();
+        let mut prefill_inputs = PrefillInputBuffer::default();
+        let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = Vec::new();
         let audio_token_id = thinker.audio_token_id();
         let mut source_closed = false;
 
-        append_prepared_audio_batch(
-            audio_token_id,
-            &mut prepared,
-            &mut audio_features,
-            &mut row_audio_lens,
-            &mut audio_offsets,
-            &mut waiting,
-            initial,
-        )?;
-        outputs.resize(prepared.len(), Vec::new());
-
-        let kv_block_capacity =
-            PagedBlockManager::allocatable_block_capacity(runtime_guard.stats().num_blocks);
+        prefill_inputs.append(audio_token_id, initial)?;
+        outputs.resize(prefill_inputs.len(), Vec::new());
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
             let mut decode_debug = ContinuousDecodeDebug::default();
             loop {
-                decode_debug.record_finished(running.as_slice());
-                free_finished_running(
-                    running.as_mut_slice(),
-                    outputs.as_mut_slice(),
-                    &mut runtime_guard,
-                );
+                {
+                    let mut runtime_guard = runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                    decode_debug.record_finished(running.as_slice());
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                    );
+                }
+                attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
 
                 let mut active_steps: Vec<(usize, usize)> = Vec::new();
                 for (slot_idx, entry) in running.iter().enumerate() {
@@ -801,219 +1483,94 @@ impl AsrBatchScheduler {
                     }
                 }
 
-                if !active_steps.is_empty() {
-                    let step_groups = group_running_by_decode_step(active_steps.as_slice());
-                    for (step, slot_indices) in step_groups {
-                        decode_debug.record_active(step, slot_indices.len());
-                        let mut batch_slots: Vec<PagedDecodeSlot> = slot_indices
-                            .iter()
-                            .map(|&slot_idx| {
-                                running[slot_idx]
-                                    .as_ref()
-                                    .map(|entry| entry.slot.clone())
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("missing running slot {slot_idx}")
-                                    })
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-
-                        #[cfg(feature = "timing")]
-                        let start_decode = std::time::Instant::now();
-                        paged_batch_decode_slots_at_step(
-                            thinker,
-                            device,
-                            &mut runtime_guard,
-                            batch_slots.as_mut_slice(),
-                            step,
-                            max_new_tokens,
-                            eos_token_ids,
-                        )?;
-                        #[cfg(feature = "timing")]
-                        if let Some(t) = timings.as_deref_mut() {
-                            t.decode_us = t
-                                .decode_us
-                                .saturating_add(duration_to_us(start_decode.elapsed()));
-                            t.steps = t.steps.saturating_add(1);
-                            t.tokens_generated =
-                                t.tokens_generated.saturating_add(slot_indices.len());
-                        }
-
-                        for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
-                            if let Some(entry) = running[slot_idx].as_mut() {
-                                entry.slot = slot.clone();
-                            }
-                        }
-                    }
-                }
-
-                for entry in running.iter_mut() {
-                    let Some(entry) = entry.as_mut() else {
-                        continue;
-                    };
-                    if !entry.slot.finished && entry.slot.decode_step >= max_new_tokens {
-                        entry.slot.finished = true;
-                    }
-                }
-
-                decode_debug.record_finished(running.as_slice());
-                free_finished_running(
+                decode_running_step_groups(
                     running.as_mut_slice(),
-                    outputs.as_mut_slice(),
-                    &mut runtime_guard,
-                );
+                    active_steps.as_slice(),
+                    thinker,
+                    device,
+                    runtime,
+                    eos_token_ids,
+                    &mut decode_debug,
+                    #[cfg(feature = "timing")]
+                    &mut timings,
+                )?;
+
+                {
+                    let mut runtime_guard = runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                    decode_debug.record_finished(running.as_slice());
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                    );
+                }
+                attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
 
                 let has_running_before_poll = running.iter().any(|entry| entry.is_some());
-                if !source_closed {
-                    loop {
-                        match poll_source(dynamic_source_poll_may_block(
-                            has_running_before_poll,
-                            waiting.len(),
-                        ))? {
-                            PreparedAudioBatchPoll::Ready(batch) => {
-                                append_prepared_audio_batch(
-                                    audio_token_id,
-                                    &mut prepared,
-                                    &mut audio_features,
-                                    &mut row_audio_lens,
-                                    &mut audio_offsets,
-                                    &mut waiting,
-                                    batch,
-                                )?;
-                                outputs.resize(prepared.len(), Vec::new());
-                            }
-                            PreparedAudioBatchPoll::Empty => break,
-                            PreparedAudioBatchPoll::Closed => {
-                                source_closed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+                let may_block_source = dynamic_source_poll_may_block(
+                    has_running_before_poll,
+                    prefill_inputs.waiting_len(),
+                );
+                let prefill_wave = self.drive_dynamic_prefill_stage(
+                    thinker,
+                    device,
+                    runtime,
+                    &mut prefill_inputs,
+                    &mut prefilled,
+                    poll_source,
+                    &mut source_closed,
+                    audio_token_id,
+                    eos_token_ids,
+                    pad_id,
+                    may_block_source,
+                    #[cfg(feature = "timing")]
+                    &mut timings,
+                )?;
+                outputs.resize(prefill_inputs.len(), Vec::new());
 
-                let mut admitted = false;
-                let manager = runtime_guard.manager();
-                let mut wave_client_indices: Vec<usize> = Vec::new();
-                let mut wave_slot_indices: Vec<usize> = Vec::new();
-                let mut projected_used = running_kv_blocks(running.as_slice(), manager);
-                let mut projected_running = running.iter().filter(|entry| entry.is_some()).count();
-                for slot_idx in 0..max_slots {
-                    if running[slot_idx].is_some() {
-                        continue;
-                    }
-                    if projected_running >= max_slots {
-                        break;
-                    }
-                    let Some(client_index) = waiting.pop_front() else {
-                        break;
-                    };
-                    let prompt_len = prepared_prompt_len(&prepared[client_index]);
-                    let next_running = projected_running.saturating_add(1);
-                    if !can_admit_with_projected_kv(
-                        manager,
-                        kv_block_capacity,
-                        prompt_len,
-                        projected_used,
-                        next_running,
-                    ) {
-                        waiting.push_front(client_index);
-                        break;
-                    }
-                    projected_used =
-                        projected_used.saturating_add(prompt_len.div_ceil(manager.block_size()));
-                    projected_running = next_running;
-                    wave_client_indices.push(client_index);
-                    wave_slot_indices.push(slot_idx);
-                }
-
-                if !wave_client_indices.is_empty() {
-                    let wave = wave_client_indices.len();
-                    let request_id_base = self.next_request_id;
-                    self.next_request_id = self.next_request_id.saturating_add(wave);
-                    let (wave_ids, wave_masks) = pad_prepared_wave_for_prefill(
-                        prepared.as_slice(),
-                        wave_client_indices.as_slice(),
-                        pad_id,
-                    )?;
-                    let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
-                    let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
-                    let features = audio_features
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing dynamic audio features"))?;
-                    let wave_audio = concat_prepared_audio(
-                        features,
-                        audio_offsets.as_slice(),
-                        row_audio_lens.as_slice(),
-                        wave_client_indices.as_slice(),
-                    )?
-                    .to_device(device)?;
-                    let engine_config = PagedBatchConfig {
-                        max_new_tokens,
-                        eos_token_ids: eos_token_ids.to_vec(),
-                        request_id_base,
-                    };
-                    let request_ids: Vec<usize> = (0..wave)
-                        .map(|i| request_id_base.saturating_add(i))
-                        .collect();
-                    #[cfg(feature = "timing")]
-                    let start_prefill = std::time::Instant::now();
-                    let state = match paged_batch_prefill(
-                        thinker,
-                        device,
-                        &mut runtime_guard,
-                        ids_rows.as_slice(),
-                        attn_rows.as_slice(),
-                        Some(&wave_audio),
-                        &engine_config,
-                    ) {
-                        Ok(state) => state,
-                        Err(error) => {
-                            paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
-                            return Err(error);
-                        }
-                    };
-                    #[cfg(feature = "timing")]
-                    let elapsed = duration_to_us(start_prefill.elapsed());
-                    #[cfg(feature = "timing")]
-                    let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-                    #[cfg(feature = "timing")]
-                    log_prefill_speed(wave, prefill_tokens, elapsed);
-                    #[cfg(feature = "timing")]
-                    if let Some(t) = timings.as_deref_mut() {
-                        t.prefill_us = t.prefill_us.saturating_add(elapsed);
-                        t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
-                        t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
-                    }
-                    for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
-                        .iter()
-                        .zip(wave_slot_indices.iter())
-                        .enumerate()
-                    {
-                        running[slot_idx] = Some(RunningSlot {
-                            client_index,
-                            slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
-                        });
-                    }
+                if prefill_wave > 0 {
+                    attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
                     let running_count = running.iter().filter(|s| s.is_some()).count();
-                    let waiting_count = waiting.len();
+                    let waiting_count = prefill_inputs.waiting_len();
+                    let prefilled_count = prefilled.len();
                     tracing::debug!(
                         target: "vasr_transcribe::pipeline",
-                        "continuous | admit wave={wave} running={running_count}/{max_slots} waiting={waiting_count}",
+                        "continuous | prefill wave={prefill_wave} running={running_count}/{max_slots} prefilled={prefilled_count} waiting={waiting_count}",
                     );
-                    admitted = true;
                 }
 
                 let has_running = running.iter().any(|entry| entry.is_some());
-                if waiting.is_empty() && !has_running && source_closed {
+                if !prefill_inputs.has_waiting()
+                    && prefilled.is_empty()
+                    && !has_running
+                    && source_closed
+                {
                     break;
                 }
-                if waiting.is_empty() && !has_running && !source_closed {
+                if !prefill_inputs.has_waiting()
+                    && prefilled.is_empty()
+                    && !has_running
+                    && !source_closed
+                {
                     thread::sleep(DYNAMIC_SOURCE_WAIT);
                 }
-                if !admitted && active_steps.is_empty() && !has_running && !waiting.is_empty() {
+                if active_steps.is_empty()
+                    && !has_running
+                    && prefilled.is_empty()
+                    && prefill_inputs.has_waiting()
+                {
+                    let free_blocks = {
+                        let runtime_guard = runtime
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                        runtime_guard.manager().free_blocks()
+                    };
                     bail!(
                         "paged KV cache exhausted: {} sequence(s) waiting, free_blocks={}",
-                        waiting.len(),
-                        runtime_guard.manager().free_blocks()
+                        prefill_inputs.waiting_len(),
+                        free_blocks
                     );
                 }
             }
@@ -1022,8 +1579,242 @@ impl AsrBatchScheduler {
             Ok(outputs)
         })();
 
-        free_all_running(&mut runtime_guard, running.as_mut_slice());
+        {
+            let mut runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            free_all_running(&mut runtime_guard, running.as_mut_slice());
+            free_all_prefilled(&mut runtime_guard, &mut prefilled);
+        }
         result
+    }
+
+    pub fn run_continuous_prepared_dynamic_async(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        initial: PreparedAudioBatch,
+        poll_source: &mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        eos_token_ids: &[u32],
+        pad_id: u32,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let max_num_seqs = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            self.config.continuous_max_num_seqs(&runtime_guard)
+        };
+        let max_slots = max_num_seqs.max(1);
+        let (message_tx, message_rx) = mpsc::channel::<Result<PrefillStageOutput>>();
+        let shared_request_ids = Arc::new(AtomicUsize::new(self.next_request_id));
+        tracing::debug!(
+            target: "vasr_transcribe::pipeline",
+            "continuous async | prefill_producer=true decode_consumer=true max_slots={max_slots}",
+        );
+
+        thread::scope(|scope| -> Result<Vec<Vec<u32>>> {
+            let producer_runtime = runtime;
+            let producer_thinker = thinker;
+            let producer_device = device;
+            let producer_eos = eos_token_ids;
+            let producer_config = self.config.clone();
+            let producer_request_ids = Arc::clone(&shared_request_ids);
+            scope.spawn(move || {
+                let send_message =
+                    |message: PrefillStageOutput| -> bool { message_tx.send(Ok(message)).is_ok() };
+
+                let run = (|| -> Result<()> {
+                    let mut producer = DynamicPrefillProducer::with_shared_request_ids(
+                        producer_config,
+                        producer_request_ids,
+                        producer_thinker,
+                        producer_device,
+                        producer_runtime,
+                        initial,
+                        poll_source,
+                        producer_eos,
+                        pad_id,
+                    )?;
+                    loop {
+                        let message = producer.run_stage(true)?;
+                        let wave = message.prefill_wave;
+                        let done = producer.is_done();
+                        if wave > 0 || message.source_closed {
+                            if !send_message(message) {
+                                return Ok(());
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                        if wave == 0 {
+                            thread::sleep(DYNAMIC_SOURCE_WAIT);
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = run {
+                    let _ = message_tx.send(Err(error));
+                }
+            });
+
+            let outputs = self.run_continuous_prefilled_dynamic(
+                thinker,
+                device,
+                runtime,
+                message_rx,
+                eos_token_ids,
+                max_slots,
+                #[cfg(feature = "timing")]
+                timings.as_deref_mut(),
+            )?;
+
+            self.next_request_id = shared_request_ids.load(Ordering::Relaxed);
+            Ok(outputs)
+        })
+    }
+
+    pub fn run_continuous_prefilled_dynamic(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        eos_token_ids: &[u32],
+        max_slots: usize,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
+        let mut running: Vec<Option<RunningSlot>> = (0..max_slots.max(1)).map(|_| None).collect();
+        let mut outputs: Vec<Vec<u32>> = Vec::new();
+        let mut source_closed = false;
+        let mut decode_debug = ContinuousDecodeDebug::default();
+        let mut async_debug = AsyncContinuousDebug::default();
+
+        loop {
+            while let Ok(message) = message_rx.try_recv() {
+                let message = message?;
+                let sequence_count = message.sequences.len();
+                apply_prefill_stage_message(
+                    message,
+                    &mut outputs,
+                    &mut prefilled,
+                    &mut source_closed,
+                    #[cfg(feature = "timing")]
+                    &mut timings,
+                );
+                async_debug.record_message(sequence_count, prefilled.len());
+            }
+
+            {
+                let mut runtime_guard = runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                decode_debug.record_finished(running.as_slice());
+                free_finished_running(
+                    running.as_mut_slice(),
+                    outputs.as_mut_slice(),
+                    &mut runtime_guard,
+                );
+            }
+            attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
+            async_debug.record_prefilled_queue(prefilled.len());
+
+            let mut active_steps: Vec<(usize, usize)> = Vec::new();
+            for (slot_idx, entry) in running.iter().enumerate() {
+                if let Some(entry) = entry {
+                    if !entry.slot.finished {
+                        active_steps.push((slot_idx, entry.slot.decode_step));
+                    }
+                }
+            }
+
+            decode_running_step_groups(
+                running.as_mut_slice(),
+                active_steps.as_slice(),
+                thinker,
+                device,
+                runtime,
+                eos_token_ids,
+                &mut decode_debug,
+                #[cfg(feature = "timing")]
+                &mut timings,
+            )?;
+
+            {
+                let mut runtime_guard = runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                decode_debug.record_finished(running.as_slice());
+                free_finished_running(
+                    running.as_mut_slice(),
+                    outputs.as_mut_slice(),
+                    &mut runtime_guard,
+                );
+            }
+            attach_prefilled_to_running(&mut prefilled, running.as_mut_slice());
+            async_debug.record_prefilled_queue(prefilled.len());
+
+            let has_running = running.iter().any(|entry| entry.is_some());
+            if source_closed && prefilled.is_empty() && !has_running {
+                match message_rx.try_recv() {
+                    Ok(message) => {
+                        let message = message?;
+                        let sequence_count = message.sequences.len();
+                        apply_prefill_stage_message(
+                            message,
+                            &mut outputs,
+                            &mut prefilled,
+                            &mut source_closed,
+                            #[cfg(feature = "timing")]
+                            &mut timings,
+                        );
+                        async_debug.record_message(sequence_count, prefilled.len());
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+            if prefilled.is_empty() && !has_running {
+                async_debug.record_empty_recv_wait();
+                match message_rx.recv_timeout(DYNAMIC_SOURCE_WAIT) {
+                    Ok(message) => {
+                        let message = message?;
+                        let sequence_count = message.sequences.len();
+                        apply_prefill_stage_message(
+                            message,
+                            &mut outputs,
+                            &mut prefilled,
+                            &mut source_closed,
+                            #[cfg(feature = "timing")]
+                            &mut timings,
+                        );
+                        async_debug.record_message(sequence_count, prefilled.len());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        async_debug.record_timeout_wait();
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        source_closed = true;
+                    }
+                }
+            }
+        }
+
+        decode_debug.log_summary(max_slots);
+        async_debug.log_summary();
+        {
+            let mut runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            free_all_running(&mut runtime_guard, running.as_mut_slice());
+            free_all_prefilled(&mut runtime_guard, &mut prefilled);
+        }
+        Ok(outputs)
     }
 }
 
@@ -1073,9 +1864,18 @@ pub fn run_paged_prepared_batch(
     eos_token_ids: &[u32],
     decode_max_seqs: usize,
     pad_id: u32,
+    audio_seconds: Option<&[f64]>,
 ) -> Result<Vec<Vec<u32>>> {
     let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
+    let default_audio_seconds;
+    let audio_seconds = match audio_seconds {
+        Some(audio_seconds) => audio_seconds,
+        None => {
+            default_audio_seconds = vec![0.0; prepared.len()];
+            default_audio_seconds.as_slice()
+        }
+    };
     if scheduler.config.continuous_batch {
         scheduler.run_continuous_prepared(
             thinker,
@@ -1083,7 +1883,7 @@ pub fn run_paged_prepared_batch(
             runtime,
             prepared,
             audio_features,
-            max_new_tokens,
+            audio_seconds,
             eos_token_ids,
             pad_id,
             #[cfg(feature = "timing")]
@@ -1120,10 +1920,19 @@ pub fn run_paged_prepared_batch_timed(
     eos_token_ids: &[u32],
     decode_max_seqs: usize,
     pad_id: u32,
+    audio_seconds: Option<&[f64]>,
 ) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
     let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     let mut timings = GenerationTimings::default();
+    let default_audio_seconds;
+    let audio_seconds = match audio_seconds {
+        Some(audio_seconds) => audio_seconds,
+        None => {
+            default_audio_seconds = vec![0.0; prepared.len()];
+            default_audio_seconds.as_slice()
+        }
+    };
     let ids = if scheduler.config.continuous_batch {
         scheduler.run_continuous_prepared(
             thinker,
@@ -1131,7 +1940,7 @@ pub fn run_paged_prepared_batch_timed(
             runtime,
             prepared,
             audio_features,
-            max_new_tokens,
+            audio_seconds,
             eos_token_ids,
             pad_id,
             Some(&mut timings),
@@ -1148,6 +1957,7 @@ pub fn run_paged_prepared_batch_timed(
             eos_token_ids,
             decode_max_seqs,
             pad_id,
+            Some(audio_seconds),
         )?;
         let elapsed = duration_to_us(start.elapsed());
         timings.prefill_us = timings.prefill_us.saturating_add(elapsed);
@@ -1160,10 +1970,11 @@ pub fn run_paged_prepared_batch_timed(
 #[cfg(test)]
 mod tests {
     use super::{
-        AsrBatchSchedulerConfig, PagedBlockManager, can_admit_with_projected_kv,
-        continuous_batch_enabled, dynamic_source_poll_may_block, group_running_by_decode_step,
-        pad_prepared_wave_for_prefill,
+        AsrBatchSchedulerConfig, collect_prefill_wave_by_kv, continuous_batch_enabled,
+        dynamic_source_poll_may_block, group_running_by_decode_step, pad_prepared_wave_for_prefill,
     };
+    use std::collections::VecDeque;
+
     use crate::processor::asr_processor::PreparedInputs;
 
     #[test]
@@ -1187,12 +1998,19 @@ mod tests {
     }
 
     #[test]
-    fn projected_kv_admission_respects_block_capacity() {
-        let manager = PagedBlockManager::new(5, 32);
-        let capacity = PagedBlockManager::allocatable_block_capacity(5);
-        assert_eq!(capacity, 4);
-        assert!(can_admit_with_projected_kv(&manager, capacity, 32, 0, 1));
-        assert!(!can_admit_with_projected_kv(&manager, capacity, 128, 3, 1));
+    fn collect_prefill_wave_uses_free_kv_not_queue_head() {
+        let mut waiting = VecDeque::from(vec![0usize, 1, 2]);
+        let capacities = [128usize, 32, 64];
+        let wave = collect_prefill_wave_by_kv(&mut waiting, 32, 3, |idx| Ok(capacities[idx]))
+            .expect("collect wave");
+        assert_eq!(wave, vec![1, 2]);
+        assert_eq!(waiting.into_iter().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn generated_token_budget_uses_minimum_for_short_audio() {
+        assert_eq!(super::generated_token_budget(0.1, 8.0, 32), 32);
+        assert_eq!(super::generated_token_budget(5.0, 8.0, 32), 40);
     }
 
     #[test]

@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "paged-attn")]
+use std::sync::mpsc as std_mpsc;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -15,12 +17,12 @@ use anyhow::{Result, bail};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-#[cfg(feature = "paged-attn")]
-use vasr::models::qwen3asr::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
-use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
+#[cfg(feature = "paged-attn")]
+use vasr::models::qwen3asr::{EncodedAsrBatchMetadata, PreparedAudioBatchPoll};
+use vasr_data::{Annotation, AudioChannel, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_data::{AudioLoadOptions, AudioLoader};
 
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
@@ -112,6 +114,7 @@ pub struct AsyncTranscribePipeline {
 pub struct TranscribeInput {
     pub index: usize,
     pub source: AudioSource,
+    pub channel: AudioChannel,
 }
 
 #[derive(Debug)]
@@ -190,7 +193,13 @@ impl AsyncTranscribePipeline {
     }
 
     pub async fn run_source(&self, index: usize, source: AudioSource) -> TranscribeItemOutcome {
-        let outcomes = self.run(vec![TranscribeInput { index, source }]).await;
+        let outcomes = self
+            .run(vec![TranscribeInput {
+                index,
+                source,
+                channel: AudioChannel::Mono,
+            }])
+            .await;
         outcomes
             .into_iter()
             .next()
@@ -316,6 +325,7 @@ struct GlobalLoadJob {
     internal_index: usize,
     request_item: RequestItemRef,
     source: AudioSource,
+    channel: AudioChannel,
 }
 
 struct PendingGlobalRequest {
@@ -472,6 +482,7 @@ fn spawn_global_submit_worker(
                     internal_index,
                     request_item,
                     source: input.source,
+                    channel: input.channel,
                 });
             }
             if let Ok(mut routes) = job_routes.lock() {
@@ -545,7 +556,8 @@ fn spawn_global_loader_task(
         let start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = job.source.clone();
-            move || loader.load(&source, &load_options)
+            let channel = job.channel;
+            move || load_transcribe_waveform(&loader, &source, &load_options, channel)
         })
         .await;
         let compute_seconds = start.elapsed().as_secs_f64();
@@ -867,10 +879,37 @@ fn parse_meminfo_kib(text: &str, key: &str) -> Option<u64> {
     None
 }
 
+fn load_transcribe_waveform(
+    loader: &AudioLoader,
+    source: &AudioSource,
+    load_options: &AudioLoadOptions,
+    channel: AudioChannel,
+) -> Result<Waveform> {
+    let waveform = loader.load(source, load_options)?;
+    match channel {
+        AudioChannel::Mono => Ok(waveform.to_mono()?),
+        AudioChannel::Left => Ok(waveform.channel(0)?),
+        AudioChannel::Right => {
+            if waveform.channels < 2 {
+                Ok(waveform.channel(0)?)
+            } else {
+                Ok(waveform.channel(1)?)
+            }
+        }
+        AudioChannel::Channel(index) => Ok(waveform.channel(index)?),
+    }
+}
+
 #[derive(Debug)]
 struct DeduplicatedTranscribeInputs {
     unique_inputs: Vec<TranscribeInput>,
     duplicate_indices: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TranscribeInputDedupKey {
+    source: AudioSourceDedupKey,
+    channel: AudioChannel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -888,7 +927,11 @@ fn deduplicate_transcribe_inputs(inputs: Vec<TranscribeInput>) -> DeduplicatedTr
     let mut duplicate_indices = Vec::new();
 
     for input in inputs {
-        if let Some(key) = audio_source_dedup_key(&input.source) {
+        if let Some(source_key) = audio_source_dedup_key(&input.source) {
+            let key = TranscribeInputDedupKey {
+                source: source_key,
+                channel: input.channel,
+            };
             if let Some(&canonical_index) = seen.get(&key) {
                 duplicate_indices.push((input.index, canonical_index));
                 continue;
@@ -1146,7 +1189,8 @@ fn spawn_loader_task(
         let start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = input.source.clone();
-            move || loader.load(&source, &load_options)
+            let channel = input.channel;
+            move || load_transcribe_waveform(&loader, &source, &load_options, channel)
         })
         .await;
 
@@ -1741,6 +1785,15 @@ struct DynamicSegmentAsrDecode {
     encoded_failures: Vec<SegmentEncodedFailure>,
     #[cfg(feature = "timing")]
     timings: TranscribeTimings,
+}
+
+#[cfg(feature = "paged-attn")]
+#[derive(Debug)]
+struct SegmentPreparedMetadata {
+    segments: Vec<AsrSegmentJob>,
+    inference: SegmentAsrInference,
+    waveforms: Vec<Waveform>,
+    meta: EncodedAsrBatchMetadata,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -2531,94 +2584,177 @@ fn run_segment_asr_decode_dynamic(
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3ASR"))?;
     let (mut inference, mut waveforms, encoded) = initial.into_parts();
     let mut consumed_segments = initial_segments;
-    let mut encoded_failures = Vec::new();
-    let mut source_closed = false;
-    let mut poll_encoded = |may_block: bool| -> Result<EncodedAsrBatchPoll> {
-        if decode_idle_flush.is_some() && !may_block {
-            return Ok(EncodedAsrBatchPoll::Empty);
-        }
-        loop {
-            if source_closed {
-                return Ok(EncodedAsrBatchPoll::Closed);
-            }
-            let message = if may_block {
-                if let Some(timeout) = decode_idle_flush {
-                    match runtime_handle.block_on(async {
-                        let mut encoded_rx = encoded_rx.lock().await;
-                        tokio::time::timeout(timeout, encoded_rx.recv()).await
-                    }) {
-                        Ok(Some(message)) => Some(message),
-                        Ok(None) => {
-                            source_closed = true;
-                            return Ok(EncodedAsrBatchPoll::Closed);
-                        }
-                        Err(tokio::time::error::Elapsed { .. }) => {
-                            source_closed = true;
-                            return Ok(EncodedAsrBatchPoll::Closed);
-                        }
-                    }
-                } else {
-                    match runtime_handle.block_on(async {
-                        let mut encoded_rx = encoded_rx.lock().await;
-                        encoded_rx.recv().await
-                    }) {
-                        Some(message) => Some(message),
-                        None => {
-                            source_closed = true;
-                            return Ok(EncodedAsrBatchPoll::Closed);
-                        }
-                    }
-                }
-            } else {
-                match runtime_handle.block_on(async {
-                    let mut encoded_rx = encoded_rx.lock().await;
-                    encoded_rx.try_recv()
-                }) {
-                    Ok(message) => Some(message),
-                    Err(mpsc::error::TryRecvError::Empty) => None,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        source_closed = true;
-                        return Ok(EncodedAsrBatchPoll::Closed);
-                    }
-                }
-            };
-            let Some(message) = message else {
-                return Ok(EncodedAsrBatchPoll::Empty);
-            };
-            match message.batch {
-                Ok(batch) => {
-                    consumed_segments.extend(message.segments);
-                    let (next_inference, mut next_waveforms, next_encoded) = batch.into_parts();
-                    inference.targets.extend(next_inference.targets);
-                    inference.segment_audio_seconds += next_inference.segment_audio_seconds;
-                    inference.active_job_count = inference
-                        .targets
-                        .iter()
-                        .map(|(job_index, _, _)| *job_index)
-                        .collect::<HashSet<_>>()
-                        .len();
-                    waveforms.append(&mut next_waveforms);
-                    return Ok(EncodedAsrBatchPoll::Ready(next_encoded));
-                }
-                Err(error) => {
-                    encoded_failures.push(SegmentEncodedFailure {
-                        segments: message.segments,
-                        stage_start: message.stage_start,
-                        error,
-                    });
-                }
-            }
-        }
-    };
+    let mut encoded_failures: Vec<SegmentEncodedFailure> = Vec::new();
+    let mut metas: Vec<EncodedAsrBatchMetadata> = Vec::new();
+    let mut batch_lens: Vec<usize> = Vec::new();
+    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
+    let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
+    batch_lens.push(initial_meta.audio_len());
+    metas.push(initial_meta);
+    let (message_tx, message_rx) = std_mpsc::channel();
+    let (meta_tx, meta_rx) = std_mpsc::channel();
+
     #[cfg(feature = "timing")]
-    let (outputs, timings) = qwen3.decode_cpu_audio_features_dynamic_outputs_timed(
-        encoded,
-        &mut poll_encoded,
-        asr_options,
-    )?;
-    #[cfg(not(feature = "timing"))]
-    let outputs =
-        qwen3.decode_cpu_audio_features_dynamic_outputs(encoded, &mut poll_encoded, asr_options)?;
+    let mut timings = TranscribeTimings::default();
+
+    let ids = std::thread::scope(|scope| -> Result<Vec<Vec<u32>>> {
+        let producer_options = runtime_options.clone();
+        let producer_qwen3 = qwen3;
+        let producer_encoded_rx = Arc::clone(&encoded_rx);
+        let producer_runtime_handle = runtime_handle.clone();
+        let producer_meta_tx = meta_tx;
+        scope.spawn(move || {
+            let run = (|| -> Result<()> {
+                let mut source_closed = false;
+                let mut poll_prepared = |may_block: bool| -> Result<PreparedAudioBatchPoll> {
+                    if decode_idle_flush.is_some() && !may_block {
+                        return Ok(PreparedAudioBatchPoll::Empty);
+                    }
+                    loop {
+                        if source_closed {
+                            return Ok(PreparedAudioBatchPoll::Closed);
+                        }
+                        let message = if may_block {
+                            if let Some(timeout) = decode_idle_flush {
+                                match producer_runtime_handle.block_on(async {
+                                    let mut encoded_rx = producer_encoded_rx.lock().await;
+                                    tokio::time::timeout(timeout, encoded_rx.recv()).await
+                                }) {
+                                    Ok(Some(message)) => Some(message),
+                                    Ok(None) => {
+                                        source_closed = true;
+                                        return Ok(PreparedAudioBatchPoll::Closed);
+                                    }
+                                    Err(tokio::time::error::Elapsed { .. }) => {
+                                        source_closed = true;
+                                        return Ok(PreparedAudioBatchPoll::Closed);
+                                    }
+                                }
+                            } else {
+                                match producer_runtime_handle.block_on(async {
+                                    let mut encoded_rx = producer_encoded_rx.lock().await;
+                                    encoded_rx.recv().await
+                                }) {
+                                    Some(message) => Some(message),
+                                    None => {
+                                        source_closed = true;
+                                        return Ok(PreparedAudioBatchPoll::Closed);
+                                    }
+                                }
+                            }
+                        } else {
+                            match producer_runtime_handle.block_on(async {
+                                let mut encoded_rx = producer_encoded_rx.lock().await;
+                                encoded_rx.try_recv()
+                            }) {
+                                Ok(message) => Some(message),
+                                Err(mpsc::error::TryRecvError::Empty) => None,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    source_closed = true;
+                                    return Ok(PreparedAudioBatchPoll::Closed);
+                                }
+                            }
+                        };
+                        let Some(message) = message else {
+                            return Ok(PreparedAudioBatchPoll::Empty);
+                        };
+                        match message.batch {
+                            Ok(batch) => {
+                                let (next_inference, next_waveforms, next_encoded) =
+                                    batch.into_parts();
+                                let (prepared, meta) =
+                                    producer_qwen3.prepare_encoded_audio_features(next_encoded)?;
+                                if producer_meta_tx
+                                    .send(Ok(SegmentPreparedMetadata {
+                                        segments: message.segments,
+                                        inference: next_inference,
+                                        waveforms: next_waveforms,
+                                        meta,
+                                    }))
+                                    .is_err()
+                                {
+                                    return Ok(PreparedAudioBatchPoll::Closed);
+                                }
+                                return Ok(PreparedAudioBatchPoll::Ready(prepared));
+                            }
+                            Err(error) => {
+                                if producer_meta_tx
+                                    .send(Err(SegmentEncodedFailure {
+                                        segments: message.segments,
+                                        stage_start: message.stage_start,
+                                        error,
+                                    }))
+                                    .is_err()
+                                {
+                                    return Ok(PreparedAudioBatchPoll::Closed);
+                                }
+                            }
+                        }
+                    }
+                };
+                let mut producer = producer_qwen3.dynamic_prefill_producer(
+                    initial_prepared,
+                    &mut poll_prepared,
+                    producer_options,
+                )?;
+                loop {
+                    let message = producer.run_stage(true)?;
+                    let wave = message.prefill_wave;
+                    let done = producer.is_done();
+                    if wave > 0 || message.source_closed {
+                        if message_tx.send(Ok(message)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    if done {
+                        break;
+                    }
+                    if wave == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = run {
+                let _ = message_tx.send(Err(error));
+            }
+        });
+
+        qwen3.decode_prefilled_dynamic_ids(
+            message_rx,
+            runtime_options,
+            #[cfg(feature = "timing")]
+            Some(&mut timings.generation),
+        )
+    })?;
+
+    for meta_message in meta_rx.try_iter() {
+        match meta_message {
+            Ok(prepared) => {
+                consumed_segments.extend(prepared.segments);
+                inference.targets.extend(prepared.inference.targets);
+                inference.segment_audio_seconds += prepared.inference.segment_audio_seconds;
+                waveforms.extend(prepared.waveforms);
+                batch_lens.push(prepared.meta.audio_len());
+                metas.push(prepared.meta);
+            }
+            Err(failure) => encoded_failures.push(failure),
+        }
+    }
+
+    inference.active_job_count = inference
+        .targets
+        .iter()
+        .map(|(job_index, _, _)| *job_index)
+        .collect::<HashSet<_>>()
+        .len();
+
+    let outputs = qwen3.decode_dynamic_ids_with_metadata(ids, metas, batch_lens)?;
+    #[cfg(feature = "timing")]
+    {
+        timings.chunks = outputs.iter().map(Vec::len).sum();
+        timings.batches = outputs.len();
+    }
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
     if decode_idle_flush.is_some() {
         vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.device());
@@ -3285,6 +3421,7 @@ mod tests {
     fn loaded_job_memory_permits_rounds_up_to_megabytes() {
         let job = LoadedJob {
             index: 0,
+            request_item: None,
             waveform: Waveform::new(vec![0.0; 1024 * 1024 + 1], 16_000),
             _queue_memory_permit: None,
         };
@@ -3295,6 +3432,7 @@ mod tests {
     fn vad_to_asr_segment_memory_permits_rounds_up_to_megabytes() {
         let message = Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
             job_index: 0,
+            request_item: None,
             job_audio_seconds: 1.0,
             speech_annotations: Vec::new(),
             segment_index: 0,
@@ -3368,11 +3506,13 @@ mod tests {
         let jobs = vec![
             AsrJob {
                 index: 0,
+                request_item: None,
                 prepared: VadPreparation::Speech(prepared_with_segments(&[(0, 100), (250, 400)])),
                 waveform: Waveform::new(vec![0.1; 8_000], 16_000),
             },
             AsrJob {
                 index: 1,
+                request_item: None,
                 prepared: VadPreparation::Speech(prepared_with_segments(&[(50, 200)])),
                 waveform: Waveform::new(vec![0.2; 8_000], 16_000),
             },
@@ -3381,7 +3521,11 @@ mod tests {
         let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default(), None);
 
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.outcome.result.is_ok())
+        );
         assert_eq!(
             *asr.seen_batch_sizes
                 .lock()
@@ -3397,6 +3541,7 @@ mod tests {
         let segments = vec![
             AsrSegmentJob {
                 job_index: 7,
+                request_item: None,
                 job_audio_seconds: 1.0,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3406,6 +3551,7 @@ mod tests {
             },
             AsrSegmentJob {
                 job_index: 7,
+                request_item: None,
                 job_audio_seconds: 1.0,
                 speech_annotations: Vec::new(),
                 segment_index: 1,
@@ -3448,8 +3594,9 @@ mod tests {
         );
 
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].index, 7);
+        assert_eq!(failed[0].outcome.index, 7);
         let err = failed[0]
+            .outcome
             .result
             .as_ref()
             .expect_err("partial segment failure should fail the whole job")
@@ -3464,6 +3611,7 @@ mod tests {
         let mut state = SegmentAsrState::default();
         let segments = vec![AsrSegmentJob {
             job_index: 11,
+            request_item: None,
             job_audio_seconds: 2.5,
             speech_annotations: Vec::new(),
             segment_index: 0,
@@ -3481,9 +3629,10 @@ mod tests {
         );
 
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].index, 11);
-        assert_eq!(failed[0].audio_seconds, 2.5);
+        assert_eq!(failed[0].outcome.index, 11);
+        assert_eq!(failed[0].outcome.audio_seconds, 2.5);
         let err = failed[0]
+            .outcome
             .result
             .as_ref()
             .expect_err("missing-state encode failure should still return an outcome")
@@ -3502,6 +3651,7 @@ mod tests {
         };
         let jobs = vec![AsrJob {
             index: 0,
+            request_item: None,
             prepared: VadPreparation::NoSpeech,
             waveform: Waveform::new(vec![0.1; 160], 16_000),
         }];
@@ -3511,6 +3661,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0]
+                .outcome
                 .result
                 .as_ref()
                 .is_ok_and(|timeline| timeline.annotations.is_empty())
@@ -3541,12 +3692,14 @@ mod tests {
             vad_to_asr_rx,
             asr_to_result_tx,
             stats,
+            None,
         );
 
         for index in 0..3usize {
             vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
                 AsrJob {
                     index,
+                    request_item: None,
                     prepared: VadPreparation::Disabled,
                     waveform: Waveform::new(vec![index as f32; 160], 16_000),
                 },
@@ -3588,11 +3741,13 @@ mod tests {
             vad_to_asr_rx,
             asr_to_result_tx,
             stats,
+            None,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
             AsrSegmentJob {
                 job_index: 0,
+                request_item: None,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3605,6 +3760,7 @@ mod tests {
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
             AsrJob {
                 index: 1,
+                request_item: None,
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
             },
@@ -3616,16 +3772,20 @@ mod tests {
             outcomes.push(outcome);
         }
         handle.await?;
-        outcomes.sort_unstable_by_key(|outcome| outcome.index);
+        outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
 
         assert_eq!(
             outcomes
                 .iter()
-                .map(|outcome| outcome.index)
+                .map(|outcome| outcome.outcome.index)
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.outcome.result.is_ok())
+        );
         Ok(())
     }
 
@@ -3646,11 +3806,13 @@ mod tests {
             vad_to_asr_rx,
             asr_to_result_tx,
             stats,
+            None,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
             AsrJob {
                 index: 0,
+                request_item: None,
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
             },
@@ -3659,6 +3821,7 @@ mod tests {
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
             AsrSegmentJob {
                 job_index: 1,
+                request_item: None,
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3674,16 +3837,20 @@ mod tests {
             outcomes.push(outcome);
         }
         handle.await?;
-        outcomes.sort_unstable_by_key(|outcome| outcome.index);
+        outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
 
         assert_eq!(
             outcomes
                 .iter()
-                .map(|outcome| outcome.index)
+                .map(|outcome| outcome.outcome.index)
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.outcome.result.is_ok())
+        );
         Ok(())
     }
 
@@ -3693,14 +3860,17 @@ mod tests {
             TranscribeInput {
                 index: 10,
                 source: AudioSource::Url("file:///same.wav".to_string()),
+                channel: AudioChannel::Mono,
             },
             TranscribeInput {
                 index: 11,
                 source: AudioSource::Url("file:///other.wav".to_string()),
+                channel: AudioChannel::Mono,
             },
             TranscribeInput {
                 index: 12,
                 source: AudioSource::Url("file:///same.wav".to_string()),
+                channel: AudioChannel::Mono,
             },
         ];
 
@@ -3718,6 +3888,88 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_transcribe_inputs_include_channel_in_key() {
+        let inputs = vec![
+            TranscribeInput {
+                index: 10,
+                source: AudioSource::Url("file:///same.wav".to_string()),
+                channel: AudioChannel::Mono,
+            },
+            TranscribeInput {
+                index: 11,
+                source: AudioSource::Url("file:///same.wav".to_string()),
+                channel: AudioChannel::Left,
+            },
+        ];
+
+        let deduped = deduplicate_transcribe_inputs(inputs);
+
+        assert_eq!(
+            deduped
+                .unique_inputs
+                .iter()
+                .map(|input| input.index)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        assert!(deduped.duplicate_indices.is_empty());
+    }
+
+    #[test]
+    fn load_transcribe_waveform_downmixes_stereo_when_mono_is_requested() -> anyhow::Result<()> {
+        let waveform = Waveform::new_with_channels(
+            vec![
+                1.0, 3.0, // frame 0
+                2.0, 4.0, // frame 1
+            ],
+            16_000,
+            2,
+        );
+
+        let loaded = load_transcribe_waveform(
+            &AudioLoader,
+            &AudioSource::Waveform(waveform),
+            &AudioLoadOptions::default(),
+            AudioChannel::Mono,
+        )?;
+
+        assert_eq!(loaded.channels, 1);
+        assert_eq!(loaded.samples, vec![0.5, 0.75]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_transcribe_waveform_extracts_requested_stereo_channel() -> anyhow::Result<()> {
+        let waveform = Waveform::new_with_channels(
+            vec![
+                1.0, 3.0, // frame 0
+                2.0, 4.0, // frame 1
+            ],
+            16_000,
+            2,
+        );
+
+        let left = load_transcribe_waveform(
+            &AudioLoader,
+            &AudioSource::Waveform(waveform.clone()),
+            &AudioLoadOptions::default(),
+            AudioChannel::Left,
+        )?;
+        let right = load_transcribe_waveform(
+            &AudioLoader,
+            &AudioSource::Waveform(waveform),
+            &AudioLoadOptions::default(),
+            AudioChannel::Right,
+        )?;
+
+        assert_eq!(left.channels, 1);
+        assert_eq!(left.samples, vec![0.25, 0.5]);
+        assert_eq!(right.channels, 1);
+        assert_eq!(right.samples, vec![0.75, 1.0]);
+        Ok(())
+    }
+
+    #[test]
     fn local_file_urls_with_same_content_keep_one_canonical_job() {
         let dir =
             std::env::temp_dir().join(format!("vasr-dedup-test-{}", uuid::Uuid::new_v4().simple()));
@@ -3731,10 +3983,12 @@ mod tests {
             TranscribeInput {
                 index: 0,
                 source: AudioSource::Url(format!("file://{}", first.display())),
+                channel: AudioChannel::Mono,
             },
             TranscribeInput {
                 index: 1,
                 source: AudioSource::Url(format!("file://{}", second.display())),
+                channel: AudioChannel::Mono,
             },
         ];
 

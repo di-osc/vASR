@@ -12,17 +12,24 @@ use anyhow::Result;
 use candle_core::Device;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "paged-attn")]
+use std::sync::mpsc;
 
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
 pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]
-pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
+pub use inference::batch_scheduler::{
+    AsrBatchScheduler, AsrBatchSchedulerConfig, DynamicPrefillProducer, PrefillStageOutput,
+    PrefilledSequence, PreparedAudioBatch, PreparedAudioBatchPoll,
+};
 pub use inference::streaming::AsrStream;
 #[cfg(feature = "paged-attn")]
 pub use inference::transcribe::EncodedAsrBatchPoll;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::transcribe::{AudioFeatureEncodeTimings, EncodedAsrBatch};
+#[cfg(feature = "paged-attn")]
+pub use inference::transcribe::{EncodedAsrBatchMetadata, decode_ids_with_metadata};
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
 #[cfg(feature = "timing")]
 pub use model::generation::GenerationTimings;
@@ -244,7 +251,7 @@ impl Qwen3ASR {
     pub fn decode_cpu_audio_features_dynamic(
         &self,
         encoded: EncodedAsrBatch,
-        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll> + Send,
         opts: TranscribeOptions,
     ) -> Result<Vec<Vec<AsrTranscription>>> {
         inference::transcribe::decode_cpu_audio_features_dynamic(
@@ -262,7 +269,7 @@ impl Qwen3ASR {
     pub fn decode_cpu_audio_features_dynamic_timed(
         &self,
         encoded: EncodedAsrBatch,
-        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll>,
+        mut poll_encoded: impl FnMut(bool) -> Result<EncodedAsrBatchPoll> + Send,
         opts: TranscribeOptions,
     ) -> Result<(Vec<Vec<AsrTranscription>>, TranscribeTimings)> {
         inference::transcribe::decode_cpu_audio_features_dynamic_timed(
@@ -273,6 +280,89 @@ impl Qwen3ASR {
             encoded,
             &mut poll_encoded,
             &opts,
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn prepare_encoded_audio_features(
+        &self,
+        encoded: EncodedAsrBatch,
+    ) -> Result<(PreparedAudioBatch, EncodedAsrBatchMetadata)> {
+        encoded.into_prepared_audio_batch_and_metadata()
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn dynamic_prefill_producer<'a>(
+        &'a self,
+        initial: PreparedAudioBatch,
+        poll_source: &'a mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
+        opts: TranscribeOptions,
+    ) -> Result<DynamicPrefillProducer<'a>> {
+        let Some(runtime) = self.paged_cache.as_ref() else {
+            anyhow::bail!(
+                "paged-attn build requires a shared paged runtime for dynamic staged ASR prefill"
+            );
+        };
+        let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
+        let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        DynamicPrefillProducer::new(
+            config,
+            self.thinker.as_ref(),
+            self.device.as_ref(),
+            runtime,
+            initial,
+            poll_source,
+            eos_token_ids.as_slice(),
+            pad_id,
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn decode_prefilled_dynamic_ids(
+        &self,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        opts: TranscribeOptions,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let Some(runtime) = self.paged_cache.as_ref() else {
+            anyhow::bail!(
+                "paged-attn build requires a shared paged runtime for dynamic staged ASR decode"
+            );
+        };
+        let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let max_slots = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            config.continuous_max_num_seqs(&runtime_guard).max(1)
+        };
+        let mut scheduler = AsrBatchScheduler::new(config);
+        scheduler.run_continuous_prefilled_dynamic(
+            self.thinker.as_ref(),
+            self.device.as_ref(),
+            runtime,
+            message_rx,
+            eos_token_ids.as_slice(),
+            max_slots,
+            #[cfg(feature = "timing")]
+            timings,
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn decode_dynamic_ids_with_metadata(
+        &self,
+        ids: Vec<Vec<u32>>,
+        metas: Vec<EncodedAsrBatchMetadata>,
+        batch_lens: Vec<usize>,
+    ) -> Result<Vec<Vec<AsrTranscription>>> {
+        inference::transcribe::decode_ids_with_metadata(
+            self.processor.as_ref(),
+            ids,
+            metas,
+            batch_lens,
         )
     }
 

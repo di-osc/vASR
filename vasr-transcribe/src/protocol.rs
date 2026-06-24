@@ -41,6 +41,15 @@ pub struct SpentDetails {
     pub sentencizer: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingBreakdown {
+    pub total: f64,
+    pub loader: f64,
+    pub pipeline: f64,
+    pub audio: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceData {
     #[serde(rename = "serviceId")]
@@ -49,6 +58,7 @@ pub struct InferenceData {
     pub spent_seconds: f64,
     #[serde(rename = "spentDetails")]
     pub spent_details: SpentDetails,
+    pub timings: TimingBreakdown,
     pub text: TextResult,
     pub sentences: Vec<SentenceResult>,
     pub is_bad: bool,
@@ -74,6 +84,14 @@ pub struct TranscribeResponse {
 
 impl InferenceData {
     pub fn from_timeline(service_id: impl Into<String>, timeline: &Timeline) -> Self {
+        Self::from_timeline_channel(service_id, timeline, "mono")
+    }
+
+    pub fn from_timeline_channel(
+        service_id: impl Into<String>,
+        timeline: &Timeline,
+        channel: &str,
+    ) -> Self {
         let transcript = timeline.transcript();
         let mut sentences = Vec::new();
         for annotation in timeline
@@ -90,22 +108,25 @@ impl InferenceData {
                         start_time: annotation.range.start.0,
                         end_time: annotation.range.end.0,
                         duration,
-                        channel: "mono".to_string(),
+                        channel: channel.to_string(),
                         sentence_index: sentences.len(),
                     });
                 }
                 _ => {}
             }
         }
+        let mut text = TextResult::default();
+        match channel {
+            "left" => text.left = transcript.text,
+            "right" => text.right = transcript.text,
+            _ => text.mono = transcript.text,
+        }
         Self {
             service_id: service_id.into(),
             spent_seconds: 0.0,
             spent_details: SpentDetails::default(),
-            text: TextResult {
-                mono: transcript.text,
-                left: String::new(),
-                right: String::new(),
-            },
+            timings: TimingBreakdown::default(),
+            text,
             sentences,
             is_bad: false,
             bad_reason: None,

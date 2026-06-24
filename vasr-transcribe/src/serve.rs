@@ -235,7 +235,7 @@ mod tests {
         };
 
         let opts = asr_options_from_pipeline(&pipeline, None);
-        assert_eq!(opts.max_new_tokens, 128);
+        assert_eq!(opts.max_new_tokens, 4096);
         assert_eq!(opts.max_batch_audio_sec, 60.0);
     }
 }

@@ -6,7 +6,7 @@ use crate::Waveform;
 
 pub type MediaId = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AudioChannel {
     Mono,
     Left,

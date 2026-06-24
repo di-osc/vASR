@@ -811,6 +811,7 @@ fn greedy_generate_cached_batch_impl(
             max_new_tokens: opts.max_new_tokens,
             eos_token_ids: opts.eos_token_ids.to_vec(),
             request_id_base: 0,
+            token_capacities: None,
         };
         let request_ids = (0..batch).collect::<Vec<_>>();
         let state = match paged_batch_prefill(
