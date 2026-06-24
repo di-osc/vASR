@@ -104,6 +104,10 @@ pub struct ServeTranscribeArgs {
     #[command(flatten)]
     pub pipeline: TranscribePipelineArgs,
 
+    /// Optional ASR language hint.
+    #[arg(long, env = "VASR_LANGUAGE")]
+    pub language: Option<String>,
+
     /// Bind host.
     #[arg(long, default_value = "127.0.0.1", env = "VASR_HOST")]
     pub host: String,
@@ -142,7 +146,7 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     let offline = build_offline_pipeline(asr)?;
     let transcribe_service = build_transcribe_service_from_parts(
         offline,
-        asr_options_from_pipeline(&args.pipeline, None),
+        asr_options_from_pipeline(&args.pipeline, args.language.clone()),
         vad_options_from_pipeline(&args.pipeline),
     );
 
