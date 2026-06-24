@@ -3,10 +3,13 @@ use std::time::Instant;
 
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
+use axum::extract::DefaultBodyLimit;
 
 use crate::pipeline::{GlobalAsyncTranscribePipeline, TranscribeInput};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
 use crate::runtime::{AsrOptions, VadOptions};
+
+const TRANSCRIBE_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct TranscribeService {
     pub pipeline: Arc<GlobalAsyncTranscribePipeline>,
@@ -16,6 +19,7 @@ pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
     Router::new()
         .route("/transcribe", post(handle_transcribe))
         .route("/inference", post(handle_transcribe))
+        .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT_BYTES))
         .with_state(service)
 }
 
