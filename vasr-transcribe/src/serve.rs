@@ -104,8 +104,8 @@ pub struct ServeTranscribeArgs {
     #[command(flatten)]
     pub pipeline: TranscribePipelineArgs,
 
-    /// Optional ASR language hint.
-    #[arg(long, env = "VASR_LANGUAGE")]
+    /// ASR language hint.
+    #[arg(long, env = "VASR_LANGUAGE", default_value = "Chinese")]
     pub language: Option<String>,
 
     /// Bind host.

@@ -26,8 +26,8 @@ pub struct BenchmarkTranscribeArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Optional ASR language hint.
-    #[arg(long, env = "VASR_LANGUAGE")]
+    /// ASR language hint.
+    #[arg(long, env = "VASR_LANGUAGE", default_value = "Chinese")]
     pub language: Option<String>,
 
     /// Process at most this many records.
