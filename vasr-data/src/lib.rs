@@ -3,6 +3,7 @@
 pub mod audio;
 mod cer;
 mod extract_audio;
+mod fasr;
 mod media;
 mod record;
 mod segment;
@@ -17,6 +18,7 @@ pub use cer::{CerStats, compute_cer, normalize_for_cer};
 pub use extract_audio::{
     ExtractAudioSummary, extract_embedded_audio, extract_embedded_audio_from_msgpack,
 };
+pub use fasr::{FasrConvertSummary, convert_fasr_audiolist_to_msgpack, read_fasr_audio_list};
 pub use media::{AudioChannel, AudioFormat, AudioSource, MediaId};
 pub use record::{
     AudioAsset, AudioEncoding, PersistedAudioFormat, RecordError, VasrRecord, VasrRecordList,

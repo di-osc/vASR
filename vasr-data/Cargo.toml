@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 base64 = { version = "0.22", optional = true }
+clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false, optional = true }
 rmp-serde = "1"
 rubato = { version = "3", optional = true }
