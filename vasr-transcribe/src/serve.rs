@@ -265,6 +265,14 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_asr_model_id(model: &str) -> &str {
+    match model.trim() {
+        "Qwen3-ASR-0.6B" => "Qwen/Qwen3-ASR-0.6B",
+        "Qwen3-ASR-1.7B" => "Qwen/Qwen3-ASR-1.7B",
+        other => other,
+    }
+}
+
 #[cfg(any(feature = "metal", feature = "cuda"))]
 fn build_paged_cache_config(
     device: &Device,
@@ -483,13 +491,14 @@ fn load_asr_model(
     tracing::info!(
         target: "vasr_transcribe::serve",
         "Loading Qwen3-ASR model `{}` from cache `{}` on {} (isq={:?}).",
-        args.model,
+        resolve_asr_model_id(&args.model),
         args.cache_dir.display(),
         device_label(&device),
         args.isq
     );
     let model_load_start = Instant::now();
-    let qwen3_asr = Qwen3ASR::from_pretrained(&args.model, &device, &load_options)?;
+    let qwen3_asr =
+        Qwen3ASR::from_pretrained(resolve_asr_model_id(&args.model), &device, &load_options)?;
     let params_bytes = match qwen3_asr.weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
