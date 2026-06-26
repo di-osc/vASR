@@ -30,6 +30,7 @@ const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 #[cfg(feature = "paged-attn")]
 const KV_BLOCK_SIZE: usize = 32;
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
+const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
 #[cfg(feature = "paged-attn")]
 const ASR_GENERATED_TOKENS_PER_SEC: f64 = 8.0;
 #[cfg(feature = "paged-attn")]
@@ -38,6 +39,8 @@ const ASR_MIN_GENERATED_TOKENS: usize = 32;
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
 #[cfg(feature = "paged-attn")]
 const ASR_FEATURE_HOP_LENGTH: usize = 160;
+#[cfg(feature = "paged-attn")]
+const KV_BASE_SEGMENT_SEC: f32 = 1.0;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -71,6 +74,14 @@ pub struct CommonModelArgs {
         env = "VASR_MAX_HOTWORD_TOKENS"
     )]
     pub max_hotword_tokens: usize,
+
+    /// Fraction of decode sequences expected to grow from base segment length to max segment length.
+    #[arg(
+        long = "kv-peak-ratio",
+        default_value_t = DEFAULT_KV_PEAK_RATIO,
+        env = "VASR_KV_PEAK_RATIO"
+    )]
+    pub kv_peak_ratio: f32,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -252,6 +263,7 @@ mod tests {
                 isq: None,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
                 max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+                kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
@@ -276,10 +288,27 @@ mod tests {
             isq: None,
             max_num_seqs: 0,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
         };
 
         let error = validate_model_args(&args).expect_err("max_num_seqs=0 should fail");
         assert!(error.to_string().contains("--max-num-seqs"));
+    }
+
+    #[test]
+    fn kv_peak_ratio_must_be_valid() {
+        let args = CommonModelArgs {
+            model: DEFAULT_ASR_MODEL.to_string(),
+            cache_dir: vasr::modelscope_cache_dir(),
+            device: "auto".to_string(),
+            isq: None,
+            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            kv_peak_ratio: 1.5,
+        };
+
+        let error = validate_model_args(&args).expect_err("kv_peak_ratio=1.5 should fail");
+        assert!(error.to_string().contains("--kv-peak-ratio"));
     }
 
     #[cfg(feature = "paged-attn")]
@@ -295,6 +324,27 @@ mod tests {
         // 30s at 16kHz with hop=160 gives 3000 frames; Qwen3-ASR's projector
         // length formula maps that to 390 audio placeholder tokens.
         assert_eq!(max_audio_prompt_tokens(30.0), 390);
+    }
+
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn kv_peak_ratio_reduces_peak_only_blocks() -> anyhow::Result<()> {
+        let fixed_prompt_tokens = 18;
+        let hotword_tokens = DEFAULT_MAX_HOTWORD_TOKENS;
+        let base = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 1.0)?;
+        let peak = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 30.0)?;
+        let base_blocks = DEFAULT_MAX_NUM_SEQS * base.blocks_per_seq;
+        let peak_extra_blocks = ((DEFAULT_MAX_NUM_SEQS
+            * (peak.blocks_per_seq - base.blocks_per_seq)) as f64
+            * f64::from(DEFAULT_KV_PEAK_RATIO))
+        .ceil() as usize;
+
+        assert_eq!(base.tokens_per_seq, 191);
+        assert_eq!(base.blocks_per_seq, 6);
+        assert_eq!(peak.tokens_per_seq, 776);
+        assert_eq!(peak.blocks_per_seq, 25);
+        assert_eq!(base_blocks + peak_extra_blocks, 2752);
+        Ok(())
     }
 }
 
@@ -321,6 +371,9 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.max_num_seqs == 0 {
         bail!("--max-num-seqs must be greater than zero");
     }
+    if !args.kv_peak_ratio.is_finite() || !(0.0..=1.0).contains(&args.kv_peak_ratio) {
+        bail!("--kv-peak-ratio must be finite and between 0.0 and 1.0");
+    }
     Ok(())
 }
 
@@ -336,13 +389,21 @@ fn resolve_asr_model_id(model: &str) -> &str {
 #[derive(Debug, Clone)]
 struct KvCacheSizing {
     max_num_seqs: usize,
+    base_segment_sec: f32,
     max_segment_sec: f32,
+    peak_ratio: f32,
     max_hotword_tokens: usize,
     fixed_prompt_tokens: usize,
-    audio_prompt_tokens: usize,
-    decode_tokens: usize,
-    tokens_per_seq: usize,
-    blocks_per_seq: usize,
+    base_audio_prompt_tokens: usize,
+    base_decode_tokens: usize,
+    base_tokens_per_seq: usize,
+    base_blocks_per_seq: usize,
+    peak_audio_prompt_tokens: usize,
+    peak_decode_tokens: usize,
+    peak_tokens_per_seq: usize,
+    peak_blocks_per_seq: usize,
+    base_blocks: usize,
+    peak_extra_blocks: usize,
     total_blocks: usize,
 }
 
@@ -375,30 +436,78 @@ fn estimate_kv_cache_sizing(
         .iter()
         .filter(|&&id| id != audio_pad_id)
         .count();
-    let audio_prompt_tokens = max_audio_prompt_tokens(pipeline.vad.vad_max_segment_sec);
-    let decode_tokens = generated_token_budget(pipeline.vad.vad_max_segment_sec);
-    let tokens_per_seq = fixed_prompt_tokens
-        .checked_add(audio_prompt_tokens)
-        .and_then(|n| n.checked_add(pipeline.model.max_hotword_tokens))
-        .and_then(|n| n.checked_add(decode_tokens))
-        .ok_or_else(|| anyhow::anyhow!("KV cache token estimate overflow"))?;
-    let blocks_per_seq = tokens_per_seq.div_ceil(KV_BLOCK_SIZE);
-    let total_blocks = pipeline
+
+    let base = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        pipeline.model.max_hotword_tokens,
+        KV_BASE_SEGMENT_SEC,
+    )?;
+    let peak = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        pipeline.model.max_hotword_tokens,
+        pipeline.vad.vad_max_segment_sec,
+    )?;
+    let base_blocks = pipeline
         .model
         .max_num_seqs
-        .checked_mul(blocks_per_seq)
+        .checked_mul(base.blocks_per_seq)
+        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
+    let extra_blocks_per_seq = peak.blocks_per_seq.saturating_sub(base.blocks_per_seq);
+    let peak_extra_blocks = ((pipeline.model.max_num_seqs * extra_blocks_per_seq) as f64
+        * f64::from(pipeline.model.kv_peak_ratio))
+    .ceil() as usize;
+    let total_blocks = base_blocks
+        .checked_add(peak_extra_blocks)
         .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
 
     Ok(KvCacheSizing {
         max_num_seqs: pipeline.model.max_num_seqs,
+        base_segment_sec: KV_BASE_SEGMENT_SEC,
         max_segment_sec: pipeline.vad.vad_max_segment_sec,
+        peak_ratio: pipeline.model.kv_peak_ratio,
         max_hotword_tokens: pipeline.model.max_hotword_tokens,
         fixed_prompt_tokens,
+        base_audio_prompt_tokens: base.audio_prompt_tokens,
+        base_decode_tokens: base.decode_tokens,
+        base_tokens_per_seq: base.tokens_per_seq,
+        base_blocks_per_seq: base.blocks_per_seq,
+        peak_audio_prompt_tokens: peak.audio_prompt_tokens,
+        peak_decode_tokens: peak.decode_tokens,
+        peak_tokens_per_seq: peak.tokens_per_seq,
+        peak_blocks_per_seq: peak.blocks_per_seq,
+        base_blocks,
+        peak_extra_blocks,
+        total_blocks,
+    })
+}
+
+#[cfg(feature = "paged-attn")]
+#[derive(Debug, Clone, Copy)]
+struct KvSegmentTokens {
+    audio_prompt_tokens: usize,
+    decode_tokens: usize,
+    tokens_per_seq: usize,
+    blocks_per_seq: usize,
+}
+
+#[cfg(feature = "paged-attn")]
+fn kv_tokens_for_segment(
+    fixed_prompt_tokens: usize,
+    max_hotword_tokens: usize,
+    segment_sec: f32,
+) -> Result<KvSegmentTokens> {
+    let audio_prompt_tokens = max_audio_prompt_tokens(segment_sec);
+    let decode_tokens = generated_token_budget(segment_sec);
+    let tokens_per_seq = fixed_prompt_tokens
+        .checked_add(audio_prompt_tokens)
+        .and_then(|n| n.checked_add(max_hotword_tokens))
+        .and_then(|n| n.checked_add(decode_tokens))
+        .ok_or_else(|| anyhow::anyhow!("KV cache token estimate overflow"))?;
+    Ok(KvSegmentTokens {
         audio_prompt_tokens,
         decode_tokens,
         tokens_per_seq,
-        blocks_per_seq,
-        total_blocks,
+        blocks_per_seq: tokens_per_seq.div_ceil(KV_BLOCK_SIZE),
     })
 }
 
@@ -423,17 +532,27 @@ fn generated_token_budget(max_segment_sec: f32) -> usize {
 fn log_kv_cache_sizing(sizing: &KvCacheSizing) {
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "KV cache sizing | blocks={} block_size={} max_seqs={} max_segment={:.1}s tokens_per_seq={} blocks_per_seq={} prompt=fixed:{} audio:{} hotword:{} decode:{}",
+        "KV cache sizing | blocks={} block_size={} max_seqs={} peak_ratio={:.2} base_blocks={} peak_extra_blocks={} | base segment={:.1}s tokens_per_seq={} blocks_per_seq={} prompt=fixed:{} audio:{} hotword:{} decode:{} | peak segment={:.1}s tokens_per_seq={} blocks_per_seq={} prompt=fixed:{} audio:{} hotword:{} decode:{}",
         sizing.total_blocks,
         KV_BLOCK_SIZE,
         sizing.max_num_seqs,
-        sizing.max_segment_sec,
-        sizing.tokens_per_seq,
-        sizing.blocks_per_seq,
+        sizing.peak_ratio,
+        sizing.base_blocks,
+        sizing.peak_extra_blocks,
+        sizing.base_segment_sec,
+        sizing.base_tokens_per_seq,
+        sizing.base_blocks_per_seq,
         sizing.fixed_prompt_tokens,
-        sizing.audio_prompt_tokens,
+        sizing.base_audio_prompt_tokens,
         sizing.max_hotword_tokens,
-        sizing.decode_tokens
+        sizing.base_decode_tokens,
+        sizing.max_segment_sec,
+        sizing.peak_tokens_per_seq,
+        sizing.peak_blocks_per_seq,
+        sizing.fixed_prompt_tokens,
+        sizing.peak_audio_prompt_tokens,
+        sizing.max_hotword_tokens,
+        sizing.peak_decode_tokens
     );
 }
 
