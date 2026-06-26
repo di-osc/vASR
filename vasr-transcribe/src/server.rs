@@ -35,8 +35,10 @@ async fn handle_transcribe(
     let request_items = request.inputs.len();
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "request_start | id={} items={}",
+        "{} {:<7} {:<5} | items={}",
         request_id,
+        "request",
+        "START",
         request_items
     );
     let mut inputs = Vec::new();
@@ -153,17 +155,18 @@ async fn handle_transcribe(
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "request_done | id={} | batch items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4} | ch mono={} stereo={} total={}",
+        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s | speed={:>6.1}x",
         request_id,
+        "request",
+        "DONE",
         performance.num_items,
         bad,
         performance.total_audio_duration_seconds,
-        performance.batch_wall_seconds,
-        performance.speedup,
-        performance.rtf,
         request_stats.mono,
         request_stats.stereo,
-        request_stats.channels
+        request_stats.channels,
+        performance.batch_wall_seconds,
+        performance.speedup
     );
     Json(TranscribeResponse {
         data,

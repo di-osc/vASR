@@ -1466,9 +1466,10 @@ fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgr
     let speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
     tracing::info!(
         target: "vasr_transcribe::pipeline",
-        "{} {} done | audio={:.1}s wall={:.3}s run={:.3}s queue={:.3}s speed={:.1}x",
+        "{} {:<7} {:<5} | audio={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | wait={:>6.3}s | speed={:>6.1}x",
         request_id,
         stage,
+        "DONE",
         progress.audio_seconds,
         wall_seconds,
         run_seconds,

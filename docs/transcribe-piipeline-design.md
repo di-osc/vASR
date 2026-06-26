@@ -150,7 +150,7 @@ ASR result 通过 result router 回到 pending request：
 当前阶段日志模板：
 
 ```text
-{id} {stage} done | audio={audio}s wall={wall}s run={run}s queue={queue}s speed={speed}x
+{id} {stage:<7} DONE  | audio={audio}s | elapsed={elapsed}s | active={active}s | wait={wait}s | speed={speed}x
 ```
 
 阶段名固定为：
@@ -163,58 +163,58 @@ ASR result 通过 result router 回到 pending request：
 
 日志级别是 `INFO`。
 
-### run
+### active
 
-`run` 表示本阶段实际执行的 request-level 覆盖窗口。
+`active` 表示本阶段实际执行的 request-level 覆盖窗口。
 
-如果一个请求在该阶段拆成多个并行 task 或多个 batch，`run` 不是所有 task 时间求和，而是：
+如果一个请求在该阶段拆成多个并行 task 或多个 batch，`active` 不是所有 task 时间求和，而是：
 
 ```text
-run = min(run_start) 到 max(run_end)
+active = min(active_start) 到 max(active_end)
 ```
 
 这样可以表达“这个请求在该阶段实际有工作运行的覆盖时间”。
 
-### queue
+### wait
 
-`queue` 表示上游产物已经可用，但当前阶段尚未开始处理的 request-level 等待覆盖窗口。
+`wait` 表示上游产物已经可用，但当前阶段尚未开始处理的 request-level 等待覆盖窗口。
 
 同样，它不是所有 item/segment 等待时间求和，也不是平均等待，而是：
 
 ```text
-queue = min(queue_start) 到 max(queue_end)
+wait = min(wait_start) 到 max(wait_end)
 ```
 
-各阶段 queue 来源：
+各阶段 wait 来源：
 
-- `load`: 无上游队列，`queue=0`。
+- `load`: 无上游队列，`wait=0`。
 - `vad`: loader 完成到 VAD task 开始。
 - `encode`: VAD 完成到 encoder batch 开始。
 - `prefill`: encode 完成到 decoder/prefill 开始。
 - `decode`: 有 prefill timing 时为 `0`，因为 decode 紧跟 prefill，在同一个 decoder worker 内；没有 prefill timing 时 fallback 为 encode 完成到 decoder worker 开始。
 
-### wall
+### elapsed
 
-`wall` 是 queue span 和 run span 的并集覆盖时间：
+`elapsed` 是 wait span 和 active span 的并集覆盖时间：
 
 ```text
-wall = union(queue_span, run_span)
+elapsed = union(wait_span, active_span)
 ```
 
 不能简单使用：
 
 ```text
-wall = queue + run
+elapsed = wait + active
 ```
 
-因为 request 内多个 item/segment 会并行推进，queue 和 run 覆盖窗口可能重叠。直接相加会双算重叠部分，甚至导致阶段 wall 大于整个 request wall。
+因为 request 内多个 item/segment 会并行推进，wait 和 active 覆盖窗口可能重叠。直接相加会双算重叠部分，甚至导致阶段 elapsed 大于整个 request elapsed。
 
 ### speed
 
 `speed` 使用：
 
 ```text
-speed = audio / wall
+speed = audio / elapsed
 ```
 
 它表达该 request 在当前阶段的端到端阶段吞吐，包含排队影响。
@@ -222,28 +222,28 @@ speed = audio / wall
 ## 日志示例
 
 ```text
-request_start | id=7b622a8f items=99
-7b622a8f load done | audio=5025.0s wall=1.703s run=1.703s queue=0.000s speed=2950.7x
-7b622a8f vad done | audio=5025.0s wall=3.858s run=3.749s queue=0.109s speed=1302.6x
-7b622a8f encode done | audio=4169.4s wall=11.959s run=11.959s queue=0.480s speed=348.6x
-7b622a8f prefill done | audio=4169.4s wall=12.276s run=12.276s queue=0.090s speed=339.6x
-7b622a8f decode done | audio=4169.4s wall=12.916s run=12.916s queue=0.000s speed=322.8x
-request_done | id=7b622a8f | batch items=99 bad=0 audio=5025.0s wall=13.081s speed=384.1x rtf=0.0026 | ch mono=99 stereo=0 total=99
+7b622a8f request START | items=99
+7b622a8f load    DONE  | audio=5025.0s | elapsed= 1.703s | active= 1.703s | wait= 0.000s | speed=2950.7x
+7b622a8f vad     DONE  | audio=5025.0s | elapsed= 3.858s | active= 3.749s | wait= 0.109s | speed=1302.6x
+7b622a8f encode  DONE  | audio=4169.4s | elapsed=11.959s | active=11.959s | wait= 0.480s | speed= 348.6x
+7b622a8f prefill DONE  | audio=4169.4s | elapsed=12.276s | active=12.276s | wait= 0.090s | speed= 339.6x
+7b622a8f decode  DONE  | audio=4169.4s | elapsed=12.916s | active=12.916s | wait= 0.000s | speed= 322.8x
+7b622a8f request DONE  | items=99 bad=0 | audio=5025.0s ch=mono:99 stereo:0 total:99 | elapsed=13.081s | speed= 384.1x
 ```
 
-注意：示例中的 `wall` 是覆盖窗口，不保证等于 `run + queue`。
+注意：示例中的 `elapsed` 是覆盖窗口，不保证等于 `active + wait`。
 
-## 如何解读 queue/run
+## 如何解读 wait/active
 
-`run` 大通常说明当前阶段自身计算耗时明显。
+`active` 大通常说明当前阶段自身计算耗时明显。
 
-`queue` 大通常说明当前阶段前存在排队、调度等待或 backpressure。例如：
+`wait` 大通常说明当前阶段前存在排队、调度等待或 backpressure。例如：
 
-- VAD queue 大：loader 产出速度高于 VAD 消费速度，或者 VAD worker 不足。
-- encode queue 大：VAD segment 产出速度高于 encoder 消费速度，或者 encoder 受 GPU/批处理调度影响。
-- prefill queue 大：encoded features 已准备好，但 decoder/prefill 侧排队，可能受连续 decode、KV cache 或 GPU 资源占用影响。
+- VAD wait 大：loader 产出速度高于 VAD 消费速度，或者 VAD worker 不足。
+- encode wait 大：VAD segment 产出速度高于 encoder 消费速度，或者 encoder 受 GPU/批处理调度影响。
+- prefill wait 大：encoded features 已准备好，但 decoder/prefill 侧排队，可能受连续 decode、KV cache 或 GPU 资源占用影响。
 
-当前 queue 是 request-level 覆盖窗口，适合判断整体是否有明显排队。它不适合回答“每个 segment 平均等多久”或“p90 等待多久”。如果需要分布诊断，应增加：
+当前 wait 是 request-level 覆盖窗口，适合判断整体是否有明显排队。它不适合回答“每个 segment 平均等多久”或“p90 等待多久”。如果需要分布诊断，应增加：
 
 ```text
 q_avg q_p50 q_p90 q_max
@@ -254,14 +254,14 @@ q_avg q_p50 q_p90 q_max
 最终 `request_done` 只打印请求总览：
 
 ```text
-request_done | id={} | batch items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4} | ch mono={} stereo={} total={}
+{id} request DONE  | items={} bad={} | audio={:.1}s ch=mono:{} stereo:{} total:{} | elapsed={:.3}s | speed={:.1}x
 ```
 
-它不包含阶段耗时。阶段耗时由每个 `{id} {stage} done` 日志单独给出。
+它不包含阶段耗时。阶段耗时由每个 `{id} {stage} DONE` 日志单独给出。
 
 ## 当前限制
 
-- request-level queue/run 是覆盖窗口，不是累计耗时。
+- request-level wait/active 是覆盖窗口，不是累计耗时。
 - 阶段日志主要服务于请求级瓶颈定位，不提供 item/segment 等待分布。
 - prefill span 依赖 Qwen timing 推导；无法取得 timing 时，decode 会 fallback 到 decoder worker span。
 - raw ASR fallback 路径没有完整的 encode/prefill/decode 分段语义。
