@@ -432,6 +432,10 @@ struct RequestStageProgress {
     vad_remaining: usize,
     encode_remaining: usize,
     decode_remaining: usize,
+    load_logged: bool,
+    vad_logged: bool,
+    encode_logged: bool,
+    decode_logged: bool,
     load: StageProgress,
     vad: StageProgress,
     encode: StageProgress,
@@ -634,6 +638,7 @@ fn spawn_global_submit_worker(
                         outcomes: Vec::with_capacity(unique_count),
                         stages: RequestStageProgress {
                             load_remaining: unique_count,
+                            vad_remaining: unique_count,
                             ..Default::default()
                         },
                         response_tx,
@@ -835,6 +840,7 @@ async fn send_global_loaded_result(
                 request_item.request_id,
                 span,
                 audio_seconds,
+                jobs.len(),
             );
         }
         if jobs.len() > 1 {
@@ -1257,6 +1263,7 @@ fn record_request_load_stage(
     request_id: PipelineRequestId,
     span: StageSpan,
     audio_seconds: f64,
+    loaded_jobs: usize,
 ) {
     if let Ok(mut pending) = pending_requests.lock() {
         let Some(request) = pending.get_mut(&request_id) else {
@@ -1267,9 +1274,12 @@ fn record_request_load_stage(
             Some(span),
         ));
         request.stages.load.audio_seconds += audio_seconds;
-        request.stages.vad_remaining += 1;
+        if loaded_jobs > 1 {
+            request.stages.vad_remaining += loaded_jobs - 1;
+        }
         request.stages.load_remaining = request.stages.load_remaining.saturating_sub(1);
-        if request.stages.load_remaining == 0 {
+        if request.stages.load_remaining == 0 && !request.stages.load_logged {
+            request.stages.load_logged = true;
             log_request_stage(&request.log_id, "load", request.stages.load);
         }
     }
@@ -1294,8 +1304,10 @@ fn record_request_vad_stage(
         request.stages.encode_remaining += segment_count;
         request.stages.decode_remaining += segment_count;
         request.stages.vad_remaining = request.stages.vad_remaining.saturating_sub(1);
-        if request.stages.vad_remaining == 0 {
+        if request.stages.vad_remaining == 0 && !request.stages.vad_logged {
+            request.stages.vad_logged = true;
             log_request_stage(&request.log_id, "vad", request.stages.vad);
+            log_ready_downstream_stages(request);
         }
     }
 }
@@ -1323,9 +1335,7 @@ fn record_request_encode_stage(
             .stages
             .encode_remaining
             .saturating_sub(segment_count);
-        if request.stages.encode_remaining == 0 {
-            log_request_stage(&request.log_id, "encode", request.stages.encode);
-        }
+        log_ready_downstream_stages(request);
     }
 }
 
@@ -1405,12 +1415,30 @@ fn record_request_decode_stage(
             .stages
             .decode_remaining
             .saturating_sub(segment_count);
-        if request.stages.decode_remaining == 0 {
-            if request.stages.prefill.run_span.is_some() {
-                log_request_stage(&request.log_id, "prefill", request.stages.prefill);
-            }
-            log_request_stage(&request.log_id, "decode", request.stages.decode);
+        log_ready_downstream_stages(request);
+    }
+}
+
+fn log_ready_downstream_stages(request: &mut PendingGlobalRequest) {
+    if !request.stages.vad_logged {
+        return;
+    }
+    if request.stages.encode_remaining == 0
+        && request.stages.encode.run_span.is_some()
+        && !request.stages.encode_logged
+    {
+        request.stages.encode_logged = true;
+        log_request_stage(&request.log_id, "encode", request.stages.encode);
+    }
+    if request.stages.decode_remaining == 0
+        && request.stages.decode.run_span.is_some()
+        && !request.stages.decode_logged
+    {
+        request.stages.decode_logged = true;
+        if request.stages.prefill.run_span.is_some() {
+            log_request_stage(&request.log_id, "prefill", request.stages.prefill);
         }
+        log_request_stage(&request.log_id, "decode", request.stages.decode);
     }
 }
 
@@ -1464,12 +1492,17 @@ fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgr
         .map(|span| span.end.duration_since(span.start).as_secs_f64())
         .unwrap_or_default();
     let speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
+    let audio_label = match stage {
+        "load" | "vad" => "input_audio",
+        _ => "speech_audio",
+    };
     tracing::info!(
         target: "vasr_transcribe::pipeline",
-        "{} {:<7} {:<5} | audio={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | wait={:>6.3}s | speed={:>6.1}x",
+        "{} {:<7} {:<5} | {}={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | wait={:>6.3}s | speed={:>6.1}x",
         request_id,
         stage,
         "DONE",
+        audio_label,
         progress.audio_seconds,
         wall_seconds,
         run_seconds,
@@ -4977,6 +5010,49 @@ mod tests {
         let empty_audio = stage_metrics(0.0, 2.0);
         assert_eq!(empty_audio.speedup, 0.0);
         assert_eq!(empty_audio.rtf, 0.0);
+    }
+
+    #[test]
+    fn downstream_stage_logging_waits_for_vad_completion() {
+        let (response_tx, _rx) = oneshot::channel();
+        let mut request = PendingGlobalRequest {
+            log_id: "test".to_string(),
+            remaining: 1,
+            duplicate_indices: Vec::new(),
+            internal_indices: Vec::new(),
+            outcomes: Vec::new(),
+            stages: RequestStageProgress {
+                vad_remaining: 1,
+                encode_remaining: 0,
+                decode_remaining: 0,
+                encode: StageProgress {
+                    run_span: Some(test_span()),
+                    audio_seconds: 1.0,
+                    ..Default::default()
+                },
+                decode: StageProgress {
+                    run_span: Some(test_span()),
+                    audio_seconds: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            response_tx,
+        };
+
+        log_ready_downstream_stages(&mut request);
+        assert!(!request.stages.encode_logged);
+        assert!(!request.stages.decode_logged);
+
+        request.stages.vad_logged = true;
+        log_ready_downstream_stages(&mut request);
+        assert!(request.stages.encode_logged);
+        assert!(request.stages.decode_logged);
+    }
+
+    fn test_span() -> StageSpan {
+        let start = Instant::now();
+        StageSpan::new(start, start)
     }
 
     fn prepared_with_segments(ranges: &[(u64, u64)]) -> VadPrepared {
