@@ -16,6 +16,8 @@ use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
+#[cfg(feature = "paged-attn")]
+use vasr::models::qwen3asr::processor::{chat_template, feat_lengths, tokenizer::Tokenizer};
 use vasr::models::qwen3asr::{LoadOptions, Qwen3ASR};
 use vasr_data::AudioLoader;
 
@@ -25,6 +27,17 @@ use crate::server::build_transcribe_service_from_parts;
 
 const DEFAULT_MAX_NUM_SEQS: usize = 256;
 const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
+#[cfg(feature = "paged-attn")]
+const KV_BLOCK_SIZE: usize = 32;
+const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
+#[cfg(feature = "paged-attn")]
+const ASR_GENERATED_TOKENS_PER_SEC: f64 = 8.0;
+#[cfg(feature = "paged-attn")]
+const ASR_MIN_GENERATED_TOKENS: usize = 32;
+#[cfg(feature = "paged-attn")]
+const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
+#[cfg(feature = "paged-attn")]
+const ASR_FEATURE_HOP_LENGTH: usize = 160;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
@@ -44,20 +57,20 @@ pub struct CommonModelArgs {
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
 
-    /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
-    #[arg(
-        long = "gpu-memory-utilization",
-        default_value_t = 0.65,
-        env = "VASR_GPU_MEMORY_UTILIZATION"
-    )]
-    pub gpu_memory_utilization: f32,
-
-    /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs; use 0 to disable CUDA graph prewarm/replay.
+    /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs and KV-cache block sizing.
     #[arg(
         long = "max-num-seqs",
         default_value_t = DEFAULT_MAX_NUM_SEQS
     )]
     pub max_num_seqs: usize,
+
+    /// Maximum hotword/context tokens reserved in every ASR KV-cache sequence.
+    #[arg(
+        long = "max-hotword-tokens",
+        default_value_t = DEFAULT_MAX_HOTWORD_TOKENS,
+        env = "VASR_MAX_HOTWORD_TOKENS"
+    )]
+    pub max_hotword_tokens: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -136,8 +149,9 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
     let transcribe_service = build_transcribe_service_from_parts(
-        build_offline_pipeline(load_asr_model(
-            &args.pipeline.model,
+        build_offline_pipeline(load_asr_model_for_pipeline(
+            &args.pipeline,
+            args.language.as_deref(),
             cuda_graph_max_batch(&args.pipeline.model),
             false,
         )?)?,
@@ -157,8 +171,9 @@ pub fn build_async_transcribe_pipeline(
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
     validate_pipeline(pipeline)?;
-    let asr = load_asr_model(
-        &pipeline.model,
+    let asr = load_asr_model_for_pipeline(
+        pipeline,
+        language.as_deref(),
         cuda_graph_max_batch(&pipeline.model),
         false,
     )?;
@@ -176,8 +191,9 @@ pub fn build_global_transcribe_pipeline(
     language: Option<String>,
 ) -> Result<Arc<GlobalAsyncTranscribePipeline>> {
     validate_pipeline(pipeline)?;
-    let asr = load_asr_model(
-        &pipeline.model,
+    let asr = load_asr_model_for_pipeline(
+        pipeline,
+        language.as_deref(),
         cuda_graph_max_batch(&pipeline.model),
         false,
     )?;
@@ -234,8 +250,8 @@ mod tests {
                 cache_dir: vasr::modelscope_cache_dir(),
                 device: "auto".to_string(),
                 isq: None,
-                gpu_memory_utilization: 0.65,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+                max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             vad: VadCliArgs {
@@ -249,6 +265,36 @@ mod tests {
         let opts = asr_options_from_pipeline(&pipeline, None);
         assert_eq!(opts.max_new_tokens, AsrOptions::default().max_new_tokens);
         assert_eq!(opts.max_batch_audio_sec, 60.0);
+    }
+
+    #[test]
+    fn max_num_seqs_must_be_positive_for_kv_sizing() {
+        let args = CommonModelArgs {
+            model: DEFAULT_ASR_MODEL.to_string(),
+            cache_dir: vasr::modelscope_cache_dir(),
+            device: "auto".to_string(),
+            isq: None,
+            max_num_seqs: 0,
+            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+        };
+
+        let error = validate_model_args(&args).expect_err("max_num_seqs=0 should fail");
+        assert!(error.to_string().contains("--max-num-seqs"));
+    }
+
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn generated_token_budget_matches_scheduler_defaults() {
+        assert_eq!(generated_token_budget(0.1), ASR_MIN_GENERATED_TOKENS);
+        assert_eq!(generated_token_budget(5.0), 40);
+    }
+
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn max_audio_prompt_tokens_uses_feature_length_math() {
+        // 30s at 16kHz with hop=160 gives 3000 frames; Qwen3-ASR's projector
+        // length formula maps that to 390 audio placeholder tokens.
+        assert_eq!(max_audio_prompt_tokens(30.0), 390);
     }
 }
 
@@ -272,8 +318,8 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.cache_dir.as_os_str().is_empty() {
         bail!("--cache-dir must not be empty");
     }
-    if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
-        bail!("--gpu-memory-utilization must be in (0.0, 1.0]");
+    if args.max_num_seqs == 0 {
+        bail!("--max-num-seqs must be greater than zero");
     }
     Ok(())
 }
@@ -286,23 +332,109 @@ fn resolve_asr_model_id(model: &str) -> &str {
     }
 }
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
+#[cfg(feature = "paged-attn")]
+#[derive(Debug, Clone)]
+struct KvCacheSizing {
+    max_num_seqs: usize,
+    max_segment_sec: f32,
+    max_hotword_tokens: usize,
+    fixed_prompt_tokens: usize,
+    audio_prompt_tokens: usize,
+    decode_tokens: usize,
+    tokens_per_seq: usize,
+    blocks_per_seq: usize,
+    total_blocks: usize,
+}
+
+#[cfg(feature = "paged-attn")]
 fn build_paged_cache_config(
-    device: &Device,
-    gpu_memory_utilization: f32,
-) -> Result<PagedCacheConfig> {
-    let memory = if device.is_cuda() {
-        PagedCacheMemory::GpuMemoryFraction {
-            fraction: gpu_memory_utilization,
-            reserved_bytes: 0,
-        }
-    } else {
-        PagedCacheMemory::ContextSize(4096)
-    };
-    Ok(PagedCacheConfig {
-        block_size: 32,
-        memory,
+    pipeline: &TranscribePipelineArgs,
+    language: Option<&str>,
+) -> Result<(PagedCacheConfig, KvCacheSizing)> {
+    let sizing = estimate_kv_cache_sizing(pipeline, language)?;
+    Ok((
+        PagedCacheConfig {
+            block_size: KV_BLOCK_SIZE,
+            memory: PagedCacheMemory::Blocks(sizing.total_blocks),
+        },
+        sizing,
+    ))
+}
+
+#[cfg(feature = "paged-attn")]
+fn estimate_kv_cache_sizing(
+    pipeline: &TranscribePipelineArgs,
+    language: Option<&str>,
+) -> Result<KvCacheSizing> {
+    let model_id = resolve_asr_model_id(&pipeline.model.model);
+    let tokenizer = Tokenizer::from_pretrained(model_id)?;
+    let fixed_prompt = chat_template::build_prompt("", language);
+    let audio_pad_id = tokenizer.token_to_id(chat_template::AUDIO_PAD)?;
+    let base_prompt_tokens = tokenizer.encode(&fixed_prompt)?;
+    let fixed_prompt_tokens = base_prompt_tokens
+        .iter()
+        .filter(|&&id| id != audio_pad_id)
+        .count();
+    let audio_prompt_tokens = max_audio_prompt_tokens(pipeline.vad.vad_max_segment_sec);
+    let decode_tokens = generated_token_budget(pipeline.vad.vad_max_segment_sec);
+    let tokens_per_seq = fixed_prompt_tokens
+        .checked_add(audio_prompt_tokens)
+        .and_then(|n| n.checked_add(pipeline.model.max_hotword_tokens))
+        .and_then(|n| n.checked_add(decode_tokens))
+        .ok_or_else(|| anyhow::anyhow!("KV cache token estimate overflow"))?;
+    let blocks_per_seq = tokens_per_seq.div_ceil(KV_BLOCK_SIZE);
+    let total_blocks = pipeline
+        .model
+        .max_num_seqs
+        .checked_mul(blocks_per_seq)
+        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
+
+    Ok(KvCacheSizing {
+        max_num_seqs: pipeline.model.max_num_seqs,
+        max_segment_sec: pipeline.vad.vad_max_segment_sec,
+        max_hotword_tokens: pipeline.model.max_hotword_tokens,
+        fixed_prompt_tokens,
+        audio_prompt_tokens,
+        decode_tokens,
+        tokens_per_seq,
+        blocks_per_seq,
+        total_blocks,
     })
+}
+
+#[cfg(feature = "paged-attn")]
+fn max_audio_prompt_tokens(max_segment_sec: f32) -> usize {
+    let samples = (f64::from(max_segment_sec) * ASR_SAMPLE_RATE_HZ).ceil() as usize;
+    let frames = samples.div_ceil(ASR_FEATURE_HOP_LENGTH);
+    feat_lengths::feat_extract_output_length(frames)
+}
+
+#[cfg(feature = "paged-attn")]
+fn generated_token_budget(max_segment_sec: f32) -> usize {
+    let estimated = if max_segment_sec.is_finite() && max_segment_sec > 0.0 {
+        (f64::from(max_segment_sec) * ASR_GENERATED_TOKENS_PER_SEC).ceil() as usize
+    } else {
+        0
+    };
+    estimated.max(ASR_MIN_GENERATED_TOKENS)
+}
+
+#[cfg(feature = "paged-attn")]
+fn log_kv_cache_sizing(sizing: &KvCacheSizing) {
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "KV cache sizing | blocks={} block_size={} max_seqs={} max_segment={:.1}s tokens_per_seq={} blocks_per_seq={} prompt=fixed:{} audio:{} hotword:{} decode:{}",
+        sizing.total_blocks,
+        KV_BLOCK_SIZE,
+        sizing.max_num_seqs,
+        sizing.max_segment_sec,
+        sizing.tokens_per_seq,
+        sizing.blocks_per_seq,
+        sizing.fixed_prompt_tokens,
+        sizing.audio_prompt_tokens,
+        sizing.max_hotword_tokens,
+        sizing.decode_tokens
+    );
 }
 
 #[cfg(any(feature = "metal", feature = "cuda"))]
@@ -313,7 +445,7 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
         PagedCacheMemory::GpuMemoryFraction {
             fraction,
             reserved_bytes: _,
-        } => format!("gpu_memory_utilization={fraction}"),
+        } => format!("gpu_memory_fraction={fraction}"),
     };
     tracing::debug!(
         target: "vasr_transcribe::serve",
@@ -440,8 +572,9 @@ fn cuda_graph_max_batch(_args: &CommonModelArgs) -> Option<usize> {
     None
 }
 
-fn load_asr_model(
-    args: &CommonModelArgs,
+fn load_asr_model_for_pipeline(
+    pipeline: &TranscribePipelineArgs,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] language: Option<&str>,
     #[cfg_attr(
         not(all(feature = "cuda-graph", feature = "paged-attn")),
         allow(unused_variables)
@@ -449,23 +582,12 @@ fn load_asr_model(
     cuda_graph_max_batch: Option<usize>,
     scheduled: bool,
 ) -> Result<Arc<dyn AsrModel>> {
+    let args = &pipeline.model;
     vasr::set_cache_dir(args.cache_dir.clone());
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
     #[cfg(feature = "paged-attn")]
-    let paged_cache_config = {
-        #[cfg(any(feature = "metal", feature = "cuda"))]
-        {
-            build_paged_cache_config(&device, args.gpu_memory_utilization)?
-        }
-        #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        {
-            vasr::PagedCacheConfig {
-                block_size: 32,
-                memory: vasr::PagedCacheMemory::ContextSize(100_000),
-            }
-        }
-    };
+    let (paged_cache_config, kv_cache_sizing) = build_paged_cache_config(pipeline, language)?;
     let load_options = LoadOptions {
         dtype,
         use_flash_attn: device.is_cuda(),
@@ -501,6 +623,8 @@ fn load_asr_model(
             device_label(&device)
         );
     }
+    #[cfg(feature = "paged-attn")]
+    log_kv_cache_sizing(&kv_cache_sizing);
     tracing::info!(
         target: "vasr_transcribe::serve",
         "Loading Qwen3-ASR model `{}` from cache `{}` on {} (isq={:?}).",
