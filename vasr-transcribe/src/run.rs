@@ -61,7 +61,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         .map(|(index, item)| TranscribeInput {
             index,
             source: item.source.clone(),
-            channel: vasr_data::AudioChannel::Mono,
+            mono: true,
         })
         .collect::<Vec<_>>();
 

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::pipeline::TranscribeInput;
 use crate::protocol::InferencePerformance;
-use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
+use crate::serve::{TranscribePipelineArgs, build_global_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::Args;
@@ -93,7 +93,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         records.truncate(limit);
     }
 
-    let pipeline = build_async_transcribe_pipeline(&args.pipeline, args.language.clone())?;
+    let pipeline = build_global_transcribe_pipeline(&args.pipeline, args.language.clone())?;
     let mut inputs = Vec::with_capacity(records.len());
     let mut record_ids = Vec::with_capacity(records.len());
     let mut references = Vec::with_capacity(records.len());
@@ -105,7 +105,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         inputs.push(TranscribeInput {
             index,
             source,
-            channel: vasr_data::AudioChannel::Mono,
+            mono: true,
         });
     }
 
@@ -125,6 +125,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
 
     let mut items = Vec::with_capacity(records.len());
     let mut total_audio_seconds = 0.0;
+    let mut bad_count = 0usize;
     let mut total_substitutions = 0usize;
     let mut total_deletions = 0usize;
     let mut total_insertions = 0usize;
@@ -160,6 +161,9 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         }
 
         let normalized_hypothesis = normalize_for_cer(&hypothesis, true);
+        if is_bad {
+            bad_count += 1;
+        }
         let (cer, stats) = if normalized_reference.is_empty() {
             num_skipped_empty_reference += 1;
             (None, CerStats::default())
@@ -237,6 +241,16 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
 
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "request | items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4}",
+        records.len(),
+        bad_count,
+        total_audio_seconds,
+        batch_wall,
+        speedup,
+        rtf
+    );
     tracing::info!(
         target: "vasr_transcribe::benchmark",
         "benchmark done | records={} evaluated={} failed={} audio={:.1}s wall={:.1}s speed={:.1}x rtf={:.4} skipped_empty_ref={} macro_cer={:.4} micro_cer={:.4} output={}",

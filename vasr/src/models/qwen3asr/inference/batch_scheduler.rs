@@ -44,74 +44,21 @@ fn log_prefill_speed(wave: usize, tokens: usize, elapsed_us: u64) {
     let tok_s = tokens as f64 / elapsed_s.max(f64::EPSILON);
     tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "continuous prefill | seqs={wave} tokens={tokens} wall={elapsed_s:.3}s tok/s={tok_s:.1}",
+        "prefill done | seqs={wave} tokens={tokens} wall={elapsed_s:.3}s tok/s={tok_s:.1}",
     );
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct NumericDistribution {
-    min: f64,
-    p50: f64,
-    p90: f64,
-    max: f64,
-}
-
-fn numeric_distribution(mut values: Vec<f64>) -> NumericDistribution {
-    if values.is_empty() {
-        return NumericDistribution::default();
-    }
-    values.sort_by(|a, b| a.total_cmp(b));
-    let len = values.len();
-    let percentile = |pct: usize| -> f64 {
-        let idx = len.saturating_sub(1).saturating_mul(pct).div_ceil(100);
-        values[idx.min(len - 1)]
-    };
-    NumericDistribution {
-        min: values[0],
-        p50: percentile(50),
-        p90: percentile(90),
-        max: values[len - 1],
-    }
-}
-
-fn log_prefill_budget(
+fn log_prefill_start(
     seqs: usize,
-    audio_seconds: Vec<f64>,
-    prompt_tokens: Vec<usize>,
-    token_capacities: &[usize],
-    block_size: usize,
-    free_blocks: usize,
+    audio_seconds: f64,
+    token_budget: usize,
+    allocated_kv_blocks: usize,
+    free_kv_blocks_before: usize,
 ) {
-    let audio = numeric_distribution(audio_seconds);
-    let prompts = numeric_distribution(prompt_tokens.iter().map(|&v| v as f64).collect());
-    let capacities = numeric_distribution(token_capacities.iter().map(|&v| v as f64).collect());
-    let blocks = numeric_distribution(
-        token_capacities
-            .iter()
-            .map(|&v| v.div_ceil(block_size) as f64)
-            .collect(),
-    );
+    let free_kv_blocks_after = free_kv_blocks_before.saturating_sub(allocated_kv_blocks);
     tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "prefill budget | seqs={} audio_sec={:.2}/{:.2}/{:.2}/{:.2} prompt_tokens={:.0}/{:.0}/{:.0}/{:.0} token_capacity={:.0}/{:.0}/{:.0}/{:.0} blocks={:.0}/{:.0}/{:.0}/{:.0} free_blocks={}",
-        seqs,
-        audio.min,
-        audio.p50,
-        audio.p90,
-        audio.max,
-        prompts.min,
-        prompts.p50,
-        prompts.p90,
-        prompts.max,
-        capacities.min,
-        capacities.p50,
-        capacities.p90,
-        capacities.max,
-        blocks.min,
-        blocks.p50,
-        blocks.p90,
-        blocks.max,
-        free_blocks,
+        "prefill start | seqs={seqs} audio={audio_seconds:.1}s token_budget={token_budget} allocated_kv_blocks={allocated_kv_blocks} free_kv_blocks_before={free_kv_blocks_before} free_kv_blocks_after={free_kv_blocks_after}",
     );
 }
 
@@ -996,18 +943,20 @@ impl AsrBatchScheduler {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        log_prefill_budget(
+        let allocated_kv_blocks = token_capacities
+            .iter()
+            .map(|&capacity| capacity.div_ceil(block_size))
+            .sum::<usize>();
+        let prefill_audio_seconds = wave_client_indices
+            .iter()
+            .map(|&client_index| audio_seconds[client_index])
+            .sum::<f64>();
+        let token_budget = token_capacities.iter().sum::<usize>();
+        log_prefill_start(
             wave,
-            wave_client_indices
-                .iter()
-                .map(|&client_index| audio_seconds[client_index])
-                .collect(),
-            wave_client_indices
-                .iter()
-                .map(|&client_index| prepared_prompt_len(&prepared[client_index]))
-                .collect(),
-            token_capacities.as_slice(),
-            block_size,
+            prefill_audio_seconds,
+            token_budget,
+            allocated_kv_blocks,
             free_blocks,
         );
         let wave_audio = concat_prepared_audio(
@@ -1123,18 +1072,20 @@ impl AsrBatchScheduler {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        log_prefill_budget(
+        let allocated_kv_blocks = token_capacities
+            .iter()
+            .map(|&capacity| capacity.div_ceil(block_size))
+            .sum::<usize>();
+        let prefill_audio_seconds = wave_client_indices
+            .iter()
+            .map(|&client_index| audio_seconds[client_index])
+            .sum::<f64>();
+        let token_budget = token_capacities.iter().sum::<usize>();
+        log_prefill_start(
             wave,
-            wave_client_indices
-                .iter()
-                .map(|&client_index| audio_seconds[client_index])
-                .collect(),
-            wave_client_indices
-                .iter()
-                .map(|&client_index| prepared_prompt_len(&prepared[client_index]))
-                .collect(),
-            token_capacities.as_slice(),
-            block_size,
+            prefill_audio_seconds,
+            token_budget,
+            allocated_kv_blocks,
             free_blocks,
         );
         let wave_audio = concat_prepared_audio(

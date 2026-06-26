@@ -11,7 +11,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -19,16 +19,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
-use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
+use vasr::models::qwen3asr::{
+    AudioFeatureEncodeTimings, AudioInput, EncodedAsrBatch, Qwen3ASR, qwen_outputs_to_timelines,
+    qwen_transcribe_options,
+};
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::{EncodedAsrBatchMetadata, PreparedAudioBatchPoll};
-use vasr_data::{Annotation, AudioChannel, AudioSource, DurationMs, Timeline, Waveform};
-use vasr_data::{AudioLoadOptions, AudioLoader};
+use vasr_data::AudioLoader;
+use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
-#[cfg(feature = "paged-attn")]
-use vasr::qwen_outputs_to_timelines;
 
 const FALLBACK_STAGE_PARALLELISM: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
@@ -52,6 +53,69 @@ struct LoaderTaskStats {
     failed: usize,
     audio_seconds: f64,
     compute_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranscribeItemTiming {
+    pub loader_seconds: f64,
+    pub vad_seconds: f64,
+    pub asr_seconds: f64,
+    pub audio_encoder_seconds: f64,
+    pub audio_encoder_prepare_seconds: f64,
+    pub audio_encoder_stack_seconds: f64,
+    pub audio_encoder_forward_seconds: f64,
+    pub audio_encoder_d2h_seconds: f64,
+    pub prefill_seconds: f64,
+    pub prefill_inputs_seconds: f64,
+    pub prefill_rope_seconds: f64,
+    pub prefill_metadata_seconds: f64,
+    pub prefill_mask_seconds: f64,
+    pub prefill_forward_seconds: f64,
+    pub prefill_gather_seconds: f64,
+    pub prefill_decode_setup_seconds: f64,
+    pub prefill_argmax_seconds: f64,
+    pub decode_seconds: f64,
+    pub decode_token_tensor_seconds: f64,
+    pub decode_embed_seconds: f64,
+    pub decode_position_seconds: f64,
+    pub decode_metadata_seconds: f64,
+    pub decode_graph_replay_seconds: f64,
+    pub decode_forward_seconds: f64,
+    pub decode_pre_argmax_sync_seconds: f64,
+    pub decode_argmax_seconds: f64,
+    pub tokenizer_decode_seconds: f64,
+}
+
+impl TranscribeItemTiming {
+    pub(crate) fn add_scaled(&mut self, other: TranscribeItemTiming, scale: f64) {
+        self.loader_seconds += other.loader_seconds * scale;
+        self.vad_seconds += other.vad_seconds * scale;
+        self.asr_seconds += other.asr_seconds * scale;
+        self.audio_encoder_seconds += other.audio_encoder_seconds * scale;
+        self.audio_encoder_prepare_seconds += other.audio_encoder_prepare_seconds * scale;
+        self.audio_encoder_stack_seconds += other.audio_encoder_stack_seconds * scale;
+        self.audio_encoder_forward_seconds += other.audio_encoder_forward_seconds * scale;
+        self.audio_encoder_d2h_seconds += other.audio_encoder_d2h_seconds * scale;
+        self.prefill_seconds += other.prefill_seconds * scale;
+        self.prefill_inputs_seconds += other.prefill_inputs_seconds * scale;
+        self.prefill_rope_seconds += other.prefill_rope_seconds * scale;
+        self.prefill_metadata_seconds += other.prefill_metadata_seconds * scale;
+        self.prefill_mask_seconds += other.prefill_mask_seconds * scale;
+        self.prefill_forward_seconds += other.prefill_forward_seconds * scale;
+        self.prefill_gather_seconds += other.prefill_gather_seconds * scale;
+        self.prefill_decode_setup_seconds += other.prefill_decode_setup_seconds * scale;
+        self.prefill_argmax_seconds += other.prefill_argmax_seconds * scale;
+        self.decode_seconds += other.decode_seconds * scale;
+        self.decode_token_tensor_seconds += other.decode_token_tensor_seconds * scale;
+        self.decode_embed_seconds += other.decode_embed_seconds * scale;
+        self.decode_position_seconds += other.decode_position_seconds * scale;
+        self.decode_metadata_seconds += other.decode_metadata_seconds * scale;
+        self.decode_graph_replay_seconds += other.decode_graph_replay_seconds * scale;
+        self.decode_forward_seconds += other.decode_forward_seconds * scale;
+        self.decode_pre_argmax_sync_seconds += other.decode_pre_argmax_sync_seconds * scale;
+        self.decode_argmax_seconds += other.decode_argmax_seconds * scale;
+        self.tokenizer_decode_seconds += other.tokenizer_decode_seconds * scale;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +169,6 @@ struct AsrStageStats {
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
     loader: AudioLoader,
-    load_options: AudioLoadOptions,
     offline: Arc<OfflinePipeline>,
     parallel_options: ParallelTranscribeOptions,
 }
@@ -114,15 +177,44 @@ pub struct AsyncTranscribePipeline {
 pub struct TranscribeInput {
     pub index: usize,
     pub source: AudioSource,
-    pub channel: AudioChannel,
+    pub mono: bool,
 }
 
 #[derive(Debug)]
 pub struct TranscribeItemOutcome {
     pub index: usize,
+    pub channel: &'static str,
     pub result: Result<Timeline>,
     pub audio_seconds: f64,
+    pub timing: TranscribeItemTiming,
+    pub spans: TranscribeItemSpans,
     pub bad_component: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranscribeItemSpans {
+    pub loader: Option<StageSpan>,
+    pub vad: Option<StageSpan>,
+    pub asr: Option<StageSpan>,
+    pub audio_encoder: Option<StageSpan>,
+    pub prefill: Option<StageSpan>,
+    pub decode: Option<StageSpan>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StageSpan {
+    pub start: Instant,
+    pub end: Instant,
+}
+
+impl StageSpan {
+    fn new(start: Instant, end: Instant) -> Self {
+        Self { start, end }
+    }
+
+    fn try_new(start: Instant, end: Instant) -> Option<Self> {
+        (end >= start).then_some(Self { start, end })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,7 +273,6 @@ impl AsyncTranscribePipeline {
     ) -> Self {
         Self {
             loader,
-            load_options: AudioLoadOptions::default(),
             offline,
             parallel_options: ParallelTranscribeOptions::from(asr_options),
         }
@@ -197,7 +288,7 @@ impl AsyncTranscribePipeline {
             .run(vec![TranscribeInput {
                 index,
                 source,
-                channel: AudioChannel::Mono,
+                mono: true,
             }])
             .await;
         outcomes
@@ -205,8 +296,11 @@ impl AsyncTranscribePipeline {
             .next()
             .unwrap_or(TranscribeItemOutcome {
                 index,
+                channel: "mono",
                 result: Err(anyhow::anyhow!("run returned no outcome")),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("recognizer"),
             })
     }
@@ -221,7 +315,6 @@ impl AsyncTranscribePipeline {
             unique_inputs,
             duplicate_indices,
         } = deduplicate_transcribe_inputs(inputs);
-        let unique_count = unique_inputs.len();
 
         let stage_parallelism = default_stage_parallelism();
         let loaded_queue_memory = loaded_queue_memory_budget();
@@ -250,11 +343,9 @@ impl AsyncTranscribePipeline {
         let asr_stats = Arc::new(Mutex::new(AsrStageStats::default()));
 
         let loader = self.loader.clone();
-        let load_options = self.load_options.clone();
         let loader_handle = spawn_loader_worker(
             unique_inputs,
             loader,
-            load_options,
             stage_parallelism,
             loaded_queue_memory,
             loader_to_vad_tx,
@@ -270,6 +361,7 @@ impl AsyncTranscribePipeline {
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
+            None,
             Arc::clone(&vad_stats),
         );
 
@@ -284,14 +376,12 @@ impl AsyncTranscribePipeline {
             asr_to_result_tx,
             Arc::clone(&asr_stats),
             None,
+            None,
         );
 
         let mut outcomes = Vec::with_capacity(job_count);
         while let Some(outcome) = asr_to_result_rx.recv().await {
             outcomes.push(outcome.into_public_outcome());
-            if outcomes.len() >= unique_count {
-                break;
-            }
         }
 
         loader_handle.abort();
@@ -301,9 +391,6 @@ impl AsyncTranscribePipeline {
         let _ = vad_handle.await;
         let _ = asr_handle.await;
 
-        if let Ok(stats) = asr_stats.lock() {
-            log_asr_summary(&stats);
-        }
         let outcomes = expand_duplicate_outcomes(outcomes, &duplicate_indices);
         log_pipeline(job_count, &outcomes, pipeline_start.elapsed().as_secs_f64());
         outcomes
@@ -316,6 +403,7 @@ pub struct GlobalAsyncTranscribePipeline {
 }
 
 struct GlobalTranscribeRequest {
+    log_id: String,
     inputs: Vec<TranscribeInput>,
     response_tx: oneshot::Sender<Vec<TranscribeItemOutcome>>,
 }
@@ -325,15 +413,37 @@ struct GlobalLoadJob {
     internal_index: usize,
     request_item: RequestItemRef,
     source: AudioSource,
-    channel: AudioChannel,
+    mono: bool,
 }
 
 struct PendingGlobalRequest {
+    log_id: String,
     remaining: usize,
     duplicate_indices: Vec<(usize, usize)>,
     internal_indices: Vec<usize>,
     outcomes: Vec<TranscribeItemOutcome>,
+    stages: RequestStageProgress,
     response_tx: oneshot::Sender<Vec<TranscribeItemOutcome>>,
+}
+
+#[derive(Debug, Default)]
+struct RequestStageProgress {
+    load_remaining: usize,
+    vad_remaining: usize,
+    encode_remaining: usize,
+    decode_remaining: usize,
+    load: StageProgress,
+    vad: StageProgress,
+    encode: StageProgress,
+    prefill: StageProgress,
+    decode: StageProgress,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StageProgress {
+    run_span: Option<StageSpan>,
+    queue_span: Option<StageSpan>,
+    audio_seconds: f64,
 }
 
 impl GlobalAsyncTranscribePipeline {
@@ -347,7 +457,6 @@ impl GlobalAsyncTranscribePipeline {
             asr_options,
             vad_options,
         };
-        let load_options = AudioLoadOptions::default();
         let stage_parallelism = default_stage_parallelism();
         let loaded_queue_memory = loaded_queue_memory_budget();
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
@@ -384,11 +493,13 @@ impl GlobalAsyncTranscribePipeline {
         );
         spawn_global_loader_worker(
             loader,
-            load_options,
             stage_parallelism,
             loaded_queue_memory,
             load_job_rx,
             loader_to_vad_tx,
+            Arc::clone(&pending_requests),
+            Arc::clone(&job_routes),
+            Arc::clone(&next_job_id),
             loader_stats,
         );
         spawn_vad_worker(
@@ -398,6 +509,7 @@ impl GlobalAsyncTranscribePipeline {
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
+            Some(Arc::clone(&pending_requests)),
             vad_stats,
         );
         spawn_asr_worker(
@@ -410,6 +522,7 @@ impl GlobalAsyncTranscribePipeline {
             Some(std::time::Duration::from_millis(
                 GLOBAL_DECODE_IDLE_FLUSH_MS,
             )),
+            Some(Arc::clone(&pending_requests)),
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
@@ -417,6 +530,14 @@ impl GlobalAsyncTranscribePipeline {
     }
 
     pub async fn run(&self, inputs: Vec<TranscribeInput>) -> Vec<TranscribeItemOutcome> {
+        self.run_with_log_id(String::new(), inputs).await
+    }
+
+    pub async fn run_with_log_id(
+        &self,
+        log_id: String,
+        inputs: Vec<TranscribeInput>,
+    ) -> Vec<TranscribeItemOutcome> {
         if inputs.is_empty() {
             return Vec::new();
         }
@@ -424,6 +545,7 @@ impl GlobalAsyncTranscribePipeline {
         if self
             .submit_tx
             .send(GlobalTranscribeRequest {
+                log_id,
                 inputs,
                 response_tx,
             })
@@ -431,18 +553,24 @@ impl GlobalAsyncTranscribePipeline {
         {
             return vec![TranscribeItemOutcome {
                 index: 0,
+                channel: "mono",
                 result: Err(anyhow::anyhow!("global transcribe pipeline stopped")),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("recognizer"),
             }];
         }
         response_rx.await.unwrap_or_else(|_| {
             vec![TranscribeItemOutcome {
                 index: 0,
+                channel: "mono",
                 result: Err(anyhow::anyhow!(
                     "global transcribe pipeline response dropped"
                 )),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("recognizer"),
             }]
         })
@@ -459,14 +587,19 @@ fn spawn_global_submit_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(request) = submit_rx.recv().await {
+            let GlobalTranscribeRequest {
+                log_id,
+                inputs,
+                response_tx,
+            } = request;
             let request_id = PipelineRequestId(next_request_id.fetch_add(1, Ordering::Relaxed));
             let DeduplicatedTranscribeInputs {
                 unique_inputs,
                 duplicate_indices,
-            } = deduplicate_transcribe_inputs(request.inputs);
+            } = deduplicate_transcribe_inputs(inputs);
             let unique_count = unique_inputs.len();
             if unique_count == 0 {
-                let _ = request.response_tx.send(Vec::new());
+                let _ = response_tx.send(Vec::new());
                 continue;
             }
             let mut load_jobs = Vec::with_capacity(unique_count);
@@ -482,7 +615,7 @@ fn spawn_global_submit_worker(
                     internal_index,
                     request_item,
                     source: input.source,
-                    channel: input.channel,
+                    mono: input.mono,
                 });
             }
             if let Ok(mut routes) = job_routes.lock() {
@@ -494,11 +627,16 @@ fn spawn_global_submit_worker(
                 pending.insert(
                     request_id,
                     PendingGlobalRequest {
+                        log_id,
                         remaining: unique_count,
                         duplicate_indices,
                         internal_indices,
                         outcomes: Vec::with_capacity(unique_count),
-                        response_tx: request.response_tx,
+                        stages: RequestStageProgress {
+                            load_remaining: unique_count,
+                            ..Default::default()
+                        },
+                        response_tx,
                     },
                 );
             }
@@ -513,11 +651,13 @@ fn spawn_global_submit_worker(
 
 fn spawn_global_loader_worker(
     loader: AudioLoader,
-    load_options: AudioLoadOptions,
     max_in_flight: usize,
     loaded_queue_memory: LoadedQueueMemoryBudget,
     mut load_job_rx: mpsc::UnboundedReceiver<GlobalLoadJob>,
     loader_to_vad_tx: mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    pending_requests: Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    job_routes: Arc<Mutex<HashMap<usize, RequestItemRef>>>,
+    next_job_id: Arc<AtomicU64>,
     stats: Arc<Mutex<LoaderStageStats>>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
@@ -527,61 +667,101 @@ fn spawn_global_loader_worker(
             tokio::select! {
                 job = load_job_rx.recv(), if tasks.len() < max_in_flight => {
                     match job {
-                        Some(job) => spawn_global_loader_task(&mut tasks, loader.clone(), load_options.clone(), job),
+                        Some(job) => spawn_global_loader_task(&mut tasks, loader.clone(), Arc::clone(&next_job_id), job),
                         None => break,
                     }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(result) = result {
-                        send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &stats).await?;
+                        send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &pending_requests, &job_routes, &stats).await?;
                     }
                 }
             }
         }
         while let Some(result) = tasks.join_next().await {
-            send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &stats)
-                .await?;
+            send_global_loaded_result(
+                result,
+                &loaded_queue_memory,
+                &loader_to_vad_tx,
+                &pending_requests,
+                &job_routes,
+                &stats,
+            )
+            .await?;
         }
         Ok(())
     })
 }
 
 fn spawn_global_loader_task(
-    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
+    tasks: &mut JoinSet<(
+        Result<Vec<LoadedJob>, TranscribeItemOutcome>,
+        LoaderTaskStats,
+    )>,
     loader: AudioLoader,
-    load_options: AudioLoadOptions,
+    next_job_id: Arc<AtomicU64>,
     job: GlobalLoadJob,
 ) {
     tasks.spawn(async move {
         let start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = job.source.clone();
-            let channel = job.channel;
-            move || load_transcribe_waveform(&loader, &source, &load_options, channel)
+            let mono = job.mono;
+            move || load_transcribe_waveforms(&loader, &source, mono)
         })
         .await;
         let compute_seconds = start.elapsed().as_secs_f64();
+        let loader_span = StageSpan::new(start, Instant::now());
         let mut stats = LoaderTaskStats {
             compute_seconds,
             ..Default::default()
         };
         let message = match loaded {
-            Ok(Ok(waveform)) => {
-                stats.jobs = 1;
-                stats.audio_seconds = waveform.duration_seconds();
-                Ok(LoadedJob {
-                    index: job.internal_index,
-                    request_item: Some(job.request_item),
-                    waveform,
-                    _queue_memory_permit: None,
-                })
+            Ok(Ok(mut waveforms)) => {
+                stats.jobs = waveforms.len();
+                stats.audio_seconds = waveforms
+                    .iter()
+                    .map(|(_, waveform)| waveform.duration_seconds())
+                    .sum();
+                Ok(waveforms
+                    .drain(..)
+                    .enumerate()
+                    .map(|(offset, (channel, waveform))| LoadedJob {
+                        index: if offset == 0 {
+                            job.internal_index
+                        } else {
+                            next_job_id.fetch_add(1, Ordering::Relaxed) as usize
+                        },
+                        request_item: Some(job.request_item),
+                        channel,
+                        waveform,
+                        timing: TranscribeItemTiming {
+                            loader_seconds: compute_seconds,
+                            ..Default::default()
+                        },
+                        spans: TranscribeItemSpans {
+                            loader: Some(loader_span),
+                            ..Default::default()
+                        },
+                        _queue_memory_permit: None,
+                    })
+                    .collect())
             }
             Ok(Err(error)) => {
                 stats.failed = 1;
                 Err(TranscribeItemOutcome {
                     index: job.internal_index,
+                    channel: "mono",
                     result: Err(error),
                     audio_seconds: 0.0,
+                    timing: TranscribeItemTiming {
+                        loader_seconds: compute_seconds,
+                        ..Default::default()
+                    },
+                    spans: TranscribeItemSpans {
+                        loader: Some(loader_span),
+                        ..Default::default()
+                    },
                     bad_component: Some("loader"),
                 })
             }
@@ -589,8 +769,17 @@ fn spawn_global_loader_task(
                 stats.failed = 1;
                 Err(TranscribeItemOutcome {
                     index: job.internal_index,
+                    channel: "mono",
                     result: Err(anyhow::anyhow!("loader join error: {error}")),
                     audio_seconds: 0.0,
+                    timing: TranscribeItemTiming {
+                        loader_seconds: compute_seconds,
+                        ..Default::default()
+                    },
+                    spans: TranscribeItemSpans {
+                        loader: Some(loader_span),
+                        ..Default::default()
+                    },
                     bad_component: Some("loader"),
                 })
             }
@@ -601,19 +790,27 @@ fn spawn_global_loader_task(
 
 async fn send_global_loaded_result(
     result: std::result::Result<
-        (Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats),
+        (
+            Result<Vec<LoadedJob>, TranscribeItemOutcome>,
+            LoaderTaskStats,
+        ),
         tokio::task::JoinError,
     >,
     loaded_queue_memory: &LoadedQueueMemoryBudget,
     loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
+    pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    job_routes: &Arc<Mutex<HashMap<usize, RequestItemRef>>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
 ) -> Result<()> {
     let (mut message, task_stats) = result.unwrap_or_else(|error| {
         (
             Err(TranscribeItemOutcome {
                 index: 0,
+                channel: "mono",
                 result: Err(anyhow::anyhow!("loader task join error: {error}")),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("loader"),
             }),
             LoaderTaskStats {
@@ -623,12 +820,59 @@ async fn send_global_loaded_result(
         )
     });
     record_loader_task_stats(stats, &task_stats);
-    if let Ok(job) = &mut message {
-        job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+    if let Ok(jobs) = &mut message {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        if let Some(request_item) = jobs[0].request_item {
+            let span = jobs[0].spans.loader.unwrap_or_else(|| {
+                let now = Instant::now();
+                StageSpan::new(now, now)
+            });
+            let audio_seconds = jobs.iter().map(|job| job.waveform.duration_seconds()).sum();
+            record_request_load_stage(
+                pending_requests,
+                request_item.request_id,
+                span,
+                audio_seconds,
+            );
+        }
+        if jobs.len() > 1 {
+            let request_item = jobs[0].request_item;
+            if let Some(request_item) = request_item {
+                if let Ok(mut pending) = pending_requests.lock() {
+                    if let Some(request) = pending.get_mut(&request_item.request_id) {
+                        request.remaining += jobs.len() - 1;
+                        request
+                            .internal_indices
+                            .extend(jobs.iter().skip(1).map(|job| job.index));
+                    }
+                }
+                if let Ok(mut routes) = job_routes.lock() {
+                    for job in jobs.iter().skip(1) {
+                        routes.insert(job.index, request_item);
+                    }
+                }
+            }
+        }
+        for job in jobs {
+            job._queue_memory_permit =
+                Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+        }
     }
-    loader_to_vad_tx
-        .send(message)
-        .map_err(|_| anyhow::anyhow!("loaded channel closed"))
+    match message {
+        Ok(jobs) => {
+            for job in jobs {
+                loader_to_vad_tx
+                    .send(Ok(job))
+                    .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
+            }
+            Ok(())
+        }
+        Err(outcome) => loader_to_vad_tx
+            .send(Err(outcome))
+            .map_err(|_| anyhow::anyhow!("loaded channel closed")),
+    }
 }
 
 fn spawn_global_result_router(
@@ -879,25 +1123,19 @@ fn parse_meminfo_kib(text: &str, key: &str) -> Option<u64> {
     None
 }
 
-fn load_transcribe_waveform(
+fn load_transcribe_waveforms(
     loader: &AudioLoader,
     source: &AudioSource,
-    load_options: &AudioLoadOptions,
-    channel: AudioChannel,
-) -> Result<Waveform> {
-    let waveform = loader.load(source, load_options)?;
-    match channel {
-        AudioChannel::Mono => Ok(waveform.to_mono()?),
-        AudioChannel::Left => Ok(waveform.channel(0)?),
-        AudioChannel::Right => {
-            if waveform.channels < 2 {
-                Ok(waveform.channel(0)?)
-            } else {
-                Ok(waveform.channel(1)?)
-            }
-        }
-        AudioChannel::Channel(index) => Ok(waveform.channel(index)?),
+    mono: bool,
+) -> Result<Vec<(&'static str, Waveform)>> {
+    let waveform = loader.load_raw(source)?;
+    if mono || waveform.channels <= 1 {
+        return Ok(vec![("mono", waveform.to_mono()?)]);
     }
+    Ok(vec![
+        ("left", waveform.channel(0)?),
+        ("right", waveform.channel(1)?),
+    ])
 }
 
 #[derive(Debug)]
@@ -909,7 +1147,7 @@ struct DeduplicatedTranscribeInputs {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TranscribeInputDedupKey {
     source: AudioSourceDedupKey,
-    channel: AudioChannel,
+    mono: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -930,7 +1168,7 @@ fn deduplicate_transcribe_inputs(inputs: Vec<TranscribeInput>) -> DeduplicatedTr
         if let Some(source_key) = audio_source_dedup_key(&input.source) {
             let key = TranscribeInputDedupKey {
                 source: source_key,
-                channel: input.channel,
+                mono: input.mono,
             };
             if let Some(&canonical_index) = seen.get(&key) {
                 duplicate_indices.push((input.index, canonical_index));
@@ -1014,6 +1252,231 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+fn record_request_load_stage(
+    pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    request_id: PipelineRequestId,
+    span: StageSpan,
+    audio_seconds: f64,
+) {
+    if let Ok(mut pending) = pending_requests.lock() {
+        let Some(request) = pending.get_mut(&request_id) else {
+            return;
+        };
+        request.stages.load.run_span = Some(merge_optional_span(
+            request.stages.load.run_span,
+            Some(span),
+        ));
+        request.stages.load.audio_seconds += audio_seconds;
+        request.stages.vad_remaining += 1;
+        request.stages.load_remaining = request.stages.load_remaining.saturating_sub(1);
+        if request.stages.load_remaining == 0 {
+            log_request_stage(&request.log_id, "load", request.stages.load);
+        }
+    }
+}
+
+fn record_request_vad_stage(
+    pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    request_id: PipelineRequestId,
+    span: StageSpan,
+    queue_span: Option<StageSpan>,
+    audio_seconds: f64,
+    segment_count: usize,
+) {
+    if let Ok(mut pending) = pending_requests.lock() {
+        let Some(request) = pending.get_mut(&request_id) else {
+            return;
+        };
+        request.stages.vad.run_span =
+            Some(merge_optional_span(request.stages.vad.run_span, Some(span)));
+        request.stages.vad.queue_span = merge_stage_span(request.stages.vad.queue_span, queue_span);
+        request.stages.vad.audio_seconds += audio_seconds;
+        request.stages.encode_remaining += segment_count;
+        request.stages.decode_remaining += segment_count;
+        request.stages.vad_remaining = request.stages.vad_remaining.saturating_sub(1);
+        if request.stages.vad_remaining == 0 {
+            log_request_stage(&request.log_id, "vad", request.stages.vad);
+        }
+    }
+}
+
+fn record_request_encode_stage(
+    pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    request_id: PipelineRequestId,
+    span: StageSpan,
+    queue_span: Option<StageSpan>,
+    audio_seconds: f64,
+    segment_count: usize,
+) {
+    if let Ok(mut pending) = pending_requests.lock() {
+        let Some(request) = pending.get_mut(&request_id) else {
+            return;
+        };
+        request.stages.encode.run_span = Some(merge_optional_span(
+            request.stages.encode.run_span,
+            Some(span),
+        ));
+        request.stages.encode.queue_span =
+            merge_stage_span(request.stages.encode.queue_span, queue_span);
+        request.stages.encode.audio_seconds += audio_seconds;
+        request.stages.encode_remaining = request
+            .stages
+            .encode_remaining
+            .saturating_sub(segment_count);
+        if request.stages.encode_remaining == 0 {
+            log_request_stage(&request.log_id, "encode", request.stages.encode);
+        }
+    }
+}
+
+fn record_request_encode_stages(
+    pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    segments: &[AsrSegmentJob],
+    span: StageSpan,
+) {
+    let Some(pending_requests) = pending_requests else {
+        return;
+    };
+    let mut by_request: HashMap<PipelineRequestId, (f64, usize, Option<StageSpan>)> =
+        HashMap::new();
+    for segment in segments {
+        let Some(request_item) = segment.request_item else {
+            continue;
+        };
+        let entry = by_request.entry(request_item.request_id).or_default();
+        entry.0 += segment.waveform.duration_seconds();
+        entry.1 += 1;
+        let queue_span = segment
+            .spans
+            .vad
+            .and_then(|vad| StageSpan::try_new(vad.end, span.start));
+        entry.2 = merge_stage_span(entry.2, queue_span);
+    }
+    for (request_id, (audio_seconds, segment_count, queue_span)) in by_request {
+        record_request_encode_stage(
+            pending_requests,
+            request_id,
+            span,
+            queue_span,
+            audio_seconds,
+            segment_count,
+        );
+    }
+}
+
+fn record_request_decode_stage(
+    pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
+    request_id: PipelineRequestId,
+    decode_span: StageSpan,
+    prefill_span: Option<StageSpan>,
+    queue_span: Option<StageSpan>,
+    audio_seconds: f64,
+    segment_count: usize,
+) {
+    if let Ok(mut pending) = pending_requests.lock() {
+        let Some(request) = pending.get_mut(&request_id) else {
+            return;
+        };
+        let (decode_run_span, decode_queue_span) = if let Some(prefill_span) = prefill_span {
+            (
+                StageSpan::try_new(prefill_span.end, decode_span.end).or(Some(decode_span)),
+                None,
+            )
+        } else {
+            (Some(decode_span), queue_span)
+        };
+        if let Some(prefill_span) = prefill_span {
+            request.stages.prefill.run_span = Some(merge_optional_span(
+                request.stages.prefill.run_span,
+                Some(prefill_span),
+            ));
+            request.stages.prefill.queue_span =
+                merge_stage_span(request.stages.prefill.queue_span, queue_span);
+            request.stages.prefill.audio_seconds += audio_seconds;
+        }
+        request.stages.decode.run_span = Some(merge_optional_span(
+            request.stages.decode.run_span,
+            decode_run_span,
+        ));
+        request.stages.decode.queue_span =
+            merge_stage_span(request.stages.decode.queue_span, decode_queue_span);
+        request.stages.decode.audio_seconds += audio_seconds;
+        request.stages.decode_remaining = request
+            .stages
+            .decode_remaining
+            .saturating_sub(segment_count);
+        if request.stages.decode_remaining == 0 {
+            if request.stages.prefill.run_span.is_some() {
+                log_request_stage(&request.log_id, "prefill", request.stages.prefill);
+            }
+            log_request_stage(&request.log_id, "decode", request.stages.decode);
+        }
+    }
+}
+
+fn record_request_decode_stages(
+    pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    segments: &[AsrSegmentJob],
+    decode_span: StageSpan,
+    prefill_span: Option<StageSpan>,
+) {
+    let Some(pending_requests) = pending_requests else {
+        return;
+    };
+    let mut by_request: HashMap<PipelineRequestId, (f64, usize, Option<StageSpan>)> =
+        HashMap::new();
+    for segment in segments {
+        let Some(request_item) = segment.request_item else {
+            continue;
+        };
+        let entry = by_request.entry(request_item.request_id).or_default();
+        entry.0 += segment.waveform.duration_seconds();
+        entry.1 += 1;
+        let queue_span = segment
+            .spans
+            .audio_encoder
+            .and_then(|encode| StageSpan::try_new(encode.end, decode_span.start));
+        entry.2 = merge_stage_span(entry.2, queue_span);
+    }
+    for (request_id, (audio_seconds, segment_count, queue_span)) in by_request {
+        record_request_decode_stage(
+            pending_requests,
+            request_id,
+            decode_span,
+            prefill_span,
+            queue_span,
+            audio_seconds,
+            segment_count,
+        );
+    }
+}
+
+fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgress) {
+    let run_seconds = progress
+        .run_span
+        .map(|span| span.end.duration_since(span.start).as_secs_f64())
+        .unwrap_or_default();
+    let queue_seconds = progress
+        .queue_span
+        .map(|span| span.end.duration_since(span.start).as_secs_f64())
+        .unwrap_or_default();
+    let wall_seconds = merge_stage_span(progress.queue_span, progress.run_span)
+        .map(|span| span.end.duration_since(span.start).as_secs_f64())
+        .unwrap_or_default();
+    let speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "{} {} done | audio={:.1}s wall={:.3}s run={:.3}s queue={:.3}s speed={:.1}x",
+        request_id,
+        stage,
+        progress.audio_seconds,
+        wall_seconds,
+        run_seconds,
+        queue_seconds,
+        speed
+    );
+}
+
 fn expand_duplicate_outcomes(
     mut outcomes: Vec<TranscribeItemOutcome>,
     duplicate_indices: &[(usize, usize)],
@@ -1025,11 +1488,11 @@ fn expand_duplicate_outcomes(
 
     let duplicate_outcomes = duplicate_indices
         .iter()
-        .filter_map(|&(duplicate_index, canonical_index)| {
+        .flat_map(|&(duplicate_index, canonical_index)| {
             outcomes
                 .iter()
-                .find(|outcome| outcome.index == canonical_index)
-                .map(|outcome| duplicate_outcome_from(outcome, duplicate_index))
+                .filter(move |outcome| outcome.index == canonical_index)
+                .map(move |outcome| duplicate_outcome_from(outcome, duplicate_index))
         })
         .collect::<Vec<_>>();
     outcomes.extend(duplicate_outcomes);
@@ -1047,8 +1510,11 @@ fn duplicate_outcome_from(
     };
     TranscribeItemOutcome {
         index: duplicate_index,
+        channel: outcome.channel,
         result,
         audio_seconds: outcome.audio_seconds,
+        timing: outcome.timing,
+        spans: outcome.spans,
         bad_component: outcome.bad_component,
     }
 }
@@ -1057,7 +1523,10 @@ fn duplicate_outcome_from(
 struct LoadedJob {
     index: usize,
     request_item: Option<RequestItemRef>,
+    channel: &'static str,
     waveform: Waveform,
+    timing: TranscribeItemTiming,
+    spans: TranscribeItemSpans,
     _queue_memory_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -1065,6 +1534,9 @@ struct LoadedJob {
 struct AsrJob {
     index: usize,
     request_item: Option<RequestItemRef>,
+    channel: &'static str,
+    timing: TranscribeItemTiming,
+    spans: TranscribeItemSpans,
     prepared: VadPreparation,
     waveform: Waveform,
 }
@@ -1074,6 +1546,9 @@ struct AsrJob {
 struct AsrSegmentJob {
     job_index: usize,
     request_item: Option<RequestItemRef>,
+    channel: &'static str,
+    timing: TranscribeItemTiming,
+    spans: TranscribeItemSpans,
     job_audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
     segment_index: usize,
@@ -1098,6 +1573,9 @@ struct VadToAsrMessage {
 struct SegmentJobState {
     index: usize,
     request_item: Option<RequestItemRef>,
+    channel: &'static str,
+    timing: TranscribeItemTiming,
+    spans: TranscribeItemSpans,
     audio_seconds: f64,
     speech_annotations: Vec<Annotation>,
     segment_annotations: Vec<Option<Vec<Annotation>>>,
@@ -1134,6 +1612,9 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
         .map(|(segment_index, (segment, waveform))| AsrSegmentJob {
             job_index: job.index,
             request_item: job.request_item,
+            channel: job.channel,
+            timing: job.timing,
+            spans: job.spans,
             job_audio_seconds: job.waveform.duration_seconds(),
             speech_annotations: if segment_index == 0 {
                 speech_annotations.clone()
@@ -1151,7 +1632,6 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
 fn spawn_loader_worker(
     inputs: Vec<TranscribeInput>,
     loader: AudioLoader,
-    load_options: AudioLoadOptions,
     max_in_flight: usize,
     loaded_queue_memory: LoadedQueueMemoryBudget,
     loader_to_vad_tx: mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
@@ -1162,7 +1642,7 @@ fn spawn_loader_worker(
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
         for input in inputs {
-            spawn_loader_task(&mut tasks, loader.clone(), load_options.clone(), input);
+            spawn_loader_task(&mut tasks, loader.clone(), input);
             if tasks.len() >= max_in_flight {
                 send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
                     .await?;
@@ -1180,42 +1660,70 @@ fn spawn_loader_worker(
 }
 
 fn spawn_loader_task(
-    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
+    tasks: &mut JoinSet<(
+        Result<Vec<LoadedJob>, TranscribeItemOutcome>,
+        LoaderTaskStats,
+    )>,
     loader: AudioLoader,
-    load_options: AudioLoadOptions,
     input: TranscribeInput,
 ) {
     tasks.spawn(async move {
         let start = Instant::now();
         let loaded = tokio::task::spawn_blocking({
             let source = input.source.clone();
-            let channel = input.channel;
-            move || load_transcribe_waveform(&loader, &source, &load_options, channel)
+            let mono = input.mono;
+            move || load_transcribe_waveforms(&loader, &source, mono)
         })
         .await;
 
         let compute_seconds = start.elapsed().as_secs_f64();
+        let loader_span = StageSpan::new(start, Instant::now());
         let mut stats = LoaderTaskStats {
             compute_seconds,
             ..Default::default()
         };
         let message = match loaded {
-            Ok(Ok(waveform)) => {
-                stats.jobs = 1;
-                stats.audio_seconds = waveform.duration_seconds();
-                Ok(LoadedJob {
-                    index: input.index,
-                    request_item: None,
-                    waveform,
-                    _queue_memory_permit: None,
-                })
+            Ok(Ok(mut waveforms)) => {
+                stats.jobs = waveforms.len();
+                stats.audio_seconds = waveforms
+                    .iter()
+                    .map(|(_, waveform)| waveform.duration_seconds())
+                    .sum();
+                Ok(waveforms
+                    .drain(..)
+                    .enumerate()
+                    .map(|(offset, (channel, waveform))| LoadedJob {
+                        index: input.index + offset,
+                        request_item: None,
+                        channel,
+                        waveform,
+                        timing: TranscribeItemTiming {
+                            loader_seconds: compute_seconds,
+                            ..Default::default()
+                        },
+                        spans: TranscribeItemSpans {
+                            loader: Some(loader_span),
+                            ..Default::default()
+                        },
+                        _queue_memory_permit: None,
+                    })
+                    .collect())
             }
             Ok(Err(error)) => {
                 stats.failed = 1;
                 Err(TranscribeItemOutcome {
                     index: input.index,
+                    channel: "mono",
                     result: Err(error),
                     audio_seconds: 0.0,
+                    timing: TranscribeItemTiming {
+                        loader_seconds: compute_seconds,
+                        ..Default::default()
+                    },
+                    spans: TranscribeItemSpans {
+                        loader: Some(loader_span),
+                        ..Default::default()
+                    },
                     bad_component: Some("loader"),
                 })
             }
@@ -1223,8 +1731,17 @@ fn spawn_loader_task(
                 stats.failed = 1;
                 Err(TranscribeItemOutcome {
                     index: input.index,
+                    channel: "mono",
                     result: Err(anyhow::anyhow!("loader join error: {error}")),
                     audio_seconds: 0.0,
+                    timing: TranscribeItemTiming {
+                        loader_seconds: compute_seconds,
+                        ..Default::default()
+                    },
+                    spans: TranscribeItemSpans {
+                        loader: Some(loader_span),
+                        ..Default::default()
+                    },
                     bad_component: Some("loader"),
                 })
             }
@@ -1234,7 +1751,10 @@ fn spawn_loader_task(
 }
 
 async fn send_next_loaded(
-    tasks: &mut JoinSet<(Result<LoadedJob, TranscribeItemOutcome>, LoaderTaskStats)>,
+    tasks: &mut JoinSet<(
+        Result<Vec<LoadedJob>, TranscribeItemOutcome>,
+        LoaderTaskStats,
+    )>,
     loaded_queue_memory: &LoadedQueueMemoryBudget,
     loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
@@ -1244,8 +1764,11 @@ async fn send_next_loaded(
         Some(Err(error)) => (
             Err(TranscribeItemOutcome {
                 index: 0,
+                channel: "mono",
                 result: Err(anyhow::anyhow!("loader task join error: {error}")),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("loader"),
             }),
             LoaderTaskStats {
@@ -1256,12 +1779,25 @@ async fn send_next_loaded(
         None => return Ok(()),
     };
     record_loader_task_stats(stats, &task_stats);
-    if let Ok(job) = &mut message {
-        job._queue_memory_permit = Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+    if let Ok(jobs) = &mut message {
+        for job in jobs {
+            job._queue_memory_permit =
+                Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
+        }
     }
-    loader_to_vad_tx
-        .send(message)
-        .map_err(|_| anyhow::anyhow!("loaded channel closed"))
+    match message {
+        Ok(jobs) => {
+            for job in jobs {
+                loader_to_vad_tx
+                    .send(Ok(job))
+                    .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
+            }
+            Ok(())
+        }
+        Err(outcome) => loader_to_vad_tx
+            .send(Err(outcome))
+            .map_err(|_| anyhow::anyhow!("loaded channel closed")),
+    }
 }
 
 fn spawn_vad_worker(
@@ -1271,6 +1807,7 @@ fn spawn_vad_worker(
     mut loader_to_vad_rx: mpsc::UnboundedReceiver<Result<LoadedJob, TranscribeItemOutcome>>,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     stats: Arc<Mutex<VadStageStats>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1286,6 +1823,7 @@ fn spawn_vad_worker(
                         vad_options.clone(),
                         vad_to_asr_tx.clone(),
                         vad_to_asr_queue_memory.clone(),
+                        pending_requests.clone(),
                         job,
                     );
                     if tasks.len() >= max_in_flight {
@@ -1320,12 +1858,14 @@ fn spawn_vad_task(
     vad_options: VadOptions,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     job: LoadedJob,
 ) {
     tasks.spawn(async move {
         let stage_start = Instant::now();
         let job_index = job.index;
         let request_item = job.request_item;
+        let mut timing = job.timing;
         let audio_seconds = job.waveform.duration_seconds();
         let prepared = tokio::task::spawn_blocking({
             let offline = Arc::clone(&offline);
@@ -1335,6 +1875,13 @@ fn spawn_vad_task(
         })
         .await;
         let compute_seconds = stage_start.elapsed().as_secs_f64();
+        timing.vad_seconds += compute_seconds;
+        let mut spans = job.spans;
+        let vad_span = StageSpan::new(stage_start, Instant::now());
+        let vad_queue_span = spans
+            .loader
+            .and_then(|loader| StageSpan::try_new(loader.end, vad_span.start));
+        spans.vad = Some(vad_span);
         let mut send_wait_seconds = 0.0;
 
         match prepared {
@@ -1344,6 +1891,9 @@ fn spawn_vad_task(
                 let asr_job = AsrJob {
                     index: job_index,
                     request_item,
+                    channel: job.channel,
+                    timing,
+                    spans,
                     prepared,
                     waveform: job.waveform,
                 };
@@ -1357,8 +1907,11 @@ fn spawn_vad_task(
                                     &vad_to_asr_queue_memory,
                                     Err(TranscribeItemOutcome {
                                         index: job_index,
+                                        channel: job.channel,
                                         result: Err(error),
                                         audio_seconds,
+                                        timing,
+                                        spans,
                                         bad_component: Some("vad"),
                                     }),
                                     &mut send_wait_seconds,
@@ -1367,20 +1920,26 @@ fn spawn_vad_task(
                                 .map_err(|error| {
                                     TranscribeItemOutcome {
                                         index: job_index,
+                                        channel: job.channel,
                                         result: Err(error),
                                         audio_seconds,
+                                        timing,
+                                        spans,
                                         bad_component: Some("vad"),
                                     }
                                 })?;
-                                log_vad(
-                                    job_index,
-                                    audio_seconds,
-                                    segments,
-                                    speech_seconds,
-                                    compute_seconds,
-                                    send_wait_seconds,
-                                    stage_start.elapsed().as_secs_f64(),
-                                );
+                                if let (Some(pending_requests), Some(request_item)) =
+                                    (&pending_requests, request_item)
+                                {
+                                    record_request_vad_stage(
+                                        pending_requests,
+                                        request_item.request_id,
+                                        vad_span,
+                                        vad_queue_span,
+                                        audio_seconds,
+                                        0,
+                                    );
+                                }
                                 return Ok(VadTaskStats {
                                     jobs: 1,
                                     failed: 1,
@@ -1405,8 +1964,11 @@ fn spawn_vad_task(
                             .map_err(|error| {
                                 TranscribeItemOutcome {
                                     index: job_index,
+                                    channel: job.channel,
                                     result: Err(error),
                                     audio_seconds,
+                                    timing,
+                                    spans,
                                     bad_component: Some("asr"),
                                 }
                             })?;
@@ -1422,21 +1984,27 @@ fn spawn_vad_task(
                         .await
                         .map_err(|error| TranscribeItemOutcome {
                             index: job_index,
+                            channel: job.channel,
                             result: Err(error),
                             audio_seconds,
+                            timing,
+                            spans,
                             bad_component: Some("asr"),
                         })?;
                     }
                 }
-                log_vad(
-                    job_index,
-                    audio_seconds,
-                    segments,
-                    speech_seconds,
-                    compute_seconds,
-                    send_wait_seconds,
-                    stage_start.elapsed().as_secs_f64(),
-                );
+                if let (Some(pending_requests), Some(request_item)) =
+                    (&pending_requests, request_item)
+                {
+                    record_request_vad_stage(
+                        pending_requests,
+                        request_item.request_id,
+                        vad_span,
+                        vad_queue_span,
+                        audio_seconds,
+                        segments,
+                    );
+                }
                 Ok(VadTaskStats {
                     jobs: 1,
                     no_speech: usize::from(no_speech),
@@ -1455,8 +2023,11 @@ fn spawn_vad_task(
                     &vad_to_asr_queue_memory,
                     Err(TranscribeItemOutcome {
                         index: job_index,
+                        channel: job.channel,
                         result: Err(error),
                         audio_seconds,
+                        timing,
+                        spans,
                         bad_component: Some("vad"),
                     }),
                     &mut send_wait_seconds,
@@ -1464,19 +2035,25 @@ fn spawn_vad_task(
                 .await
                 .map_err(|error| TranscribeItemOutcome {
                     index: job_index,
+                    channel: job.channel,
                     result: Err(error),
                     audio_seconds,
+                    timing,
+                    spans,
                     bad_component: Some("vad"),
                 })?;
-                log_vad(
-                    job_index,
-                    audio_seconds,
-                    0,
-                    0.0,
-                    compute_seconds,
-                    send_wait_seconds,
-                    stage_start.elapsed().as_secs_f64(),
-                );
+                if let (Some(pending_requests), Some(request_item)) =
+                    (&pending_requests, request_item)
+                {
+                    record_request_vad_stage(
+                        pending_requests,
+                        request_item.request_id,
+                        vad_span,
+                        vad_queue_span,
+                        audio_seconds,
+                        0,
+                    );
+                }
                 Ok(VadTaskStats {
                     jobs: 1,
                     failed: 1,
@@ -1493,8 +2070,11 @@ fn spawn_vad_task(
                     &vad_to_asr_queue_memory,
                     Err(TranscribeItemOutcome {
                         index: job_index,
+                        channel: job.channel,
                         result: Err(anyhow::anyhow!("VAD join error: {error}")),
                         audio_seconds,
+                        timing,
+                        spans,
                         bad_component: Some("vad"),
                     }),
                     &mut send_wait_seconds,
@@ -1502,19 +2082,25 @@ fn spawn_vad_task(
                 .await
                 .map_err(|error| TranscribeItemOutcome {
                     index: job_index,
+                    channel: job.channel,
                     result: Err(error),
                     audio_seconds,
+                    timing,
+                    spans,
                     bad_component: Some("vad"),
                 })?;
-                log_vad(
-                    job_index,
-                    audio_seconds,
-                    0,
-                    0.0,
-                    compute_seconds,
-                    send_wait_seconds,
-                    stage_start.elapsed().as_secs_f64(),
-                );
+                if let (Some(pending_requests), Some(request_item)) =
+                    (&pending_requests, request_item)
+                {
+                    record_request_vad_stage(
+                        pending_requests,
+                        request_item.request_id,
+                        vad_span,
+                        vad_queue_span,
+                        audio_seconds,
+                        0,
+                    );
+                }
                 Ok(VadTaskStats {
                     jobs: 1,
                     failed: 1,
@@ -1560,8 +2146,11 @@ async fn send_next_vad_task(
         }
         Some(Err(error)) => Err(TranscribeItemOutcome {
             index: 0,
+            channel: "mono",
             result: Err(anyhow::anyhow!("VAD task join error: {error}")),
             audio_seconds: 0.0,
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             bad_component: Some("vad"),
         }),
         None => Ok(()),
@@ -1584,6 +2173,7 @@ struct SegmentEncodeBatch {
 struct SegmentEncodedMessage {
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
+    encoder_timing: TranscribeItemTiming,
     batch: Result<SegmentEncodedAsrBatch>,
 }
 
@@ -1594,6 +2184,7 @@ fn spawn_segment_encoder_worker(
     mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeRequest>,
     encoded_tx: mpsc::UnboundedSender<SegmentEncodedMessage>,
     stats: Arc<Mutex<AsrStageStats>>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut pending = VecDeque::new();
@@ -1625,25 +2216,27 @@ fn spawn_segment_encoder_worker(
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
             let encode_wall_seconds = encode_start.elapsed().as_secs_f64();
+            let encode_span = StageSpan::new(encode_start, Instant::now());
             let encode_timings = batch
                 .as_ref()
                 .map(|batch| batch.timings)
                 .unwrap_or_default();
-            log_asr_audio_encoder_batch(
-                segments_for_result.len(),
-                segment_audio_seconds,
-                encode_wall_seconds,
-                encode_timings,
-            );
+            let encoder_timing = audio_encoder_timing_seconds(encode_timings);
             record_asr_encode_stats(
                 &stats,
                 segments_for_result.len(),
                 segment_audio_seconds,
                 encode_wall_seconds,
             );
+            let mut segments_for_result = segments_for_result;
+            for segment in &mut segments_for_result {
+                segment.spans.audio_encoder = Some(encode_span);
+            }
+            record_request_encode_stages(&pending_requests, &segments_for_result, encode_span);
             let message = SegmentEncodedMessage {
                 segments: segments_for_result,
                 stage_start: request.stage_start,
+                encoder_timing,
                 batch,
             };
             if encoded_tx.send(message).is_err() {
@@ -1699,6 +2292,7 @@ fn spawn_segment_decoder_worker(
     #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] decode_idle_flush: Option<
         std::time::Duration,
     >,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
@@ -1714,10 +2308,12 @@ fn spawn_segment_decoder_worker(
                     break;
                 };
                 let SegmentEncodedMessage {
-                    segments,
+                    mut segments,
                     stage_start,
+                    encoder_timing,
                     batch,
                 } = first;
+                apply_batch_timing_to_segments(&mut segments, encoder_timing);
                 let initial = match batch {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -1726,6 +2322,7 @@ fn spawn_segment_decoder_worker(
                             &segments,
                             stage_start,
                             Err(error),
+                            None,
                             Some(&stats),
                         );
                         for outcome in outcomes {
@@ -1745,6 +2342,7 @@ fn spawn_segment_decoder_worker(
                     &asr_to_result_tx,
                     &stats,
                     decode_idle_flush,
+                    pending_requests.clone(),
                 )
                 .await;
                 if decode_idle_flush.is_none() {
@@ -1762,6 +2360,7 @@ fn spawn_segment_decoder_worker(
                 &mut segment_state,
                 &asr_to_result_tx,
                 &stats,
+                pending_requests.clone(),
             )
             .await;
         }
@@ -1808,6 +2407,7 @@ async fn handle_dynamic_segment_encoded_message(
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
     decode_idle_flush: Option<std::time::Duration>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) {
     let decode_start = Instant::now();
     let batch = tokio::task::spawn_blocking({
@@ -1850,6 +2450,10 @@ async fn handle_dynamic_segment_encoded_message(
         Err(error) => (segments, Err(error), Vec::new()),
     };
     #[cfg(feature = "timing")]
+    let asr_timing = timings.as_ref().map(transcribe_timing_seconds);
+    #[cfg(not(feature = "timing"))]
+    let asr_timing = None;
+    #[cfg(feature = "timing")]
     if let Some(timings) = timings.as_ref() {
         record_asr_timing_stats(stats, timings);
     }
@@ -1862,11 +2466,20 @@ async fn handle_dynamic_segment_encoded_message(
             .sum(),
         decode_start.elapsed().as_secs_f64(),
     );
+    let decode_span = StageSpan::new(decode_start, Instant::now());
+    let prefill_span = prefill_span_from_decode(decode_span, asr_timing);
+    record_request_decode_stages(
+        &pending_requests,
+        &consumed_segments,
+        decode_span,
+        prefill_span,
+    );
     let outcomes = finish_segment_asr_batch(
         segment_state,
         &consumed_segments,
         stage_start,
         batch,
+        asr_timing,
         Some(stats),
     );
     for outcome in outcomes {
@@ -1878,6 +2491,7 @@ async fn handle_dynamic_segment_encoded_message(
             failure.segments.as_slice(),
             failure.stage_start,
             Err(failure.error),
+            None,
             Some(stats),
         );
         for outcome in outcomes {
@@ -1894,17 +2508,21 @@ async fn handle_segment_encoded_messages(
     encoded_messages: Vec<SegmentEncodedMessage>,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) {
     let mut ok_batches = Vec::new();
     for encoded in encoded_messages {
+        let mut encoded_segments = encoded.segments;
+        apply_batch_timing_to_segments(&mut encoded_segments, encoded.encoder_timing);
         match encoded.batch {
-            Ok(batch) => ok_batches.push((encoded.segments, encoded.stage_start, batch)),
+            Ok(batch) => ok_batches.push((encoded_segments, encoded.stage_start, batch)),
             Err(error) => {
                 let outcomes = finish_segment_asr_batch(
                     segment_state,
-                    &encoded.segments,
+                    &encoded_segments,
                     encoded.stage_start,
                     Err(error),
+                    None,
                     Some(stats),
                 );
                 for outcome in outcomes {
@@ -1937,6 +2555,7 @@ async fn handle_segment_encoded_messages(
         batch,
         asr_to_result_tx,
         stats,
+        pending_requests,
     )
     .await;
 }
@@ -1951,6 +2570,7 @@ async fn handle_merged_segment_encoded_batch(
     batch: Result<SegmentEncodedAsrBatch>,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) {
     let decode_start = Instant::now();
     #[cfg(feature = "timing")]
@@ -1964,6 +2584,13 @@ async fn handle_merged_segment_encoded_batch(
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
         Err(error) => Err(error),
     };
+    #[cfg(feature = "timing")]
+    let asr_timing = batch
+        .as_ref()
+        .ok()
+        .map(|(_, _, timings)| transcribe_timing_seconds(timings));
+    #[cfg(not(feature = "timing"))]
+    let asr_timing = None;
     #[cfg(feature = "timing")]
     if let Ok((_, _, timings)) = &batch {
         record_asr_timing_stats(stats, timings);
@@ -1988,10 +2615,19 @@ async fn handle_merged_segment_encoded_batch(
             .sum(),
         decode_start.elapsed().as_secs_f64(),
     );
+    let decode_span = StageSpan::new(decode_start, Instant::now());
+    let prefill_span = prefill_span_from_decode(decode_span, asr_timing);
+    record_request_decode_stages(&pending_requests, &segments, decode_span, prefill_span);
     #[cfg(feature = "timing")]
     let batch = batch.map(|(inference, timelines, _timings)| (inference, timelines));
-    let outcomes =
-        finish_segment_asr_batch(segment_state, &segments, stage_start, batch, Some(stats));
+    let outcomes = finish_segment_asr_batch(
+        segment_state,
+        &segments,
+        stage_start,
+        batch,
+        asr_timing,
+        Some(stats),
+    );
     for outcome in outcomes {
         let _ = asr_to_result_tx.send(outcome.into()).await;
     }
@@ -2006,19 +2642,11 @@ async fn handle_ready_segment_encoded_messages(
     segment_state: &mut SegmentAsrState,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) {
     let mut messages = vec![first];
     while let Ok(message) = encoder_to_decoder_rx.try_recv() {
         messages.push(message);
-    }
-    if messages.len() > 1 {
-        let segs: usize = messages.iter().map(|message| message.segments.len()).sum();
-        tracing::debug!(
-            target: "vasr_transcribe::pipeline",
-            "asr audio_features decode merge | batches={} segs={}",
-            messages.len(),
-            segs,
-        );
     }
     handle_segment_encoded_messages(
         offline,
@@ -2027,6 +2655,7 @@ async fn handle_ready_segment_encoded_messages(
         messages,
         asr_to_result_tx,
         stats,
+        pending_requests,
     )
     .await;
 }
@@ -2051,6 +2680,7 @@ fn spawn_asr_worker(
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
     decode_idle_flush: Option<std::time::Duration>,
+    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut fallback_segment_state = SegmentAsrState::default();
@@ -2064,6 +2694,7 @@ fn spawn_asr_worker(
             asr_to_encoder_rx,
             encoder_to_decoder_tx,
             Arc::clone(&stats),
+            pending_requests.clone(),
         );
         let segment_decoder_handle = spawn_segment_decoder_worker(
             Arc::clone(&offline),
@@ -2072,6 +2703,7 @@ fn spawn_asr_worker(
             asr_to_result_tx.clone(),
             Arc::clone(&stats),
             decode_idle_flush,
+            pending_requests.clone(),
         );
 
         while let Some(envelope) = match pending.pop_front() {
@@ -2119,8 +2751,11 @@ fn spawn_asr_worker(
                         vec![
                             TranscribeItemOutcome {
                                 index: 0,
+                                channel: "mono",
                                 result: Err(anyhow::anyhow!("ASR join error: {error}")),
                                 audio_seconds: 0.0,
+                                timing: TranscribeItemTiming::default(),
+                                spans: TranscribeItemSpans::default(),
                                 bad_component: Some("recognizer"),
                             }
                             .into(),
@@ -2174,6 +2809,7 @@ fn spawn_asr_worker(
                             &segments,
                             stage_start,
                             batch,
+                            None,
                             None,
                         );
                         for outcome in outcomes {
@@ -2343,6 +2979,9 @@ fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegment
             .or_insert_with(|| SegmentJobState {
                 index: segment.job_index,
                 request_item: segment.request_item,
+                channel: segment.channel,
+                timing: segment.timing,
+                spans: segment.spans,
                 audio_seconds: segment.job_audio_seconds,
                 speech_annotations: segment.speech_annotations.clone(),
                 segment_annotations: vec![None; segment.segment_count],
@@ -2376,8 +3015,11 @@ fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
     }
     TranscribeItemOutcome {
         index: job.index,
+        channel: job.channel,
         result: Ok(timeline),
         audio_seconds: job.audio_seconds,
+        timing: job.timing,
+        spans: job.spans,
         bad_component: None,
     }
 }
@@ -2491,6 +3133,29 @@ fn run_segment_asr_inference(
         },
         timelines,
     ))
+}
+
+fn run_raw_asr_inference(
+    offline: &OfflinePipeline,
+    waveforms: &[Waveform],
+    asr_options: &AsrOptions,
+) -> Result<(Vec<Timeline>, Option<TranscribeItemTiming>)> {
+    #[cfg(feature = "timing")]
+    if let Some(qwen3) = offline.asr.as_any().downcast_ref::<Qwen3ASR>() {
+        let runtime_options = qwen_transcribe_options(asr_options);
+        let audio = waveforms
+            .iter()
+            .map(|waveform| AudioInput::Waveform {
+                samples: &waveform.samples,
+                sample_rate: waveform.sample_rate,
+            })
+            .collect::<Vec<_>>();
+        let (outputs, timings) = Qwen3ASR::transcribe_timed(qwen3, audio, runtime_options)?;
+        let timing = transcribe_timing_seconds(&timings);
+        return Ok((qwen_outputs_to_timelines(outputs, waveforms)?, Some(timing)));
+    }
+
+    Ok((offline.asr.transcribe(waveforms, asr_options)?, None))
 }
 
 fn run_segment_asr_encode(
@@ -2755,10 +3420,6 @@ fn run_segment_asr_decode_dynamic(
         timings.chunks = outputs.iter().map(Vec::len).sum();
         timings.batches = outputs.len();
     }
-    #[cfg(all(feature = "cuda", feature = "paged-attn"))]
-    if decode_idle_flush.is_some() {
-        vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.device());
-    }
     let mut timelines = Vec::with_capacity(waveforms.len());
     let mut waveform_offset = 0usize;
     for outputs in outputs {
@@ -2798,6 +3459,7 @@ fn finish_segment_asr_batch(
     segments: &[AsrSegmentJob],
     stage_start: Instant,
     batch: Result<(SegmentAsrInference, Vec<Timeline>)>,
+    asr_timing: Option<TranscribeItemTiming>,
     stats: Option<&Arc<Mutex<AsrStageStats>>>,
 ) -> Vec<RoutedTranscribeItemOutcome> {
     if segments.is_empty() {
@@ -2809,23 +3471,8 @@ fn finish_segment_asr_batch(
     match batch {
         Ok((inference, timelines)) => {
             let elapsed = stage_start.elapsed().as_secs_f64();
-            if stats.is_some() {
-                log_asr_wave(
-                    "vad-segment",
-                    inference.active_job_count,
-                    segments.len(),
-                    inference.segment_audio_seconds,
-                    elapsed,
-                );
-            } else {
-                log_asr(
-                    "vad-segment",
-                    inference.active_job_count,
-                    segments.len(),
-                    inference.segment_audio_seconds,
-                    elapsed,
-                );
-            }
+            let asr_span = StageSpan::new(stage_start, Instant::now());
+            let prefill_span = prefill_span_from_decode(asr_span, asr_timing);
             if let Some(stats) = stats {
                 record_asr_batch_stats(
                     stats,
@@ -2836,6 +3483,7 @@ fn finish_segment_asr_batch(
                 );
             }
             if timelines.len() == inference.targets.len() {
+                let target_count = inference.targets.len();
                 for ((job_index, segment_index, offset), asr_timeline) in
                     inference.targets.into_iter().zip(timelines)
                 {
@@ -2853,6 +3501,33 @@ fn finish_segment_asr_batch(
                         if job.segment_annotations[segment_index].is_none() {
                             job.segments_done = job.segments_done.saturating_add(1);
                         }
+                        let segment_audio_seconds = segments
+                            .iter()
+                            .find(|segment| {
+                                segment.job_index == job_index
+                                    && segment.segment_index == segment_index
+                            })
+                            .map(|segment| segment.waveform.duration_seconds())
+                            .unwrap_or(0.0);
+                        job.timing.asr_seconds += allocated_batch_seconds(
+                            segment_audio_seconds,
+                            inference.segment_audio_seconds,
+                            target_count,
+                            elapsed,
+                        );
+                        if let Some(asr_timing) = asr_timing {
+                            let scale = allocation_scale(
+                                segment_audio_seconds,
+                                inference.segment_audio_seconds,
+                                target_count,
+                            );
+                            job.timing.add_scaled(asr_timing, scale);
+                        }
+                        job.spans.asr = Some(merge_optional_span(job.spans.asr, Some(asr_span)));
+                        job.spans.prefill =
+                            Some(merge_optional_span(job.spans.prefill, prefill_span));
+                        job.spans.decode =
+                            Some(merge_optional_span(job.spans.decode, Some(asr_span)));
                         job.segment_annotations[segment_index] =
                             Some(offset_annotations(asr_timeline.annotations, offset));
                         if job.segments_done >= job.segment_count {
@@ -2870,12 +3545,44 @@ fn finish_segment_asr_batch(
                 );
                 let affected: HashSet<usize> =
                     segments.iter().map(|segment| segment.job_index).collect();
+                let affected_count = affected.len();
                 for job_index in affected {
                     if let Some(job) = state.jobs.remove(&job_index) {
                         let request_item = job.request_item;
+                        let mut timing = job.timing;
+                        timing.asr_seconds += allocated_batch_seconds(
+                            segments
+                                .iter()
+                                .filter(|segment| segment.job_index == job_index)
+                                .map(|segment| segment.waveform.duration_seconds())
+                                .sum(),
+                            inference.segment_audio_seconds,
+                            affected_count,
+                            elapsed,
+                        );
+                        if let Some(asr_timing) = asr_timing {
+                            let item_audio_seconds = segments
+                                .iter()
+                                .filter(|segment| segment.job_index == job_index)
+                                .map(|segment| segment.waveform.duration_seconds())
+                                .sum();
+                            let scale = allocation_scale(
+                                item_audio_seconds,
+                                inference.segment_audio_seconds,
+                                affected_count,
+                            );
+                            timing.add_scaled(asr_timing, scale);
+                        }
+                        let mut spans = job.spans;
+                        spans.asr = Some(merge_optional_span(spans.asr, Some(asr_span)));
+                        spans.prefill = Some(merge_optional_span(spans.prefill, prefill_span));
+                        spans.decode = Some(merge_optional_span(spans.decode, Some(asr_span)));
                         let outcome = outcome_from_result(
                             job.index,
+                            job.channel,
                             job.audio_seconds,
+                            timing,
+                            spans,
                             Err(anyhow::anyhow!(err.clone())),
                         );
                         completed.push(route_outcome(request_item, outcome));
@@ -2884,15 +3591,40 @@ fn finish_segment_asr_batch(
             }
         }
         Err(error) => {
+            let elapsed = stage_start.elapsed().as_secs_f64();
+            let asr_span = StageSpan::new(stage_start, Instant::now());
+            let prefill_span = prefill_span_from_decode(asr_span, asr_timing);
             let reason = error.to_string();
             let affected: HashSet<usize> =
                 segments.iter().map(|segment| segment.job_index).collect();
+            let total_audio_seconds: f64 = segments
+                .iter()
+                .map(|segment| segment.waveform.duration_seconds())
+                .sum();
             for job_index in affected {
                 if let Some(job) = state.jobs.remove(&job_index) {
                     let request_item = job.request_item;
+                    let mut timing = job.timing;
+                    let mut spans = job.spans;
+                    spans.asr = Some(merge_optional_span(spans.asr, Some(asr_span)));
+                    spans.prefill = Some(merge_optional_span(spans.prefill, prefill_span));
+                    spans.decode = Some(merge_optional_span(spans.decode, Some(asr_span)));
+                    timing.asr_seconds += allocated_batch_seconds(
+                        segments
+                            .iter()
+                            .filter(|segment| segment.job_index == job_index)
+                            .map(|segment| segment.waveform.duration_seconds())
+                            .sum(),
+                        total_audio_seconds,
+                        1,
+                        elapsed,
+                    );
                     let outcome = outcome_from_result(
                         job.index,
+                        job.channel,
                         job.audio_seconds,
+                        timing,
+                        spans,
                         Err(anyhow::anyhow!(reason.clone())),
                     );
                     completed.push(route_outcome(request_item, outcome));
@@ -2916,7 +3648,7 @@ fn run_segment_microbatch(
 
     let stage_start = Instant::now();
     let batch = run_segment_asr_inference(offline, &segments, asr_options);
-    finish_segment_asr_batch(state, &segments, stage_start, batch, None)
+    finish_segment_asr_batch(state, &segments, stage_start, batch, None, None)
         .into_iter()
         .map(RoutedTranscribeItemOutcome::into_public_outcome)
         .collect()
@@ -2943,8 +3675,11 @@ fn run_asr_jobs_batch(
                 let request_item = job.request_item;
                 let outcome = TranscribeItemOutcome {
                     index: job.index,
+                    channel: job.channel,
                     result: Ok(Timeline::new("offline_audio")),
                     audio_seconds: job.waveform.duration_seconds(),
+                    timing: job.timing,
+                    spans: job.spans,
                     bad_component: None,
                 };
                 outcomes.push(route_outcome(request_item, outcome));
@@ -2957,6 +3692,11 @@ fn run_asr_jobs_batch(
         let indices: Vec<usize> = raw_jobs.iter().map(|(job, _)| job.index).collect();
         let request_items: Vec<Option<RequestItemRef>> =
             raw_jobs.iter().map(|(job, _)| job.request_item).collect();
+        let channels: Vec<&'static str> = raw_jobs.iter().map(|(job, _)| job.channel).collect();
+        let timings: Vec<TranscribeItemTiming> =
+            raw_jobs.iter().map(|(job, _)| job.timing).collect();
+        let mut spans: Vec<TranscribeItemSpans> =
+            raw_jobs.iter().map(|(job, _)| job.spans).collect();
         let audio_seconds: Vec<f64> = raw_jobs
             .iter()
             .map(|(job, _)| job.waveform.duration_seconds())
@@ -2968,25 +3708,12 @@ fn run_asr_jobs_batch(
         let total_audio_seconds: f64 = audio_seconds.iter().sum();
         let waveforms: Vec<Waveform> = raw_jobs.into_iter().map(|(job, _)| job.waveform).collect();
         let stage_start = Instant::now();
-        let result = offline.asr.transcribe(&waveforms, asr_options);
-        let elapsed = stage_start.elapsed().as_secs_f64();
-        if stats.is_some() {
-            log_asr_wave(
-                "raw",
-                indices.len(),
-                waveforms.len(),
-                total_audio_seconds,
-                elapsed,
-            );
-        } else {
-            log_asr(
-                "raw",
-                indices.len(),
-                waveforms.len(),
-                total_audio_seconds,
-                elapsed,
-            );
+        let result = run_raw_asr_inference(offline, &waveforms, asr_options);
+        let asr_span = StageSpan::new(stage_start, Instant::now());
+        for spans in &mut spans {
+            spans.asr = Some(asr_span);
         }
+        let elapsed = stage_start.elapsed().as_secs_f64();
         if let Some(stats) = stats {
             record_asr_batch_stats(
                 stats,
@@ -2997,15 +3724,41 @@ fn run_asr_jobs_batch(
             );
         }
         match result {
-            Ok(timelines) if timelines.len() == indices.len() => {
-                for ((((index, request_item), audio_seconds), mut timeline), mut annotations) in
-                    indices
-                        .into_iter()
-                        .zip(request_items)
-                        .zip(audio_seconds)
-                        .zip(timelines)
-                        .zip(speech_annotations)
+            Ok((timelines, batch_timing)) if timelines.len() == indices.len() => {
+                for (
+                    (
+                        (
+                            ((((index, request_item), channel), audio_seconds), mut timing),
+                            mut spans,
+                        ),
+                        mut timeline,
+                    ),
+                    mut annotations,
+                ) in indices
+                    .into_iter()
+                    .zip(request_items)
+                    .zip(channels)
+                    .zip(audio_seconds)
+                    .zip(timings)
+                    .zip(spans)
+                    .zip(timelines)
+                    .zip(speech_annotations)
                 {
+                    timing.asr_seconds += allocated_batch_seconds(
+                        audio_seconds,
+                        total_audio_seconds,
+                        waveforms.len(),
+                        elapsed,
+                    );
+                    if let Some(batch_timing) = batch_timing {
+                        let scale =
+                            allocation_scale(audio_seconds, total_audio_seconds, waveforms.len());
+                        timing.add_scaled(batch_timing, scale);
+                        spans.prefill = Some(merge_optional_span(
+                            spans.prefill,
+                            prefill_span_from_decode(asr_span, Some(batch_timing)),
+                        ));
+                    }
                     if !annotations.is_empty() {
                         annotations.extend(timeline.annotations);
                         timeline.annotations = annotations;
@@ -3014,34 +3767,82 @@ fn run_asr_jobs_batch(
                         request_item,
                         TranscribeItemOutcome {
                             index,
+                            channel,
                             result: Ok(timeline),
                             audio_seconds,
+                            timing,
+                            spans,
                             bad_component: None,
                         },
                     ));
                 }
             }
-            Ok(timelines) => {
+            Ok((timelines, batch_timing)) => {
                 let err = anyhow::anyhow!(
                     "ASR batch returned {} timelines for {} jobs",
                     timelines.len(),
                     indices.len()
                 );
-                for ((index, request_item), audio_seconds) in
-                    indices.into_iter().zip(request_items).zip(audio_seconds)
+                for (((((index, request_item), channel), audio_seconds), mut timing), mut spans) in
+                    indices
+                        .into_iter()
+                        .zip(request_items)
+                        .zip(channels)
+                        .zip(audio_seconds)
+                        .zip(timings)
+                        .zip(spans)
                 {
-                    let outcome =
-                        outcome_from_result(index, audio_seconds, Err(anyhow::anyhow!("{err}")));
+                    timing.asr_seconds += allocated_batch_seconds(
+                        audio_seconds,
+                        total_audio_seconds,
+                        waveforms.len(),
+                        elapsed,
+                    );
+                    if let Some(batch_timing) = batch_timing {
+                        let scale =
+                            allocation_scale(audio_seconds, total_audio_seconds, waveforms.len());
+                        timing.add_scaled(batch_timing, scale);
+                        spans.prefill = Some(merge_optional_span(
+                            spans.prefill,
+                            prefill_span_from_decode(asr_span, Some(batch_timing)),
+                        ));
+                    }
+                    let outcome = outcome_from_result(
+                        index,
+                        channel,
+                        audio_seconds,
+                        timing,
+                        spans,
+                        Err(anyhow::anyhow!("{err}")),
+                    );
                     outcomes.push(route_outcome(request_item, outcome));
                 }
             }
             Err(error) => {
                 let reason = error.to_string();
-                for ((index, request_item), audio_seconds) in
-                    indices.into_iter().zip(request_items).zip(audio_seconds)
+                for (((((index, request_item), channel), audio_seconds), mut timing), spans) in
+                    indices
+                        .into_iter()
+                        .zip(request_items)
+                        .zip(channels)
+                        .zip(audio_seconds)
+                        .zip(timings)
+                        .zip(spans)
                 {
-                    let outcome =
-                        outcome_from_result(index, audio_seconds, Err(anyhow::anyhow!("{reason}")));
+                    timing.asr_seconds += allocated_batch_seconds(
+                        audio_seconds,
+                        total_audio_seconds,
+                        waveforms.len(),
+                        elapsed,
+                    );
+                    let outcome = outcome_from_result(
+                        index,
+                        channel,
+                        audio_seconds,
+                        timing,
+                        spans,
+                        Err(anyhow::anyhow!("{reason}")),
+                    );
                     outcomes.push(route_outcome(request_item, outcome));
                 }
             }
@@ -3057,8 +3858,11 @@ fn run_asr_jobs_batch(
                 Err(error) => outcomes.push(
                     TranscribeItemOutcome {
                         index: 0,
+                        channel: "mono",
                         result: Err(error),
                         audio_seconds: 0.0,
+                        timing: TranscribeItemTiming::default(),
+                        spans: TranscribeItemSpans::default(),
                         bad_component: Some("vad"),
                     }
                     .into(),
@@ -3095,6 +3899,140 @@ fn stage_metrics(audio_seconds: f64, wall_seconds: f64) -> StageMetrics {
     }
 }
 
+fn allocated_batch_seconds(
+    item_audio_seconds: f64,
+    total_audio_seconds: f64,
+    item_count: usize,
+    elapsed_seconds: f64,
+) -> f64 {
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    if total_audio_seconds > 0.0 && item_audio_seconds > 0.0 {
+        return elapsed_seconds * item_audio_seconds / total_audio_seconds;
+    }
+    if item_count > 0 {
+        return elapsed_seconds / item_count as f64;
+    }
+    elapsed_seconds
+}
+
+fn merge_optional_span(left: Option<StageSpan>, right: Option<StageSpan>) -> StageSpan {
+    match (left, right) {
+        (Some(left), Some(right)) => StageSpan {
+            start: left.start.min(right.start),
+            end: left.end.max(right.end),
+        },
+        (Some(span), None) | (None, Some(span)) => span,
+        (None, None) => {
+            let now = Instant::now();
+            StageSpan::new(now, now)
+        }
+    }
+}
+
+fn merge_stage_span(left: Option<StageSpan>, right: Option<StageSpan>) -> Option<StageSpan> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(StageSpan {
+            start: left.start.min(right.start),
+            end: left.end.max(right.end),
+        }),
+        (Some(span), None) | (None, Some(span)) => Some(span),
+        (None, None) => None,
+    }
+}
+
+fn prefill_span_from_decode(
+    decode_span: StageSpan,
+    timing: Option<TranscribeItemTiming>,
+) -> Option<StageSpan> {
+    let prefill_seconds = timing?.prefill_seconds;
+    if prefill_seconds <= 0.0 {
+        return None;
+    }
+    let prefill_duration = Duration::from_secs_f64(prefill_seconds);
+    let decode_duration = decode_span.end.duration_since(decode_span.start);
+    let duration = prefill_duration.min(decode_duration);
+    Some(StageSpan::new(
+        decode_span.start,
+        decode_span.start + duration,
+    ))
+}
+
+fn apply_batch_timing_to_segments(segments: &mut [AsrSegmentJob], timing: TranscribeItemTiming) {
+    if segments.is_empty() {
+        return;
+    }
+    let total_audio_seconds: f64 = segments
+        .iter()
+        .map(|segment| segment.waveform.duration_seconds())
+        .sum();
+    let item_count = segments.len();
+    for segment in segments {
+        let scale = allocation_scale(
+            segment.waveform.duration_seconds(),
+            total_audio_seconds,
+            item_count,
+        );
+        segment.timing.add_scaled(timing, scale);
+    }
+}
+
+fn allocation_scale(item_audio_seconds: f64, total_audio_seconds: f64, item_count: usize) -> f64 {
+    if total_audio_seconds > 0.0 && item_audio_seconds > 0.0 {
+        item_audio_seconds / total_audio_seconds
+    } else if item_count > 0 {
+        1.0 / item_count as f64
+    } else {
+        1.0
+    }
+}
+
+fn audio_encoder_timing_seconds(timings: AudioFeatureEncodeTimings) -> TranscribeItemTiming {
+    TranscribeItemTiming {
+        audio_encoder_seconds: timing_us_to_seconds(
+            timings
+                .prepare_us
+                .saturating_add(timings.stack_us)
+                .saturating_add(timings.forward_us)
+                .saturating_add(timings.d2h_us),
+        ),
+        audio_encoder_prepare_seconds: timing_us_to_seconds(timings.prepare_us),
+        audio_encoder_stack_seconds: timing_us_to_seconds(timings.stack_us),
+        audio_encoder_forward_seconds: timing_us_to_seconds(timings.forward_us),
+        audio_encoder_d2h_seconds: timing_us_to_seconds(timings.d2h_us),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "timing")]
+fn transcribe_timing_seconds(timings: &TranscribeTimings) -> TranscribeItemTiming {
+    let generation = &timings.generation;
+    TranscribeItemTiming {
+        audio_encoder_seconds: timing_us_to_seconds(timings.audio_encoder_us),
+        prefill_seconds: timing_us_to_seconds(generation.prefill_us),
+        prefill_inputs_seconds: timing_us_to_seconds(generation.prefill_inputs_us),
+        prefill_rope_seconds: timing_us_to_seconds(generation.prefill_rope_us),
+        prefill_metadata_seconds: timing_us_to_seconds(generation.prefill_metadata_us),
+        prefill_mask_seconds: timing_us_to_seconds(generation.prefill_mask_us),
+        prefill_forward_seconds: timing_us_to_seconds(generation.prefill_forward_us),
+        prefill_gather_seconds: timing_us_to_seconds(generation.prefill_gather_us),
+        prefill_decode_setup_seconds: timing_us_to_seconds(generation.prefill_decode_setup_us),
+        prefill_argmax_seconds: timing_us_to_seconds(generation.prefill_argmax_us),
+        decode_seconds: timing_us_to_seconds(generation.decode_us),
+        decode_token_tensor_seconds: timing_us_to_seconds(generation.decode_token_tensor_us),
+        decode_embed_seconds: timing_us_to_seconds(generation.decode_embed_us),
+        decode_position_seconds: timing_us_to_seconds(generation.decode_position_us),
+        decode_metadata_seconds: timing_us_to_seconds(generation.decode_metadata_us),
+        decode_graph_replay_seconds: timing_us_to_seconds(generation.decode_graph_replay_us),
+        decode_forward_seconds: timing_us_to_seconds(generation.decode_forward_us),
+        decode_pre_argmax_sync_seconds: timing_us_to_seconds(generation.decode_pre_argmax_sync_us),
+        decode_argmax_seconds: timing_us_to_seconds(generation.decode_argmax_us),
+        tokenizer_decode_seconds: timing_us_to_seconds(timings.tokenizer_decode_us),
+        ..Default::default()
+    }
+}
+
 fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
     match prepared {
         VadPreparation::Speech(prepared) => {
@@ -3107,24 +4045,6 @@ fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
         }
         VadPreparation::Disabled | VadPreparation::NoSpeech => (0, 0.0),
     }
-}
-
-fn log_vad(
-    index: usize,
-    audio_seconds: f64,
-    segments: usize,
-    speech_seconds: f64,
-    compute_seconds: f64,
-    send_wait_seconds: f64,
-    wall_seconds: f64,
-) {
-    let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | compute={compute_seconds:.2}s | send_wait={send_wait_seconds:.2}s | wall={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
-        metrics.speedup,
-        metrics.rtf
-    );
 }
 
 fn record_loader_task_stats(stats: &Arc<Mutex<LoaderStageStats>>, task: &LoaderTaskStats) {
@@ -3212,9 +4132,9 @@ fn record_asr_batch_stats(
 
 fn log_loader_summary(stats: &LoaderStageStats) {
     let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "loader | jobs={} failed={} audio={:.1}s wall={:.1}s compute={:.1}s speed={:.1}x",
+        "load | jobs={} failed={} audio={:.1}s wall={:.1}s compute={:.1}s speed={:.1}x",
         stats.jobs,
         stats.failed,
         stats.audio_seconds,
@@ -3226,7 +4146,7 @@ fn log_loader_summary(stats: &LoaderStageStats) {
 
 fn log_vad_summary(stats: &VadStageStats) {
     let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
         "vad | jobs={} failed={} no_speech={} segments={} speech={:.1}s audio={:.1}s wall={:.1}s compute={:.1}s send_wait={:.1}s speed={:.1}x",
         stats.jobs,
@@ -3242,77 +4162,8 @@ fn log_vad_summary(stats: &VadStageStats) {
     );
 }
 
-fn log_asr_audio_encoder_batch(
-    segments: usize,
-    audio_s: f64,
-    wall_s: f64,
-    timings: AudioFeatureEncodeTimings,
-) {
-    let speedup = audio_s / wall_s.max(f64::EPSILON);
-    let prepare_s = timing_us_to_seconds(timings.prepare_us);
-    let stack_s = timing_us_to_seconds(timings.stack_us);
-    let forward_s = timing_us_to_seconds(timings.forward_us);
-    let d2h_s = timing_us_to_seconds(timings.d2h_us);
-    let tokens = timings.audio_tokens;
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "asr audio_encoder | segs={segments} tokens={tokens} audio={audio_s:.1}s wall={wall_s:.2}s speed={speedup:.1}x prepare={prepare_s:.3}s stack={stack_s:.3}s forward={forward_s:.3}s d2h={d2h_s:.3}s"
-    );
-}
-
 fn timing_us_to_seconds(us: u64) -> f64 {
     us as f64 / 1_000_000.0
-}
-
-fn log_asr_summary(stats: &AsrStageStats) {
-    if stats.jobs == 0 && stats.segments == 0 {
-        return;
-    }
-    let metrics = stage_metrics(stats.audio_seconds, stats.wall_seconds);
-    let audio_encoder_seconds = if stats.audio_encoder_seconds > 0.0 {
-        stats.audio_encoder_seconds
-    } else {
-        stats.encode_seconds
-    };
-    let audio_encoder_speed = stats.encode_audio_seconds / audio_encoder_seconds.max(f64::EPSILON);
-    let prefill_ktok_s =
-        stats.prefill_tokens as f64 / stats.prefill_seconds.max(f64::EPSILON) / 1000.0;
-    let decode_ktok_s =
-        stats.decode_tokens as f64 / stats.decode_model_seconds.max(f64::EPSILON) / 1000.0;
-    tracing::info!(
-        target: "vasr_transcribe::pipeline",
-        "asr | jobs={} segs={} audio={:.1}s wall={:.1}s speed={:.1}x audio_encoder_compute={:.1}s/{:.1}x prefill_compute={:.1}s tokens={} {:.1}ktok/s decode_compute={:.1}s tokens={} {:.1}ktok/s decode_calls={}",
-        stats.jobs,
-        stats.segments,
-        stats.audio_seconds,
-        stats.wall_seconds,
-        metrics.speedup,
-        audio_encoder_seconds,
-        audio_encoder_speed,
-        stats.prefill_seconds,
-        stats.prefill_tokens,
-        prefill_ktok_s,
-        stats.decode_model_seconds,
-        stats.decode_tokens,
-        decode_ktok_s,
-        stats.decode_steps
-    );
-}
-
-fn log_asr(kind: &'static str, jobs: usize, segments: usize, audio_s: f64, wall_s: f64) {
-    let speedup = audio_s / wall_s.max(f64::EPSILON);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "asr | {kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
-    );
-}
-
-fn log_asr_wave(kind: &'static str, jobs: usize, segments: usize, audio_s: f64, wall_s: f64) {
-    let speedup = audio_s / wall_s.max(f64::EPSILON);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "asr wave | mode=serve | source={kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
-    );
 }
 
 fn log_pipeline(job_count: usize, outcomes: &[TranscribeItemOutcome], wall_seconds: f64) {
@@ -3349,7 +4200,10 @@ fn log_pipeline(job_count: usize, outcomes: &[TranscribeItemOutcome], wall_secon
 
 fn outcome_from_result(
     index: usize,
+    channel: &'static str,
     audio_seconds: f64,
+    timing: TranscribeItemTiming,
+    spans: TranscribeItemSpans,
     result: Result<Timeline>,
 ) -> TranscribeItemOutcome {
     let bad_component = if result.is_err() {
@@ -3359,8 +4213,11 @@ fn outcome_from_result(
     };
     TranscribeItemOutcome {
         index,
+        channel,
         result,
         audio_seconds,
+        timing,
+        spans,
         bad_component,
     }
 }
@@ -3422,7 +4279,10 @@ mod tests {
         let job = LoadedJob {
             index: 0,
             request_item: None,
+            channel: "mono",
             waveform: Waveform::new(vec![0.0; 1024 * 1024 + 1], 16_000),
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             _queue_memory_permit: None,
         };
         assert_eq!(loaded_job_memory_permits(&job), 5);
@@ -3433,6 +4293,9 @@ mod tests {
         let message = Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
             job_index: 0,
             request_item: None,
+            channel: "mono",
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             job_audio_seconds: 1.0,
             speech_annotations: Vec::new(),
             segment_index: 0,
@@ -3447,8 +4310,11 @@ mod tests {
     fn vad_to_asr_error_messages_do_not_need_memory_permits() {
         let message = Err(TranscribeItemOutcome {
             index: 0,
+            channel: "mono",
             result: Err(anyhow::anyhow!("failed")),
             audio_seconds: 0.0,
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             bad_component: Some("vad"),
         });
         assert_eq!(vad_to_asr_message_memory_permits(&message), 0);
@@ -3507,12 +4373,18 @@ mod tests {
             AsrJob {
                 index: 0,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 prepared: VadPreparation::Speech(prepared_with_segments(&[(0, 100), (250, 400)])),
                 waveform: Waveform::new(vec![0.1; 8_000], 16_000),
             },
             AsrJob {
                 index: 1,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 prepared: VadPreparation::Speech(prepared_with_segments(&[(50, 200)])),
                 waveform: Waveform::new(vec![0.2; 8_000], 16_000),
             },
@@ -3542,6 +4414,9 @@ mod tests {
             AsrSegmentJob {
                 job_index: 7,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 job_audio_seconds: 1.0,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3552,6 +4427,9 @@ mod tests {
             AsrSegmentJob {
                 job_index: 7,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 job_audio_seconds: 1.0,
                 speech_annotations: Vec::new(),
                 segment_index: 1,
@@ -3582,6 +4460,7 @@ mod tests {
                 vec![ok_timeline],
             )),
             None,
+            None,
         );
         assert!(ok.is_empty());
 
@@ -3590,6 +4469,7 @@ mod tests {
             &segments[1..],
             Instant::now(),
             Err(anyhow::anyhow!("encoded feature failed")),
+            None,
             None,
         );
 
@@ -3612,6 +4492,9 @@ mod tests {
         let segments = vec![AsrSegmentJob {
             job_index: 11,
             request_item: None,
+            channel: "mono",
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             job_audio_seconds: 2.5,
             speech_annotations: Vec::new(),
             segment_index: 0,
@@ -3625,6 +4508,7 @@ mod tests {
             segments.as_slice(),
             Instant::now(),
             Err(anyhow::anyhow!("first encoded batch failed")),
+            None,
             None,
         );
 
@@ -3652,6 +4536,9 @@ mod tests {
         let jobs = vec![AsrJob {
             index: 0,
             request_item: None,
+            channel: "mono",
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
             prepared: VadPreparation::NoSpeech,
             waveform: Waveform::new(vec![0.1; 160], 16_000),
         }];
@@ -3693,6 +4580,7 @@ mod tests {
             asr_to_result_tx,
             stats,
             None,
+            None,
         );
 
         for index in 0..3usize {
@@ -3700,6 +4588,9 @@ mod tests {
                 AsrJob {
                     index,
                     request_item: None,
+                    channel: "mono",
+                    timing: TranscribeItemTiming::default(),
+                    spans: TranscribeItemSpans::default(),
                     prepared: VadPreparation::Disabled,
                     waveform: Waveform::new(vec![index as f32; 160], 16_000),
                 },
@@ -3742,12 +4633,16 @@ mod tests {
             asr_to_result_tx,
             stats,
             None,
+            None,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
             AsrSegmentJob {
                 job_index: 0,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3761,6 +4656,9 @@ mod tests {
             AsrJob {
                 index: 1,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
             },
@@ -3807,12 +4705,16 @@ mod tests {
             asr_to_result_tx,
             stats,
             None,
+            None,
         );
 
         vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
             AsrJob {
                 index: 0,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 prepared: VadPreparation::Disabled,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
             },
@@ -3822,6 +4724,9 @@ mod tests {
             AsrSegmentJob {
                 job_index: 1,
                 request_item: None,
+                channel: "mono",
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 job_audio_seconds: 0.01,
                 speech_annotations: Vec::new(),
                 segment_index: 0,
@@ -3860,17 +4765,17 @@ mod tests {
             TranscribeInput {
                 index: 10,
                 source: AudioSource::Url("file:///same.wav".to_string()),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
             TranscribeInput {
                 index: 11,
                 source: AudioSource::Url("file:///other.wav".to_string()),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
             TranscribeInput {
                 index: 12,
                 source: AudioSource::Url("file:///same.wav".to_string()),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
         ];
 
@@ -3888,17 +4793,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_transcribe_inputs_include_channel_in_key() {
+    fn duplicate_transcribe_inputs_include_mono_flag_in_key() {
         let inputs = vec![
             TranscribeInput {
                 index: 10,
                 source: AudioSource::Url("file:///same.wav".to_string()),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
             TranscribeInput {
                 index: 11,
                 source: AudioSource::Url("file:///same.wav".to_string()),
-                channel: AudioChannel::Left,
+                mono: false,
             },
         ];
 
@@ -3926,20 +4831,38 @@ mod tests {
             2,
         );
 
-        let loaded = load_transcribe_waveform(
-            &AudioLoader,
-            &AudioSource::Waveform(waveform),
-            &AudioLoadOptions::default(),
-            AudioChannel::Mono,
-        )?;
+        let loaded =
+            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), true)?;
 
-        assert_eq!(loaded.channels, 1);
-        assert_eq!(loaded.samples, vec![0.5, 0.75]);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "mono");
+        assert_eq!(loaded[0].1.channels, 1);
+        assert_eq!(loaded[0].1.samples, vec![2.0, 3.0]);
         Ok(())
     }
 
     #[test]
-    fn load_transcribe_waveform_extracts_requested_stereo_channel() -> anyhow::Result<()> {
+    fn load_transcribe_waveforms_preserves_source_sample_rate() -> anyhow::Result<()> {
+        let waveform = Waveform::new_with_channels(
+            vec![
+                1.0, 3.0, // frame 0
+                2.0, 4.0, // frame 1
+            ],
+            48_000,
+            2,
+        );
+
+        let loaded =
+            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), true)?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.sample_rate, 48_000);
+        assert_eq!(loaded[0].1.channels, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn load_transcribe_waveforms_splits_stereo_when_mono_is_false() -> anyhow::Result<()> {
         let waveform = Waveform::new_with_channels(
             vec![
                 1.0, 3.0, // frame 0
@@ -3949,23 +4872,16 @@ mod tests {
             2,
         );
 
-        let left = load_transcribe_waveform(
-            &AudioLoader,
-            &AudioSource::Waveform(waveform.clone()),
-            &AudioLoadOptions::default(),
-            AudioChannel::Left,
-        )?;
-        let right = load_transcribe_waveform(
-            &AudioLoader,
-            &AudioSource::Waveform(waveform),
-            &AudioLoadOptions::default(),
-            AudioChannel::Right,
-        )?;
+        let loaded =
+            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), false)?;
 
-        assert_eq!(left.channels, 1);
-        assert_eq!(left.samples, vec![0.25, 0.5]);
-        assert_eq!(right.channels, 1);
-        assert_eq!(right.samples, vec![0.75, 1.0]);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].0, "left");
+        assert_eq!(loaded[0].1.channels, 1);
+        assert_eq!(loaded[0].1.samples, vec![1.0, 2.0]);
+        assert_eq!(loaded[1].0, "right");
+        assert_eq!(loaded[1].1.channels, 1);
+        assert_eq!(loaded[1].1.samples, vec![3.0, 4.0]);
         Ok(())
     }
 
@@ -3983,12 +4899,12 @@ mod tests {
             TranscribeInput {
                 index: 0,
                 source: AudioSource::Url(format!("file://{}", first.display())),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
             TranscribeInput {
                 index: 1,
                 source: AudioSource::Url(format!("file://{}", second.display())),
-                channel: AudioChannel::Mono,
+                mono: true,
             },
         ];
 
@@ -4013,14 +4929,20 @@ mod tests {
         let outcomes = vec![
             TranscribeItemOutcome {
                 index: 10,
+                channel: "mono",
                 result: Ok(timeline),
                 audio_seconds: 1.25,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: None,
             },
             TranscribeItemOutcome {
                 index: 11,
+                channel: "mono",
                 result: Err(anyhow::anyhow!("loader failed")),
                 audio_seconds: 0.0,
+                timing: TranscribeItemTiming::default(),
+                spans: TranscribeItemSpans::default(),
                 bad_component: Some("loader"),
             },
         ];

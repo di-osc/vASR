@@ -38,7 +38,7 @@ impl Default for AudioLoadOptions {
 pub struct AudioLoader;
 
 impl AudioLoader {
-    pub fn load(&self, source: &AudioSource, options: &AudioLoadOptions) -> Result<Waveform> {
+    pub fn load_raw(&self, source: &AudioSource) -> Result<Waveform> {
         let waveform = match source {
             AudioSource::Path(path) => decode::decode_path_waveform(path)?,
             AudioSource::Url(url) => {
@@ -58,7 +58,11 @@ impl AudioLoader {
             }
             AudioSource::Waveform(waveform) => waveform.clone(),
         };
-        normalize_loaded_waveform(waveform, options)
+        Ok(waveform)
+    }
+
+    pub fn load(&self, source: &AudioSource, options: &AudioLoadOptions) -> Result<Waveform> {
+        normalize_loaded_waveform(self.load_raw(source)?, options)
     }
 }
 

@@ -20,6 +20,7 @@ use vasr::models::qwen3asr::{LoadOptions, Qwen3ASR};
 use vasr_data::AudioLoader;
 
 use crate::pipeline::AsyncTranscribePipeline;
+use crate::pipeline::GlobalAsyncTranscribePipeline;
 use crate::server::build_transcribe_service_from_parts;
 
 const DEFAULT_MAX_NUM_SEQS: usize = 256;
@@ -27,7 +28,7 @@ const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
-    /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B`, `Qwen/Qwen3-ASR-1.7B`, or a local directory.
+    /// Qwen3-ASR model: `Qwen3-ASR-0.6B` / `Qwen3-ASR-1.7B` auto-map to their repo ids, or pass a repo id / local directory directly.
     #[arg(long, default_value = DEFAULT_ASR_MODEL, env = "VASR_MODEL")]
     pub model: String,
 
@@ -42,10 +43,6 @@ pub struct CommonModelArgs {
     /// Enable in-situ quantization, for example q8_0.
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
-
-    /// Maximum decode tokens per request.
-    #[arg(long, default_value_t = 4096, env = "VASR_MAX_NEW_TOKENS")]
-    pub max_new_tokens: usize,
 
     /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
     #[arg(
@@ -74,7 +71,7 @@ pub struct VadCliArgs {
     pub vad_min_speech_ms: u64,
 
     /// Minimum trailing silence in milliseconds before ending a speech segment.
-    #[arg(long, default_value_t = 500, env = "VASR_VAD_MIN_SILENCE_MS")]
+    #[arg(long, default_value_t = 800, env = "VASR_VAD_MIN_SILENCE_MS")]
     pub vad_min_silence_ms: u64,
 
     /// Maximum offline VAD segment duration in seconds before ASR.
@@ -138,14 +135,12 @@ pub fn init_logging(verbose: bool) {
 
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
-    let asr = load_asr_model(
-        &args.pipeline.model,
-        cuda_graph_max_batch(&args.pipeline.model),
-        false,
-    )?;
-    let offline = build_offline_pipeline(asr)?;
     let transcribe_service = build_transcribe_service_from_parts(
-        offline,
+        build_offline_pipeline(load_asr_model(
+            &args.pipeline.model,
+            cuda_graph_max_batch(&args.pipeline.model),
+            false,
+        )?)?,
         asr_options_from_pipeline(&args.pipeline, args.language.clone()),
         vad_options_from_pipeline(&args.pipeline),
     );
@@ -176,6 +171,25 @@ pub fn build_async_transcribe_pipeline(
     .with_vad_options(vad_options_from_pipeline(pipeline)))
 }
 
+pub fn build_global_transcribe_pipeline(
+    pipeline: &TranscribePipelineArgs,
+    language: Option<String>,
+) -> Result<Arc<GlobalAsyncTranscribePipeline>> {
+    validate_pipeline(pipeline)?;
+    let asr = load_asr_model(
+        &pipeline.model,
+        cuda_graph_max_batch(&pipeline.model),
+        false,
+    )?;
+    let offline = build_offline_pipeline(asr)?;
+    Ok(Arc::new(GlobalAsyncTranscribePipeline::start(
+        vasr_data::AudioLoader,
+        offline,
+        asr_options_from_pipeline(pipeline, language),
+        vad_options_from_pipeline(pipeline),
+    )))
+}
+
 pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {
     validate_model_args(&pipeline.model)?;
     validate_vad_args(&pipeline.vad)
@@ -202,7 +216,6 @@ fn asr_options_from_pipeline(
 ) -> AsrOptions {
     AsrOptions {
         language,
-        max_new_tokens: pipeline.model.max_new_tokens,
         max_batch_audio_sec: pipeline.max_batch_audio_sec,
         chunk_max_sec: None,
         ..AsrOptions::default()
@@ -221,7 +234,6 @@ mod tests {
                 cache_dir: vasr::modelscope_cache_dir(),
                 device: "auto".to_string(),
                 isq: None,
-                max_new_tokens: 4096,
                 gpu_memory_utilization: 0.65,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             },
@@ -229,13 +241,13 @@ mod tests {
             vad: VadCliArgs {
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
-                vad_min_silence_ms: 500,
+                vad_min_silence_ms: 800,
                 vad_max_segment_sec: 30.0,
             },
         };
 
         let opts = asr_options_from_pipeline(&pipeline, None);
-        assert_eq!(opts.max_new_tokens, 4096);
+        assert_eq!(opts.max_new_tokens, AsrOptions::default().max_new_tokens);
         assert_eq!(opts.max_batch_audio_sec, 60.0);
     }
 }
@@ -259,9 +271,6 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     }
     if args.cache_dir.as_os_str().is_empty() {
         bail!("--cache-dir must not be empty");
-    }
-    if args.max_new_tokens == 0 {
-        bail!("--max-new-tokens must be greater than zero");
     }
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");

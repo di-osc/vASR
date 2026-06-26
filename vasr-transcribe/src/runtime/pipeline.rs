@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use vasr_data::{Annotation, DurationMs, Timeline, Waveform};
+use vasr_data::{
+    Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, Timeline, Waveform, normalize_audio_input,
+};
 
 use crate::runtime::model::{AsrModel, AsrOptions, VadModel, VadOptions, VadSegment};
 
@@ -69,7 +71,8 @@ impl OfflinePipeline {
         let Some(vad) = &self.vad else {
             return Ok(VadPreparation::Disabled);
         };
-        let segments = vad.detect(waveform, vad_options)?;
+        let vad_waveform = prepare_waveform_for_vad(waveform)?;
+        let segments = vad.detect(&vad_waveform, vad_options)?;
         if segments.is_empty() {
             return Ok(VadPreparation::NoSpeech);
         }
@@ -139,4 +142,90 @@ pub fn offset_annotations(annotations: Vec<Annotation>, offset: DurationMs) -> V
             annotation
         })
         .collect()
+}
+
+fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
+    let mono = waveform.to_mono()?;
+    if mono.sample_rate == SAMPLE_RATE_HZ && mono.is_normalized {
+        return Ok(mono);
+    }
+    let samples = normalize_audio_input(&AudioInput::Waveform {
+        samples: &mono.samples,
+        sample_rate: mono.sample_rate,
+    })?;
+    Ok(Waveform::new(samples, SAMPLE_RATE_HZ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::sync::Mutex;
+    use vasr_data::TimeRange;
+
+    #[derive(Default)]
+    struct RecordingVad {
+        seen: Mutex<Vec<(u32, u16)>>,
+    }
+
+    impl VadModel for RecordingVad {
+        fn detect(&self, waveform: &Waveform, _options: &VadOptions) -> Result<Vec<VadSegment>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((waveform.sample_rate, waveform.channels));
+            Ok(vec![VadSegment {
+                range: TimeRange::new(DurationMs(0), DurationMs(500)),
+                probability: 0.9,
+            }])
+        }
+
+        fn new_stream(
+            &self,
+            _options: &VadOptions,
+        ) -> Result<Box<dyn crate::runtime::model::StreamingVadSession>> {
+            anyhow::bail!("streaming VAD is not used in this test")
+        }
+    }
+
+    struct NoopAsr;
+
+    impl AsrModel for NoopAsr {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn transcribe(
+            &self,
+            waveforms: &[Waveform],
+            _options: &AsrOptions,
+        ) -> Result<Vec<Timeline>> {
+            Ok(waveforms
+                .iter()
+                .map(|_| Timeline::new("test_audio"))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn vad_stage_resamples_for_vad_but_slices_original_waveform() -> Result<()> {
+        let vad = Arc::new(RecordingVad::default());
+        let pipeline = OfflinePipeline {
+            vad: Some(vad.clone()),
+            asr: Arc::new(NoopAsr),
+        };
+        let waveform = Waveform::new_with_channels(vec![0.0; 48_000 * 2], 48_000, 2);
+
+        let prepared = pipeline.prepare_vad_stage(&waveform, &VadOptions::default())?;
+
+        assert_eq!(vad.seen.lock().unwrap().as_slice(), &[(SAMPLE_RATE_HZ, 1)]);
+        let VadPreparation::Speech(prepared) = prepared else {
+            panic!("expected speech");
+        };
+        assert_eq!(prepared.slices.len(), 1);
+        assert_eq!(prepared.slices[0].sample_rate, 48_000);
+        assert_eq!(prepared.slices[0].channels, 2);
+        assert_eq!(prepared.slices[0].duration_ms(), 500.0);
+        Ok(())
+    }
 }

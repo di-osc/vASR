@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{Json, Router, routing::post};
 use axum::extract::DefaultBodyLimit;
-use vasr_data::{AudioChannel, AudioLoadOptions, AudioLoader, AudioSource};
+use axum::{Json, Router, routing::post};
+use vasr_data::AudioSource;
 
-use crate::pipeline::{GlobalAsyncTranscribePipeline, TranscribeInput};
+use crate::pipeline::{GlobalAsyncTranscribePipeline, TranscribeInput, TranscribeItemTiming};
 use crate::protocol::{
     InferenceData, InferencePerformance, TimingBreakdown, TranscribeRequest, TranscribeResponse,
 };
@@ -31,15 +31,22 @@ async fn handle_transcribe(
     Json(request): Json<TranscribeRequest>,
 ) -> Json<TranscribeResponse> {
     let start = Instant::now();
+    let request_id = short_request_id();
+    let request_items = request.inputs.len();
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "request_start | id={} items={}",
+        request_id,
+        request_items
+    );
     let mut inputs = Vec::new();
-    let mut routes = Vec::new();
-    let mut data_slots = vec![None; request.inputs.len()];
-    let mut request_metas = vec![RequestMeta::default(); request.inputs.len()];
-    let loader = AudioLoader;
-    let load_options = AudioLoadOptions::default();
+    let mut data_slots = vec![None; request_items];
+    let mut request_metas = vec![RequestMeta::default(); request_items];
+    let mut request_stats = RequestStats::default();
 
     for (index, input) in request.inputs.into_iter().enumerate() {
         request_metas[index].service_id = service.service_id.clone();
+        let mono = input.mono.unwrap_or(false);
         let source = if let Some(url) = input.url {
             AudioSource::Url(url)
         } else if let Some(b64) = input.b64_str {
@@ -49,104 +56,60 @@ async fn handle_transcribe(
                 request_metas[index].service_id.clone(),
                 "loader",
                 "必须提供 url 或 b64_str 之一".to_string(),
-                request_metas[index].loader_seconds,
-                0.0,
+                TranscribeItemTiming::default(),
                 0.0,
             ));
             continue;
         };
-        let load_start = Instant::now();
-        let waveform = match load_waveform(loader.clone(), source, load_options.clone()).await {
-            Ok(waveform) => {
-                request_metas[index].loader_seconds += load_start.elapsed().as_secs_f64();
-                waveform
-            }
-            Err(error) => {
-                request_metas[index].loader_seconds += load_start.elapsed().as_secs_f64();
-                data_slots[index] = Some(error_data(
-                    request_metas[index].service_id.clone(),
-                    "loader",
-                    error.to_string(),
-                    request_metas[index].loader_seconds,
-                    0.0,
-                    0.0,
-                ));
-                continue;
-            }
-        };
-        let channels = waveform.channels;
-        if input.mono == Some(true) || channels <= 1 {
-            let task_index = inputs.len();
-            inputs.push(TranscribeInput {
-                index: task_index,
-                source: AudioSource::Waveform(waveform),
-                channel: AudioChannel::Mono,
-            });
-            routes.push(TaskRoute {
-                request_index: index,
-                channel: "mono",
-            });
-        } else {
-            let task_index = inputs.len();
-            inputs.push(TranscribeInput {
-                index: task_index,
-                source: AudioSource::Waveform(waveform.clone()),
-                channel: AudioChannel::Left,
-            });
-            routes.push(TaskRoute {
-                request_index: index,
-                channel: "left",
-            });
-            let task_index = inputs.len();
-            inputs.push(TranscribeInput {
-                index: task_index,
-                source: AudioSource::Waveform(waveform),
-                channel: AudioChannel::Right,
-            });
-            routes.push(TaskRoute {
-                request_index: index,
-                channel: "right",
-            });
-        }
+        inputs.push(TranscribeInput {
+            index,
+            source,
+            mono,
+        });
     }
 
-    let pipeline_start = Instant::now();
-    let outcomes = service.pipeline.run(inputs).await;
-    let pipeline_wall = pipeline_start.elapsed().as_secs_f64();
+    let outcomes = service
+        .pipeline
+        .run_with_log_id(request_id.clone(), inputs)
+        .await;
     let mut total_audio_duration_seconds = 0.0;
+    let mut component_timing = TranscribeItemTiming::default();
 
     for outcome in outcomes {
-        let Some(route) = routes.get(outcome.index).copied() else {
+        if outcome.channel == "mono" {
+            request_stats.mono += 1;
+        } else if outcome.channel == "left" {
+            request_stats.stereo += 1;
+        }
+        request_stats.channels += 1;
+        let Some(meta) = request_metas.get(outcome.index) else {
             continue;
         };
-        let meta = &request_metas[route.request_index];
         match outcome.result {
             Ok(timeline) => {
                 total_audio_duration_seconds += outcome.audio_seconds;
+                component_timing.add_scaled(outcome.timing, 1.0);
                 let mut channel_data = InferenceData::from_timeline_channel(
                     meta.service_id.clone(),
                     &timeline,
-                    route.channel,
+                    outcome.channel,
                 );
-                fill_timing_fields(
-                    &mut channel_data,
-                    meta.loader_seconds,
-                    pipeline_wall,
-                    outcome.audio_seconds,
-                );
-                merge_channel_data(&mut data_slots[route.request_index], channel_data);
+                fill_timing_fields(&mut channel_data, outcome.timing, outcome.audio_seconds);
+                merge_channel_data(&mut data_slots[outcome.index], channel_data);
             }
-            Err(error) => merge_channel_data(
-                &mut data_slots[route.request_index],
-                error_data(
-                    meta.service_id.clone(),
-                    outcome.bad_component.unwrap_or("recognizer"),
-                    format!("{}: {}", route.channel, error),
-                    meta.loader_seconds,
-                    pipeline_wall,
-                    outcome.audio_seconds,
-                ),
-            ),
+            Err(error) => {
+                component_timing.add_scaled(outcome.timing, 1.0);
+                merge_channel_data(
+                    &mut data_slots[outcome.index],
+                    error_data(
+                        meta.service_id.clone(),
+                        outcome.bad_component.unwrap_or("recognizer"),
+                        format!("{}: {}", outcome.channel, error),
+                        outcome.timing,
+                        outcome.audio_seconds,
+                    ),
+                )
+            }
         }
     }
     let data = data_slots
@@ -158,8 +121,7 @@ async fn handle_transcribe(
                     request_metas[index].service_id.clone(),
                     "loader",
                     "no transcribe outcome".to_string(),
-                    request_metas[index].loader_seconds,
-                    pipeline_wall,
+                    TranscribeItemTiming::default(),
                     0.0,
                 )
             })
@@ -191,13 +153,17 @@ async fn handle_transcribe(
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "request | items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4}",
+        "request_done | id={} | batch items={} bad={} audio={:.1}s wall={:.3}s speed={:.1}x rtf={:.4} | ch mono={} stereo={} total={}",
+        request_id,
         performance.num_items,
         bad,
         performance.total_audio_duration_seconds,
         performance.batch_wall_seconds,
         performance.speedup,
-        performance.rtf
+        performance.rtf,
+        request_stats.mono,
+        request_stats.stereo,
+        request_stats.channels
     );
     Json(TranscribeResponse {
         data,
@@ -205,26 +171,20 @@ async fn handle_transcribe(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TaskRoute {
-    request_index: usize,
-    channel: &'static str,
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestStats {
+    mono: usize,
+    stereo: usize,
+    channels: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 struct RequestMeta {
     service_id: String,
-    loader_seconds: f64,
 }
 
-async fn load_waveform(
-    loader: AudioLoader,
-    source: AudioSource,
-    load_options: AudioLoadOptions,
-) -> anyhow::Result<vasr_data::Waveform> {
-    tokio::task::spawn_blocking(move || loader.load(&source, &load_options))
-        .await
-        .map_err(|error| anyhow::anyhow!("loader join error: {error}"))?
+fn short_request_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
 fn merge_channel_data(slot: &mut Option<InferenceData>, channel_data: InferenceData) {
@@ -282,29 +242,25 @@ fn merge_channel_data(slot: &mut Option<InferenceData>, channel_data: InferenceD
     existing.timings.audio += channel_data.timings.audio;
 }
 
-fn fill_timing_fields(
-    data: &mut InferenceData,
-    loader_seconds: f64,
-    pipeline_seconds: f64,
-    audio_seconds: f64,
-) {
+fn fill_timing_fields(data: &mut InferenceData, timing: TranscribeItemTiming, audio_seconds: f64) {
+    let pipeline_seconds = timing.vad_seconds + timing.asr_seconds;
     data.timings = TimingBreakdown {
-        total: loader_seconds + pipeline_seconds,
-        loader: loader_seconds,
+        total: timing.loader_seconds + pipeline_seconds,
+        loader: timing.loader_seconds,
         pipeline: pipeline_seconds,
         audio: audio_seconds,
     };
     data.spent_seconds = data.timings.total;
-    data.spent_details.loader = loader_seconds;
-    data.spent_details.recognizer = pipeline_seconds;
+    data.spent_details.loader = timing.loader_seconds;
+    data.spent_details.detector = timing.vad_seconds;
+    data.spent_details.recognizer = timing.asr_seconds;
 }
 
 fn error_data(
     service_id: String,
     component: &str,
     reason: String,
-    loader_seconds: f64,
-    pipeline_seconds: f64,
+    timing: TranscribeItemTiming,
     audio_seconds: f64,
 ) -> InferenceData {
     let mut data = InferenceData {
@@ -318,7 +274,7 @@ fn error_data(
         bad_reason: Some(reason),
         bad_component: Some(component.to_string()),
     };
-    fill_timing_fields(&mut data, loader_seconds, pipeline_seconds, audio_seconds);
+    fill_timing_fields(&mut data, timing, audio_seconds);
     data
 }
 
@@ -351,6 +307,7 @@ mod tests {
             service_id: String::new(),
             spent_seconds: 0.0,
             spent_details: Default::default(),
+            timings: Default::default(),
             text: TextResult::default(),
             sentences: vec![SentenceResult {
                 text: text.to_string(),
