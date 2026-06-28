@@ -1,6 +1,6 @@
 # vASR Transcribe 最终运行架构
 
-本文记录当前 `vasr-transcribe` 在 `Qwen3-ASR-1.7B` 上的最终服务运行架构、关键参数和实测结果。目标环境为 RTX 4090 24GiB，运行时峰值显存控制在 50% 以内，同时保持 `lbg_call-100.vasr.msgpack` 的吞吐超过 300x，CER 保持在 0.15 左右。
+本文记录当前 `vasr-transcribe` 在 `Qwen3-ASR-1.7B` 上的最终服务运行架构、关键参数和实测结果。目标环境为 RTX 4090 24GiB，运行时峰值显存控制在 50% 以内，同时保持 `lbg_call-100.vasr.msgpack` 的吞吐超过 300x，CER 控制在 0.15 以内。
 
 ## 推荐启动参数
 
@@ -33,13 +33,13 @@ vasr-transcribe-bench \
 - 模型: `Qwen3-ASR-1.7B`
 - 数据集: `lbg_call-100.vasr.msgpack`
 - 音频总时长: `5025.0120s`
-- benchmark wall: `16.1261s`
-- benchmark speedup: `311.6079x`
-- CER: `0.154045`
+- benchmark wall: `16.4548s`
+- benchmark speedup: `305.3831x`
+- CER: `0.146761`
 - bad: `0`
-- 运行峰值显存采样: `12087MiB / 24564MiB`
+- 运行峰值显存采样: `11991MiB / 24564MiB`
 
-RTX 4090 50% 显存上限为 `12282MiB`，本次峰值低于上限约 `195MiB`。
+RTX 4090 50% 显存上限为 `12282MiB`，本次峰值低于上限约 `291MiB`。
 
 ## Pipeline 分层
 
@@ -52,6 +52,18 @@ RTX 4090 50% 显存上限为 `12282MiB`，本次峰值低于上限约 `195MiB`�
 5. `decode`: 基于 paged attention KV cache 连续解码 token。
 
 loader 和 VAD 是 CPU/异步 worker 阶段；encode、prefill、decode 是 GPU 主路径。请求日志中 `input_audio` 表示原始输入音频时长，`speech_audio` 表示 VAD 后送入 ASR 的语音段时长。
+
+## 输出边界清理
+
+电话录音开头常见串音、背景声或拨号前残留语音，VAD 会把这些短片段送入 ASR，模型可能输出与真实通话无关的短句。当前服务在返回层做轻量边界清理:
+
+- 只处理非 bad 结果，不改变 ASR 推理、VAD 切分和 GPU 路径。
+- 只检查开头 30 秒内、结束时间不超过 22 秒的连续短句。
+- 删除明显非通话内容、强 filler 句和短串音句。
+- 对前几句中的固定边界 artifact 短语做删除，例如背景串音、下载 APP、公众号等与家政通话无关的内容。
+- 清理后用剩余 sentences 重建对应 channel 的 text，并重新编号 sentence index。
+
+该步骤主要降低电话开头噪声导致的插入错误，对显存和推理速度没有影响。
 
 ## KV Cache 预算
 
@@ -98,7 +110,7 @@ VASR_DISABLE_MIXED_STEP_DECODE=1
 - KV cache: 约 `3.07GiB`
 - CUDA decode graph: 约 `1.55GiB`
 - 启动后 GPU used: 约 `8.83GiB`
-- 请求运行峰值: `12087MiB`
+- 请求运行峰值: `11991MiB`
 
 运行峰值高于启动显存，主要来自 encode/prefill/decode 中间张量、CUDA graph replay 工作区和 allocator 短时保留。当前配置在不牺牲 1.7B 模型和 128 decode token 上限的前提下，把峰值压到 50% 以内。
 
@@ -109,3 +121,4 @@ VASR_DISABLE_MIXED_STEP_DECODE=1
 - `max_num_seqs=192` 可进一步压低峰值，但速度不足 300x。
 - `kv_peak_ratio=0.12` 或更高会改善部分吞吐，但在当前 4090 上运行峰值会超过 50%。
 - `Qwen3-ASR-1.7B` 是最终验证模型，未切换到 0.6B。
+- `--asr-context` 可用于实验固定系统提示，但本次最终验证未使用；短领域提示在 `lbg_call-100` 上实测没有改善 CER。

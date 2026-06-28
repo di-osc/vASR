@@ -76,6 +76,10 @@ pub struct CommonModelArgs {
     )]
     pub max_new_tokens: usize,
 
+    /// Fixed ASR system context inserted before the audio prompt.
+    #[arg(long = "asr-context", default_value = "", env = "VASR_ASR_CONTEXT")]
+    pub asr_context: String,
+
     /// Maximum hotword/context tokens reserved in every ASR KV-cache sequence.
     #[arg(
         long = "max-hotword-tokens",
@@ -276,6 +280,7 @@ fn asr_options_from_pipeline(
 ) -> AsrOptions {
     AsrOptions {
         language,
+        context: pipeline.model.asr_context.clone(),
         max_new_tokens: pipeline.model.max_new_tokens,
         decode_max_seqs: pipeline.model.max_num_seqs,
         max_batch_audio_sec: pipeline.max_batch_audio_sec,
@@ -305,6 +310,7 @@ mod tests {
                 isq: None,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
                 max_new_tokens: AsrOptions::default().max_new_tokens,
+                asr_context: String::new(),
                 max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
                 kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
             },
@@ -322,6 +328,36 @@ mod tests {
         let opts = asr_options_from_pipeline(&pipeline, None);
         assert_eq!(opts.max_new_tokens, AsrOptions::default().max_new_tokens);
         assert_eq!(opts.max_batch_audio_sec, 60.0);
+        assert!(opts.context.is_empty());
+    }
+
+    #[test]
+    fn asr_context_is_passed_to_runtime_options() {
+        let pipeline = TranscribePipelineArgs {
+            model: CommonModelArgs {
+                model: DEFAULT_ASR_MODEL.to_string(),
+                cache_dir: vasr::modelscope_cache_dir(),
+                device: "auto".to_string(),
+                isq: None,
+                max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+                max_new_tokens: AsrOptions::default().max_new_tokens,
+                asr_context: "家政电话".to_string(),
+                max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+                kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
+            },
+            max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
+            num_load_workers: 0,
+            num_vad_workers: 0,
+            vad: VadCliArgs {
+                vad_threshold: 0.6,
+                vad_min_speech_ms: 250,
+                vad_min_silence_ms: 800,
+                vad_max_segment_sec: 30.0,
+            },
+        };
+
+        let opts = asr_options_from_pipeline(&pipeline, None);
+        assert_eq!(opts.context, "家政电话");
     }
 
     #[test]
@@ -333,6 +369,7 @@ mod tests {
             isq: None,
             max_num_seqs: 0,
             max_new_tokens: AsrOptions::default().max_new_tokens,
+            asr_context: String::new(),
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
             kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
         };
@@ -350,6 +387,7 @@ mod tests {
             isq: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             max_new_tokens: AsrOptions::default().max_new_tokens,
+            asr_context: String::new(),
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
             kv_peak_ratio: 1.5,
         };
