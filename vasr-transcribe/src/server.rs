@@ -5,7 +5,9 @@ use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
 
-use crate::pipeline::{GlobalAsyncTranscribePipeline, TranscribeInput, TranscribeItemTiming};
+use crate::pipeline::{
+    GlobalAsyncTranscribePipeline, PipelineWorkerOptions, TranscribeInput, TranscribeItemTiming,
+};
 use crate::protocol::{
     InferenceData, InferencePerformance, TimingBreakdown, TranscribeRequest, TranscribeResponse,
 };
@@ -33,27 +35,28 @@ async fn handle_transcribe(
     let start = Instant::now();
     let request_id = short_request_id();
     let request_items = request.inputs.len();
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "{} {:<7} {:<5} | items={}",
-        request_id,
-        "request",
-        "START",
-        request_items
-    );
     let mut inputs = Vec::new();
     let mut data_slots = vec![None; request_items];
     let mut request_metas = vec![RequestMeta::default(); request_items];
     let mut request_stats = RequestStats::default();
+    let mut start_stats = RequestStartStats::default();
 
     for (index, input) in request.inputs.into_iter().enumerate() {
         request_metas[index].service_id = service.service_id.clone();
         let mono = input.mono.unwrap_or(false);
+        if mono {
+            start_stats.mono_true += 1;
+        } else {
+            start_stats.mono_false += 1;
+        }
         let source = if let Some(url) = input.url {
+            start_stats.url += 1;
             AudioSource::Url(url)
         } else if let Some(b64) = input.b64_str {
+            start_stats.base64 += 1;
             AudioSource::Base64(b64)
         } else {
+            start_stats.missing += 1;
             data_slots[index] = Some(error_data(
                 request_metas[index].service_id.clone(),
                 "loader",
@@ -69,6 +72,19 @@ async fn handle_transcribe(
             mono,
         });
     }
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{} {:<7} {:<5} | items={} src=url:{} base64:{} missing:{} mono=true:{} false:{}",
+        request_id,
+        "request",
+        "START",
+        request_items,
+        start_stats.url,
+        start_stats.base64,
+        start_stats.missing,
+        start_stats.mono_true,
+        start_stats.mono_false
+    );
 
     let outcomes = service
         .pipeline
@@ -100,6 +116,16 @@ async fn handle_transcribe(
                 merge_channel_data(&mut data_slots[outcome.index], channel_data);
             }
             Err(error) => {
+                tracing::error!(
+                    target: "vasr_transcribe::serve",
+                    "{} request BAD   | index={} channel={} component={} audio={:.1}s reason={}",
+                    request_id,
+                    outcome.index,
+                    outcome.channel,
+                    outcome.bad_component.unwrap_or("recognizer"),
+                    outcome.audio_seconds,
+                    error
+                );
                 component_timing.add_scaled(outcome.timing, 1.0);
                 merge_channel_data(
                     &mut data_slots[outcome.index],
@@ -179,6 +205,15 @@ struct RequestStats {
     mono: usize,
     stereo: usize,
     channels: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestStartStats {
+    url: usize,
+    base64: usize,
+    missing: usize,
+    mono_true: usize,
+    mono_false: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,11 +381,13 @@ pub fn build_transcribe_service_from_parts(
     offline: Arc<crate::runtime::OfflinePipeline>,
     asr_options: AsrOptions,
     vad_options: VadOptions,
+    worker_options: PipelineWorkerOptions,
 ) -> Arc<TranscribeService> {
     build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start(
         vasr_data::AudioLoader,
         offline,
         asr_options,
         vad_options,
+        worker_options,
     )))
 }

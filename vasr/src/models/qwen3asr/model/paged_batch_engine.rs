@@ -4,7 +4,7 @@
 //! `paged_batch_decode_step` directly to drive batch membership across steps.
 
 use anyhow::{Result, bail};
-use candle_core::{Device, Tensor};
+use candle_core::{Device, IndexOp, Tensor};
 
 use crate::model::attention;
 use crate::model::generation::{
@@ -15,11 +15,19 @@ use crate::model::paged_cache_runtime::{PagedCacheRuntime, SharedPagedCacheRunti
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
+#[cfg(feature = "cuda-graph")]
+use vasr_paged_attn::DecodeGraphOutputKind;
 use vasr_quant::isq_linear::set_linear_is_prefill;
 
 const DECODE_TOKEN_REPEAT_LIMIT: usize = 32;
 const DECODE_PATTERN_REPEAT_LIMIT: usize = 16;
 const DECODE_MAX_REPEAT_PATTERN_LEN: usize = 8;
+
+enum DecodeStepOutput {
+    Logits(Tensor),
+    NextIds(Tensor),
+    NextIdCandidates(Tensor),
+}
 
 fn has_repeated_tail(tokens: &[u32]) -> bool {
     if tokens.len() < DECODE_TOKEN_REPEAT_LIMIT {
@@ -295,7 +303,7 @@ pub fn paged_batch_decode_slots_at_step(
         device,
     )?;
 
-    let logits_new = paged_batch_decode_forward(
+    let decode_output = paged_batch_decode_forward(
         thinker,
         runtime,
         device,
@@ -303,7 +311,7 @@ pub fn paged_batch_decode_slots_at_step(
         &position_ids_new,
         &input_metadata,
     )?;
-    let next_active = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, active_batch)?;
+    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
     for (slot_idx, &i) in active_indices.iter().enumerate() {
         slots[i].next_id = *next_active
             .get(slot_idx)
@@ -439,7 +447,7 @@ pub fn paged_batch_decode_slots_at_step_shared(
         step,
         device,
     )?;
-    let logits_new = paged_batch_decode_forward_shared(
+    let decode_output = paged_batch_decode_forward_shared(
         thinker,
         runtime,
         &cache,
@@ -447,7 +455,7 @@ pub fn paged_batch_decode_slots_at_step_shared(
         &position_ids_new,
         &input_metadata,
     )?;
-    let next_active = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, active_batch)?;
+    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
     for (slot_idx, &i) in active_indices.iter().enumerate() {
         slots[i].next_id = *next_active
             .get(slot_idx)
@@ -456,6 +464,158 @@ pub fn paged_batch_decode_slots_at_step_shared(
     }
 
     let _ = eos_fill_id;
+    Ok(())
+}
+
+pub fn paged_batch_decode_slots_mixed_steps_shared(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    runtime: &SharedPagedCacheRuntime,
+    slots: &mut [PagedDecodeSlot],
+    slot_indices: &[usize],
+    eos_token_ids: &[u32],
+) -> Result<()> {
+    if slot_indices.is_empty() {
+        return Ok(());
+    }
+    let mut forward_indices = Vec::with_capacity(slot_indices.len());
+
+    let (cache, block_tables_active, prompt_lens_active_usize, starts, context_lens) = {
+        let runtime_guard = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        let block_size = runtime_guard.manager().block_size();
+        for &i in slot_indices {
+            let slot = &mut slots[i];
+            if slot.finished {
+                continue;
+            }
+            let num_tokens =
+                decode_step_required_tokens(slot.prompt_len_usize, slot.generated.len())?;
+            if num_tokens > slot.token_capacity {
+                bail!(
+                    "paged decode exceeded allocated KV capacity: request_id={} needed_tokens={} capacity_tokens={} prompt_tokens={} generated_tokens={}",
+                    slot.request_id,
+                    num_tokens,
+                    slot.token_capacity,
+                    slot.prompt_len_usize,
+                    slot.generated.len()
+                );
+            }
+            let allocated_blocks = runtime_guard.manager().blocks_for_request(slot.request_id);
+            let required_blocks = num_tokens.div_ceil(block_size);
+            if allocated_blocks < required_blocks {
+                bail!(
+                    "paged decode missing preallocated KV blocks: request_id={} needed_blocks={} allocated_blocks={} needed_tokens={} capacity_tokens={}",
+                    slot.request_id,
+                    required_blocks,
+                    allocated_blocks,
+                    num_tokens,
+                    slot.token_capacity
+                );
+            }
+
+            let tok = slot.next_id;
+            if eos_token_ids.contains(&tok) {
+                slot.finished = true;
+                slot.decode_step = slot.decode_step.saturating_add(1);
+                continue;
+            }
+            slot.generated.push(tok);
+            if has_repeated_tail(&slot.generated) {
+                slot.finished = true;
+                slot.decode_step = slot.decode_step.saturating_add(1);
+                continue;
+            }
+            forward_indices.push(i);
+        }
+
+        if forward_indices.is_empty() {
+            return Ok(());
+        }
+
+        let request_ids: Vec<usize> = forward_indices
+            .iter()
+            .map(|&i| slots[i].request_id)
+            .collect();
+        let block_tables_active = runtime_guard.block_tables_for(&request_ids)?;
+        let prompt_lens_active_usize: Vec<usize> = forward_indices
+            .iter()
+            .map(|&i| slots[i].prompt_len_usize)
+            .collect();
+        let mut starts = Vec::with_capacity(forward_indices.len());
+        let mut context_lens = Vec::with_capacity(forward_indices.len());
+        for &i in &forward_indices {
+            let start = slots[i]
+                .prompt_len_usize
+                .checked_add(slots[i].decode_step)
+                .ok_or_else(|| anyhow::anyhow!("paged decode start overflow"))?;
+            starts.push(start);
+            context_lens.push(
+                start
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("paged decode context length overflow"))?,
+            );
+        }
+        (
+            runtime_guard.cache_clone(),
+            block_tables_active,
+            prompt_lens_active_usize,
+            starts,
+            context_lens,
+        )
+    };
+
+    let tokens_in: Vec<u32> = forward_indices
+        .iter()
+        .map(|&i| {
+            slots[i]
+                .generated
+                .last()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing generated token for slot {i}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let active_batch = forward_indices.len();
+    let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
+    let pos: Vec<i64> = forward_indices
+        .iter()
+        .map(|&i| {
+            let step = i64::try_from(slots[i].decode_step)
+                .map_err(|_| anyhow::anyhow!("decode step overflows i64"))?;
+            slots[i]
+                .prompt_len_i64
+                .checked_add(step)
+                .ok_or_else(|| anyhow::anyhow!("position id overflow"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let position_ids_new = Tensor::from_vec(pos, (active_batch, 1usize), device)?
+        .unsqueeze(0)?
+        .broadcast_as((3usize, active_batch, 1usize))?;
+    let input_metadata = cache.input_metadata_from_block_tables(
+        &block_tables_active,
+        starts.as_slice(),
+        1,
+        context_lens.as_slice(),
+        device,
+    )?;
+    let decode_output = paged_batch_decode_forward_shared(
+        thinker,
+        runtime,
+        &cache,
+        &input_ids_new,
+        &position_ids_new,
+        &input_metadata,
+    )?;
+    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
+    for (slot_idx, &i) in forward_indices.iter().enumerate() {
+        slots[i].next_id = *next_active
+            .get(slot_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing argmax for slot index {slot_idx}"))?;
+        slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+    }
+
+    let _ = prompt_lens_active_usize;
     Ok(())
 }
 
@@ -1285,7 +1445,7 @@ pub fn paged_batch_decode_step(
         device,
     )?;
 
-    let logits_new = paged_batch_decode_forward(
+    let decode_output = paged_batch_decode_forward(
         thinker,
         runtime,
         device,
@@ -1293,8 +1453,7 @@ pub fn paged_batch_decode_step(
         &position_ids_new,
         &input_metadata,
     )?;
-    let next_active = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, active_batch)?;
-    drop(logits_new);
+    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
     drop(input_metadata);
     drop(position_ids_new);
     drop(input_ids_new);
@@ -1315,7 +1474,7 @@ fn paged_batch_decode_forward(
     input_ids_new: &Tensor,
     position_ids_new: &Tensor,
     input_metadata: &PagedInputMetadata,
-) -> Result<Tensor> {
+) -> Result<DecodeStepOutput> {
     #[cfg(feature = "cuda-graph")]
     {
         if runtime.cuda_decode_graph_enabled_for(input_ids_new, input_metadata)? {
@@ -1325,7 +1484,15 @@ fn paged_batch_decode_forward(
                 position_ids_new,
                 input_metadata,
             ) {
-                Ok(logits) => return Ok(logits),
+                Ok(output) => {
+                    return Ok(match output.kind {
+                        DecodeGraphOutputKind::Logits => DecodeStepOutput::Logits(output.tensor),
+                        DecodeGraphOutputKind::NextIds => DecodeStepOutput::NextIds(output.tensor),
+                        DecodeGraphOutputKind::NextIdCandidates => {
+                            DecodeStepOutput::NextIdCandidates(output.tensor)
+                        }
+                    });
+                }
                 Err(err) => {
                     tracing::warn!("CUDA decode graph key disabled after decode error: {err}");
                     if let Err(disable_err) =
@@ -1340,13 +1507,13 @@ fn paged_batch_decode_forward(
         }
     }
 
-    paged_batch_decode_forward_without_graph(
+    Ok(DecodeStepOutput::Logits(paged_batch_decode_forward_without_graph(
         thinker,
         runtime.cache(),
         input_ids_new,
         position_ids_new,
         input_metadata,
-    )
+    )?))
 }
 
 fn paged_batch_decode_forward_shared(
@@ -1356,7 +1523,7 @@ fn paged_batch_decode_forward_shared(
     input_ids_new: &Tensor,
     position_ids_new: &Tensor,
     input_metadata: &PagedInputMetadata,
-) -> Result<Tensor> {
+) -> Result<DecodeStepOutput> {
     #[cfg(feature = "cuda-graph")]
     {
         let graph_result = {
@@ -1371,7 +1538,13 @@ fn paged_batch_decode_forward_shared(
                         position_ids_new,
                         input_metadata,
                     ) {
-                        Ok(logits) => Ok(logits),
+                        Ok(output) => Ok(match output.kind {
+                            DecodeGraphOutputKind::Logits => DecodeStepOutput::Logits(output.tensor),
+                            DecodeGraphOutputKind::NextIds => DecodeStepOutput::NextIds(output.tensor),
+                            DecodeGraphOutputKind::NextIdCandidates => {
+                                DecodeStepOutput::NextIdCandidates(output.tensor)
+                            }
+                        }),
                         Err(err) => {
                             tracing::warn!(
                                 "CUDA decode graph key disabled after decode error: {err}"
@@ -1391,18 +1564,73 @@ fn paged_batch_decode_forward_shared(
                 None
             }
         };
-        if let Some(Ok(logits)) = graph_result {
-            return Ok(logits);
+        if let Some(Ok(output)) = graph_result {
+            return Ok(output);
         }
     }
 
-    paged_batch_decode_forward_without_graph(
+    Ok(DecodeStepOutput::Logits(paged_batch_decode_forward_without_graph(
         thinker,
         cache,
         input_ids_new,
         position_ids_new,
         input_metadata,
-    )
+    )?))
+}
+
+fn next_token_ids_from_decode_output(
+    output: DecodeStepOutput,
+    active_batch: usize,
+) -> Result<Vec<u32>> {
+    match output {
+        DecodeStepOutput::Logits(logits) => {
+            argmax_token_ids_from_logits(&logits.squeeze(1)?, active_batch)
+        }
+        DecodeStepOutput::NextIds(next_ids) => {
+            let next_ids = next_ids.to_dtype(candle_core::DType::U32)?;
+            let ids = next_ids.to_vec1::<u32>()?;
+            if ids.len() != active_batch {
+                bail!(
+                    "CUDA graph next-id output length mismatch: got {} expected {active_batch}",
+                    ids.len()
+                );
+            }
+            Ok(ids)
+        }
+        DecodeStepOutput::NextIdCandidates(candidates) => {
+            let dims = candidates.dims();
+            if dims.len() != 3 || dims[0] != 2 || dims[1] != active_batch {
+                bail!(
+                    "CUDA graph chunked argmax candidates shape mismatch: got {dims:?}, expected [2,{active_batch},chunks]"
+                );
+            }
+            let chunks = dims[2];
+            let values = candidates.i(0usize)?.to_vec2::<f32>()?;
+            let ids = candidates.i(1usize)?.to_vec2::<f32>()?;
+            let mut next = Vec::with_capacity(active_batch);
+            for row in 0..active_batch {
+                let mut best_value = f32::NEG_INFINITY;
+                let mut best_id = 0u32;
+                for chunk in 0..chunks {
+                    let value = values
+                        .get(row)
+                        .and_then(|row_values| row_values.get(chunk))
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("missing chunked argmax value row={row} chunk={chunk}"))?;
+                    if value > best_value {
+                        best_value = value;
+                        best_id = ids
+                            .get(row)
+                            .and_then(|row_ids| row_ids.get(chunk))
+                            .copied()
+                            .unwrap_or(0.0) as u32;
+                    }
+                }
+                next.push(best_id);
+            }
+            Ok(next)
+        }
+    }
 }
 
 fn paged_batch_decode_forward_without_graph(

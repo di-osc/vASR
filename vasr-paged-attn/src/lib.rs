@@ -18,7 +18,9 @@ pub use paged_cache_runtime::{
 pub use paged_kv_cache::{PAD_SLOT_ID, PagedInputMetadata, PagedKvCache};
 
 #[cfg(feature = "cuda-graph")]
-pub use cuda_graph::{CUDA_DECODE_GRAPH_CONTEXT_TOKENS, CUDA_DECODE_GRAPH_MAX_BATCH};
+pub use cuda_graph::{
+    CUDA_DECODE_GRAPH_CONTEXT_TOKENS, CUDA_DECODE_GRAPH_MAX_BATCH, DecodeGraphOutputKind,
+};
 
 #[cfg(feature = "paged-attn")]
 pub use mistralrs_paged_attn;

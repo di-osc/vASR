@@ -155,6 +155,8 @@ pub struct GenerationTimings {
     pub prefill_tokens: usize,
     /// Time spent in the token-by-token decode loop (including mRoPE indices).
     pub decode_us: u64,
+    /// Time spent waiting after prefill has completed before a sequence is attached to decode.
+    pub decode_queue_us: u64,
     /// Time spent creating the one-token decode input tensor.
     pub decode_token_tensor_us: u64,
     /// Time spent embedding the one-token decode input.

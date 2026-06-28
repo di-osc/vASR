@@ -312,6 +312,45 @@ impl LinearX {
             Self::AfqLinear(linear) => linear.forward(x),
         }
     }
+
+    pub fn forward_chunked_argmax_candidates(
+        &self,
+        x: &Tensor,
+        chunk_size: usize,
+    ) -> Result<Option<Tensor>> {
+        let Self::Linear(linear) = self else {
+            return Ok(None);
+        };
+        if linear.bias().is_some() || chunk_size == 0 {
+            return Ok(None);
+        }
+        let weight = linear.weight();
+        let (out_dim, _in_dim) = weight.dims2()?;
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < out_dim {
+            let len = (out_dim - start).min(chunk_size);
+            let chunk_weight = weight.narrow(0, start, len)?;
+            let chunk_linear = Linear::new(chunk_weight, None);
+            let logits = chunk_linear.forward(x)?;
+            let logits = match logits.dims() {
+                [_, 1, _] => logits.squeeze(1)?,
+                [_, _] => logits,
+                dims => {
+                    candle_core::bail!(
+                        "chunked argmax expects logits shape (batch,vocab_chunk) or (batch,1,vocab_chunk), got {dims:?}"
+                    );
+                }
+            };
+            let values = logits.max(1)?.to_dtype(DType::F32)?;
+            let ids = logits.argmax(1usize)?.to_dtype(DType::F32)?;
+            let offset = Tensor::new(start as f32, x.device())?;
+            let ids = ids.broadcast_add(&offset)?;
+            chunks.push(Tensor::stack(&[values, ids], 0)?);
+            start = start.saturating_add(len);
+        }
+        Ok(Some(Tensor::stack(chunks.as_slice(), 2)?))
+    }
 }
 
 #[cfg(feature = "paged-attn")]

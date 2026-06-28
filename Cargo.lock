@@ -5046,6 +5046,7 @@ dependencies = [
  "base64 0.22.1",
  "candle-core",
  "clap",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",

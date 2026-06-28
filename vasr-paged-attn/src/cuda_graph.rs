@@ -46,6 +46,10 @@ pub fn cuda_memory_snapshot(device: &Device) -> Option<CudaMemorySnapshot> {
 }
 
 pub fn cuda_trim_device_mem_pools(device: &Device) {
+    cuda_trim_device_mem_pools_to(device, 0);
+}
+
+pub fn cuda_trim_device_mem_pools_to(device: &Device, reserved_bytes: usize) {
     let Some(cuda) = device.as_cuda_device().ok() else {
         return;
     };
@@ -61,12 +65,18 @@ pub fn cuda_trim_device_mem_pools(device: &Device) {
         if let Ok(pool) =
             candle_core::cuda_backend::cudarc::driver::result::device::get_mem_pool(dev)
         {
-            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(pool, 0);
+            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(
+                pool,
+                reserved_bytes,
+            );
         }
         if let Ok(pool) =
             candle_core::cuda_backend::cudarc::driver::result::device::get_default_mem_pool(dev)
         {
-            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(pool, 0);
+            let _ = candle_core::cuda_backend::cudarc::driver::result::mem_pool::trim_to(
+                pool,
+                reserved_bytes,
+            );
         }
     }
     if let Ok((free, total)) = cuda.cuda_stream().context().mem_get_info() {
@@ -82,6 +92,28 @@ pub fn cuda_trim_device_mem_pools(device: &Device) {
 
 pub fn cuda_trim_default_mem_pool(device: &Device) {
     cuda_trim_device_mem_pools(device);
+}
+
+pub fn cuda_set_default_mem_pool_release_threshold(device: &Device, threshold_bytes: u64) {
+    let Some(cuda) = device.as_cuda_device().ok() else {
+        return;
+    };
+    let device = cuda.cuda_stream().context().cu_device();
+    let mut pool: CUmemoryPool = ptr::null_mut();
+    unsafe {
+        if sys::cuDeviceGetDefaultMemPool(&mut pool, device)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        let _ = sys::cuMemPoolSetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold_bytes as *const _ as _,
+        )
+        .result();
+    }
 }
 
 pub fn bytes_to_mib(bytes: usize) -> f64 {
@@ -118,6 +150,10 @@ pub fn cuda_graph_batch_bucket(actual_batch: usize, max_batch: usize) -> Option<
     if actual_batch == 0 || max_batch == 0 || actual_batch > max_batch {
         return None;
     }
+    if cuda_graph_single_bucket_enabled() {
+        return Some(max_batch);
+    }
+    let min_bucket = cuda_graph_min_bucket(max_batch);
     let bucket = match actual_batch {
         1 => 1,
         2 => 2,
@@ -125,7 +161,7 @@ pub fn cuda_graph_batch_bucket(actual_batch: usize, max_batch: usize) -> Option<
         5..=8 => 8,
         n => n.div_ceil(16) * 16,
     };
-    Some(bucket.min(max_batch))
+    Some(bucket.max(min_bucket).min(max_batch))
 }
 
 pub fn cuda_graph_batch_buckets(max_batch: usize) -> Vec<usize> {
@@ -133,21 +169,43 @@ pub fn cuda_graph_batch_buckets(max_batch: usize) -> Vec<usize> {
     if max_batch == 0 {
         return Vec::new();
     }
+    if cuda_graph_single_bucket_enabled() {
+        return vec![max_batch];
+    }
     let mut out = Vec::new();
+    let min_bucket = cuda_graph_min_bucket(max_batch);
     for bucket in [1usize, 2, 4, 8] {
-        if bucket <= max_batch {
+        if bucket >= min_bucket && bucket <= max_batch {
             out.push(bucket);
         }
     }
     let mut bucket = 16usize;
     while bucket <= max_batch {
-        out.push(bucket);
+        if bucket >= min_bucket {
+            out.push(bucket);
+        }
         bucket = bucket.saturating_add(16);
+    }
+    if out.is_empty() {
+        out.push(min_bucket.min(max_batch));
     }
     if out.last().copied() != Some(max_batch) {
         out.push(max_batch);
     }
     out
+}
+
+fn cuda_graph_min_bucket(max_batch: usize) -> usize {
+    std::env::var("VASR_CUDA_GRAPH_MIN_BUCKET")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .map(|value| value.min(max_batch))
+        .unwrap_or(1)
+}
+
+fn cuda_graph_single_bucket_enabled() -> bool {
+    std::env::var_os("VASR_CUDA_GRAPH_SINGLE_BUCKET").is_some()
 }
 
 /// Blocks per 256-token CUDA graph bucket.
@@ -217,6 +275,22 @@ pub struct DecodeCudaGraph {
     context_lens: Tensor,
     _block_tables: Tensor,
     output: Tensor,
+    output_kind: DecodeGraphOutputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeGraphOutputKind {
+    Logits,
+    NextIds,
+    NextIdCandidates,
+}
+
+pub fn cuda_graph_next_ids_enabled() -> bool {
+    std::env::var_os("VASR_CUDA_GRAPH_NEXT_IDS").is_some()
+}
+
+pub fn cuda_graph_chunked_argmax_enabled() -> bool {
+    std::env::var_os("VASR_CUDA_GRAPH_CHUNKED_ARGMAX").is_some()
 }
 
 impl DecodeCudaGraph {
@@ -305,26 +379,63 @@ impl DecodeCudaGraph {
 
         let _htod_cache = cuda.enable_cuda_graph_htod_cache();
         let _linear_decode_guard = set_linear_is_prefill(false);
-        let warmup_logits = thinker
-            .forward_input_ids_with_paged_cache(
+        let output_kind = if cuda_graph_chunked_argmax_enabled() {
+            DecodeGraphOutputKind::NextIdCandidates
+        } else if cuda_graph_next_ids_enabled() {
+            DecodeGraphOutputKind::NextIds
+        } else {
+            DecodeGraphOutputKind::Logits
+        };
+        let warmup_logits = match output_kind {
+            DecodeGraphOutputKind::Logits => thinker.forward_input_ids_with_paged_cache(
                 &input_ids_buf,
                 &position_ids_buf,
                 paged_cache,
                 &graph_metadata,
-            )
-            .map_err(|err| anyhow!("CUDA graph capture warmup forward failed: {err}"))?;
+            ),
+            DecodeGraphOutputKind::NextIds => thinker.forward_next_ids_with_paged_cache(
+                &input_ids_buf,
+                &position_ids_buf,
+                paged_cache,
+                &graph_metadata,
+            ),
+            DecodeGraphOutputKind::NextIdCandidates => Ok(thinker
+                .forward_next_id_candidates_with_paged_cache(
+                    &input_ids_buf,
+                    &position_ids_buf,
+                    paged_cache,
+                    &graph_metadata,
+                )?
+                .ok_or_else(|| anyhow!("CUDA graph chunked argmax is unsupported by model"))?),
+        }
+        .map_err(|err| anyhow!("CUDA graph capture warmup forward failed: {err}"))?;
         sync_stream(&stream)?;
         set_capture_mem_pool(&stream)?;
         CudaGraph::begin(&stream)
             .map_err(|err| anyhow!("CUDA graph capture begin failed: {err}"))?;
-        let output = thinker
-            .forward_input_ids_with_paged_cache(
+        let output = match output_kind {
+            DecodeGraphOutputKind::Logits => thinker.forward_input_ids_with_paged_cache(
                 &input_ids_buf,
                 &position_ids_buf,
                 paged_cache,
                 &graph_metadata,
-            )
-            .map_err(|err| anyhow!("CUDA graph captured forward failed: {err}"))?;
+            ),
+            DecodeGraphOutputKind::NextIds => thinker.forward_next_ids_with_paged_cache(
+                &input_ids_buf,
+                &position_ids_buf,
+                paged_cache,
+                &graph_metadata,
+            ),
+            DecodeGraphOutputKind::NextIdCandidates => Ok(thinker
+                .forward_next_id_candidates_with_paged_cache(
+                    &input_ids_buf,
+                    &position_ids_buf,
+                    paged_cache,
+                    &graph_metadata,
+                )?
+                .ok_or_else(|| anyhow!("CUDA graph chunked argmax is unsupported by model"))?),
+        }
+        .map_err(|err| anyhow!("CUDA graph captured forward failed: {err}"))?;
         let graph = CudaGraph::end(stream)
             .map_err(|err| anyhow!("CUDA graph capture end/instantiate failed: {err}"))?;
         graph
@@ -341,6 +452,7 @@ impl DecodeCudaGraph {
                 context_lens,
                 _block_tables: block_tables,
                 output,
+                output_kind,
             },
             warmup_logits,
         ))
@@ -410,6 +522,7 @@ impl DecodeCudaGraph {
             context_lens,
             _block_tables: block_tables,
             output,
+            output_kind: DecodeGraphOutputKind::Logits,
         })
     }
 
@@ -441,6 +554,10 @@ impl DecodeCudaGraph {
 
     pub fn captured_batch(&self) -> usize {
         self.input_ids.dims().get(0).copied().unwrap_or(0)
+    }
+
+    pub fn output_kind(&self) -> DecodeGraphOutputKind {
+        self.output_kind
     }
 
     pub fn replay_decode(

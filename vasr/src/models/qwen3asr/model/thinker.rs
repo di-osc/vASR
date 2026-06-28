@@ -737,4 +737,28 @@ impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration
             input_metadata,
         )
     }
+
+    fn forward_next_id_candidates_with_paged_cache(
+        &self,
+        input_ids: &Tensor,
+        position_ids: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+    ) -> Result<Option<Tensor>> {
+        let chunk_size = std::env::var("VASR_CUDA_GRAPH_CHUNKED_ARGMAX_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(4096);
+        let inputs_embeds = self.embed_tokens(input_ids)?;
+        let hidden_states = self.text_model.forward_with_paged_cache(
+            position_ids,
+            &inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        Ok(self
+            .lm_head
+            .forward_chunked_argmax_candidates(&hidden_states, chunk_size)?)
+    }
 }

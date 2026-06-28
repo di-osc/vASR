@@ -9,9 +9,10 @@ use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::cuda_graph::{
-    bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
+    CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats, DecodeCudaGraph,
+    DecodeGraphOutputKind, bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
     cuda_graph_default_block_table_cols, cuda_graph_prewarm_batch_limit, cuda_memory_snapshot,
-    pad_decode_batch_to_max, CudaGraphPrewarmStats, DecodeCudaGraph, CUDA_DECODE_GRAPH_MAX_GRAPHS,
+    pad_decode_batch_to_max,
 };
 #[cfg(feature = "cuda-graph")]
 use crate::decode_forward::PagedCudaDecodeForward;
@@ -34,6 +35,8 @@ pub enum PagedCacheMemory {
 pub struct PagedCacheConfig {
     pub block_size: usize,
     pub memory: PagedCacheMemory,
+    #[cfg(feature = "cuda-graph")]
+    pub cuda_graph_context_tokens: Option<usize>,
 }
 
 impl Default for PagedCacheConfig {
@@ -44,8 +47,16 @@ impl Default for PagedCacheConfig {
                 fraction: 0.8,
                 reserved_bytes: 0,
             },
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_context_tokens: None,
         }
     }
+}
+
+#[cfg(feature = "cuda-graph")]
+pub struct CudaDecodeGraphOutput {
+    pub tensor: Tensor,
+    pub kind: DecodeGraphOutputKind,
 }
 
 /// Estimated KV bytes for one paged block (all transformer layers).
@@ -396,6 +407,8 @@ pub struct PagedCacheRuntime {
     #[cfg(feature = "cuda-graph")]
     cuda_graph_max_batch: usize,
     #[cfg(feature = "cuda-graph")]
+    cuda_graph_block_table_cols: usize,
+    #[cfg(feature = "cuda-graph")]
     cuda_decode_graphs_disabled: bool,
     #[cfg(feature = "cuda-graph")]
     cuda_decode_graph_disabled_keys: HashSet<CudaDecodeGraphKey>,
@@ -431,6 +444,11 @@ impl PagedCacheRuntime {
         if num_blocks <= 1 {
             candle_core::bail!("paged cache requires at least 2 blocks including null block");
         }
+        #[cfg(feature = "cuda-graph")]
+        let cuda_graph_block_table_cols = config
+            .cuda_graph_context_tokens
+            .map(|tokens| tokens.div_ceil(config.block_size).max(1))
+            .unwrap_or_else(|| cuda_graph_default_block_table_cols(config.block_size));
         let cache = PagedKvCache::new_pool(
             num_layers,
             num_kv_heads,
@@ -454,6 +472,8 @@ impl PagedCacheRuntime {
             stats,
             #[cfg(feature = "cuda-graph")]
             cuda_graph_max_batch: 0,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_block_table_cols,
             #[cfg(feature = "cuda-graph")]
             cuda_decode_graphs_disabled: false,
             #[cfg(feature = "cuda-graph")]
@@ -554,8 +574,12 @@ impl PagedCacheRuntime {
         if !self.cuda_decode_graphs_enabled() {
             return Ok(false);
         }
+        let (actual_batch, q_len) = input_ids.dims2()?;
+        if q_len != 1 || actual_batch == 0 || actual_batch > self.cuda_graph_max_batch {
+            return Ok(false);
+        }
         let meta_cols = metadata.block_tables.dim(1)?;
-        let graph_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
+        let graph_cols = self.cuda_graph_block_table_cols;
         if meta_cols > graph_cols {
             return Ok(false);
         }
@@ -593,7 +617,7 @@ impl PagedCacheRuntime {
         input_ids: &Tensor,
         position_ids: &Tensor,
         metadata: &PagedInputMetadata,
-    ) -> Result<Tensor> {
+    ) -> Result<CudaDecodeGraphOutput> {
         if !input_ids.device().is_cuda() {
             candle_core::bail!("CUDA decode graph requires a CUDA device");
         }
@@ -606,10 +630,10 @@ impl PagedCacheRuntime {
             candle_core::bail!("CUDA decode graph disabled for key={key:?}");
         }
         let graph_batch = key.batch;
-        let graph_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
+        let graph_cols = self.cuda_graph_block_table_cols;
         let device = input_ids.device();
 
-        let run_graph = |graph: &DecodeCudaGraph| -> Result<Tensor> {
+        let run_graph = |graph: &DecodeCudaGraph| -> Result<CudaDecodeGraphOutput> {
             if graph.captured_batch() != graph_batch {
                 candle_core::bail!(
                     "CUDA decode graph batch mismatch: captured={} bucket={graph_batch}",
@@ -632,9 +656,13 @@ impl PagedCacheRuntime {
                 .map_err(|err| {
                     candle_core::Error::Msg(format!("CUDA decode graph replay failed: {err}"))
                 })?;
-            logits
+            let tensor = logits
                 .narrow(0, 0, actual_batch)
-                .map_err(|err| candle_core::Error::from(err))
+                .map_err(|err| candle_core::Error::from(err))?;
+            Ok(CudaDecodeGraphOutput {
+                tensor,
+                kind: graph.output_kind(),
+            })
         };
 
         if let Some(graph) = self.cuda_decode_graphs.get(&key) {
@@ -665,6 +693,7 @@ impl PagedCacheRuntime {
                 "CUDA decode graph capture failed for batch={graph_batch} fixed_block_table_cols={graph_cols}: {err}"
             ))
         })?;
+        let output_kind = graph.output_kind();
         self.insert_cuda_decode_graph(key, graph);
         let mem_after = cuda_memory_snapshot(device);
         if let (Some(before), Some(after)) = (mem_before, mem_after) {
@@ -688,9 +717,13 @@ impl PagedCacheRuntime {
                 self.cuda_decode_graphs.len()
             );
         }
-        warmup_logits
+        let tensor = warmup_logits
             .narrow(0, 0, actual_batch)
-            .map_err(|err| candle_core::Error::from(err))
+            .map_err(|err| candle_core::Error::from(err))?;
+        Ok(CudaDecodeGraphOutput {
+            tensor,
+            kind: output_kind,
+        })
     }
 
     #[cfg(feature = "cuda-graph")]
@@ -704,7 +737,7 @@ impl PagedCacheRuntime {
             return Ok(CudaGraphPrewarmStats::empty());
         }
 
-        let graph_block_table_cols = cuda_graph_default_block_table_cols(self.cache.block_size());
+        let graph_block_table_cols = self.cuda_graph_block_table_cols;
         let graph_context_tokens = graph_block_table_cols.saturating_mul(self.cache.block_size());
         let requested_limit = cuda_graph_prewarm_batch_limit(max_batch);
         let limit = requested_limit;
@@ -720,12 +753,30 @@ impl PagedCacheRuntime {
         self.cuda_decode_graphs.clear();
 
         let mem_before = cuda_memory_snapshot(device);
+        if std::env::var_os("VASR_CUDA_GRAPH_LAZY_CAPTURE").is_some() {
+            tracing::info!(
+                "CUDA decode graph lazy capture enabled up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} kv_blocks={}",
+                self.cache.num_blocks()
+            );
+            return Ok(CudaGraphPrewarmStats {
+                graphs: 0,
+                max_batch: limit,
+                context_tokens: graph_context_tokens,
+                memory_before: mem_before,
+                memory_after: mem_before,
+            });
+        }
         let mut captured = 0usize;
         // Capture the widest graph first. mistralrs paged-attn v2 uses a
         // process-global workspace that grows with batch size; growing it after
         // a smaller graph has been captured would invalidate the pointer stored
         // in that CUDA graph.
-        let mut prewarm_batches = cuda_graph_batch_buckets(limit);
+        let mut prewarm_batches = if std::env::var_os("VASR_CUDA_GRAPH_PREWARM_MAX_ONLY").is_some()
+        {
+            vec![limit]
+        } else {
+            cuda_graph_batch_buckets(limit)
+        };
         prewarm_batches.reverse();
         for batch in prewarm_batches {
             let graph = DecodeCudaGraph::capture_batch_warmup(
@@ -783,8 +834,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::blocks_for_byte_budget;
     use super::{
-        bytes_per_paged_block, PagedBlockManager, PagedCacheConfig, PagedCacheMemory,
-        PagedCacheRuntime,
+        PagedBlockManager, PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime,
+        bytes_per_paged_block,
     };
 
     #[test]
@@ -860,6 +911,7 @@ mod tests {
             PagedCacheConfig {
                 block_size: 16,
                 memory: PagedCacheMemory::Blocks(8),
+                cuda_graph_context_tokens: None,
             },
         )?;
         runtime.set_cuda_graph_max_batch_for_test(20);
@@ -910,6 +962,7 @@ mod tests {
             PagedCacheConfig {
                 block_size: 16,
                 memory: PagedCacheMemory::Blocks(8),
+                cuda_graph_context_tokens: None,
             },
         )?;
         runtime.set_cuda_graph_max_batch_for_test(20);

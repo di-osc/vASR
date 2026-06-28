@@ -13,6 +13,8 @@ use candle_core::Device;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "paged-attn")]
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "paged-attn")]
 use std::sync::mpsc;
 
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
@@ -52,6 +54,8 @@ pub struct Qwen3ASR {
     thinker: Arc<model::thinker::ThinkerForConditionalGeneration>,
     #[cfg(feature = "paged-attn")]
     paged_cache: Option<vasr_paged_attn::SharedPagedCacheRuntime>,
+    #[cfg(feature = "paged-attn")]
+    next_paged_request_id: Arc<AtomicUsize>,
 }
 
 pub type Qwen3Asr = Qwen3ASR;
@@ -96,6 +100,8 @@ impl Qwen3ASR {
                     } else {
                         vasr_paged_attn::PagedCacheMemory::ContextSize(100_000)
                     },
+                    #[cfg(feature = "cuda-graph")]
+                    cuda_graph_context_tokens: None,
                 });
             Some(Arc::new(std::sync::Mutex::new(
                 vasr_paged_attn::PagedCacheRuntime::new(
@@ -122,6 +128,8 @@ impl Qwen3ASR {
             thinker,
             #[cfg(feature = "paged-attn")]
             paged_cache,
+            #[cfg(feature = "paged-attn")]
+            next_paged_request_id: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -305,9 +313,12 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
-        DynamicPrefillProducer::new(
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
+            .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
+        DynamicPrefillProducer::with_shared_request_ids(
             config,
+            Arc::clone(&self.next_paged_request_id),
             self.thinker.as_ref(),
             self.device.as_ref(),
             runtime,
@@ -331,7 +342,9 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
+            .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
         let max_slots = {
             let runtime_guard = runtime
                 .lock()

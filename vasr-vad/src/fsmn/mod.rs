@@ -22,6 +22,7 @@ mod e2e;
 use e2e::{E2EVadConfig, E2EVadModel};
 
 pub const FSMN_VAD_CHUNK_SIZE: usize = 512;
+const FSMN_VAD_STREAM_SCORE_SAMPLES: usize = 10 * FSMN_VAD_SAMPLE_RATE as usize;
 const FSMN_VAD_FRAME_SHIFT_SAMPLES: usize = 160;
 const FSMN_VAD_FRAME_LENGTH_SAMPLES: usize = 400;
 const FSMN_VAD_FEAT_CHUNK_SIZE: usize = 6000;
@@ -603,7 +604,7 @@ impl FsmnVadSession {
             caches,
             e2e: build_e2e_model(&options),
             vad_options: options,
-            pending: Vec::with_capacity(FSMN_VAD_CHUNK_SIZE),
+            pending: Vec::with_capacity(FSMN_VAD_STREAM_SCORE_SAMPLES),
             timing: FsmnVadTiming::default(),
         })
     }
@@ -620,23 +621,19 @@ impl FsmnVadSession {
         let mut input = samples;
 
         if !self.pending.is_empty() {
-            let needed = FSMN_VAD_CHUNK_SIZE - self.pending.len();
+            let needed = FSMN_VAD_STREAM_SCORE_SAMPLES - self.pending.len();
             let take = needed.min(input.len());
             self.pending.extend_from_slice(&input[..take]);
             input = &input[take..];
-            if self.pending.len() == FSMN_VAD_CHUNK_SIZE {
-                let mut chunk = [0i16; FSMN_VAD_CHUNK_SIZE];
-                chunk.copy_from_slice(&self.pending);
-                self.pending.clear();
+            if self.pending.len() == FSMN_VAD_STREAM_SCORE_SAMPLES {
+                let chunk = std::mem::take(&mut self.pending);
                 segments.extend(self.score_and_segment(&chunk, false)?);
             }
         }
 
-        let (full_chunks, tail) = split_full_chunks(input);
-        for chunk_slice in full_chunks.chunks_exact(FSMN_VAD_CHUNK_SIZE) {
-            let mut chunk = [0i16; FSMN_VAD_CHUNK_SIZE];
-            chunk.copy_from_slice(chunk_slice);
-            segments.extend(self.score_and_segment(&chunk, false)?);
+        let (full_chunks, tail) = split_full_chunks(input, FSMN_VAD_STREAM_SCORE_SAMPLES);
+        for chunk_slice in full_chunks.chunks_exact(FSMN_VAD_STREAM_SCORE_SAMPLES) {
+            segments.extend(self.score_and_segment(chunk_slice, false)?);
         }
         self.pending.extend_from_slice(tail);
         Ok(segments
@@ -651,10 +648,7 @@ impl FsmnVadSession {
     fn finish_segments(&mut self) -> Result<Vec<VadSegment>> {
         let mut segments = Vec::new();
         if !self.pending.is_empty() {
-            let mut chunk = [0i16; FSMN_VAD_CHUNK_SIZE];
-            let len = self.pending.len();
-            chunk[..len].copy_from_slice(&self.pending);
-            self.pending.clear();
+            let chunk = std::mem::take(&mut self.pending);
             segments.extend(self.score_and_segment(&chunk, true)?);
         } else {
             let segmenter_start = Instant::now();
@@ -673,11 +667,21 @@ impl FsmnVadSession {
             .collect())
     }
 
-    fn score_and_segment(
-        &mut self,
-        chunk: &[i16; FSMN_VAD_CHUNK_SIZE],
-        is_final: bool,
-    ) -> Result<Vec<(u64, u64)>> {
+    fn score_and_segment(&mut self, chunk: &[i16], is_final: bool) -> Result<Vec<(u64, u64)>> {
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+        let padded;
+        let chunk = if chunk.len() < FSMN_VAD_CHUNK_SIZE {
+            padded = {
+                let mut padded = vec![0i16; FSMN_VAD_CHUNK_SIZE];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                padded
+            };
+            padded.as_slice()
+        } else {
+            chunk
+        };
         let frontend_start = Instant::now();
         let feats = self.weights.frontend.extract_features(chunk)?;
         self.timing.frontend_seconds += frontend_start.elapsed().as_secs_f64();
@@ -705,8 +709,8 @@ impl FsmnVadSession {
     }
 }
 
-fn split_full_chunks(samples: &[i16]) -> (&[i16], &[i16]) {
-    let full_len = samples.len() / FSMN_VAD_CHUNK_SIZE * FSMN_VAD_CHUNK_SIZE;
+fn split_full_chunks(samples: &[i16], chunk_size: usize) -> (&[i16], &[i16]) {
+    let full_len = samples.len() / chunk_size * chunk_size;
     samples.split_at(full_len)
 }
 
@@ -1079,7 +1083,7 @@ fn download_fsmn_vad() -> Result<PathBuf> {
         FSMN_VAD_REPO,
         &cache,
     ))
-        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
     Ok(target)
 }
 
@@ -1182,6 +1186,43 @@ mod tests {
         assert_eq!(ranges, vec![(100, 350), (350, 600), (600, 760)]);
     }
 
+    fn split_segments_without_refine(
+        segments: &[VadSegment],
+        max_segment_ms: u64,
+    ) -> Vec<VadSegment> {
+        segments
+            .iter()
+            .flat_map(|segment| hard_split_segment(segment, max_segment_ms))
+            .collect()
+    }
+
+    #[test]
+    fn splitting_raw_segments_individually_matches_batch_split_for_hard_split() -> Result<()> {
+        let options = VadOptions {
+            max_segment_ms: 250,
+            ..VadOptions::default()
+        };
+        let raw_segments = vec![
+            VadSegment {
+                range: TimeRange::new(DurationMs(100), DurationMs(760)),
+                probability: 0.9,
+            },
+            VadSegment {
+                range: TimeRange::new(DurationMs(900), DurationMs(1300)),
+                probability: 0.9,
+            },
+        ];
+
+        let batch = split_segments_without_refine(&raw_segments, options.max_segment_ms);
+        let individual = raw_segments
+            .iter()
+            .flat_map(|segment| hard_split_segment(segment, options.max_segment_ms))
+            .collect::<Vec<_>>();
+
+        assert_eq!(individual, batch);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "downloads funasr/fsmn-vad and uses local raw_audios fixture"]
     fn fsmn_vad_detects_local_raw_audio() -> Result<()> {
@@ -1197,6 +1238,34 @@ mod tests {
             "FSMN VAD should detect speech in {}",
             wav.display()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "uses local FSMN VAD and raw_audios fixture"]
+    fn split_raw_segments_individually_matches_batch_split_on_local_audio() -> Result<()> {
+        let wav = std::path::Path::new("raw_audios/audio (13).wav");
+        let model_dir = std::path::Path::new(".cache/fsmn-vad");
+        if !wav.exists() || !model_dir.exists() {
+            return Ok(());
+        }
+        let waveform = load_pcm16_wav(wav)?;
+        let model = FsmnVadModel::from_pretrained(Some(model_dir))?;
+        let options = VadOptions::default();
+        let raw_segments = model.detect_raw_segments(&waveform, &options)?;
+
+        let batch = model.split_segments_for_asr(&waveform, &raw_segments, &options)?;
+        let mut individual = Vec::new();
+        for segment in &raw_segments {
+            individual.extend(model.split_segments_for_asr(
+                &waveform,
+                std::slice::from_ref(segment),
+                &options,
+            )?);
+        }
+
+        assert_eq!(individual, batch);
+        assert_eq!(batch, model.detect(&waveform, &options)?);
         Ok(())
     }
 
@@ -1448,7 +1517,7 @@ mod tests {
             .map(|sample| sample as i16)
             .collect::<Vec<_>>();
 
-        let (full_chunks, tail) = split_full_chunks(&samples);
+        let (full_chunks, tail) = split_full_chunks(&samples, FSMN_VAD_CHUNK_SIZE);
         let chunks = full_chunks
             .chunks_exact(FSMN_VAD_CHUNK_SIZE)
             .collect::<Vec<_>>();

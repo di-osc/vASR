@@ -144,7 +144,7 @@ pub fn offset_annotations(annotations: Vec<Annotation>, offset: DurationMs) -> V
         .collect()
 }
 
-fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
+pub(crate) fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
     let mono = waveform.to_mono()?;
     if mono.sample_rate == SAMPLE_RATE_HZ && mono.is_normalized {
         return Ok(mono);

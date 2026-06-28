@@ -24,7 +24,9 @@ use vasr::models::qwen3asr::{
     qwen_transcribe_options,
 };
 #[cfg(feature = "paged-attn")]
-use vasr::models::qwen3asr::{EncodedAsrBatchMetadata, PreparedAudioBatchPoll};
+use vasr::models::qwen3asr::{
+    EncodedAsrBatchMetadata, PrefillStageOutput, PreparedAudioBatch, PreparedAudioBatchPoll,
+};
 use vasr_data::AudioLoader;
 use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 
@@ -36,7 +38,52 @@ const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
+const ASR_ENCODER_BATCH_COLLECT_WAIT_MS: u64 = 10;
+const ASR_PREFILL_COALESCE_WAIT_MS: u64 = 20;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
+
+fn dynamic_staged_asr_enabled() -> bool {
+    std::env::var_os("VASR_DISABLE_DYNAMIC_STAGED_ASR").is_none()
+}
+
+#[cfg(feature = "paged-attn")]
+fn asr_prefill_coalesce_wait() -> Duration {
+    let millis = std::env::var("VASR_ASR_PREFILL_COALESCE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ASR_PREFILL_COALESCE_WAIT_MS);
+    Duration::from_millis(millis)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineWorkerOptions {
+    pub num_load_workers: usize,
+    pub num_vad_workers: usize,
+}
+
+impl Default for PipelineWorkerOptions {
+    fn default() -> Self {
+        Self {
+            num_load_workers: 0,
+            num_vad_workers: 0,
+        }
+    }
+}
+
+impl PipelineWorkerOptions {
+    fn resolved(self) -> ResolvedPipelineWorkerOptions {
+        ResolvedPipelineWorkerOptions {
+            load_workers: resolve_worker_count(self.num_load_workers),
+            vad_workers: resolve_worker_count(self.num_vad_workers),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPipelineWorkerOptions {
+    load_workers: usize,
+    vad_workers: usize,
+}
 
 #[derive(Debug, Default)]
 struct LoaderStageStats {
@@ -171,6 +218,7 @@ pub struct AsyncTranscribePipeline {
     loader: AudioLoader,
     offline: Arc<OfflinePipeline>,
     parallel_options: ParallelTranscribeOptions,
+    worker_options: PipelineWorkerOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -275,11 +323,17 @@ impl AsyncTranscribePipeline {
             loader,
             offline,
             parallel_options: ParallelTranscribeOptions::from(asr_options),
+            worker_options: PipelineWorkerOptions::default(),
         }
     }
 
     pub fn with_vad_options(mut self, vad_options: VadOptions) -> Self {
         self.parallel_options.vad_options = vad_options;
+        self
+    }
+
+    pub fn with_worker_options(mut self, worker_options: PipelineWorkerOptions) -> Self {
+        self.worker_options = worker_options;
         self
     }
 
@@ -316,14 +370,16 @@ impl AsyncTranscribePipeline {
             duplicate_indices,
         } = deduplicate_transcribe_inputs(inputs);
 
-        let stage_parallelism = default_stage_parallelism();
+        let worker_options = self.worker_options.resolved();
+        let loader_parallelism = worker_options.load_workers;
+        let vad_parallelism = worker_options.vad_workers;
         let loaded_queue_memory = loaded_queue_memory_budget();
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
             "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
-            stage_parallelism,
-            stage_parallelism,
+            loader_parallelism,
+            vad_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits)
         );
@@ -346,7 +402,7 @@ impl AsyncTranscribePipeline {
         let loader_handle = spawn_loader_worker(
             unique_inputs,
             loader,
-            stage_parallelism,
+            loader_parallelism,
             loaded_queue_memory,
             loader_to_vad_tx,
             Arc::clone(&loader_stats),
@@ -357,7 +413,7 @@ impl AsyncTranscribePipeline {
         let vad_handle = spawn_vad_worker(
             offline,
             vad_options,
-            stage_parallelism,
+            vad_parallelism,
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
@@ -456,19 +512,22 @@ impl GlobalAsyncTranscribePipeline {
         offline: Arc<OfflinePipeline>,
         asr_options: AsrOptions,
         vad_options: VadOptions,
+        worker_options: PipelineWorkerOptions,
     ) -> Self {
         let parallel_options = ParallelTranscribeOptions {
             asr_options,
             vad_options,
         };
-        let stage_parallelism = default_stage_parallelism();
+        let worker_options = worker_options.resolved();
+        let loader_parallelism = worker_options.load_workers;
+        let vad_parallelism = worker_options.vad_workers;
         let loaded_queue_memory = loaded_queue_memory_budget();
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
-        tracing::info!(
+        tracing::debug!(
             target: "vasr_transcribe::pipeline",
             "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded decode_idle_flush={}ms",
-            stage_parallelism,
-            stage_parallelism,
+            loader_parallelism,
+            vad_parallelism,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
             GLOBAL_DECODE_IDLE_FLUSH_MS
@@ -497,7 +556,7 @@ impl GlobalAsyncTranscribePipeline {
         );
         spawn_global_loader_worker(
             loader,
-            stage_parallelism,
+            loader_parallelism,
             loaded_queue_memory,
             load_job_rx,
             loader_to_vad_tx,
@@ -509,7 +568,7 @@ impl GlobalAsyncTranscribePipeline {
         spawn_vad_worker(
             Arc::clone(&offline),
             parallel_options.vad_options.clone(),
-            stage_parallelism,
+            vad_parallelism,
             loader_to_vad_rx,
             vad_to_asr_tx,
             vad_to_asr_queue_memory,
@@ -932,6 +991,14 @@ fn default_stage_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(FALLBACK_STAGE_PARALLELISM)
+}
+
+fn resolve_worker_count(configured: usize) -> usize {
+    if configured == 0 {
+        default_stage_parallelism()
+    } else {
+        configured
+    }
 }
 
 fn permits_to_gib(permits: usize) -> f64 {
@@ -1897,10 +1964,18 @@ fn spawn_vad_task(
 ) {
     tasks.spawn(async move {
         let stage_start = Instant::now();
-        let job_index = job.index;
         let request_item = job.request_item;
         let mut timing = job.timing;
         let audio_seconds = job.waveform.duration_seconds();
+        let job_index = job.index;
+        let job_channel = job.channel;
+        let job_timing = job.timing;
+        let mut spans = job.spans;
+        let vad_span = StageSpan::new(stage_start, Instant::now());
+        let vad_queue_span = spans
+            .loader
+            .and_then(|loader| StageSpan::try_new(loader.end, vad_span.start));
+        spans.vad = Some(vad_span);
         let prepared = tokio::task::spawn_blocking({
             let offline = Arc::clone(&offline);
             let waveform = job.waveform.clone();
@@ -1910,12 +1985,6 @@ fn spawn_vad_task(
         .await;
         let compute_seconds = stage_start.elapsed().as_secs_f64();
         timing.vad_seconds += compute_seconds;
-        let mut spans = job.spans;
-        let vad_span = StageSpan::new(stage_start, Instant::now());
-        let vad_queue_span = spans
-            .loader
-            .and_then(|loader| StageSpan::try_new(loader.end, vad_span.start));
-        spans.vad = Some(vad_span);
         let mut send_wait_seconds = 0.0;
 
         match prepared {
@@ -1933,7 +2002,7 @@ fn spawn_vad_task(
                 };
                 match asr_job.prepared {
                     VadPreparation::Speech(_) => {
-                        let segments = match speech_job_to_segments(asr_job) {
+                        let segment_jobs = match speech_job_to_segments(asr_job) {
                             Ok(segments) => segments,
                             Err(error) => {
                                 send_vad_to_asr_timed(
@@ -1962,32 +2031,10 @@ fn spawn_vad_task(
                                         bad_component: Some("vad"),
                                     }
                                 })?;
-                                if let (Some(pending_requests), Some(request_item)) =
-                                    (&pending_requests, request_item)
-                                {
-                                    record_request_vad_stage(
-                                        pending_requests,
-                                        request_item.request_id,
-                                        vad_span,
-                                        vad_queue_span,
-                                        audio_seconds,
-                                        0,
-                                    );
-                                }
-                                return Ok(VadTaskStats {
-                                    jobs: 1,
-                                    failed: 1,
-                                    segments,
-                                    audio_seconds,
-                                    speech_seconds,
-                                    compute_seconds,
-                                    send_wait_seconds,
-                                    wall_seconds: stage_start.elapsed().as_secs_f64(),
-                                    ..Default::default()
-                                });
+                                Vec::new()
                             }
                         };
-                        for segment in segments {
+                        for segment in segment_jobs {
                             send_vad_to_asr_timed(
                                 &vad_to_asr_tx,
                                 &vad_to_asr_queue_memory,
@@ -2104,10 +2151,10 @@ fn spawn_vad_task(
                     &vad_to_asr_queue_memory,
                     Err(TranscribeItemOutcome {
                         index: job_index,
-                        channel: job.channel,
+                        channel: job_channel,
                         result: Err(anyhow::anyhow!("VAD join error: {error}")),
                         audio_seconds,
-                        timing,
+                        timing: job_timing,
                         spans,
                         bad_component: Some("vad"),
                     }),
@@ -2116,10 +2163,10 @@ fn spawn_vad_task(
                 .await
                 .map_err(|error| TranscribeItemOutcome {
                     index: job_index,
-                    channel: job.channel,
+                    channel: job_channel,
                     result: Err(error),
                     audio_seconds,
-                    timing,
+                    timing: job_timing,
                     spans,
                     bad_component: Some("vad"),
                 })?;
@@ -2211,12 +2258,28 @@ struct SegmentEncodedMessage {
     batch: Result<SegmentEncodedAsrBatch>,
 }
 
+#[derive(Debug)]
+enum SegmentEncodeMessage {
+    Segment(SegmentEncodeRequest),
+}
+
+#[derive(Debug)]
+enum SegmentEncoderOutput {
+    Encoded(SegmentEncodedMessage),
+}
+
+#[cfg(feature = "paged-attn")]
+type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentPrefillMessage>;
+
+#[cfg(not(feature = "paged-attn"))]
+type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentEncoderOutput>;
+
 fn spawn_segment_encoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
     max_batch_audio_sec: f32,
-    mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeRequest>,
-    encoded_tx: mpsc::UnboundedSender<SegmentEncodedMessage>,
+    mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeMessage>,
+    encoded_tx: mpsc::UnboundedSender<SegmentEncoderOutput>,
     stats: Arc<Mutex<AsrStageStats>>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
@@ -2229,12 +2292,16 @@ fn spawn_segment_encoder_worker(
             }) else {
                 break;
             };
+            let request = match request {
+                SegmentEncodeMessage::Segment(request) => request,
+            };
             let request = collect_encoder_segment_batch(
                 request,
                 max_batch_audio_sec,
                 &mut request_rx,
                 &mut pending,
-            );
+            )
+            .await;
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
             let segment_audio_seconds = segments_for_result
@@ -2273,39 +2340,184 @@ fn spawn_segment_encoder_worker(
                 encoder_timing,
                 batch,
             };
-            if encoded_tx.send(message).is_err() {
+            if encoded_tx
+                .send(SegmentEncoderOutput::Encoded(message))
+                .is_err()
+            {
                 break;
             }
         }
     })
 }
 
-fn collect_encoder_segment_batch(
+#[cfg(feature = "paged-attn")]
+enum SegmentPrefillMessage {
+    Session(SegmentPrefilledSession),
+    Failure(SegmentEncodedFailure),
+}
+
+#[cfg(feature = "paged-attn")]
+struct SegmentPrefilledSession {
+    consumed_segments: Vec<AsrSegmentJob>,
+    stage_start: Instant,
+    inference: SegmentAsrInference,
+    waveforms: Vec<Waveform>,
+    metas: Vec<EncodedAsrBatchMetadata>,
+    batch_lens: Vec<usize>,
+    encoded_failures: Vec<SegmentEncodedFailure>,
+    message_rx: std_mpsc::Receiver<Result<PrefillStageOutput>>,
+    meta_rx: std_mpsc::Receiver<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+}
+
+#[cfg(feature = "paged-attn")]
+enum SegmentPreparedEvent {
+    Prepared(SegmentPreparedMetadata),
+}
+
+#[cfg(feature = "paged-attn")]
+struct PrefillCoalescedPrepared {
+    prepared: PreparedAudioBatch,
+    num_batches: usize,
+    num_segments: usize,
+}
+
+#[cfg(feature = "paged-attn")]
+enum PrefillCoalescedPoll {
+    Ready(PrefillCoalescedPrepared),
+    Empty,
+    Closed,
+}
+
+#[cfg(feature = "paged-attn")]
+fn spawn_segment_prefill_worker(
+    offline: Arc<OfflinePipeline>,
+    asr_options: AsrOptions,
+    encoded_rx: mpsc::UnboundedReceiver<SegmentEncoderOutput>,
+    prefilled_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
+    decode_idle_flush: Option<std::time::Duration>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let encoded_rx = Arc::new(tokio::sync::Mutex::new(encoded_rx));
+        loop {
+            let first = {
+                let mut encoded_rx = encoded_rx.lock().await;
+                encoded_rx.recv().await
+            };
+            let Some(first) = first else {
+                break;
+            };
+            let first = match first {
+                SegmentEncoderOutput::Encoded(message) => message,
+            };
+            let SegmentEncodedMessage {
+                mut segments,
+                stage_start,
+                encoder_timing,
+                batch,
+            } = first;
+            apply_batch_timing_to_segments(&mut segments, encoder_timing);
+            let initial = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    if prefilled_tx
+                        .send(SegmentPrefillMessage::Failure(SegmentEncodedFailure {
+                            segments,
+                            stage_start,
+                            error,
+                        }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let session = tokio::task::spawn_blocking({
+                let offline = Arc::clone(&offline);
+                let asr_options = asr_options.clone();
+                let encoded_rx = Arc::clone(&encoded_rx);
+                let runtime_handle = tokio::runtime::Handle::current();
+                move || {
+                    prepare_segment_prefill_session(
+                        offline,
+                        segments,
+                        stage_start,
+                        initial,
+                        encoded_rx,
+                        runtime_handle,
+                        &asr_options,
+                        decode_idle_flush,
+                    )
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(anyhow::anyhow!(
+                    "ASR dynamic prefill session join error: {error}"
+                ))
+            });
+            match session {
+                Ok((session, prefill_join)) => {
+                    if prefilled_tx
+                        .send(SegmentPrefillMessage::Session(session))
+                        .is_err()
+                    {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = prefill_join.join();
+                        })
+                        .await;
+                        break;
+                    }
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = prefill_join.join();
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vasr_transcribe::pipeline",
+                        "ASR dynamic prefill session failed: {error}"
+                    );
+                }
+            }
+            if decode_idle_flush.is_none() {
+                break;
+            }
+        }
+    })
+}
+
+async fn collect_encoder_segment_batch(
     first: SegmentEncodeRequest,
-    max_batch_audio_sec: f32,
-    request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeRequest>,
-    pending: &mut VecDeque<SegmentEncodeRequest>,
+    _max_batch_audio_sec: f32,
+    request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeMessage>,
+    _pending: &mut VecDeque<SegmentEncodeMessage>,
 ) -> SegmentEncodeBatch {
-    let mut audio_sec = first.segment.waveform.duration_seconds() as f32;
     let mut stage_start = first.stage_start;
     let mut segments = vec![first.segment];
-    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+    loop {
         match request_rx.try_recv() {
-            Ok(request) => {
-                let next_audio_sec = request.segment.waveform.duration_seconds() as f32;
-                if max_batch_audio_sec > 0.0
-                    && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                {
-                    pending.push_back(request);
-                    break;
-                }
-                audio_sec += next_audio_sec;
+            Ok(SegmentEncodeMessage::Segment(request)) => {
                 stage_start = stage_start.min(request.stage_start);
                 segments.push(request.segment);
             }
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                 break;
             }
+        }
+    }
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(ASR_ENCODER_BATCH_COLLECT_WAIT_MS),
+            request_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(SegmentEncodeMessage::Segment(request))) => {
+                stage_start = stage_start.min(request.stage_start);
+                segments.push(request.segment);
+            }
+            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
     segments.sort_by_key(|segment| (segment.job_index, segment.offset.0));
@@ -2318,77 +2530,52 @@ fn collect_encoder_segment_batch(
 fn spawn_segment_decoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut encoded_rx: mpsc::UnboundedReceiver<
-        SegmentEncodedMessage,
-    >,
+    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut decoder_rx: SegmentDecoderReceiver,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
-    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] decode_idle_flush: Option<
-        std::time::Duration,
-    >,
+    #[allow(unused_variables)] decode_idle_flush: Option<std::time::Duration>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
         #[cfg(feature = "paged-attn")]
-        {
-            let encoded_rx = Arc::new(tokio::sync::Mutex::new(encoded_rx));
-            loop {
-                let first = {
-                    let mut encoded_rx = encoded_rx.lock().await;
-                    encoded_rx.recv().await
-                };
-                let Some(first) = first else {
-                    break;
-                };
-                let SegmentEncodedMessage {
-                    mut segments,
-                    stage_start,
-                    encoder_timing,
-                    batch,
-                } = first;
-                apply_batch_timing_to_segments(&mut segments, encoder_timing);
-                let initial = match batch {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        let outcomes = finish_segment_asr_batch(
-                            &mut segment_state,
-                            &segments,
-                            stage_start,
-                            Err(error),
-                            None,
-                            Some(&stats),
-                        );
-                        for outcome in outcomes {
-                            let _ = asr_to_result_tx.send(outcome.into()).await;
-                        }
-                        continue;
+        while let Some(message) = decoder_rx.recv().await {
+            match message {
+                SegmentPrefillMessage::Session(session) => {
+                    handle_dynamic_segment_prefilled_session(
+                        session,
+                        &offline,
+                        &asr_options,
+                        &mut segment_state,
+                        &asr_to_result_tx,
+                        &stats,
+                        pending_requests.clone(),
+                    )
+                    .await;
+                }
+                SegmentPrefillMessage::Failure(failure) => {
+                    let outcomes = finish_segment_asr_batch(
+                        &mut segment_state,
+                        failure.segments.as_slice(),
+                        failure.stage_start,
+                        Err(failure.error),
+                        None,
+                        Some(&stats),
+                    );
+                    for outcome in outcomes {
+                        let _ = asr_to_result_tx.send(outcome.into()).await;
                     }
-                };
-                handle_dynamic_segment_encoded_message(
-                    segments,
-                    stage_start,
-                    initial,
-                    Arc::clone(&encoded_rx),
-                    &offline,
-                    &asr_options,
-                    &mut segment_state,
-                    &asr_to_result_tx,
-                    &stats,
-                    decode_idle_flush,
-                    pending_requests.clone(),
-                )
-                .await;
-                if decode_idle_flush.is_none() {
-                    break;
                 }
             }
         }
         #[cfg(not(feature = "paged-attn"))]
-        while let Some(first) = encoded_rx.recv().await {
+        while let Some(first) = decoder_rx.recv().await {
+            let first = match first {
+                SegmentEncoderOutput::Encoded(first) => first,
+            };
             handle_ready_segment_encoded_messages(
                 first,
-                &mut encoded_rx,
+                &mut decoder_rx,
                 &offline,
                 &asr_options,
                 &mut segment_state,
@@ -2430,36 +2617,78 @@ struct SegmentPreparedMetadata {
 }
 
 #[cfg(feature = "paged-attn")]
-async fn handle_dynamic_segment_encoded_message(
+#[allow(clippy::too_many_arguments)]
+fn prepare_segment_prefill_session(
+    offline: Arc<OfflinePipeline>,
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     initial: SegmentEncodedAsrBatch,
-    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncodedMessage>>>,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: tokio::runtime::Handle,
+    asr_options: &AsrOptions,
+    decode_idle_flush: Option<std::time::Duration>,
+) -> Result<(SegmentPrefilledSession, std::thread::JoinHandle<()>)> {
+    let qwen3 = offline
+        .asr
+        .as_any()
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR prefill requires Qwen3ASR"))?;
+    let (inference, waveforms, encoded) = initial.into_parts();
+    let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
+    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
+    let (message_tx, message_rx) = std_mpsc::channel();
+    let (meta_tx, meta_rx) = std_mpsc::channel();
+    let initial_batch_len = initial_meta.audio_len();
+    let prefill_join = std::thread::spawn(move || {
+        let qwen3 = offline
+            .asr
+            .as_any()
+            .downcast_ref::<Qwen3ASR>()
+            .expect("dynamic staged ASR prefill requires Qwen3ASR");
+        run_segment_asr_prefill_dynamic_worker(
+            qwen3,
+            initial_prepared,
+            encoded_rx,
+            runtime_handle,
+            runtime_options,
+            decode_idle_flush,
+            message_tx,
+            meta_tx,
+        );
+    });
+    Ok((
+        SegmentPrefilledSession {
+            consumed_segments: segments,
+            stage_start,
+            inference,
+            waveforms,
+            metas: vec![initial_meta],
+            batch_lens: vec![initial_batch_len],
+            encoded_failures: Vec::new(),
+            message_rx,
+            meta_rx,
+        },
+        prefill_join,
+    ))
+}
+
+#[cfg(feature = "paged-attn")]
+async fn handle_dynamic_segment_prefilled_session(
+    session: SegmentPrefilledSession,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
-    decode_idle_flush: Option<std::time::Duration>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) {
     let decode_start = Instant::now();
+    let fallback_segments = session.consumed_segments.clone();
+    let stage_start = session.stage_start;
     let batch = tokio::task::spawn_blocking({
         let asr = Arc::clone(&offline.asr);
         let asr_options = asr_options.clone();
-        let segments = segments.clone();
-        let runtime_handle = tokio::runtime::Handle::current();
-        move || {
-            run_segment_asr_decode_dynamic(
-                asr.as_ref(),
-                segments,
-                initial,
-                encoded_rx,
-                runtime_handle,
-                &asr_options,
-                decode_idle_flush,
-            )
-        }
+        move || run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options)
     })
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
@@ -2472,7 +2701,7 @@ async fn handle_dynamic_segment_encoded_message(
             decoded.encoded_failures,
             Some(decoded.timings),
         ),
-        Err(error) => (segments, Err(error), Vec::new(), None),
+        Err(error) => (fallback_segments, Err(error), Vec::new(), None),
     };
     #[cfg(not(feature = "timing"))]
     let (consumed_segments, batch, encoded_failures) = match batch {
@@ -2481,7 +2710,7 @@ async fn handle_dynamic_segment_encoded_message(
             Ok((decoded.inference, decoded.timelines)),
             decoded.encoded_failures,
         ),
-        Err(error) => (segments, Err(error), Vec::new()),
+        Err(error) => (fallback_segments, Err(error), Vec::new()),
     };
     #[cfg(feature = "timing")]
     let asr_timing = timings.as_ref().map(transcribe_timing_seconds);
@@ -2530,6 +2759,378 @@ async fn handle_dynamic_segment_encoded_message(
         );
         for outcome in outcomes {
             let _ = asr_to_result_tx.send(outcome.into()).await;
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+fn run_segment_asr_decode_prefilled_session(
+    asr: &dyn crate::runtime::model::AsrModel,
+    mut session: SegmentPrefilledSession,
+    asr_options: &AsrOptions,
+) -> Result<DynamicSegmentAsrDecode> {
+    let qwen3 = asr
+        .as_any()
+        .downcast_ref::<Qwen3ASR>()
+        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3ASR"))?;
+    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
+    #[cfg(feature = "timing")]
+    let mut timings = TranscribeTimings::default();
+    let ids = qwen3.decode_prefilled_dynamic_ids(
+        session.message_rx,
+        runtime_options,
+        #[cfg(feature = "timing")]
+        Some(&mut timings.generation),
+    )?;
+
+    for meta_message in session.meta_rx.try_iter() {
+        match meta_message {
+            Ok(SegmentPreparedEvent::Prepared(prepared)) => {
+                session.consumed_segments.extend(prepared.segments);
+                session.inference.targets.extend(prepared.inference.targets);
+                session.inference.segment_audio_seconds += prepared.inference.segment_audio_seconds;
+                session.waveforms.extend(prepared.waveforms);
+                session.batch_lens.push(prepared.meta.audio_len());
+                session.metas.push(prepared.meta);
+            }
+            Err(failure) => session.encoded_failures.push(failure),
+        }
+    }
+
+    session.inference.active_job_count = session
+        .inference
+        .targets
+        .iter()
+        .map(|(job_index, _, _)| *job_index)
+        .collect::<HashSet<_>>()
+        .len();
+
+    let outputs = qwen3.decode_dynamic_ids_with_metadata(ids, session.metas, session.batch_lens)?;
+    #[cfg(feature = "timing")]
+    {
+        timings.chunks = outputs.iter().map(Vec::len).sum();
+        timings.batches = outputs.len();
+    }
+    let mut timelines = Vec::with_capacity(session.waveforms.len());
+    let mut waveform_offset = 0usize;
+    for outputs in outputs {
+        let end = waveform_offset.saturating_add(outputs.len());
+        if end > session.waveforms.len() {
+            bail!(
+                "dynamic ASR waveform split mismatch: end={} waveforms={}",
+                end,
+                session.waveforms.len()
+            );
+        }
+        timelines.extend(qwen_outputs_to_timelines(
+            outputs,
+            &session.waveforms[waveform_offset..end],
+        )?);
+        waveform_offset = end;
+    }
+    if waveform_offset != session.waveforms.len() {
+        bail!(
+            "dynamic ASR unused waveforms: used={} waveforms={}",
+            waveform_offset,
+            session.waveforms.len()
+        );
+    }
+    Ok(DynamicSegmentAsrDecode {
+        consumed_segments: session.consumed_segments,
+        inference: session.inference,
+        timelines,
+        encoded_failures: session.encoded_failures,
+        #[cfg(feature = "timing")]
+        timings,
+    })
+}
+
+#[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
+fn run_segment_asr_prefill_dynamic_worker(
+    qwen3: &Qwen3ASR,
+    initial_prepared: PreparedAudioBatch,
+    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: tokio::runtime::Handle,
+    runtime_options: vasr::models::qwen3asr::TranscribeOptions,
+    decode_idle_flush: Option<std::time::Duration>,
+    message_tx: std_mpsc::Sender<Result<PrefillStageOutput>>,
+    meta_tx: std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+) {
+    let run = (|| -> Result<()> {
+        let mut source_closed = false;
+        let mut poll_prepared = |may_block: bool| -> Result<PreparedAudioBatchPoll> {
+            if decode_idle_flush.is_some() && !may_block {
+                return Ok(PreparedAudioBatchPoll::Empty);
+            }
+            loop {
+                if source_closed {
+                    return Ok(PreparedAudioBatchPoll::Closed);
+                }
+                let message = if may_block {
+                    recv_segment_encoded_message_blocking(
+                        &encoded_rx,
+                        &runtime_handle,
+                        decode_idle_flush,
+                        &mut source_closed,
+                    )
+                } else {
+                    try_recv_segment_encoded_message(
+                        &encoded_rx,
+                        &runtime_handle,
+                        &mut source_closed,
+                    )
+                };
+                let Some(message) = message else {
+                    return Ok(PreparedAudioBatchPoll::Empty);
+                };
+                match prepare_coalesced_segment_prefill_batch(
+                    qwen3,
+                    message,
+                    &encoded_rx,
+                    &runtime_handle,
+                    &meta_tx,
+                )? {
+                    PrefillCoalescedPoll::Ready(coalesced) => {
+                        if coalesced.num_batches > 1 {
+                            tracing::debug!(
+                                target: "vasr_transcribe::pipeline",
+                                "prefill coalesced | batches={} segments={}",
+                                coalesced.num_batches,
+                                coalesced.num_segments,
+                            );
+                        }
+                        return Ok(PreparedAudioBatchPoll::Ready(coalesced.prepared));
+                    }
+                    PrefillCoalescedPoll::Empty => return Ok(PreparedAudioBatchPoll::Empty),
+                    PrefillCoalescedPoll::Closed => return Ok(PreparedAudioBatchPoll::Closed),
+                }
+            }
+        };
+        let mut producer = qwen3.dynamic_prefill_producer(
+            initial_prepared,
+            &mut poll_prepared,
+            runtime_options,
+        )?;
+        loop {
+            let message = producer.run_stage(true)?;
+            let wave = message.prefill_wave;
+            let done = producer.is_done();
+            if (wave > 0 || message.source_closed) && message_tx.send(Ok(message)).is_err() {
+                return Ok(());
+            }
+            if done {
+                break;
+            }
+            if wave == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = run {
+        let _ = message_tx.send(Err(error));
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+fn prepare_coalesced_segment_prefill_batch(
+    qwen3: &Qwen3ASR,
+    first: SegmentEncoderOutput,
+    encoded_rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: &tokio::runtime::Handle,
+    meta_tx: &std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+) -> Result<PrefillCoalescedPoll> {
+    let mut prepared_batches = Vec::new();
+    let mut num_batches = 0usize;
+    let mut num_segments = 0usize;
+
+    let mut current = Some(first);
+    let deadline = std::time::Instant::now() + asr_prefill_coalesce_wait();
+    loop {
+        let Some(message) = current.take() else {
+            break;
+        };
+        if !prepare_segment_encoded_for_prefill(
+            qwen3,
+            message,
+            meta_tx,
+            &mut prepared_batches,
+            &mut num_batches,
+            &mut num_segments,
+        )? {
+            return Ok(PrefillCoalescedPoll::Closed);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        current =
+            try_recv_segment_encoded_message_for_coalesce(encoded_rx, runtime_handle, deadline);
+        if current.is_none() {
+            break;
+        }
+    }
+
+    if prepared_batches.is_empty() {
+        return Ok(PrefillCoalescedPoll::Empty);
+    }
+
+    Ok(PrefillCoalescedPoll::Ready(PrefillCoalescedPrepared {
+        prepared: merge_prepared_audio_batches(prepared_batches)?,
+        num_batches,
+        num_segments,
+    }))
+}
+
+#[cfg(feature = "paged-attn")]
+fn prepare_segment_encoded_for_prefill(
+    qwen3: &Qwen3ASR,
+    message: SegmentEncoderOutput,
+    meta_tx: &std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+    prepared_batches: &mut Vec<PreparedAudioBatch>,
+    num_batches: &mut usize,
+    num_segments: &mut usize,
+) -> Result<bool> {
+    let SegmentEncoderOutput::Encoded(message) = message;
+    match message.batch {
+        Ok(batch) => {
+            let segment_count = message.segments.len();
+            let (next_inference, next_waveforms, next_encoded) = batch.into_parts();
+            let (prepared, meta) = qwen3.prepare_encoded_audio_features(next_encoded)?;
+            if meta_tx
+                .send(Ok(SegmentPreparedEvent::Prepared(
+                    SegmentPreparedMetadata {
+                        segments: message.segments,
+                        inference: next_inference,
+                        waveforms: next_waveforms,
+                        meta,
+                    },
+                )))
+                .is_err()
+            {
+                return Ok(false);
+            }
+            *num_batches = num_batches.saturating_add(1);
+            *num_segments = num_segments.saturating_add(segment_count);
+            prepared_batches.push(prepared);
+        }
+        Err(error) => {
+            if meta_tx
+                .send(Err(SegmentEncodedFailure {
+                    segments: message.segments,
+                    stage_start: message.stage_start,
+                    error,
+                }))
+                .is_err()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(feature = "paged-attn")]
+fn try_recv_segment_encoded_message_for_coalesce(
+    encoded_rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: &tokio::runtime::Handle,
+    deadline: std::time::Instant,
+) -> Option<SegmentEncoderOutput> {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    match runtime_handle.block_on(async {
+        let mut encoded_rx = encoded_rx.lock().await;
+        tokio::time::timeout(remaining, encoded_rx.recv()).await
+    }) {
+        Ok(Some(message)) => Some(message),
+        Ok(None) | Err(tokio::time::error::Elapsed { .. }) => None,
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+fn merge_prepared_audio_batches(batches: Vec<PreparedAudioBatch>) -> Result<PreparedAudioBatch> {
+    let mut prepared = Vec::new();
+    let mut audio_seconds = Vec::new();
+    let mut audio_features = Vec::new();
+    for batch in batches {
+        prepared.extend(batch.prepared);
+        audio_seconds.extend(batch.audio_seconds);
+        audio_features.push(batch.audio_features);
+    }
+
+    let audio_features = if audio_features.len() == 1 {
+        audio_features
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing prepared audio features"))?
+    } else {
+        let first_dims = audio_features
+            .first()
+            .map(|tensor| tensor.dims().to_vec())
+            .unwrap_or_default();
+        if first_dims.len() != 2 {
+            bail!("prepared audio features must be rank-2, got dims={first_dims:?}");
+        }
+        candle_core::Tensor::cat(audio_features.as_slice(), 0)?
+    };
+
+    Ok(PreparedAudioBatch {
+        prepared,
+        audio_features,
+        audio_seconds,
+    })
+}
+
+#[cfg(feature = "paged-attn")]
+fn recv_segment_encoded_message_blocking(
+    encoded_rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: &tokio::runtime::Handle,
+    timeout: Option<std::time::Duration>,
+    source_closed: &mut bool,
+) -> Option<SegmentEncoderOutput> {
+    if let Some(timeout) = timeout {
+        match runtime_handle.block_on(async {
+            let mut encoded_rx = encoded_rx.lock().await;
+            tokio::time::timeout(timeout, encoded_rx.recv()).await
+        }) {
+            Ok(Some(message)) => Some(message),
+            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => {
+                *source_closed = true;
+                None
+            }
+        }
+    } else {
+        match runtime_handle.block_on(async {
+            let mut encoded_rx = encoded_rx.lock().await;
+            encoded_rx.recv().await
+        }) {
+            Some(message) => Some(message),
+            None => {
+                *source_closed = true;
+                None
+            }
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+fn try_recv_segment_encoded_message(
+    encoded_rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
+    runtime_handle: &tokio::runtime::Handle,
+    source_closed: &mut bool,
+) -> Option<SegmentEncoderOutput> {
+    match runtime_handle.block_on(async {
+        let mut encoded_rx = encoded_rx.lock().await;
+        encoded_rx.try_recv()
+    }) {
+        Ok(message) => Some(message),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            *source_closed = true;
+            None
         }
     }
 }
@@ -2670,7 +3271,7 @@ async fn handle_merged_segment_encoded_batch(
 #[cfg(not(feature = "paged-attn"))]
 async fn handle_ready_segment_encoded_messages(
     first: SegmentEncodedMessage,
-    encoder_to_decoder_rx: &mut mpsc::UnboundedReceiver<SegmentEncodedMessage>,
+    encoder_to_decoder_rx: &mut mpsc::UnboundedReceiver<SegmentEncoderOutput>,
     offline: &OfflinePipeline,
     asr_options: &AsrOptions,
     segment_state: &mut SegmentAsrState,
@@ -2680,6 +3281,7 @@ async fn handle_ready_segment_encoded_messages(
 ) {
     let mut messages = vec![first];
     while let Ok(message) = encoder_to_decoder_rx.try_recv() {
+        let SegmentEncoderOutput::Encoded(message) = message;
         messages.push(message);
     }
     handle_segment_encoded_messages(
@@ -2695,10 +3297,13 @@ async fn handle_ready_segment_encoded_messages(
 }
 
 fn send_segment_encode_request(
-    asr_to_encoder_tx: &mpsc::UnboundedSender<SegmentEncodeRequest>,
+    asr_to_encoder_tx: &mpsc::UnboundedSender<SegmentEncodeMessage>,
     request: SegmentEncodeRequest,
 ) {
-    if asr_to_encoder_tx.send(request).is_err() {
+    if asr_to_encoder_tx
+        .send(SegmentEncodeMessage::Segment(request))
+        .is_err()
+    {
         tracing::warn!(
             target: "vasr_transcribe::pipeline",
             "ASR audio feature encoder closed"
@@ -2720,20 +3325,42 @@ fn spawn_asr_worker(
         let mut fallback_segment_state = SegmentAsrState::default();
         let mut pending = VecDeque::new();
         let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::unbounded_channel();
-        let (encoder_to_decoder_tx, encoder_to_decoder_rx) = mpsc::unbounded_channel();
+        let (encoder_to_prefill_tx, encoder_to_prefill_rx) = mpsc::unbounded_channel();
         let segment_encoder_handle = spawn_segment_encoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
             max_batch_audio_sec,
             asr_to_encoder_rx,
-            encoder_to_decoder_tx,
+            encoder_to_prefill_tx,
             Arc::clone(&stats),
             pending_requests.clone(),
         );
+        #[cfg(feature = "paged-attn")]
+        let segment_prefill_and_decoder_handles = {
+            let (prefill_to_decoder_tx, prefill_to_decoder_rx) = mpsc::unbounded_channel();
+            let prefill_handle = spawn_segment_prefill_worker(
+                Arc::clone(&offline),
+                asr_options.clone(),
+                encoder_to_prefill_rx,
+                prefill_to_decoder_tx,
+                decode_idle_flush,
+            );
+            let decoder_handle = spawn_segment_decoder_worker(
+                Arc::clone(&offline),
+                asr_options.clone(),
+                prefill_to_decoder_rx,
+                asr_to_result_tx.clone(),
+                Arc::clone(&stats),
+                decode_idle_flush,
+                pending_requests.clone(),
+            );
+            (prefill_handle, decoder_handle)
+        };
+        #[cfg(not(feature = "paged-attn"))]
         let segment_decoder_handle = spawn_segment_decoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
-            encoder_to_decoder_rx,
+            encoder_to_prefill_rx,
             asr_to_result_tx.clone(),
             Arc::clone(&stats),
             decode_idle_flush,
@@ -2801,7 +3428,7 @@ fn spawn_asr_worker(
                 }
                 Ok(AsrPipelineMessage::Segment(segment)) => {
                     let stage_start = Instant::now();
-                    if offline.asr.as_any().is::<Qwen3ASR>() {
+                    if offline.asr.as_any().is::<Qwen3ASR>() && dynamic_staged_asr_enabled() {
                         let request = SegmentEncodeRequest {
                             segment,
                             stage_start,
@@ -2856,36 +3483,32 @@ fn spawn_asr_worker(
 
         drop(asr_to_encoder_tx);
         let _ = segment_encoder_handle.await;
+        #[cfg(feature = "paged-attn")]
+        {
+            let (segment_prefill_handle, segment_decoder_handle) =
+                segment_prefill_and_decoder_handles;
+            let _ = segment_prefill_handle.await;
+            let _ = segment_decoder_handle.await;
+        }
+        #[cfg(not(feature = "paged-attn"))]
         let _ = segment_decoder_handle.await;
     })
 }
 
 async fn collect_job_microbatch(
     first: AsrJob,
-    max_batch_audio_sec: f32,
+    _max_batch_audio_sec: f32,
     vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
     pending: &mut VecDeque<VadToAsrMessage>,
 ) -> Vec<Result<AsrPipelineMessage, TranscribeItemOutcome>> {
-    let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut messages = vec![Ok(AsrPipelineMessage::Job(first))];
-    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+    loop {
         match vad_to_asr_rx.try_recv() {
             Ok(envelope) => match envelope.message {
                 Ok(AsrPipelineMessage::Segment(_)) => {
                     pending.push_back(envelope);
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
-                    let next_audio_sec = job.waveform.duration_seconds() as f32;
-                    if max_batch_audio_sec > 0.0
-                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                    {
-                        pending.push_back(VadToAsrMessage {
-                            message: Ok(AsrPipelineMessage::Job(job)),
-                            _queue_memory_permit: envelope._queue_memory_permit,
-                        });
-                        break;
-                    }
-                    audio_sec += next_audio_sec;
                     messages.push(Ok(AsrPipelineMessage::Job(job)));
                 }
                 message => messages.push(message),
@@ -2894,7 +3517,7 @@ async fn collect_job_microbatch(
             Err(mpsc::error::TryRecvError::Disconnected) => return messages,
         }
     }
-    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+    loop {
         match tokio::time::timeout(
             std::time::Duration::from_millis(ASR_MICROBATCH_COLLECT_WAIT_MS),
             vad_to_asr_rx.recv(),
@@ -2906,17 +3529,6 @@ async fn collect_job_microbatch(
                     pending.push_back(envelope);
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
-                    let next_audio_sec = job.waveform.duration_seconds() as f32;
-                    if max_batch_audio_sec > 0.0
-                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                    {
-                        pending.push_back(VadToAsrMessage {
-                            message: Ok(AsrPipelineMessage::Job(job)),
-                            _queue_memory_permit: envelope._queue_memory_permit,
-                        });
-                        break;
-                    }
-                    audio_sec += next_audio_sec;
                     messages.push(Ok(AsrPipelineMessage::Job(job)));
                 }
                 message => messages.push(message),
@@ -2929,28 +3541,16 @@ async fn collect_job_microbatch(
 
 async fn collect_segment_microbatch(
     first: AsrSegmentJob,
-    max_batch_audio_sec: f32,
+    _max_batch_audio_sec: f32,
     vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
     pending: &mut VecDeque<VadToAsrMessage>,
 ) -> Vec<AsrSegmentJob> {
-    let mut audio_sec = first.waveform.duration_seconds() as f32;
     let mut segments = vec![first];
     // Phase 1: non-blocking drain of everything already in the channel.
-    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+    loop {
         match vad_to_asr_rx.try_recv() {
             Ok(envelope) => match envelope.message {
                 Ok(AsrPipelineMessage::Segment(segment)) => {
-                    let next_audio_sec = segment.waveform.duration_seconds() as f32;
-                    if max_batch_audio_sec > 0.0
-                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                    {
-                        pending.push_back(VadToAsrMessage {
-                            message: Ok(AsrPipelineMessage::Segment(segment)),
-                            _queue_memory_permit: envelope._queue_memory_permit,
-                        });
-                        break;
-                    }
-                    audio_sec += next_audio_sec;
                     segments.push(segment);
                 }
                 message => {
@@ -2968,7 +3568,7 @@ async fn collect_segment_microbatch(
     }
     // Phase 2: briefly wait for more segments so the continuous scheduler sees
     // larger admit waves without adding noticeable tail latency.
-    while max_batch_audio_sec <= 0.0 || audio_sec < max_batch_audio_sec {
+    loop {
         match tokio::time::timeout(
             std::time::Duration::from_millis(ASR_MICROBATCH_COLLECT_WAIT_MS),
             vad_to_asr_rx.recv(),
@@ -2977,17 +3577,6 @@ async fn collect_segment_microbatch(
         {
             Ok(Some(envelope)) => match envelope.message {
                 Ok(AsrPipelineMessage::Segment(segment)) => {
-                    let next_audio_sec = segment.waveform.duration_seconds() as f32;
-                    if max_batch_audio_sec > 0.0
-                        && audio_sec + next_audio_sec > max_batch_audio_sec + f32::EPSILON
-                    {
-                        pending.push_back(VadToAsrMessage {
-                            message: Ok(AsrPipelineMessage::Segment(segment)),
-                            _queue_memory_permit: envelope._queue_memory_permit,
-                        });
-                        break;
-                    }
-                    audio_sec += next_audio_sec;
                     segments.push(segment);
                 }
                 message => {
@@ -3265,227 +3854,6 @@ fn run_segment_asr_decode(
         asr_options,
     )?;
     Ok((encoded.inference, timelines))
-}
-
-#[cfg(feature = "paged-attn")]
-fn run_segment_asr_decode_dynamic(
-    asr: &dyn crate::runtime::model::AsrModel,
-    initial_segments: Vec<AsrSegmentJob>,
-    initial: SegmentEncodedAsrBatch,
-    encoded_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncodedMessage>>>,
-    runtime_handle: tokio::runtime::Handle,
-    asr_options: &AsrOptions,
-    decode_idle_flush: Option<std::time::Duration>,
-) -> Result<DynamicSegmentAsrDecode> {
-    let qwen3 = asr
-        .as_any()
-        .downcast_ref::<Qwen3ASR>()
-        .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3ASR"))?;
-    let (mut inference, mut waveforms, encoded) = initial.into_parts();
-    let mut consumed_segments = initial_segments;
-    let mut encoded_failures: Vec<SegmentEncodedFailure> = Vec::new();
-    let mut metas: Vec<EncodedAsrBatchMetadata> = Vec::new();
-    let mut batch_lens: Vec<usize> = Vec::new();
-    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
-    let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
-    batch_lens.push(initial_meta.audio_len());
-    metas.push(initial_meta);
-    let (message_tx, message_rx) = std_mpsc::channel();
-    let (meta_tx, meta_rx) = std_mpsc::channel();
-
-    #[cfg(feature = "timing")]
-    let mut timings = TranscribeTimings::default();
-
-    let ids = std::thread::scope(|scope| -> Result<Vec<Vec<u32>>> {
-        let producer_options = runtime_options.clone();
-        let producer_qwen3 = qwen3;
-        let producer_encoded_rx = Arc::clone(&encoded_rx);
-        let producer_runtime_handle = runtime_handle.clone();
-        let producer_meta_tx = meta_tx;
-        scope.spawn(move || {
-            let run = (|| -> Result<()> {
-                let mut source_closed = false;
-                let mut poll_prepared = |may_block: bool| -> Result<PreparedAudioBatchPoll> {
-                    if decode_idle_flush.is_some() && !may_block {
-                        return Ok(PreparedAudioBatchPoll::Empty);
-                    }
-                    loop {
-                        if source_closed {
-                            return Ok(PreparedAudioBatchPoll::Closed);
-                        }
-                        let message = if may_block {
-                            if let Some(timeout) = decode_idle_flush {
-                                match producer_runtime_handle.block_on(async {
-                                    let mut encoded_rx = producer_encoded_rx.lock().await;
-                                    tokio::time::timeout(timeout, encoded_rx.recv()).await
-                                }) {
-                                    Ok(Some(message)) => Some(message),
-                                    Ok(None) => {
-                                        source_closed = true;
-                                        return Ok(PreparedAudioBatchPoll::Closed);
-                                    }
-                                    Err(tokio::time::error::Elapsed { .. }) => {
-                                        source_closed = true;
-                                        return Ok(PreparedAudioBatchPoll::Closed);
-                                    }
-                                }
-                            } else {
-                                match producer_runtime_handle.block_on(async {
-                                    let mut encoded_rx = producer_encoded_rx.lock().await;
-                                    encoded_rx.recv().await
-                                }) {
-                                    Some(message) => Some(message),
-                                    None => {
-                                        source_closed = true;
-                                        return Ok(PreparedAudioBatchPoll::Closed);
-                                    }
-                                }
-                            }
-                        } else {
-                            match producer_runtime_handle.block_on(async {
-                                let mut encoded_rx = producer_encoded_rx.lock().await;
-                                encoded_rx.try_recv()
-                            }) {
-                                Ok(message) => Some(message),
-                                Err(mpsc::error::TryRecvError::Empty) => None,
-                                Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    source_closed = true;
-                                    return Ok(PreparedAudioBatchPoll::Closed);
-                                }
-                            }
-                        };
-                        let Some(message) = message else {
-                            return Ok(PreparedAudioBatchPoll::Empty);
-                        };
-                        match message.batch {
-                            Ok(batch) => {
-                                let (next_inference, next_waveforms, next_encoded) =
-                                    batch.into_parts();
-                                let (prepared, meta) =
-                                    producer_qwen3.prepare_encoded_audio_features(next_encoded)?;
-                                if producer_meta_tx
-                                    .send(Ok(SegmentPreparedMetadata {
-                                        segments: message.segments,
-                                        inference: next_inference,
-                                        waveforms: next_waveforms,
-                                        meta,
-                                    }))
-                                    .is_err()
-                                {
-                                    return Ok(PreparedAudioBatchPoll::Closed);
-                                }
-                                return Ok(PreparedAudioBatchPoll::Ready(prepared));
-                            }
-                            Err(error) => {
-                                if producer_meta_tx
-                                    .send(Err(SegmentEncodedFailure {
-                                        segments: message.segments,
-                                        stage_start: message.stage_start,
-                                        error,
-                                    }))
-                                    .is_err()
-                                {
-                                    return Ok(PreparedAudioBatchPoll::Closed);
-                                }
-                            }
-                        }
-                    }
-                };
-                let mut producer = producer_qwen3.dynamic_prefill_producer(
-                    initial_prepared,
-                    &mut poll_prepared,
-                    producer_options,
-                )?;
-                loop {
-                    let message = producer.run_stage(true)?;
-                    let wave = message.prefill_wave;
-                    let done = producer.is_done();
-                    if wave > 0 || message.source_closed {
-                        if message_tx.send(Ok(message)).is_err() {
-                            return Ok(());
-                        }
-                    }
-                    if done {
-                        break;
-                    }
-                    if wave == 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(error) = run {
-                let _ = message_tx.send(Err(error));
-            }
-        });
-
-        qwen3.decode_prefilled_dynamic_ids(
-            message_rx,
-            runtime_options,
-            #[cfg(feature = "timing")]
-            Some(&mut timings.generation),
-        )
-    })?;
-
-    for meta_message in meta_rx.try_iter() {
-        match meta_message {
-            Ok(prepared) => {
-                consumed_segments.extend(prepared.segments);
-                inference.targets.extend(prepared.inference.targets);
-                inference.segment_audio_seconds += prepared.inference.segment_audio_seconds;
-                waveforms.extend(prepared.waveforms);
-                batch_lens.push(prepared.meta.audio_len());
-                metas.push(prepared.meta);
-            }
-            Err(failure) => encoded_failures.push(failure),
-        }
-    }
-
-    inference.active_job_count = inference
-        .targets
-        .iter()
-        .map(|(job_index, _, _)| *job_index)
-        .collect::<HashSet<_>>()
-        .len();
-
-    let outputs = qwen3.decode_dynamic_ids_with_metadata(ids, metas, batch_lens)?;
-    #[cfg(feature = "timing")]
-    {
-        timings.chunks = outputs.iter().map(Vec::len).sum();
-        timings.batches = outputs.len();
-    }
-    let mut timelines = Vec::with_capacity(waveforms.len());
-    let mut waveform_offset = 0usize;
-    for outputs in outputs {
-        let end = waveform_offset.saturating_add(outputs.len());
-        if end > waveforms.len() {
-            bail!(
-                "dynamic ASR waveform split mismatch: end={} waveforms={}",
-                end,
-                waveforms.len()
-            );
-        }
-        timelines.extend(qwen_outputs_to_timelines(
-            outputs,
-            &waveforms[waveform_offset..end],
-        )?);
-        waveform_offset = end;
-    }
-    if waveform_offset != waveforms.len() {
-        bail!(
-            "dynamic ASR unused waveforms: used={} waveforms={}",
-            waveform_offset,
-            waveforms.len()
-        );
-    }
-    Ok(DynamicSegmentAsrDecode {
-        consumed_segments,
-        inference,
-        timelines,
-        encoded_failures,
-        #[cfg(feature = "timing")]
-        timings,
-    })
 }
 
 fn finish_segment_asr_batch(

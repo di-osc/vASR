@@ -35,18 +35,26 @@ pub struct SentenceResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpentDetails {
+    #[serde(default)]
     pub loader: f64,
+    #[serde(default)]
     pub detector: f64,
+    #[serde(default)]
     pub recognizer: f64,
+    #[serde(default)]
     pub sentencizer: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimingBreakdown {
+    #[serde(default)]
     pub total: f64,
+    #[serde(default)]
     pub loader: f64,
+    #[serde(default)]
     pub pipeline: f64,
+    #[serde(default)]
     pub audio: f64,
 }
 
@@ -57,7 +65,9 @@ pub struct InferenceData {
     #[serde(rename = "spentSeconds")]
     pub spent_seconds: f64,
     #[serde(rename = "spentDetails")]
+    #[serde(default)]
     pub spent_details: SpentDetails,
+    #[serde(default)]
     pub timings: TimingBreakdown,
     pub text: TextResult,
     pub sentences: Vec<SentenceResult>,

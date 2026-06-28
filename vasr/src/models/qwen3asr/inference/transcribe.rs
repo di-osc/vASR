@@ -673,6 +673,10 @@ fn merge_generation_timings(dst: &mut TranscribeTimings, src: &GenerationTimings
         .prefill_tokens
         .saturating_add(src.prefill_tokens);
     dst.generation.decode_us = dst.generation.decode_us.saturating_add(src.decode_us);
+    dst.generation.decode_queue_us = dst
+        .generation
+        .decode_queue_us
+        .saturating_add(src.decode_queue_us);
     dst.generation.decode_token_tensor_us = dst
         .generation
         .decode_token_tensor_us
@@ -1094,7 +1098,8 @@ fn chunk_audio_seconds(samples: usize) -> f32 {
     samples as f32 / SAMPLE_RATE_HZ as f32
 }
 
-/// Group chunk indices into ASR pools bounded only by total audio seconds.
+/// Group chunk indices by total input audio seconds. A non-positive budget keeps
+/// all chunks in one pool and leaves runtime capacity to sequence/KV limits.
 fn group_chunk_indices(
     ordered_indices: &[usize],
     chunks: &[ChunkItem],
@@ -1103,47 +1108,32 @@ fn group_chunk_indices(
     if ordered_indices.is_empty() {
         return Ok(Vec::new());
     }
-
     if max_batch_audio_sec <= 0.0 {
         return Ok(vec![ordered_indices.to_vec()]);
     }
 
     let mut groups = Vec::new();
     let mut current = Vec::new();
-    let mut current_sec = 0.0f32;
+    let mut current_audio_sec = 0.0f32;
 
-    for &idx in ordered_indices {
+    for &index in ordered_indices {
         let chunk = chunks
-            .get(idx)
-            .ok_or_else(|| anyhow::anyhow!("missing chunk {idx}"))?;
-        let sec = chunk_audio_seconds(chunk.wav.len());
-
-        if sec > max_batch_audio_sec {
-            if !current.is_empty() {
-                groups.push(current);
-                current = Vec::new();
-                current_sec = 0.0;
-            }
-            groups.push(vec![idx]);
-            continue;
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("chunk index {index} out of range"))?;
+        let audio_sec = chunk_audio_seconds(chunk.wav.len());
+        if !current.is_empty()
+            && current_audio_sec + audio_sec > max_batch_audio_sec
+        {
+            groups.push(std::mem::take(&mut current));
+            current_audio_sec = 0.0;
         }
-
-        let exceeds_duration =
-            !current.is_empty() && current_sec + sec > max_batch_audio_sec + f32::EPSILON;
-        if exceeds_duration {
-            groups.push(current);
-            current = Vec::new();
-            current_sec = 0.0;
-        }
-
-        current.push(idx);
-        current_sec += sec;
+        current.push(index);
+        current_audio_sec += audio_sec;
     }
 
     if !current.is_empty() {
         groups.push(current);
     }
-
     Ok(groups)
 }
 
@@ -2529,7 +2519,9 @@ pub fn decode_cpu_audio_features_dynamic(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    );
+    )
+    .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
+    .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2570,7 +2562,9 @@ pub fn decode_cpu_audio_features_dynamic_timed(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    );
+    )
+    .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
+    .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2750,14 +2744,12 @@ mod batch_grouping_tests {
         ];
         let indices = vec![0, 1, 2, 3];
         let groups = group_chunk_indices(indices.as_slice(), &chunks, 60.0)?;
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0], vec![0, 1, 2]);
-        assert_eq!(groups[1], vec![3]);
+        assert_eq!(groups, vec![vec![0, 1, 2], vec![3]]);
         Ok(())
     }
 
     #[test]
-    fn group_chunk_indices_puts_oversized_chunk_alone() -> anyhow::Result<()> {
+    fn group_chunk_indices_keeps_oversized_chunk_alone() -> anyhow::Result<()> {
         let chunks = vec![chunk_with_seconds(65.0), chunk_with_seconds(5.0)];
         let groups = group_chunk_indices(&[0, 1], &chunks, 60.0)?;
         assert_eq!(groups, vec![vec![0], vec![1]]);
