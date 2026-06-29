@@ -87,6 +87,10 @@ pub struct CommonModelArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct VadCliArgs {
+    /// FSMN VAD device: auto, cpu, cuda.
+    #[arg(long = "vad-device", default_value = "auto", env = "VASR_VAD_DEVICE")]
+    pub vad_device: String,
+
     /// FSMN VAD speech probability threshold (`speech_noise_thres`).
     #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
     pub vad_threshold: f32,
@@ -177,12 +181,15 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
     let transcribe_service = build_transcribe_service_from_parts(
-        build_offline_pipeline(load_asr_model_for_pipeline(
-            &args.pipeline,
-            args.language.as_deref(),
-            cuda_graph_max_batch(&args.pipeline.model),
-            false,
-        )?)?,
+        build_offline_pipeline(
+            load_asr_model_for_pipeline(
+                &args.pipeline,
+                args.language.as_deref(),
+                cuda_graph_max_batch(&args.pipeline.model),
+                false,
+            )?,
+            &args.pipeline.vad,
+        )?,
         asr_options_from_pipeline(&args.pipeline, args.language.clone()),
         vad_options_from_pipeline(&args.pipeline),
         worker_options_from_pipeline(&args.pipeline),
@@ -206,7 +213,7 @@ pub fn build_async_transcribe_pipeline(
         cuda_graph_max_batch(&pipeline.model),
         false,
     )?;
-    let offline = build_offline_pipeline(asr)?;
+    let offline = build_offline_pipeline(asr, &pipeline.vad)?;
     Ok(AsyncTranscribePipeline::new(
         AudioLoader,
         offline,
@@ -227,7 +234,7 @@ pub fn build_global_transcribe_pipeline(
         cuda_graph_max_batch(&pipeline.model),
         false,
     )?;
-    let offline = build_offline_pipeline(asr)?;
+    let offline = build_offline_pipeline(asr, &pipeline.vad)?;
     Ok(Arc::new(GlobalAsyncTranscribePipeline::start(
         vasr_data::AudioLoader,
         offline,
@@ -242,14 +249,18 @@ pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {
     validate_vad_args(&pipeline.vad)
 }
 
-fn build_offline_pipeline(asr: Arc<dyn AsrModel>) -> Result<Arc<OfflinePipeline>> {
+fn build_offline_pipeline(
+    asr: Arc<dyn AsrModel>,
+    vad_args: &VadCliArgs,
+) -> Result<Arc<OfflinePipeline>> {
     let vad_load_start = Instant::now();
-    let vad = load_fsmn_vad()?;
+    let vad_device = resolve_vad_device(vad_args.vad_device.as_str())?;
+    let vad = load_fsmn_vad(&vad_device)?;
     tracing::info!(
         target: "vasr_transcribe::serve",
         "loaded vad | {:.3}s model=fsmn device={}",
         vad_load_start.elapsed().as_secs_f64(),
-        "cuda:0",
+        device_label(&vad_device),
     );
     tracing::debug!(
         target: "vasr_transcribe::serve",
@@ -303,6 +314,7 @@ mod tests {
             num_load_workers: 0,
             num_vad_workers: 0,
             vad: VadCliArgs {
+                vad_device: "auto".to_string(),
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 800,
@@ -740,6 +752,10 @@ fn percentage(bytes: usize, total: usize) -> f64 {
 }
 
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
+    match vad.vad_device.trim().to_ascii_lowercase().as_str() {
+        "auto" | "cpu" | "cuda" | "gpu" => {}
+        other => bail!("--vad-device must be auto, cpu, or cuda; got {other:?}"),
+    }
     if !(0.0..=1.0).contains(&vad.vad_threshold) {
         bail!("--vad-threshold must be between 0.0 and 1.0");
     }
@@ -984,8 +1000,35 @@ async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn load_fsmn_vad() -> Result<FsmnVadModel> {
-    FsmnVadModel::from_pretrained(None::<&std::path::Path>)
+fn resolve_vad_device(value: &str) -> Result<Device> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => {
+            #[cfg(feature = "cuda")]
+            {
+                if let Ok(device) = Device::new_cuda(0) {
+                    return Ok(device);
+                }
+            }
+            Ok(Device::Cpu)
+        }
+        "cpu" => Ok(Device::Cpu),
+        "cuda" | "gpu" => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0)
+                    .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0 for VAD: {err}"))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!("--vad-device cuda requires building with `--features cuda`")
+            }
+        }
+        other => bail!("--vad-device must be auto, cpu, or cuda; got {other:?}"),
+    }
+}
+
+fn load_fsmn_vad(device: &Device) -> Result<FsmnVadModel> {
+    FsmnVadModel::from_pretrained_on_device(None::<&std::path::Path>, device)
 }
 
 async fn health() -> Json<serde_json::Value> {

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use candle_core::Device;
 use vasr_data::Waveform;
 use vasr_vad as model_vad;
 
@@ -15,6 +16,15 @@ impl FsmnVadModel {
     pub fn from_pretrained(path: Option<impl AsRef<Path>>) -> Result<Self> {
         Ok(Self {
             inner: model_vad::FsmnVadModel::from_pretrained(path)?,
+        })
+    }
+
+    pub fn from_pretrained_on_device(
+        path: Option<impl AsRef<Path>>,
+        device: &Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: model_vad::FsmnVadModel::from_pretrained_on_device(path, device)?,
         })
     }
 

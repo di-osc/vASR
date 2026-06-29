@@ -67,11 +67,18 @@ pub struct FsmnVadModel {
 
 impl FsmnVadModel {
     pub fn from_pretrained(path: Option<impl AsRef<Path>>) -> Result<Self> {
+        Self::from_pretrained_on_device(path, &fsmn_vad_device()?)
+    }
+
+    pub fn from_pretrained_on_device(
+        path: Option<impl AsRef<Path>>,
+        device: &Device,
+    ) -> Result<Self> {
         let model_dir = match path {
             Some(path) => path.as_ref().to_path_buf(),
             None => download_fsmn_vad()?,
         };
-        let weights = Arc::new(FsmnVadWeights::load(&model_dir)?);
+        let weights = Arc::new(FsmnVadWeights::load_on_device(&model_dir, device)?);
         Ok(Self { weights, model_dir })
     }
 
@@ -412,10 +419,6 @@ impl std::fmt::Debug for FsmnVadWeights {
 }
 
 impl FsmnVadWeights {
-    fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_on_device(model_dir, &fsmn_vad_device()?)
-    }
-
     fn load_on_device(model_dir: &Path, device: &Device) -> Result<Self> {
         let model_path = model_dir.join("model.pt");
         let cmvn_path = model_dir.join("am.mvn");
