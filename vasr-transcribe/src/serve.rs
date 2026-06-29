@@ -88,7 +88,7 @@ pub struct CommonModelArgs {
 #[derive(Debug, Clone, Args)]
 pub struct VadCliArgs {
     /// FSMN VAD device: auto, cpu, cuda.
-    #[arg(long = "vad-device", default_value = "auto", env = "VASR_VAD_DEVICE")]
+    #[arg(long = "vad-device", default_value = "cpu", env = "VASR_VAD_DEVICE")]
     pub vad_device: String,
 
     /// FSMN VAD speech probability threshold (`speech_noise_thres`).
@@ -314,7 +314,7 @@ mod tests {
             num_load_workers: 0,
             num_vad_workers: 0,
             vad: VadCliArgs {
-                vad_device: "auto".to_string(),
+                vad_device: "cpu".to_string(),
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 800,
