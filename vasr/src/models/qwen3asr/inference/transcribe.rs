@@ -1121,9 +1121,7 @@ fn group_chunk_indices(
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("chunk index {index} out of range"))?;
         let audio_sec = chunk_audio_seconds(chunk.wav.len());
-        if !current.is_empty()
-            && current_audio_sec + audio_sec > max_batch_audio_sec
-        {
+        if !current.is_empty() && current_audio_sec + audio_sec > max_batch_audio_sec {
             groups.push(std::mem::take(&mut current));
             current_audio_sec = 0.0;
         }
@@ -2520,8 +2518,7 @@ pub fn decode_cpu_audio_features_dynamic(
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
     )
-    .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
-    .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
+    .with_optional_fixed_decode_tokens(opts.max_new_tokens);
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2563,8 +2560,7 @@ pub fn decode_cpu_audio_features_dynamic_timed(
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
     )
-    .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
-    .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
+    .with_optional_fixed_decode_tokens(opts.max_new_tokens);
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,

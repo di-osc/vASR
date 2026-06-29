@@ -27,9 +27,9 @@ use crate::model::paged_batch_engine::{
 };
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
-use vasr_paged_attn::{PagedCacheRuntime, SharedPagedCacheRuntime};
 #[cfg(feature = "cuda-graph")]
 use vasr_paged_attn::cuda_graph::{cuda_memory_snapshot, cuda_trim_device_mem_pools};
+use vasr_paged_attn::{PagedCacheRuntime, SharedPagedCacheRuntime};
 
 #[cfg(feature = "timing")]
 fn duration_to_us(d: std::time::Duration) -> u64 {
@@ -153,8 +153,8 @@ impl Default for AsrBatchSchedulerConfig {
             explicit_decode_max_seqs: None,
             prefill_max_wave: prefill_max_wave_from_env(),
             continuous_batch: continuous_batch_enabled(),
-            generated_tokens_per_sec: 8.0,
-            min_generated_tokens: 32,
+            generated_tokens_per_sec: 4.25,
+            min_generated_tokens: 128,
             max_generated_tokens: None,
         }
     }
@@ -188,6 +188,15 @@ impl AsrBatchSchedulerConfig {
         self.prefill_max_wave
             .unwrap_or_else(|| self.continuous_max_num_seqs(runtime))
             .max(1)
+    }
+
+    pub fn with_optional_fixed_decode_tokens(mut self, max_new_tokens: usize) -> Self {
+        if max_new_tokens > 0 {
+            let budget = max_new_tokens.saturating_add(2);
+            self.min_generated_tokens = budget;
+            self.max_generated_tokens = Some(budget);
+        }
+        self
     }
 
     pub fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
@@ -833,10 +842,7 @@ fn decode_running_step_groups(
 
         #[cfg(feature = "timing")]
         let start_decode = std::time::Instant::now();
-        maybe_trim_cuda_above_target(
-            device,
-            "VASR_TRIM_CUDA_MEMPOOL_BEFORE_DECODE_TARGET_MIB",
-        );
+        maybe_trim_cuda_above_target(device, "VASR_TRIM_CUDA_MEMPOOL_BEFORE_DECODE_TARGET_MIB");
         paged_batch_decode_slots_at_step_shared(
             thinker,
             device,
@@ -845,10 +851,7 @@ fn decode_running_step_groups(
             step,
             eos_token_ids,
         )?;
-        maybe_trim_cuda_above_target(
-            device,
-            "VASR_TRIM_CUDA_MEMPOOL_AFTER_DECODE_TARGET_MIB",
-        );
+        maybe_trim_cuda_above_target(device, "VASR_TRIM_CUDA_MEMPOOL_AFTER_DECODE_TARGET_MIB");
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
             t.decode_us = t
@@ -2059,8 +2062,7 @@ pub fn run_paged_micro_batch(
     decode_max_seqs: usize,
 ) -> Result<Vec<Vec<u32>>> {
     let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_min_generated_tokens(max_new_tokens.saturating_add(2))
-        .with_max_generated_tokens(max_new_tokens.saturating_add(2));
+        .with_optional_fixed_decode_tokens(max_new_tokens);
     let mut scheduler = AsrBatchScheduler::new(config);
     scheduler.run_micro_batch(
         thinker,
@@ -2087,8 +2089,7 @@ pub fn run_paged_prepared_batch(
     audio_seconds: Option<&[f64]>,
 ) -> Result<Vec<Vec<u32>>> {
     let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_min_generated_tokens(max_new_tokens.saturating_add(2))
-        .with_max_generated_tokens(max_new_tokens.saturating_add(2));
+        .with_optional_fixed_decode_tokens(max_new_tokens);
     let mut scheduler = AsrBatchScheduler::new(config);
     let default_audio_seconds;
     let audio_seconds = match audio_seconds {
@@ -2145,8 +2146,7 @@ pub fn run_paged_prepared_batch_timed(
     audio_seconds: Option<&[f64]>,
 ) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
     let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_min_generated_tokens(max_new_tokens.saturating_add(2))
-        .with_max_generated_tokens(max_new_tokens.saturating_add(2));
+        .with_optional_fixed_decode_tokens(max_new_tokens);
     let mut scheduler = AsrBatchScheduler::new(config);
     let mut timings = GenerationTimings::default();
     let default_audio_seconds;
@@ -2233,8 +2233,9 @@ mod tests {
 
     #[test]
     fn generated_token_budget_uses_minimum_for_short_audio() {
-        assert_eq!(super::generated_token_budget(0.1, 8.0, 32), 32);
-        assert_eq!(super::generated_token_budget(5.0, 8.0, 32), 40);
+        assert_eq!(super::generated_token_budget(0.1, 4.25, 128, None), 128);
+        assert_eq!(super::generated_token_budget(5.0, 4.25, 128, None), 128);
+        assert_eq!(super::generated_token_budget(30.0, 4.25, 128, None), 128);
     }
 
     #[test]

@@ -11,7 +11,6 @@ vasr-transcribe serve \
   --max-num-seqs 256 \
   --kv-peak-ratio 0.10 \
   --max-hotword-tokens 0 \
-  --max-new-tokens 128 \
   --vad-max-segment-sec 30 \
   --num-load-workers 4 \
   --num-vad-workers 4
@@ -33,13 +32,13 @@ vasr-transcribe-bench \
 - 模型: `Qwen3-ASR-1.7B`
 - 数据集: `lbg_call-100.vasr.msgpack`
 - 音频总时长: `5025.0120s`
-- benchmark wall: `16.4548s`
-- benchmark speedup: `305.3831x`
-- CER: `0.146761`
+- benchmark wall: `16.6168s`
+- benchmark speedup: `302.4062x`
+- CER: `0.147363`
 - bad: `0`
-- 运行峰值显存采样: `11991MiB / 24564MiB`
+- 运行峰值显存采样: `12215MiB / 24564MiB`
 
-RTX 4090 50% 显存上限为 `12282MiB`，本次峰值低于上限约 `291MiB`。
+RTX 4090 50% 显存上限为 `12282MiB`，本次峰值低于上限约 `67MiB`。
 
 ## Pipeline 分层
 
@@ -73,7 +72,7 @@ loader 和 VAD 是 CPU/异步 worker 阶段；encode、prefill、decode 是 GPU 
 - `vad_max_segment_sec=30`: 单个 VAD segment 最大 30 秒。
 - `kv_peak_ratio=0.10`: 只为约 10% 并发 sequence 预留 30 秒长段峰值空间。
 - `max_hotword_tokens=0`: benchmark 不使用热词，避免为每个 sequence 固定浪费 128 tokens。
-- `max_new_tokens=128`: 保留完整 decode 上限，避免 capacity error 和识别截断。
+- decode 上限不再作为启动参数暴露。prefill 会根据每个 segment 的实际音频时长估算 decode token 预算，并使用内部安全下限保证短段不被过早截断。
 
 最终启动日志中的 KV 预算:
 
@@ -110,13 +109,12 @@ VASR_DISABLE_MIXED_STEP_DECODE=1
 - KV cache: 约 `3.07GiB`
 - CUDA decode graph: 约 `1.55GiB`
 - 启动后 GPU used: 约 `8.83GiB`
-- 请求运行峰值: `11991MiB`
+- 请求运行峰值: `12215MiB`
 
-运行峰值高于启动显存，主要来自 encode/prefill/decode 中间张量、CUDA graph replay 工作区和 allocator 短时保留。当前配置在不牺牲 1.7B 模型和 128 decode token 上限的前提下，把峰值压到 50% 以内。
+运行峰值高于启动显存，主要来自 encode/prefill/decode 中间张量、CUDA graph replay 工作区和 allocator 短时保留。当前配置在不牺牲 1.7B 模型和自动 decode 预算稳定性的前提下，把峰值压到 50% 以内。
 
 ## 注意事项
 
-- 不要把 `max_new_tokens` 降到 124 或更低；实测会出现 paged decode capacity error，并造成 bad 和 CER 明显恶化。
 - `max_hotword_tokens=0` 适用于无热词 benchmark；如果线上需要热词，需要重新计算 KV 预算并重新压测显存。
 - `max_num_seqs=192` 可进一步压低峰值，但速度不足 300x。
 - `kv_peak_ratio=0.12` 或更高会改善部分吞吐，但在当前 4090 上运行峰值会超过 50%。

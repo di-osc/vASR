@@ -157,6 +157,14 @@ fn decode_step_required_tokens(
         .ok_or_else(|| anyhow::anyhow!("paged slot token count overflow"))
 }
 
+fn decode_budget_exhausted(
+    prompt_len: usize,
+    generated_len_after_push: usize,
+    token_capacity: usize,
+) -> Result<bool> {
+    Ok(decode_step_required_tokens(prompt_len, generated_len_after_push)? > token_capacity)
+}
+
 fn cuda_packed_prefill_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CUDA_PACKED_PREFILL").is_none()
 }
@@ -250,6 +258,15 @@ pub fn paged_batch_decode_slots_at_step(
             continue;
         }
         slots[i].generated.push(tok);
+        if decode_budget_exhausted(
+            slots[i].prompt_len_usize,
+            slots[i].generated.len(),
+            slots[i].token_capacity,
+        )? {
+            slots[i].finished = true;
+            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+            continue;
+        }
         if has_repeated_tail(&slots[i].generated) {
             slots[i].finished = true;
             slots[i].decode_step = slots[i].decode_step.saturating_add(1);
@@ -388,6 +405,15 @@ pub fn paged_batch_decode_slots_at_step_shared(
                 continue;
             }
             slots[i].generated.push(tok);
+            if decode_budget_exhausted(
+                slots[i].prompt_len_usize,
+                slots[i].generated.len(),
+                slots[i].token_capacity,
+            )? {
+                slots[i].finished = true;
+                slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+                continue;
+            }
             if has_repeated_tail(&slots[i].generated) {
                 slots[i].finished = true;
                 slots[i].decode_step = slots[i].decode_step.saturating_add(1);
@@ -522,6 +548,15 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
                 continue;
             }
             slot.generated.push(tok);
+            if decode_budget_exhausted(
+                slot.prompt_len_usize,
+                slot.generated.len(),
+                slot.token_capacity,
+            )? {
+                slot.finished = true;
+                slot.decode_step = slot.decode_step.saturating_add(1);
+                continue;
+            }
             if has_repeated_tail(&slot.generated) {
                 slot.finished = true;
                 slot.decode_step = slot.decode_step.saturating_add(1);
@@ -1319,9 +1354,8 @@ fn prefill_token_capacities(
     prompt_lens
         .iter()
         .map(|&prompt_len| {
-            let max_new_tokens = config.max_new_tokens.max(256);
             prompt_len
-                .checked_add(max_new_tokens)
+                .checked_add(config.max_new_tokens)
                 .ok_or_else(|| anyhow::anyhow!("token capacity overflow"))
         })
         .collect()
@@ -1391,6 +1425,14 @@ pub fn paged_batch_decode_step(
             continue;
         }
         state.generated[i].push(tok);
+        if decode_budget_exhausted(
+            state.prompt_lens_usize[i],
+            state.generated[i].len(),
+            state.token_capacities[i],
+        )? {
+            state.finished[i] = true;
+            continue;
+        }
         if has_repeated_tail(&state.generated[i]) {
             state.finished[i] = true;
             continue;
@@ -1507,13 +1549,15 @@ fn paged_batch_decode_forward(
         }
     }
 
-    Ok(DecodeStepOutput::Logits(paged_batch_decode_forward_without_graph(
-        thinker,
-        runtime.cache(),
-        input_ids_new,
-        position_ids_new,
-        input_metadata,
-    )?))
+    Ok(DecodeStepOutput::Logits(
+        paged_batch_decode_forward_without_graph(
+            thinker,
+            runtime.cache(),
+            input_ids_new,
+            position_ids_new,
+            input_metadata,
+        )?,
+    ))
 }
 
 fn paged_batch_decode_forward_shared(
@@ -1539,8 +1583,12 @@ fn paged_batch_decode_forward_shared(
                         input_metadata,
                     ) {
                         Ok(output) => Ok(match output.kind {
-                            DecodeGraphOutputKind::Logits => DecodeStepOutput::Logits(output.tensor),
-                            DecodeGraphOutputKind::NextIds => DecodeStepOutput::NextIds(output.tensor),
+                            DecodeGraphOutputKind::Logits => {
+                                DecodeStepOutput::Logits(output.tensor)
+                            }
+                            DecodeGraphOutputKind::NextIds => {
+                                DecodeStepOutput::NextIds(output.tensor)
+                            }
                             DecodeGraphOutputKind::NextIdCandidates => {
                                 DecodeStepOutput::NextIdCandidates(output.tensor)
                             }
@@ -1569,13 +1617,15 @@ fn paged_batch_decode_forward_shared(
         }
     }
 
-    Ok(DecodeStepOutput::Logits(paged_batch_decode_forward_without_graph(
-        thinker,
-        cache,
-        input_ids_new,
-        position_ids_new,
-        input_metadata,
-    )?))
+    Ok(DecodeStepOutput::Logits(
+        paged_batch_decode_forward_without_graph(
+            thinker,
+            cache,
+            input_ids_new,
+            position_ids_new,
+            input_metadata,
+        )?,
+    ))
 }
 
 fn next_token_ids_from_decode_output(
@@ -1616,7 +1666,9 @@ fn next_token_ids_from_decode_output(
                         .get(row)
                         .and_then(|row_values| row_values.get(chunk))
                         .copied()
-                        .ok_or_else(|| anyhow::anyhow!("missing chunked argmax value row={row} chunk={chunk}"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing chunked argmax value row={row} chunk={chunk}")
+                        })?;
                     if value > best_value {
                         best_value = value;
                         best_id = ids

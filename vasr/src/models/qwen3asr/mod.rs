@@ -314,8 +314,7 @@ impl Qwen3ASR {
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
-            .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
+            .with_optional_fixed_decode_tokens(opts.max_new_tokens);
         DynamicPrefillProducer::with_shared_request_ids(
             config,
             Arc::clone(&self.next_paged_request_id),
@@ -343,8 +342,7 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_min_generated_tokens(opts.max_new_tokens.saturating_add(2))
-            .with_max_generated_tokens(opts.max_new_tokens.saturating_add(2));
+            .with_optional_fixed_decode_tokens(opts.max_new_tokens);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()

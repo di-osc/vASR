@@ -33,7 +33,7 @@ const KV_BLOCK_SIZE: usize = 32;
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
 const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
 #[cfg(feature = "paged-attn")]
-const ASR_GENERATED_TOKENS_PER_SEC: f64 = 8.0;
+const ASR_GENERATED_TOKENS_PER_SEC: f64 = 4.25;
 #[cfg(feature = "paged-attn")]
 const ASR_MIN_GENERATED_TOKENS: usize = 32;
 #[cfg(feature = "paged-attn")]
@@ -67,14 +67,6 @@ pub struct CommonModelArgs {
         default_value_t = DEFAULT_MAX_NUM_SEQS
     )]
     pub max_num_seqs: usize,
-
-    /// Maximum tokens generated per ASR segment.
-    #[arg(
-        long = "max-new-tokens",
-        default_value_t = AsrOptions::default().max_new_tokens,
-        env = "VASR_MAX_NEW_TOKENS"
-    )]
-    pub max_new_tokens: usize,
 
     /// Maximum hotword/context tokens reserved in every ASR KV-cache sequence.
     #[arg(
@@ -276,7 +268,7 @@ fn asr_options_from_pipeline(
 ) -> AsrOptions {
     AsrOptions {
         language,
-        max_new_tokens: pipeline.model.max_new_tokens,
+        max_new_tokens: 0,
         decode_max_seqs: pipeline.model.max_num_seqs,
         max_batch_audio_sec: pipeline.max_batch_audio_sec,
         chunk_max_sec: None,
@@ -304,7 +296,6 @@ mod tests {
                 device: "auto".to_string(),
                 isq: None,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-                max_new_tokens: AsrOptions::default().max_new_tokens,
                 max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
                 kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
             },
@@ -320,7 +311,7 @@ mod tests {
         };
 
         let opts = asr_options_from_pipeline(&pipeline, None);
-        assert_eq!(opts.max_new_tokens, AsrOptions::default().max_new_tokens);
+        assert_eq!(opts.max_new_tokens, 0);
         assert_eq!(opts.max_batch_audio_sec, 60.0);
         assert!(opts.context.is_empty());
     }
@@ -333,7 +324,6 @@ mod tests {
             device: "auto".to_string(),
             isq: None,
             max_num_seqs: 0,
-            max_new_tokens: AsrOptions::default().max_new_tokens,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
             kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
         };
@@ -350,7 +340,6 @@ mod tests {
             device: "auto".to_string(),
             isq: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            max_new_tokens: AsrOptions::default().max_new_tokens,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
             kv_peak_ratio: 1.5,
         };
@@ -379,10 +368,8 @@ mod tests {
     fn kv_peak_ratio_reduces_peak_only_blocks() -> anyhow::Result<()> {
         let fixed_prompt_tokens = 18;
         let hotword_tokens = DEFAULT_MAX_HOTWORD_TOKENS;
-        let max_new_tokens = AsrOptions::default().max_new_tokens;
-        let base = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, max_new_tokens, 1.0)?;
-        let peak =
-            kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, max_new_tokens, 30.0)?;
+        let base = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 1.0)?;
+        let peak = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 30.0)?;
         let base_blocks = DEFAULT_MAX_NUM_SEQS * base.blocks_per_seq;
         let peak_extra_blocks = ((DEFAULT_MAX_NUM_SEQS
             * (peak.blocks_per_seq - base.blocks_per_seq)) as f64
@@ -503,13 +490,11 @@ fn estimate_kv_cache_sizing(
     let base = kv_tokens_for_segment(
         fixed_prompt_tokens,
         pipeline.model.max_hotword_tokens,
-        pipeline.model.max_new_tokens,
         KV_BASE_SEGMENT_SEC,
     )?;
     let peak = kv_tokens_for_segment(
         fixed_prompt_tokens,
         pipeline.model.max_hotword_tokens,
-        pipeline.model.max_new_tokens,
         pipeline.vad.vad_max_segment_sec,
     )?;
     let base_blocks = pipeline
@@ -559,11 +544,10 @@ struct KvSegmentTokens {
 fn kv_tokens_for_segment(
     fixed_prompt_tokens: usize,
     max_hotword_tokens: usize,
-    max_new_tokens: usize,
     segment_sec: f32,
 ) -> Result<KvSegmentTokens> {
     let audio_prompt_tokens = max_audio_prompt_tokens(segment_sec);
-    let decode_tokens = generated_token_budget(segment_sec).min(max_new_tokens);
+    let decode_tokens = generated_token_budget(segment_sec);
     let tokens_per_seq = fixed_prompt_tokens
         .checked_add(audio_prompt_tokens)
         .and_then(|n| n.checked_add(max_hotword_tokens))
