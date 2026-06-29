@@ -2014,33 +2014,6 @@ pub(crate) fn group_running_by_decode_step(active: &[(usize, usize)]) -> Vec<(us
     out
 }
 
-/// Convenience entry when a scheduler instance is not needed.
-pub fn run_paged_micro_batch(
-    thinker: &ThinkerForConditionalGeneration,
-    device: &Device,
-    runtime: &SharedPagedCacheRuntime,
-    input_ids: &[&[u32]],
-    attention_mask: &[&[u32]],
-    audio_features: Option<&Tensor>,
-    max_new_tokens: usize,
-    eos_token_ids: &[u32],
-    decode_max_seqs: usize,
-) -> Result<Vec<Vec<u32>>> {
-    let _ = max_new_tokens;
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
-    let mut scheduler = AsrBatchScheduler::new(config);
-    scheduler.run_micro_batch(
-        thinker,
-        device,
-        runtime,
-        input_ids,
-        attention_mask,
-        audio_features,
-        max_new_tokens,
-        eos_token_ids,
-    )
-}
-
 pub fn run_paged_prepared_batch(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,

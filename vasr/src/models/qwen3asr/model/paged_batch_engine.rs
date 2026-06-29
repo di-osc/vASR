@@ -79,7 +79,6 @@ pub struct PagedBatchState {
     pub generated: Vec<Vec<u32>>,
     pub finished: Vec<bool>,
     pub decode_step: usize,
-    pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
     pub token_capacities: Vec<usize>,
 }
@@ -1020,7 +1019,6 @@ pub fn paged_batch_prefill(
         generated: vec![Vec::new(); batch],
         finished,
         decode_step: 0,
-        max_new_tokens: config.max_new_tokens,
         eos_token_ids: config.eos_token_ids.clone(),
         token_capacities,
     })
@@ -1362,7 +1360,6 @@ fn paged_batch_prefill_with_allocated(
         generated: vec![Vec::new(); batch],
         finished,
         decode_step: 0,
-        max_new_tokens: config.max_new_tokens,
         eos_token_ids: config.eos_token_ids.clone(),
         token_capacities,
     })
@@ -1764,7 +1761,6 @@ mod tests {
             generated: vec![vec![]; 4],
             finished: vec![false, true, false, true],
             decode_step: 0,
-            max_new_tokens: 16,
             eos_token_ids: vec![0],
             token_capacities: vec![24; 4],
         };
