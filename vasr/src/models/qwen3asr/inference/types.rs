@@ -60,6 +60,8 @@ pub struct TranscribeOptions {
     /// Maximum total audio duration (seconds) per ASR pool. `0` disables duration grouping.
     pub max_batch_audio_sec: f32,
     pub chunk_max_sec: Option<f32>,
+    pub decode_tokens_per_sec: f64,
+    pub decode_min_tokens: usize,
     /// If true, bucket chunked audio by length before batching to reduce padding overhead.
     pub bucket_by_length: bool,
 }
@@ -74,6 +76,8 @@ impl Default for TranscribeOptions {
             decode_max_seqs: 0,
             max_batch_audio_sec: 180.0,
             chunk_max_sec: None,
+            decode_tokens_per_sec: 4.25,
+            decode_min_tokens: 128,
             bucket_by_length: true,
         }
     }

@@ -33,9 +33,8 @@ const KV_BLOCK_SIZE: usize = 32;
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
 const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
 #[cfg(feature = "paged-attn")]
-const ASR_GENERATED_TOKENS_PER_SEC: f64 = 4.25;
-#[cfg(feature = "paged-attn")]
-const ASR_MIN_GENERATED_TOKENS: usize = 32;
+const DEFAULT_DECODE_TOKENS_PER_SEC: f64 = 4.25;
+const DEFAULT_DECODE_MIN_TOKENS: usize = 128;
 #[cfg(feature = "paged-attn")]
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
 #[cfg(feature = "paged-attn")]
@@ -75,6 +74,14 @@ pub struct CommonModelArgs {
         env = "VASR_MAX_HOTWORD_TOKENS"
     )]
     pub max_hotword_tokens: usize,
+
+    /// Estimated ASR decode tokens generated per second of segment audio.
+    #[arg(long = "decode-tokens-per-sec", default_value_t = DEFAULT_DECODE_TOKENS_PER_SEC)]
+    pub decode_tokens_per_sec: f64,
+
+    /// Minimum runtime decode tokens reserved per ASR segment.
+    #[arg(long = "decode-min-tokens", default_value_t = DEFAULT_DECODE_MIN_TOKENS)]
+    pub decode_min_tokens: usize,
 
     /// Fraction of decode sequences expected to grow from base segment length to max segment length.
     #[arg(
@@ -283,6 +290,8 @@ fn asr_options_from_pipeline(
         decode_max_seqs: pipeline.model.max_num_seqs,
         max_batch_audio_sec: pipeline.max_batch_audio_sec,
         chunk_max_sec: None,
+        decode_tokens_per_sec: pipeline.model.decode_tokens_per_sec,
+        decode_min_tokens: pipeline.model.decode_min_tokens,
         ..AsrOptions::default()
     }
 }
@@ -308,6 +317,8 @@ mod tests {
                 isq: None,
                 max_num_seqs: DEFAULT_MAX_NUM_SEQS,
                 max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+                decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
+                decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
                 kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
             },
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
@@ -337,6 +348,8 @@ mod tests {
             isq: None,
             max_num_seqs: 0,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
+            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
             kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
         };
 
@@ -353,6 +366,8 @@ mod tests {
             isq: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
+            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
             kv_peak_ratio: 1.5,
         };
 
@@ -363,8 +378,11 @@ mod tests {
     #[cfg(feature = "paged-attn")]
     #[test]
     fn generated_token_budget_matches_scheduler_defaults() {
-        assert_eq!(generated_token_budget(0.1), ASR_MIN_GENERATED_TOKENS);
-        assert_eq!(generated_token_budget(5.0), 40);
+        assert_eq!(
+            generated_token_budget(0.1, 4.25, KV_BLOCK_SIZE),
+            KV_BLOCK_SIZE
+        );
+        assert_eq!(generated_token_budget(5.0, 4.25, KV_BLOCK_SIZE), 40);
     }
 
     #[cfg(feature = "paged-attn")]
@@ -380,8 +398,18 @@ mod tests {
     fn kv_peak_ratio_reduces_peak_only_blocks() -> anyhow::Result<()> {
         let fixed_prompt_tokens = 18;
         let hotword_tokens = DEFAULT_MAX_HOTWORD_TOKENS;
-        let base = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 1.0)?;
-        let peak = kv_tokens_for_segment(fixed_prompt_tokens, hotword_tokens, 30.0)?;
+        let base = kv_tokens_for_segment(
+            fixed_prompt_tokens,
+            hotword_tokens,
+            1.0,
+            DEFAULT_DECODE_TOKENS_PER_SEC,
+        )?;
+        let peak = kv_tokens_for_segment(
+            fixed_prompt_tokens,
+            hotword_tokens,
+            30.0,
+            DEFAULT_DECODE_TOKENS_PER_SEC,
+        )?;
         let base_blocks = DEFAULT_MAX_NUM_SEQS * base.blocks_per_seq;
         let peak_extra_blocks = ((DEFAULT_MAX_NUM_SEQS
             * (peak.blocks_per_seq - base.blocks_per_seq)) as f64
@@ -420,6 +448,12 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.max_num_seqs == 0 {
         bail!("--max-num-seqs must be greater than zero");
     }
+    if !args.decode_tokens_per_sec.is_finite() || args.decode_tokens_per_sec <= 0.0 {
+        bail!("--decode-tokens-per-sec must be finite and greater than zero");
+    }
+    if args.decode_min_tokens == 0 {
+        bail!("--decode-min-tokens must be greater than zero");
+    }
     if !args.kv_peak_ratio.is_finite() || !(0.0..=1.0).contains(&args.kv_peak_ratio) {
         bail!("--kv-peak-ratio must be finite and between 0.0 and 1.0");
     }
@@ -442,6 +476,9 @@ struct KvCacheSizing {
     max_segment_sec: f32,
     peak_ratio: f32,
     max_hotword_tokens: usize,
+    decode_tokens_per_sec: f64,
+    decode_min_tokens: usize,
+    planning_decode_min_tokens: usize,
     fixed_prompt_tokens: usize,
     base_audio_prompt_tokens: usize,
     base_decode_tokens: usize,
@@ -503,11 +540,13 @@ fn estimate_kv_cache_sizing(
         fixed_prompt_tokens,
         pipeline.model.max_hotword_tokens,
         KV_BASE_SEGMENT_SEC,
+        pipeline.model.decode_tokens_per_sec,
     )?;
     let peak = kv_tokens_for_segment(
         fixed_prompt_tokens,
         pipeline.model.max_hotword_tokens,
         pipeline.vad.vad_max_segment_sec,
+        pipeline.model.decode_tokens_per_sec,
     )?;
     let base_blocks = pipeline
         .model
@@ -528,6 +567,9 @@ fn estimate_kv_cache_sizing(
         max_segment_sec: pipeline.vad.vad_max_segment_sec,
         peak_ratio: pipeline.model.kv_peak_ratio,
         max_hotword_tokens: pipeline.model.max_hotword_tokens,
+        decode_tokens_per_sec: pipeline.model.decode_tokens_per_sec,
+        decode_min_tokens: pipeline.model.decode_min_tokens,
+        planning_decode_min_tokens: KV_BLOCK_SIZE,
         fixed_prompt_tokens,
         base_audio_prompt_tokens: base.audio_prompt_tokens,
         base_decode_tokens: base.decode_tokens,
@@ -557,9 +599,10 @@ fn kv_tokens_for_segment(
     fixed_prompt_tokens: usize,
     max_hotword_tokens: usize,
     segment_sec: f32,
+    decode_tokens_per_sec: f64,
 ) -> Result<KvSegmentTokens> {
     let audio_prompt_tokens = max_audio_prompt_tokens(segment_sec);
-    let decode_tokens = generated_token_budget(segment_sec);
+    let decode_tokens = generated_token_budget(segment_sec, decode_tokens_per_sec, KV_BLOCK_SIZE);
     let tokens_per_seq = fixed_prompt_tokens
         .checked_add(audio_prompt_tokens)
         .and_then(|n| n.checked_add(max_hotword_tokens))
@@ -581,13 +624,13 @@ fn max_audio_prompt_tokens(max_segment_sec: f32) -> usize {
 }
 
 #[cfg(feature = "paged-attn")]
-fn generated_token_budget(max_segment_sec: f32) -> usize {
+fn generated_token_budget(max_segment_sec: f32, tokens_per_sec: f64, min_tokens: usize) -> usize {
     let estimated = if max_segment_sec.is_finite() && max_segment_sec > 0.0 {
-        (f64::from(max_segment_sec) * ASR_GENERATED_TOKENS_PER_SEC).ceil() as usize
+        (f64::from(max_segment_sec) * tokens_per_sec).ceil() as usize
     } else {
         0
     };
-    estimated.max(ASR_MIN_GENERATED_TOKENS)
+    estimated.max(min_tokens)
 }
 
 #[cfg(feature = "paged-attn")]
@@ -596,11 +639,14 @@ fn log_kv_cache_sizing(sizing: &KvCacheSizing) {
         ((sizing.max_num_seqs as f64) * f64::from(sizing.peak_ratio)).ceil() as usize;
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "planning paged kv cache | max_num_seqs={} vad_max_segment_sec={:.1}s kv_peak_ratio={:.2} max_hotword_tokens={}tok",
+        "planning paged kv cache | max_num_seqs={} vad_max_segment_sec={:.1}s kv_peak_ratio={:.2} max_hotword_tokens={}tok decode={:.2}tok/s runtime_min={}tok planning_min={}tok",
         sizing.max_num_seqs,
         sizing.max_segment_sec,
         sizing.peak_ratio,
-        sizing.max_hotword_tokens
+        sizing.max_hotword_tokens,
+        sizing.decode_tokens_per_sec,
+        sizing.decode_min_tokens,
+        sizing.planning_decode_min_tokens,
     );
     tracing::info!(
         target: "vasr_transcribe::serve",

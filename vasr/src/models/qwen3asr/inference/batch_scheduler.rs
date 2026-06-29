@@ -168,6 +168,16 @@ impl AsrBatchSchedulerConfig {
         config
     }
 
+    pub fn with_decode_budget(mut self, tokens_per_sec: f64, min_tokens: usize) -> Self {
+        if tokens_per_sec.is_finite() && tokens_per_sec > 0.0 {
+            self.generated_tokens_per_sec = tokens_per_sec;
+        }
+        if min_tokens > 0 {
+            self.min_generated_tokens = min_tokens;
+        }
+        self
+    }
+
     pub fn prefill_max_wave(&self, runtime: &PagedCacheRuntime) -> usize {
         self.prefill_max_wave
             .unwrap_or_else(|| self.continuous_max_num_seqs(runtime))
