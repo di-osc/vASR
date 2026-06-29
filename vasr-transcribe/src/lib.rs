@@ -1,4 +1,5 @@
-pub mod benchmark;
+pub mod eval;
+pub mod perf;
 pub mod pipeline;
 pub mod protocol;
 pub mod run;
@@ -6,7 +7,8 @@ mod runtime;
 pub mod serve;
 pub mod server;
 
-pub use benchmark::{BenchmarkTranscribeArgs, run_benchmark};
+pub use eval::{EvalArgs, run_eval};
+pub use perf::{PerfArgs, run_perf};
 pub use pipeline::{
     AsyncTranscribePipeline, GlobalAsyncTranscribePipeline, TranscribeInput, TranscribeItemOutcome,
 };

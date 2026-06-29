@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::Path};
 use vasr_transcribe::{
-    BenchmarkTranscribeArgs, RunTranscribeArgs, ServeTranscribeArgs, init_logging, run_benchmark,
-    run_local, run_transcribe,
+    EvalArgs, PerfArgs, RunTranscribeArgs, ServeTranscribeArgs, init_logging, run_eval, run_local,
+    run_perf, run_transcribe,
 };
 
 #[derive(Debug, Parser)]
@@ -27,8 +27,10 @@ enum Command {
     Serve(ServeTranscribeArgs),
     /// Transcribe local audio files and write `{stem}-transcription.json` outputs.
     Run(RunTranscribeArgs),
-    /// Benchmark ASR CER against a `VasrRecordList` MessagePack file.
-    Benchmark(BenchmarkTranscribeArgs),
+    /// Evaluate service CER with a labeled vASR MessagePack dataset.
+    Eval(EvalArgs),
+    /// Run service throughput and latency tests with URL input.
+    Perf(PerfArgs),
 }
 
 fn load_dotenv() -> Result<()> {
@@ -69,6 +71,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve(args) => run_transcribe(args).await,
         Command::Run(args) => run_local(args).await,
-        Command::Benchmark(args) => run_benchmark(args).await,
+        Command::Eval(args) => run_eval(args).await,
+        Command::Perf(args) => run_perf(args).await,
     }
 }

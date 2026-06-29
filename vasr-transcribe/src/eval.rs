@@ -2,30 +2,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use clap::{Parser, ValueEnum};
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 use vasr_data::{AudioAsset, CerStats, VasrRecord, VasrRecordList, normalize_for_cer};
-use vasr_transcribe::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "vasr-transcribe-bench",
-    version,
-    about = "Benchmark a running vASR transcribe HTTP service with a .vasr.msgpack dataset"
-)]
-struct Args {
+#[derive(Debug, Args)]
+pub struct EvalArgs {
     /// vASR `VasrRecordList` MessagePack dataset.
-    #[arg(short, long, alias = "input", value_name = "PATH")]
-    dataset: PathBuf,
+    #[arg(short, long, alias = "dataset", value_name = "PATH")]
+    input: PathBuf,
 
     /// Transcribe service endpoint.
-    #[arg(
-        long,
-        env = "VASR_BENCH_SERVER",
-        default_value = "http://127.0.0.1:8867/inference"
-    )]
+    #[arg(long, default_value = "http://127.0.0.1:8867/inference")]
     server: String,
 
     /// Directory used when `--output` is not provided.
@@ -53,12 +44,12 @@ struct Args {
     timeout_sec: u64,
 
     /// Text normalization used before CER.
-    #[arg(long, value_enum, default_value_t = BenchNormalizer::Bench)]
-    normalizer: BenchNormalizer,
+    #[arg(long, value_enum, default_value_t = EvalNormalizer::Bench)]
+    normalizer: EvalNormalizer,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum BenchNormalizer {
+enum EvalNormalizer {
     /// vASR bench normalizer: width/case/number/erhua plus punctuation and space removal.
     Bench,
     /// Existing simple vASR CER normalizer: punctuation and space removal only.
@@ -109,7 +100,7 @@ struct Summary {
 }
 
 #[derive(Debug, Serialize)]
-struct BenchReport<'a> {
+struct EvalReport<'a> {
     timestamp: String,
     dataset: &'a str,
     service_url: &'a str,
@@ -118,33 +109,27 @@ struct BenchReport<'a> {
     response: TranscribeResponse,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    run(args).await
-}
-
-async fn run(args: Args) -> Result<()> {
-    if !args.dataset.exists() {
-        bail!("dataset path does not exist: {}", args.dataset.display());
+pub async fn run_eval(args: EvalArgs) -> Result<()> {
+    if !args.input.exists() {
+        bail!("input path does not exist: {}", args.input.display());
     }
     if args.retries == 0 {
         bail!("--retries must be greater than 0");
     }
 
     let timestamp = unix_timestamp_string();
-    let mut records = VasrRecordList::read_msgpack(&args.dataset)
-        .with_context(|| format!("failed to read dataset {}", args.dataset.display()))?
+    let mut records = VasrRecordList::read_msgpack(&args.input)
+        .with_context(|| format!("failed to read dataset {}", args.input.display()))?
         .records;
     if let Some(limit) = args.limit {
         records.truncate(limit);
     }
     if records.is_empty() {
-        bail!("dataset is empty: {}", args.dataset.display());
+        bail!("dataset is empty: {}", args.input.display());
     }
 
     println!("service: {}", args.server);
-    println!("dataset:  {}", args.dataset.display());
+    println!("input:    {}", args.input.display());
     println!("items:    {}", records.len());
 
     let request = build_request(&records, args.mono)?;
@@ -152,22 +137,7 @@ async fn run(args: Args) -> Result<()> {
     let items = extract_items(&records, &response, args.normalizer);
     let summary = summarize(&items, wall_seconds, &response)?;
 
-    println!("wall:     {:.4}s", summary.wall_seconds);
-    println!("audio:    {:.4}s", summary.audio_seconds);
-    println!(
-        "speedup:  {:.4} audio_s/s",
-        summary.speedup_audio_seconds_per_second
-    );
-    println!("rtf:      {:.6}", summary.rtf);
-    println!(
-        "cer:      {:.6}  (avg={:.6})",
-        summary.cer_weighted, summary.cer_average
-    );
-    println!("acc:      {:.2}%", summary.accuracy_percent);
-    println!(
-        "counts:   correct={} ins={} del={} sub={}",
-        summary.correct, summary.insertions, summary.deletions, summary.substitutions
-    );
+    print_eval_summary_table(&summary, records.len());
 
     let bad_items: Vec<_> = items.iter().filter(|item| item.is_bad).collect();
     if !bad_items.is_empty() {
@@ -185,12 +155,12 @@ async fn run(args: Args) -> Result<()> {
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| args.results_dir.join(format!("bench_{timestamp}.json")));
+        .unwrap_or_else(|| args.results_dir.join(format!("eval_{timestamp}.json")));
     save_report(
         &output,
-        &BenchReport {
+        &EvalReport {
             timestamp,
-            dataset: &args.dataset.to_string_lossy(),
+            dataset: &args.input.to_string_lossy(),
             service_url: &args.server,
             summary,
             items,
@@ -200,6 +170,36 @@ async fn run(args: Args) -> Result<()> {
     println!("[saved] {}", output.display());
 
     Ok(())
+}
+
+fn print_eval_summary_table(summary: &Summary, items: usize) {
+    println!();
+    println!("+----------------------+----------------+");
+    println!("| metric               | value          |");
+    println!("+----------------------+----------------+");
+    println!("| items                | {:>14} |", items);
+    println!("| wall                 | {:>13.4}s |", summary.wall_seconds);
+    println!(
+        "| audio                | {:>13.4}s |",
+        summary.audio_seconds
+    );
+    println!(
+        "| speed                | {:>10.4}x |",
+        summary.speedup_audio_seconds_per_second
+    );
+    println!("| rtf                  | {:>14.6} |", summary.rtf);
+    println!("| cer weighted         | {:>14.6} |", summary.cer_weighted);
+    println!("| cer average          | {:>14.6} |", summary.cer_average);
+    println!(
+        "| accuracy             | {:>12.2}% |",
+        summary.accuracy_percent
+    );
+    println!("| correct              | {:>14} |", summary.correct);
+    println!("| insertions           | {:>14} |", summary.insertions);
+    println!("| deletions            | {:>14} |", summary.deletions);
+    println!("| substitutions        | {:>14} |", summary.substitutions);
+    println!("+----------------------+----------------+");
+    println!();
 }
 
 fn build_request(records: &[VasrRecord], mono: bool) -> Result<TranscribeRequest> {
@@ -228,7 +228,7 @@ fn build_request(records: &[VasrRecord], mono: bool) -> Result<TranscribeRequest
 }
 
 async fn request_batch(
-    args: &Args,
+    args: &EvalArgs,
     request: TranscribeRequest,
 ) -> Result<(TranscribeResponse, f64)> {
     let client = reqwest::Client::builder()
@@ -281,7 +281,7 @@ async fn request_batch(
 fn extract_items(
     records: &[VasrRecord],
     response: &TranscribeResponse,
-    normalizer: BenchNormalizer,
+    normalizer: EvalNormalizer,
 ) -> Vec<ItemResult> {
     records
         .iter()
@@ -521,7 +521,7 @@ fn reference_text(record: &VasrRecord) -> String {
     record.timeline.transcript().text
 }
 
-fn hypothesis_text(item: &vasr_transcribe::InferenceData) -> String {
+fn hypothesis_text(item: &crate::InferenceData) -> String {
     if !item.text.mono.is_empty() {
         return item.text.mono.clone();
     }
@@ -531,10 +531,10 @@ fn hypothesis_text(item: &vasr_transcribe::InferenceData) -> String {
     item.text.right.clone()
 }
 
-fn normalize_text(text: &str, normalizer: BenchNormalizer) -> String {
+fn normalize_text(text: &str, normalizer: EvalNormalizer) -> String {
     match normalizer {
-        BenchNormalizer::Simple => normalize_for_cer(text, true),
-        BenchNormalizer::Bench => normalize_bench_text(text),
+        EvalNormalizer::Simple => normalize_for_cer(text, true),
+        EvalNormalizer::Bench => normalize_bench_text(text),
     }
 }
 
@@ -729,7 +729,7 @@ async fn sleep_before_retry(attempt: usize) {
     tokio::time::sleep(Duration::from_secs(2 + attempt as u64 * 2)).await;
 }
 
-fn save_report(path: &Path, report: &BenchReport<'_>) -> Result<()> {
+fn save_report(path: &Path, report: &EvalReport<'_>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
@@ -770,26 +770,26 @@ fn round6(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchNormalizer, normalize_text};
+    use super::{EvalNormalizer, normalize_text};
 
     #[test]
     fn bench_normalizer_folds_width_case_punctuation_and_spaces() {
         assert_eq!(
-            normalize_text("ＡＢＣ， The number １ ２ ３！", BenchNormalizer::Bench),
+            normalize_text("ＡＢＣ， The number １ ２ ３！", EvalNormalizer::Bench),
             "abcthenumber123"
         );
     }
 
     #[test]
     fn bench_normalizer_removes_common_erhua_suffix() {
-        assert_eq!(normalize_text("一会儿。", BenchNormalizer::Bench), "1会");
-        assert_eq!(normalize_text("这儿啊", BenchNormalizer::Bench), "这啊");
+        assert_eq!(normalize_text("一会儿。", EvalNormalizer::Bench), "1会");
+        assert_eq!(normalize_text("这儿啊", EvalNormalizer::Bench), "这啊");
     }
 
     #[test]
     fn bench_normalizer_converts_chinese_numbers() {
         assert_eq!(
-            normalize_text("一百二十三个，二零二六年，十次", BenchNormalizer::Bench),
+            normalize_text("一百二十三个，二零二六年，十次", EvalNormalizer::Bench),
             "123个2026年10次"
         );
     }
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn simple_normalizer_keeps_existing_vasr_behavior() {
         assert_eq!(
-            normalize_text("ＡＢＣ，一百二十三", BenchNormalizer::Simple),
+            normalize_text("ＡＢＣ，一百二十三", EvalNormalizer::Simple),
             "ＡＢＣ一百二十三"
         );
     }

@@ -9,10 +9,6 @@ repository.workspace = true
 name = "vasr-transcribe"
 path = "src/bin/vasr_transcribe.rs"
 
-[[bin]]
-name = "vasr-transcribe-bench"
-path = "src/bin/vasr_transcribe_bench.rs"
-
 [dependencies]
 anyhow = "1"
 axum = "0.8"
