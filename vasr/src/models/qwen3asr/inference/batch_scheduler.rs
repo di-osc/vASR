@@ -143,7 +143,6 @@ pub struct AsrBatchSchedulerConfig {
     pub continuous_batch: bool,
     pub generated_tokens_per_sec: f64,
     pub min_generated_tokens: usize,
-    pub max_generated_tokens: Option<usize>,
 }
 
 impl Default for AsrBatchSchedulerConfig {
@@ -155,7 +154,6 @@ impl Default for AsrBatchSchedulerConfig {
             continuous_batch: continuous_batch_enabled(),
             generated_tokens_per_sec: 4.25,
             min_generated_tokens: 128,
-            max_generated_tokens: None,
         }
     }
 }
@@ -170,33 +168,10 @@ impl AsrBatchSchedulerConfig {
         config
     }
 
-    pub fn with_min_generated_tokens(mut self, min_generated_tokens: usize) -> Self {
-        if min_generated_tokens > 0 {
-            self.min_generated_tokens = min_generated_tokens;
-        }
-        self
-    }
-
-    pub fn with_max_generated_tokens(mut self, max_generated_tokens: usize) -> Self {
-        if max_generated_tokens > 0 {
-            self.max_generated_tokens = Some(max_generated_tokens);
-        }
-        self
-    }
-
     pub fn prefill_max_wave(&self, runtime: &PagedCacheRuntime) -> usize {
         self.prefill_max_wave
             .unwrap_or_else(|| self.continuous_max_num_seqs(runtime))
             .max(1)
-    }
-
-    pub fn with_optional_fixed_decode_tokens(mut self, max_new_tokens: usize) -> Self {
-        if max_new_tokens > 0 {
-            let budget = max_new_tokens.saturating_add(2);
-            self.min_generated_tokens = budget;
-            self.max_generated_tokens = Some(budget);
-        }
-        self
     }
 
     pub fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
@@ -639,17 +614,13 @@ fn generated_token_budget(
     audio_seconds: f64,
     generated_tokens_per_sec: f64,
     min_generated_tokens: usize,
-    max_generated_tokens: Option<usize>,
 ) -> usize {
     let estimated = if audio_seconds.is_finite() && audio_seconds > 0.0 {
         (audio_seconds * generated_tokens_per_sec).ceil() as usize
     } else {
         0
     };
-    let budget = estimated.max(min_generated_tokens);
-    max_generated_tokens
-        .map(|max| budget.min(max))
-        .unwrap_or(budget)
+    estimated.max(min_generated_tokens)
 }
 
 fn prepared_token_capacity(
@@ -658,14 +629,12 @@ fn prepared_token_capacity(
     row_index: usize,
     generated_tokens_per_sec: f64,
     min_generated_tokens: usize,
-    max_generated_tokens: Option<usize>,
 ) -> Result<usize> {
     prepared_prompt_len(row)
         .checked_add(generated_token_budget(
             audio_seconds.get(row_index).copied().unwrap_or(0.0),
             generated_tokens_per_sec,
             min_generated_tokens,
-            max_generated_tokens,
         ))
         .ok_or_else(|| anyhow::anyhow!("prepared token capacity overflow"))
 }
@@ -1112,7 +1081,6 @@ impl AsrBatchScheduler {
                     client_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
-                    self.config.max_generated_tokens,
                 )
             },
         )?;
@@ -1136,7 +1104,6 @@ impl AsrBatchScheduler {
                     client_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
-                    self.config.max_generated_tokens,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1256,7 +1223,6 @@ impl AsrBatchScheduler {
                     client_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
-                    self.config.max_generated_tokens,
                 )
             },
         )?;
@@ -1280,7 +1246,6 @@ impl AsrBatchScheduler {
                     client_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
-                    self.config.max_generated_tokens,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2061,8 +2026,8 @@ pub fn run_paged_micro_batch(
     eos_token_ids: &[u32],
     decode_max_seqs: usize,
 ) -> Result<Vec<Vec<u32>>> {
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_optional_fixed_decode_tokens(max_new_tokens);
+    let _ = max_new_tokens;
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     scheduler.run_micro_batch(
         thinker,
@@ -2088,8 +2053,7 @@ pub fn run_paged_prepared_batch(
     pad_id: u32,
     audio_seconds: Option<&[f64]>,
 ) -> Result<Vec<Vec<u32>>> {
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_optional_fixed_decode_tokens(max_new_tokens);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     let default_audio_seconds;
     let audio_seconds = match audio_seconds {
@@ -2145,8 +2109,7 @@ pub fn run_paged_prepared_batch_timed(
     pad_id: u32,
     audio_seconds: Option<&[f64]>,
 ) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
-        .with_optional_fixed_decode_tokens(max_new_tokens);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
     let mut scheduler = AsrBatchScheduler::new(config);
     let mut timings = GenerationTimings::default();
     let default_audio_seconds;
@@ -2233,9 +2196,9 @@ mod tests {
 
     #[test]
     fn generated_token_budget_uses_minimum_for_short_audio() {
-        assert_eq!(super::generated_token_budget(0.1, 4.25, 128, None), 128);
-        assert_eq!(super::generated_token_budget(5.0, 4.25, 128, None), 128);
-        assert_eq!(super::generated_token_budget(30.0, 4.25, 128, None), 128);
+        assert_eq!(super::generated_token_budget(0.1, 4.25, 128), 128);
+        assert_eq!(super::generated_token_budget(5.0, 4.25, 128), 128);
+        assert_eq!(super::generated_token_budget(30.0, 4.25, 128), 128);
     }
 
     #[test]

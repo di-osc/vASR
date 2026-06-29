@@ -165,6 +165,23 @@ fn decode_budget_exhausted(
     Ok(decode_step_required_tokens(prompt_len, generated_len_after_push)? > token_capacity)
 }
 
+fn warn_decode_budget_exhausted(
+    request_id: usize,
+    prompt_len: usize,
+    generated_len: usize,
+    token_capacity: usize,
+    next_token: u32,
+) {
+    tracing::warn!(
+        "paged decode reached token capacity before EOS | request_id={} prompt_tokens={} generated_tokens={} capacity_tokens={} last_token={}",
+        request_id,
+        prompt_len,
+        generated_len,
+        token_capacity,
+        next_token
+    );
+}
+
 fn cuda_packed_prefill_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CUDA_PACKED_PREFILL").is_none()
 }
@@ -263,6 +280,13 @@ pub fn paged_batch_decode_slots_at_step(
             slots[i].generated.len(),
             slots[i].token_capacity,
         )? {
+            warn_decode_budget_exhausted(
+                slots[i].request_id,
+                slots[i].prompt_len_usize,
+                slots[i].generated.len(),
+                slots[i].token_capacity,
+                tok,
+            );
             slots[i].finished = true;
             slots[i].decode_step = slots[i].decode_step.saturating_add(1);
             continue;
@@ -410,6 +434,13 @@ pub fn paged_batch_decode_slots_at_step_shared(
                 slots[i].generated.len(),
                 slots[i].token_capacity,
             )? {
+                warn_decode_budget_exhausted(
+                    slots[i].request_id,
+                    slots[i].prompt_len_usize,
+                    slots[i].generated.len(),
+                    slots[i].token_capacity,
+                    tok,
+                );
                 slots[i].finished = true;
                 slots[i].decode_step = slots[i].decode_step.saturating_add(1);
                 continue;
@@ -553,6 +584,13 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
                 slot.generated.len(),
                 slot.token_capacity,
             )? {
+                warn_decode_budget_exhausted(
+                    slot.request_id,
+                    slot.prompt_len_usize,
+                    slot.generated.len(),
+                    slot.token_capacity,
+                    tok,
+                );
                 slot.finished = true;
                 slot.decode_step = slot.decode_step.saturating_add(1);
                 continue;
@@ -1430,6 +1468,13 @@ pub fn paged_batch_decode_step(
             state.generated[i].len(),
             state.token_capacities[i],
         )? {
+            warn_decode_budget_exhausted(
+                state.request_ids[i],
+                state.prompt_lens_usize[i],
+                state.generated[i].len(),
+                state.token_capacities[i],
+                tok,
+            );
             state.finished[i] = true;
             continue;
         }

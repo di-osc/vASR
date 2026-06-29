@@ -2517,8 +2517,7 @@ pub fn decode_cpu_audio_features_dynamic(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    )
-    .with_optional_fixed_decode_tokens(opts.max_new_tokens);
+    );
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2559,8 +2558,7 @@ pub fn decode_cpu_audio_features_dynamic_timed(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    )
-    .with_optional_fixed_decode_tokens(opts.max_new_tokens);
+    );
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
