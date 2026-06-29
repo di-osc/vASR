@@ -121,4 +121,3 @@ VASR_DISABLE_MIXED_STEP_DECODE=1
 - `max_num_seqs=192` 可进一步压低峰值，但速度不足 300x。
 - `kv_peak_ratio=0.12` 或更高会改善部分吞吐，但在当前 4090 上运行峰值会超过 50%。
 - `Qwen3-ASR-1.7B` 是最终验证模型，未切换到 0.6B。
-- `--asr-context` 可用于实验固定系统提示，但本次最终验证未使用；短领域提示在 `lbg_call-100` 上实测没有改善 CER。
