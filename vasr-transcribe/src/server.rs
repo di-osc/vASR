@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
 use axum::extract::DefaultBodyLimit;
@@ -6,7 +9,8 @@ use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
 
 use crate::pipeline::{
-    GlobalAsyncTranscribePipeline, PipelineWorkerOptions, TranscribeInput, TranscribeItemTiming,
+    GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions, StageSpan,
+    TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
 };
 use crate::protocol::{
     InferenceData, InferencePerformance, SentenceResult, TextResult, TimingBreakdown,
@@ -19,6 +23,9 @@ const TRANSCRIBE_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 pub struct TranscribeService {
     pub service_id: String,
     pub pipeline: Arc<GlobalAsyncTranscribePipeline>,
+    pub active_requests: AtomicUsize,
+    #[cfg(feature = "cuda-graph")]
+    pub baseline_cuda_used_bytes: Option<usize>,
 }
 
 pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
@@ -35,6 +42,8 @@ async fn handle_transcribe(
 ) -> Json<TranscribeResponse> {
     let start = Instant::now();
     let request_id = short_request_id();
+    let q8_fast_path_start = vasr::models::qwen3asr::model::q8_fast_path_stats();
+    service.active_requests.fetch_add(1, Ordering::AcqRel);
     let request_items = request.inputs.len();
     let mut inputs = Vec::new();
     let mut data_slots = vec![None; request_items];
@@ -93,6 +102,7 @@ async fn handle_transcribe(
         .await;
     let mut total_audio_duration_seconds = 0.0;
     let mut component_timing = TranscribeItemTiming::default();
+    let mut active_spans = Vec::new();
 
     for outcome in outcomes {
         if outcome.channel == "mono" {
@@ -104,6 +114,7 @@ async fn handle_transcribe(
         let Some(meta) = request_metas.get(outcome.index) else {
             continue;
         };
+        collect_active_spans(outcome.spans, &mut active_spans);
         match outcome.result {
             Ok(timeline) => {
                 total_audio_duration_seconds += outcome.audio_seconds;
@@ -160,6 +171,8 @@ async fn handle_transcribe(
         .collect::<Vec<_>>();
 
     let wall = start.elapsed().as_secs_f64();
+    let active = active_spans_seconds(active_spans).min(wall).max(0.0);
+    let wait = (wall - active).max(0.0);
     let num_items = data.len();
     let bad = data.iter().filter(|item| item.is_bad).count();
     let performance = InferencePerformance {
@@ -184,7 +197,7 @@ async fn handle_transcribe(
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s | speed={:>6.1}x",
+        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s active={:>6.3}s idle={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         "request",
         "DONE",
@@ -195,12 +208,250 @@ async fn handle_transcribe(
         request_stats.stereo,
         request_stats.channels,
         performance.batch_wall_seconds,
+        active,
+        wait,
+        performance.total_audio_duration_seconds / active.max(f64::EPSILON),
         performance.speedup
+    );
+    #[cfg(feature = "cuda-graph")]
+    maybe_trim_cuda_after_request(&request_id, &service);
+    #[cfg(not(feature = "cuda-graph"))]
+    service.active_requests.fetch_sub(1, Ordering::AcqRel);
+    log_request_memory_debug(
+        &request_id,
+        &service.pipeline.memory_snapshot(),
+        q8_fast_path_start,
+        #[cfg(feature = "cuda-graph")]
+        service.baseline_cuda_used_bytes,
     );
     Json(TranscribeResponse {
         data,
         inference_performance: performance,
     })
+}
+
+#[cfg(feature = "cuda-graph")]
+fn maybe_trim_cuda_after_request(request_id: &str, service: &TranscribeService) {
+    let active_after = service.active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_some() {
+        return;
+    }
+    if let Some(trim) = service.pipeline.trim_cuda_mempool() {
+        log_request_trim_debug(request_id, active_after, trim);
+    }
+}
+
+fn request_memory_debug_enabled() -> bool {
+    std::env::var_os("VASR_DEBUG_CUDA_MEM").is_some()
+        || std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()
+}
+
+fn log_request_memory_debug(
+    request_id: &str,
+    snapshot: &PipelineMemorySnapshot,
+    q8_fast_path_start: vasr::models::qwen3asr::model::Q8FastPathStats,
+    #[cfg(feature = "cuda-graph")] baseline_cuda_used_bytes: Option<usize>,
+) {
+    if !request_memory_debug_enabled() {
+        return;
+    }
+    #[cfg(feature = "paged-attn")]
+    let kv = snapshot
+        .paged_cache
+        .as_ref()
+        .map(|stats| {
+            let usable_blocks = stats.num_blocks.saturating_sub(1);
+            format!(
+                "kv_free={}/{} usable kv_blocks={} kv_capacity={}tok",
+                stats.free_blocks, usable_blocks, stats.num_blocks, stats.max_context_tokens
+            )
+        })
+        .unwrap_or_else(|| "kv=n/a".to_string());
+    #[cfg(not(feature = "paged-attn"))]
+    let kv = "kv=n/a".to_string();
+
+    #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+    let graphs = snapshot
+        .cuda_decode_graphs
+        .map(|count| format!("cuda_graphs={count}"))
+        .unwrap_or_else(|| "cuda_graphs=n/a".to_string());
+    #[cfg(not(all(feature = "paged-attn", feature = "cuda-graph")))]
+    let graphs = "cuda_graphs=n/a".to_string();
+
+    #[cfg(feature = "cuda-graph")]
+    let cuda = snapshot
+        .cuda_memory
+        .map(|memory| {
+            let baseline = baseline_cuda_used_bytes
+                .map(|baseline| {
+                    let delta_mib =
+                        (memory.used_bytes as i128 - baseline as i128) as f64 / (1024.0 * 1024.0);
+                    format!(" cuda_delta={delta_mib:+.1}MiB")
+                })
+                .unwrap_or_default();
+            let pool = cuda_pool_fields(memory);
+            format!(
+                "cuda_used={:.2}GiB cuda_free={:.2}GiB cuda_total={:.2}GiB{}{}",
+                bytes_to_gib(memory.used_bytes),
+                bytes_to_gib(memory.free_bytes),
+                bytes_to_gib(memory.total_bytes),
+                baseline,
+                pool
+            )
+        })
+        .unwrap_or_else(|| "cuda=n/a".to_string());
+    #[cfg(not(feature = "cuda-graph"))]
+    let cuda = "cuda=n/a".to_string();
+    let q8 = vasr::models::qwen3asr::model::q8_fast_path_stats().saturating_sub(q8_fast_path_start);
+    let q8_fast_path = format!(
+        "q8_fast=plain_audio:{}calls/{}rows plain_prefill:{}calls/{}rows mmq_prefill:{}calls/{}rows plain_lm_head:{}calls/{}rows mmq_lm_head:{}calls/{}rows mmq_lm_head_skip:{}calls/{}rows prefill_next_id:{}calls/{}rows decode_next_id:{}calls/{}rows plain_decode:{}calls/{}rows mmq_decode:{}calls/{}rows fused_glu:{}calls/{}rows fused_act:{}calls/{}rows fused_qkv:{}calls/{}rows mmq_fused_qkv:{}calls/{}rows",
+        q8.plain_audio_calls,
+        q8.plain_audio_rows,
+        q8.plain_prefill_calls,
+        q8.plain_prefill_rows,
+        q8.mmq_prefill_calls,
+        q8.mmq_prefill_rows,
+        q8.plain_lm_head_calls,
+        q8.plain_lm_head_rows,
+        q8.mmq_lm_head_calls,
+        q8.mmq_lm_head_rows,
+        q8.prefill_lm_head_mmq_skip_calls,
+        q8.prefill_lm_head_mmq_skip_rows,
+        q8.prefill_next_id_calls,
+        q8.prefill_next_id_rows,
+        q8.decode_next_id_calls,
+        q8.decode_next_id_rows,
+        q8.plain_decode_calls,
+        q8.plain_decode_rows,
+        q8.mmq_decode_calls,
+        q8.mmq_decode_rows,
+        q8.fused_glu_decode_calls,
+        q8.fused_glu_decode_rows,
+        q8.fused_act_calls,
+        q8.fused_act_rows,
+        q8.fused_qkv_calls,
+        q8.fused_qkv_rows,
+        q8.mmq_fused_qkv_calls,
+        q8.mmq_fused_qkv_rows,
+    );
+
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{} request MEM   | {} | {} | {} | {}",
+        request_id,
+        cuda,
+        kv,
+        graphs,
+        q8_fast_path,
+    );
+}
+
+#[cfg(feature = "cuda-graph")]
+fn log_request_trim_debug(
+    request_id: &str,
+    active_requests: usize,
+    trim: crate::pipeline::PipelineCudaTrimSnapshot,
+) {
+    if !request_memory_debug_enabled() {
+        return;
+    }
+    let before = trim
+        .before
+        .map(cuda_memory_fields)
+        .unwrap_or_else(|| "before=n/a".to_string());
+    let after = trim
+        .after
+        .map(cuda_memory_fields)
+        .unwrap_or_else(|| "after=n/a".to_string());
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{} request TRIM  | active_requests={} | {} | {}",
+        request_id,
+        active_requests,
+        before,
+        after,
+    );
+}
+
+#[cfg(feature = "cuda-graph")]
+fn cuda_memory_fields(memory: crate::pipeline::PipelineCudaMemorySnapshot) -> String {
+    format!(
+        "used={:.2}GiB free={:.2}GiB total={:.2}GiB{}",
+        bytes_to_gib(memory.used_bytes),
+        bytes_to_gib(memory.free_bytes),
+        bytes_to_gib(memory.total_bytes),
+        cuda_pool_fields(memory)
+    )
+}
+
+#[cfg(feature = "cuda-graph")]
+fn cuda_pool_fields(memory: crate::pipeline::PipelineCudaMemorySnapshot) -> String {
+    let current = match (memory.pool_used_bytes, memory.pool_reserved_bytes) {
+        (Some(used), Some(reserved)) => format!(
+            " pool_current={:.2}/{:.2}GiB",
+            bytes_to_gib(used),
+            bytes_to_gib(reserved)
+        ),
+        (Some(used), None) => format!(" pool_current={:.2}/n/aGiB", bytes_to_gib(used)),
+        (None, Some(reserved)) => {
+            format!(" pool_current=n/a/{:.2}GiB", bytes_to_gib(reserved))
+        }
+        (None, None) => " pool_current=n/a".to_string(),
+    };
+    let default = match (
+        memory.default_pool_used_bytes,
+        memory.default_pool_reserved_bytes,
+    ) {
+        (Some(used), Some(reserved)) => format!(
+            " pool_default={:.2}/{:.2}GiB",
+            bytes_to_gib(used),
+            bytes_to_gib(reserved)
+        ),
+        (Some(used), None) => format!(" pool_default={:.2}/n/aGiB", bytes_to_gib(used)),
+        (None, Some(reserved)) => {
+            format!(" pool_default=n/a/{:.2}GiB", bytes_to_gib(reserved))
+        }
+        (None, None) => " pool_default=n/a".to_string(),
+    };
+    format!("{current}{default}")
+}
+
+fn bytes_to_gib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn collect_active_spans(spans: TranscribeItemSpans, out: &mut Vec<StageSpan>) {
+    out.extend(
+        [
+            spans.loader,
+            spans.vad,
+            spans.audio_encoder,
+            spans.prefill,
+            spans.decode,
+        ]
+        .into_iter()
+        .flatten(),
+    );
+}
+
+fn active_spans_seconds(mut spans: Vec<StageSpan>) -> f64 {
+    if spans.is_empty() {
+        return 0.0;
+    }
+    spans.sort_by_key(|span| span.start);
+    let mut total = 0.0;
+    let mut current = spans[0];
+    for span in spans.into_iter().skip(1) {
+        if span.start <= current.end {
+            if span.end > current.end {
+                current.end = span.end;
+            }
+        } else {
+            total += current.seconds();
+            current = span;
+        }
+    }
+    total + current.seconds()
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -551,7 +802,9 @@ fn error_data(
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_call_boundary_noise, merge_channel_data};
+    use std::time::Instant;
+
+    use super::{StageSpan, active_spans_seconds, clean_call_boundary_noise, merge_channel_data};
     use crate::protocol::{InferenceData, SentenceResult, TextResult};
 
     #[test]
@@ -607,6 +860,24 @@ mod tests {
         assert_eq!(data.sentences.len(), 2);
         assert!(!data.text.mono.contains("资料下载APP"));
         assert!(data.text.mono.contains("请问您现在还在找工作吗？"));
+    }
+
+    #[test]
+    fn active_spans_seconds_merges_overlaps() {
+        let base = Instant::now();
+        let spans = vec![
+            StageSpan::new(base, base + std::time::Duration::from_secs(2)),
+            StageSpan::new(
+                base + std::time::Duration::from_secs(1),
+                base + std::time::Duration::from_secs(3),
+            ),
+            StageSpan::new(
+                base + std::time::Duration::from_secs(5),
+                base + std::time::Duration::from_secs(6),
+            ),
+        ];
+
+        assert_eq!(active_spans_seconds(spans), 4.0);
     }
 
     fn channel_data(channel: &str, text: &str, start_time: u64) -> InferenceData {
@@ -675,9 +946,19 @@ mod tests {
 pub fn build_transcribe_service(
     pipeline: Arc<GlobalAsyncTranscribePipeline>,
 ) -> Arc<TranscribeService> {
+    #[cfg(feature = "cuda-graph")]
+    let _ = pipeline.trim_cuda_mempool();
+    #[cfg(feature = "cuda-graph")]
+    let baseline_cuda_used_bytes = pipeline
+        .memory_snapshot()
+        .cuda_memory
+        .map(|memory| memory.used_bytes);
     Arc::new(TranscribeService {
         service_id: format!("transcribe-{}", uuid::Uuid::new_v4().simple()),
         pipeline,
+        active_requests: AtomicUsize::new(0),
+        #[cfg(feature = "cuda-graph")]
+        baseline_cuda_used_bytes,
     })
 }
 

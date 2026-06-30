@@ -46,7 +46,14 @@ pub(crate) fn load_model_from_pretrained(
     let weights_paths = ensure_weights_files(model_id_or_path, &model_dir)?;
 
     let weight_refs: Vec<&Path> = weights_paths.iter().map(PathBuf::as_path).collect();
-    let vb = unsafe { var_builder_from_safetensors(weight_refs.as_slice(), opts.dtype, device)? };
+    let vb = unsafe {
+        var_builder_from_safetensors(
+            weight_refs.as_slice(),
+            opts.dtype,
+            device,
+            opts.isq.is_some(),
+        )?
+    };
     let thinker = super::thinker::ThinkerForConditionalGeneration::load(
         &config.thinker_config,
         vb.pp("thinker"),
@@ -69,10 +76,14 @@ unsafe fn var_builder_from_safetensors(
     paths: &[&Path],
     dtype: DType,
     device: &Device,
+    stage_on_cpu: bool,
 ) -> candle_core::Result<VarBuilder<'static>> {
-    if device.is_metal() {
+    if device.is_metal() || (device.is_cuda() && stage_on_cpu) {
         let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(paths)? };
-        let backend = CpuStagedSafeTensors { tensors };
+        let backend = CpuStagedSafeTensors {
+            tensors,
+            stage_isq_linears_on_cpu: device.is_cuda() && stage_on_cpu,
+        };
         Ok(VarBuilder::from_backend(
             Box::new(backend),
             dtype,
@@ -85,6 +96,7 @@ unsafe fn var_builder_from_safetensors(
 
 struct CpuStagedSafeTensors {
     tensors: candle_core::safetensors::MmapedSafetensors,
+    stage_isq_linears_on_cpu: bool,
 }
 
 impl CpuStagedSafeTensors {
@@ -94,11 +106,31 @@ impl CpuStagedSafeTensors {
         dtype: DType,
         device: &Device,
     ) -> candle_core::Result<Tensor> {
-        self.tensors
-            .load(name, &Device::Cpu)?
-            .to_dtype(dtype)?
-            .to_device(device)
+        let tensor = self.tensors.load(name, &Device::Cpu)?.to_dtype(dtype)?;
+        if self.stage_isq_linears_on_cpu && is_isq_linear_tensor(name) {
+            Ok(tensor)
+        } else {
+            tensor.to_device(device)
+        }
     }
+}
+
+fn is_isq_linear_tensor(name: &str) -> bool {
+    let name = name.trim_end_matches(".weight").trim_end_matches(".bias");
+    name.ends_with(".q_proj")
+        || name.ends_with(".k_proj")
+        || name.ends_with(".v_proj")
+        || name.ends_with(".o_proj")
+        || name.ends_with(".out_proj")
+        || name.ends_with(".gate_proj")
+        || name.ends_with(".up_proj")
+        || name.ends_with(".down_proj")
+        || name.ends_with(".lm_head")
+        || name.ends_with(".fc1")
+        || name.ends_with(".fc2")
+        || name.ends_with(".conv_out")
+        || name.ends_with(".proj1")
+        || name.ends_with(".proj2")
 }
 
 impl SimpleBackend for CpuStagedSafeTensors {
@@ -369,7 +401,7 @@ fn ensure_weights_files(_model_id_or_path: &str, model_dir: &Path) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::shard_filenames_from_index;
+    use super::{is_isq_linear_tensor, shard_filenames_from_index};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -407,6 +439,45 @@ mod tests {
             anyhow::bail!("unexpected shard list: got={got:?} want={want:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_isq_linear_tensor_matches_all_qwen3_asr_linear_targets() {
+        for name in [
+            "thinker.audio_tower.layers.0.self_attn.q_proj.weight",
+            "thinker.audio_tower.layers.0.self_attn.k_proj.weight",
+            "thinker.audio_tower.layers.0.self_attn.v_proj.weight",
+            "thinker.audio_tower.layers.0.self_attn.out_proj.weight",
+            "thinker.audio_tower.layers.0.fc1.weight",
+            "thinker.audio_tower.layers.0.fc2.weight",
+            "thinker.audio_tower.conv_out.weight",
+            "thinker.audio_tower.proj1.weight",
+            "thinker.audio_tower.proj2.weight",
+            "thinker.model.layers.0.self_attn.q_proj.weight",
+            "thinker.model.layers.0.self_attn.k_proj.weight",
+            "thinker.model.layers.0.self_attn.v_proj.weight",
+            "thinker.model.layers.0.self_attn.o_proj.weight",
+            "thinker.model.layers.0.mlp.gate_proj.weight",
+            "thinker.model.layers.0.mlp.up_proj.weight",
+            "thinker.model.layers.0.mlp.down_proj.weight",
+            "thinker.lm_head.weight",
+        ] {
+            assert!(
+                is_isq_linear_tensor(name),
+                "{name} should be staged for ISQ"
+            );
+        }
+
+        for name in [
+            "thinker.model.embed_tokens.weight",
+            "thinker.model.layers.0.input_layernorm.weight",
+            "thinker.audio_tower.layers.0.self_attn_layer_norm.weight",
+        ] {
+            assert!(
+                !is_isq_linear_tensor(name),
+                "{name} should not be staged as an ISQ linear"
+            );
+        }
     }
 
     #[test]

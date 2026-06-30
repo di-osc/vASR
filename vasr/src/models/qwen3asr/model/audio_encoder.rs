@@ -10,13 +10,11 @@
 //! added separately (behind `--features flash-attn` and load options).
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{
-    Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder, conv2d, layer_norm, linear,
-    linear_no_bias,
-};
+use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Module, VarBuilder, conv2d, layer_norm};
 
 use crate::config::AudioEncoderConfig;
 use crate::model::cuda_mem_debug::log_cuda_mem;
+use crate::model::isq_linear::{self, IsqLinear};
 use crate::processor::feat_lengths::feat_extract_output_length;
 
 #[cfg(feature = "flash-attn")]
@@ -262,14 +260,19 @@ struct AudioAttention {
     num_heads: usize,
     head_dim: usize,
     scaling: f64,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
+    q_proj: IsqLinear,
+    k_proj: IsqLinear,
+    v_proj: IsqLinear,
+    out_proj: IsqLinear,
 }
 
 impl AudioAttention {
-    fn load(cfg: &AudioEncoderConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
+    fn load(
+        cfg: &AudioEncoderConfig,
+        vb: VarBuilder,
+        use_flash_attn: bool,
+        isq: Option<&str>,
+    ) -> Result<Self> {
         let embed_dim = cfg.d_model;
         let num_heads = cfg.encoder_attention_heads;
         if num_heads == 0 {
@@ -279,10 +282,10 @@ impl AudioAttention {
             candle_core::bail!("d_model must be divisible by num_heads");
         }
         let head_dim = embed_dim / num_heads;
-        let q_proj = linear(embed_dim, embed_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(embed_dim, embed_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(embed_dim, embed_dim, vb.pp("v_proj"))?;
-        let out_proj = linear(embed_dim, embed_dim, vb.pp("out_proj"))?;
+        let q_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("q_proj"), isq)?;
+        let k_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("k_proj"), isq)?;
+        let v_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("v_proj"), isq)?;
+        let out_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("out_proj"), isq)?;
         Ok(Self {
             use_flash_attn,
             num_heads,
@@ -293,6 +296,26 @@ impl AudioAttention {
             v_proj,
             out_proj,
         })
+    }
+
+    fn project_qkv(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(qkv) = isq_linear::try_fused_q8_qkv(
+                &self.q_proj,
+                &self.k_proj,
+                &self.v_proj,
+                hidden_states,
+            )? {
+                return Ok(qkv);
+            }
+        }
+
+        Ok((
+            self.q_proj.forward(hidden_states)?,
+            self.k_proj.forward(hidden_states)?,
+            self.v_proj.forward(hidden_states)?,
+        ))
     }
 
     fn forward(
@@ -310,19 +333,17 @@ impl AudioAttention {
             );
         }
 
-        let q = self.q_proj.forward(hidden_states)?;
+        let (q, k, v) = self.project_qkv(hidden_states)?;
         let q = q
             .reshape((seq_len, self.num_heads, self.head_dim))?
             .detach();
         log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_q_proj", seq_len);
 
-        let k = self.k_proj.forward(hidden_states)?;
         let k = k
             .reshape((seq_len, self.num_heads, self.head_dim))?
             .detach();
         log_audio_layer_stage(hidden_states.device(), layer_idx, "attn_k_proj", seq_len);
 
-        let v = self.v_proj.forward(hidden_states)?;
         let v = v
             .reshape((seq_len, self.num_heads, self.head_dim))?
             .detach();
@@ -492,15 +513,20 @@ impl AudioAttention {
 struct AudioEncoderLayer {
     self_attn: AudioAttention,
     self_attn_layer_norm: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: IsqLinear,
+    fc2: IsqLinear,
     final_layer_norm: LayerNorm,
 }
 
 impl AudioEncoderLayer {
-    fn load(cfg: &AudioEncoderConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
+    fn load(
+        cfg: &AudioEncoderConfig,
+        vb: VarBuilder,
+        use_flash_attn: bool,
+        isq: Option<&str>,
+    ) -> Result<Self> {
         let embed_dim = cfg.d_model;
-        let self_attn = AudioAttention::load(cfg, vb.pp("self_attn"), use_flash_attn)?;
+        let self_attn = AudioAttention::load(cfg, vb.pp("self_attn"), use_flash_attn, isq)?;
         let self_attn_layer_norm = layer_norm(
             embed_dim,
             candle_nn::LayerNormConfig::from(LAYER_NORM_EPS),
@@ -511,8 +537,8 @@ impl AudioEncoderLayer {
             candle_nn::LayerNormConfig::from(LAYER_NORM_EPS),
             vb.pp("final_layer_norm"),
         )?;
-        let fc1 = linear(embed_dim, cfg.encoder_ffn_dim, vb.pp("fc1"))?;
-        let fc2 = linear(cfg.encoder_ffn_dim, embed_dim, vb.pp("fc2"))?;
+        let fc1 = isq_linear::linear_b(embed_dim, cfg.encoder_ffn_dim, true, vb.pp("fc1"), isq)?;
+        let fc2 = isq_linear::linear_b(cfg.encoder_ffn_dim, embed_dim, true, vb.pp("fc2"), isq)?;
         Ok(Self {
             self_attn,
             self_attn_layer_norm,
@@ -552,13 +578,36 @@ impl AudioEncoderLayer {
         drop(x);
         log_audio_layer_stage(device, layer_idx, "final_layer_norm", seq_len);
 
-        let fc1 = self.fc1.forward(&normed)?.detach();
-        drop(normed);
-        log_audio_layer_stage(device, layer_idx, "fc1", seq_len);
+        let activated = {
+            #[cfg(feature = "cuda")]
+            {
+                if let Some(activated) = isq_linear::try_fused_q8_gelu_erf(&self.fc1, &normed)? {
+                    drop(normed);
+                    log_audio_layer_stage(device, layer_idx, "fc1_gelu", seq_len);
+                    activated.detach()
+                } else {
+                    let fc1 = self.fc1.forward(&normed)?.detach();
+                    drop(normed);
+                    log_audio_layer_stage(device, layer_idx, "fc1", seq_len);
 
-        let activated = gelu(&fc1)?.detach();
-        drop(fc1);
-        log_audio_layer_stage(device, layer_idx, "gelu", seq_len);
+                    let activated = gelu(&fc1)?.detach();
+                    drop(fc1);
+                    log_audio_layer_stage(device, layer_idx, "gelu", seq_len);
+                    activated
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let fc1 = self.fc1.forward(&normed)?.detach();
+                drop(normed);
+                log_audio_layer_stage(device, layer_idx, "fc1", seq_len);
+
+                let activated = gelu(&fc1)?.detach();
+                drop(fc1);
+                log_audio_layer_stage(device, layer_idx, "gelu", seq_len);
+                activated
+            }
+        };
 
         let fc2 = self.fc2.forward(&activated)?.detach();
         drop(activated);
@@ -588,11 +637,11 @@ pub struct AudioTower {
     conv2d1: Conv2d,
     conv2d2: Conv2d,
     conv2d3: Conv2d,
-    conv_out: Linear,
+    conv_out: IsqLinear,
     layers: Vec<AudioEncoderLayer>,
     ln_post: LayerNorm,
-    proj1: Linear,
-    proj2: Linear,
+    proj1: IsqLinear,
+    proj2: IsqLinear,
     use_flash_attn: bool,
 }
 
@@ -604,7 +653,12 @@ struct AudioConvSample {
 }
 
 impl AudioTower {
-    pub fn load(cfg: &AudioEncoderConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
+    pub fn load(
+        cfg: &AudioEncoderConfig,
+        vb: VarBuilder,
+        use_flash_attn: bool,
+        isq: Option<&str>,
+    ) -> Result<Self> {
         let device = vb.device().clone();
 
         let positional_embedding =
@@ -633,7 +687,8 @@ impl AudioTower {
 
         let mel_after = cfg.num_mel_bins.div_ceil(2).div_ceil(2).div_ceil(2);
         let conv_out_in = cfg.downsample_hidden_size * mel_after;
-        let conv_out = linear_no_bias(conv_out_in, cfg.d_model, vb.pp("conv_out"))?;
+        let conv_out =
+            isq_linear::linear_no_bias(conv_out_in, cfg.d_model, vb.pp("conv_out"), isq)?;
 
         let mut layers = Vec::with_capacity(cfg.encoder_layers);
         for i in 0..cfg.encoder_layers {
@@ -641,6 +696,7 @@ impl AudioTower {
                 cfg,
                 vb.pp("layers").pp(i),
                 use_flash_attn,
+                isq,
             )?);
         }
 
@@ -649,8 +705,8 @@ impl AudioTower {
             candle_nn::LayerNormConfig::from(LAYER_NORM_EPS),
             vb.pp("ln_post"),
         )?;
-        let proj1 = linear(cfg.d_model, cfg.d_model, vb.pp("proj1"))?;
-        let proj2 = linear(cfg.d_model, cfg.output_dim, vb.pp("proj2"))?;
+        let proj1 = isq_linear::linear_b(cfg.d_model, cfg.d_model, true, vb.pp("proj1"), isq)?;
+        let proj2 = isq_linear::linear_b(cfg.d_model, cfg.output_dim, true, vb.pp("proj2"), isq)?;
 
         Ok(Self {
             config: cfg.clone(),
@@ -884,7 +940,7 @@ impl AudioTower {
             });
         }
 
-        let input_t = input_feature.transpose(0, 1)?; // (frames, mel)
+        let input_t = input_feature.transpose(0, 1)?;
         let chunk_num = frames.div_ceil(window);
         let mut padded_chunks: Vec<Tensor> = Vec::with_capacity(chunk_num);
         let mut aftercnn_lens: Vec<usize> = Vec::with_capacity(chunk_num);
@@ -1211,6 +1267,7 @@ mod tests {
     };
     use crate::config::AudioEncoderConfig;
     use candle_nn::Linear;
+    use vasr_quant::isq_linear::IsqLinear;
 
     #[test]
     fn test_sinusoidal_positional_embedding_shape() -> anyhow::Result<()> {
@@ -1260,7 +1317,7 @@ mod tests {
             downsample_hidden_size: 2,
         };
         let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
-        let tower = AudioTower::load(&cfg, vb, false)?;
+        let tower = AudioTower::load(&cfg, vb, false, None)?;
 
         let batch = 2usize;
         let mel = cfg.num_mel_bins;
@@ -1323,7 +1380,7 @@ mod tests {
             downsample_hidden_size: 2,
         };
         let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
-        let tower = AudioTower::load(&cfg, vb, false)?;
+        let tower = AudioTower::load(&cfg, vb, false, None)?;
 
         let batch = 3usize;
         let mel = cfg.num_mel_bins;
@@ -1478,10 +1535,10 @@ mod tests {
             eye[i * embed_dim + i] = 1.0;
         }
         let w = candle_core::Tensor::from_vec(eye, (embed_dim, embed_dim), &device)?;
-        let q_proj = Linear::new(w.clone(), None);
-        let k_proj = Linear::new(w.clone(), None);
-        let v_proj = Linear::new(w.clone(), None);
-        let out_proj = Linear::new(w, None);
+        let q_proj = IsqLinear::new(Linear::new(w.clone(), None), None, &device)?;
+        let k_proj = IsqLinear::new(Linear::new(w.clone(), None), None, &device)?;
+        let v_proj = IsqLinear::new(Linear::new(w.clone(), None), None, &device)?;
+        let out_proj = IsqLinear::new(Linear::new(w, None), None, &device)?;
 
         let attn = AudioAttention {
             use_flash_attn: false,

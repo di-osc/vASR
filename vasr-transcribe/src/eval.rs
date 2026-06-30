@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use clap::{Args, ValueEnum};
+use clap::{ArgAction, Args, ValueEnum};
+use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use serde::Serialize;
 use vasr_data::{AudioAsset, CerStats, VasrRecord, VasrRecordList, normalize_for_cer};
 
@@ -31,9 +32,9 @@ pub struct EvalArgs {
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Send mono=true for every request item.
-    #[arg(long, default_value_t = true)]
-    mono: bool,
+    /// Override mono mode for every request item. Omit to let the server decide.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    mono: Option<bool>,
 
     /// HTTP request retries.
     #[arg(long, default_value_t = 5)]
@@ -128,14 +129,35 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
         bail!("dataset is empty: {}", args.input.display());
     }
 
-    println!("service: {}", args.server);
-    println!("input:    {}", args.input.display());
-    println!("items:    {}", records.len());
+    println!(
+        "eval START | input={} items={} server={} normalizer={:?} mono={}",
+        args.input.display(),
+        records.len(),
+        args.server,
+        args.normalizer,
+        format_mono(args.mono)
+    );
 
     let request = build_request(&records, args.mono)?;
+    println!(
+        "eval request START | items={} retries={} timeout={}s",
+        request.inputs.len(),
+        args.retries,
+        args.timeout_sec
+    );
     let (response, wall_seconds) = request_batch(&args, request).await?;
     let items = extract_items(&records, &response, args.normalizer);
     let summary = summarize(&items, wall_seconds, &response)?;
+    let bad_count = items.iter().filter(|item| item.is_bad).count();
+    println!(
+        "eval request DONE  | items={} bad={} elapsed={:.3}s audio={:.1}s speed={:.1}x cer={:.4}",
+        records.len(),
+        bad_count,
+        summary.wall_seconds,
+        summary.audio_seconds,
+        summary.speedup_audio_seconds_per_second,
+        summary.cer_weighted,
+    );
 
     print_eval_summary_table(&summary, records.len());
 
@@ -156,6 +178,14 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| args.results_dir.join(format!("eval_{timestamp}.json")));
+    println!(
+        "eval DONE | items={} bad={} elapsed={:.3}s speed={:.1}x output={}",
+        records.len(),
+        bad_count,
+        summary.wall_seconds,
+        summary.speedup_audio_seconds_per_second,
+        output.display()
+    );
     save_report(
         &output,
         &EvalReport {
@@ -173,49 +203,77 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
 }
 
 fn print_eval_summary_table(summary: &Summary, items: usize) {
-    println!();
-    println!("+----------------------+----------------+");
-    println!("| metric               | value          |");
-    println!("+----------------------+----------------+");
-    println!("| items                | {:>14} |", items);
-    println!("| wall                 | {:>13.4}s |", summary.wall_seconds);
-    println!(
-        "| audio                | {:>13.4}s |",
-        summary.audio_seconds
-    );
-    println!(
-        "| speed                | {:>10.4}x |",
-        summary.speedup_audio_seconds_per_second
-    );
-    println!("| rtf                  | {:>14.6} |", summary.rtf);
-    println!("| cer weighted         | {:>14.6} |", summary.cer_weighted);
-    println!("| cer average          | {:>14.6} |", summary.cer_average);
-    println!(
-        "| accuracy             | {:>12.2}% |",
-        summary.accuracy_percent
-    );
-    println!("| correct              | {:>14} |", summary.correct);
-    println!("| insertions           | {:>14} |", summary.insertions);
-    println!("| deletions            | {:>14} |", summary.deletions);
-    println!("| substitutions        | {:>14} |", summary.substitutions);
-    println!("+----------------------+----------------+");
-    println!();
+    let mut table = summary_table();
+    table.add_rows([
+        vec!["items".to_string(), items.to_string()],
+        vec![
+            "elapsed".to_string(),
+            format!("{:.3}s", summary.wall_seconds),
+        ],
+        vec![
+            "audio".to_string(),
+            format!("{:.1}s", summary.audio_seconds),
+        ],
+        vec![
+            "speed".to_string(),
+            format!("{:.1}x", summary.speedup_audio_seconds_per_second),
+        ],
+        vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
+        vec![
+            "cer weighted".to_string(),
+            format!("{:.6}", summary.cer_weighted),
+        ],
+        vec![
+            "cer average".to_string(),
+            format!("{:.6}", summary.cer_average),
+        ],
+        vec![
+            "accuracy".to_string(),
+            format!("{:.2}%", summary.accuracy_percent),
+        ],
+        vec!["correct".to_string(), summary.correct.to_string()],
+        vec!["insertions".to_string(), summary.insertions.to_string()],
+        vec!["deletions".to_string(), summary.deletions.to_string()],
+        vec![
+            "substitutions".to_string(),
+            summary.substitutions.to_string(),
+        ],
+    ]);
+    println!("\n{table}\n");
 }
 
-fn build_request(records: &[VasrRecord], mono: bool) -> Result<TranscribeRequest> {
+fn summary_table() -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["metric", "value"]);
+    table
+}
+
+fn format_mono(mono: Option<bool>) -> &'static str {
+    match mono {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "auto",
+    }
+}
+
+fn build_request(records: &[VasrRecord], mono: Option<bool>) -> Result<TranscribeRequest> {
     let mut inputs = Vec::with_capacity(records.len());
     for record in records {
         let input = match &record.media {
             AudioAsset::Uri { uri, .. } => AudioInputDto {
                 url: Some(uri.clone()),
                 b64_str: None,
-                mono: Some(mono),
+                mono,
                 hotword: hotword_from_record(record),
             },
             AudioAsset::Embedded { bytes, .. } => AudioInputDto {
                 url: None,
                 b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-                mono: Some(mono),
+                mono,
                 hotword: hotword_from_record(record),
             },
         };

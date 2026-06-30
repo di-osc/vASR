@@ -4,7 +4,7 @@
 //! `paged_batch_decode_step` directly to drive batch membership across steps.
 
 use anyhow::{Result, bail};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{Device, Tensor};
 
 use crate::model::attention;
 use crate::model::generation::{
@@ -17,16 +17,18 @@ use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
 #[cfg(feature = "cuda-graph")]
 use vasr_paged_attn::DecodeGraphOutputKind;
+use vasr_paged_attn::PagedCudaDecodeForward;
 use vasr_quant::isq_linear::set_linear_is_prefill;
 
 const DECODE_TOKEN_REPEAT_LIMIT: usize = 32;
 const DECODE_PATTERN_REPEAT_LIMIT: usize = 16;
 const DECODE_MAX_REPEAT_PATTERN_LEN: usize = 8;
+#[cfg(not(feature = "cuda-graph"))]
+const DEFAULT_PREFILL_CHUNKED_ARGMAX_SIZE: usize = 4096;
 
 enum DecodeStepOutput {
     Logits(Tensor),
     NextIds(Tensor),
-    NextIdCandidates(Tensor),
 }
 
 fn has_repeated_tail(tokens: &[u32]) -> bool {
@@ -54,6 +56,18 @@ fn has_repeated_tail(tokens: &[u32]) -> bool {
         }
     }
     false
+}
+
+fn prefill_chunked_argmax_size(runtime: &PagedCacheRuntime) -> usize {
+    #[cfg(feature = "cuda-graph")]
+    {
+        runtime.cuda_graph_chunked_argmax_size()
+    }
+    #[cfg(not(feature = "cuda-graph"))]
+    {
+        let _ = runtime;
+        DEFAULT_PREFILL_CHUNKED_ARGMAX_SIZE
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -842,10 +856,11 @@ pub fn paged_batch_prefill(
     }
     let block_tables = runtime.block_tables_for(&request_ids)?;
     let cache = runtime.cache_clone();
+    let prefill_next_id_chunk_size = prefill_chunked_argmax_size(runtime);
 
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
     let use_packed_cuda_prefill = device.is_cuda() && cuda_packed_prefill_enabled();
-    let (last_logits, prompt_lens_i64) = if use_packed_cuda_prefill {
+    let (next_ids, prompt_lens_i64) = if use_packed_cuda_prefill {
         let total_tokens: usize = prompt_lens_usize.iter().sum();
         let mut packed_ids = Vec::with_capacity(total_tokens);
         let mut packed_audio_features: Vec<Tensor> = Vec::new();
@@ -917,15 +932,29 @@ pub fn paged_batch_prefill(
         if offset != total_tokens {
             bail!("packed prompt total mismatch: lens_total={offset} total_tokens={total_tokens}");
         }
-        let last_logits = {
+        let next_ids = {
             let _linear_prefill_guard = set_linear_is_prefill(true);
-            thinker.forward_last_logits_packed_prefill_with_paged_cache(
+            if let Some(next_ids) = thinker.forward_last_next_ids_packed_prefill_with_paged_cache(
                 &packed_position_ids,
                 &packed_inputs_embeds,
                 &cache,
                 &input_metadata,
                 last_token_indices.as_slice(),
-            )?
+                prefill_next_id_chunk_size,
+            )? {
+                next_token_ids_from_decode_output(DecodeStepOutput::NextIds(next_ids), batch)?
+            } else {
+                let last_logits = thinker.forward_last_logits_packed_prefill_with_paged_cache(
+                    &packed_position_ids,
+                    &packed_inputs_embeds,
+                    &cache,
+                    &input_metadata,
+                    last_token_indices.as_slice(),
+                )?;
+                let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
+                drop(last_logits);
+                next_ids
+            }
         };
         drop(packed_inputs_embeds);
         drop(packed_position_ids);
@@ -940,7 +969,7 @@ pub fn paged_batch_prefill(
             })
             .collect::<Result<Vec<_>>>()?;
         drop(input_metadata);
-        (last_logits, prompt_lens_i64)
+        (next_ids, prompt_lens_i64)
     } else {
         let inputs_embeds = thinker.inputs_embeds_with_audio_features(
             &input_ids_t,
@@ -973,15 +1002,29 @@ pub fn paged_batch_prefill(
                 .ok_or_else(|| anyhow::anyhow!("last token index overflow at batch {row}"))?;
             last_token_indices.push(idx);
         }
-        let last_logits = {
+        let next_ids = {
             let _linear_prefill_guard = set_linear_is_prefill(true);
-            thinker.forward_last_logits_with_paged_cache(
+            if let Some(next_ids) = thinker.forward_last_next_ids_with_paged_cache(
                 &position_ids,
                 &inputs_embeds,
                 &cache,
                 &input_metadata,
                 last_token_indices.as_slice(),
-            )?
+                prefill_next_id_chunk_size,
+            )? {
+                next_token_ids_from_decode_output(DecodeStepOutput::NextIds(next_ids), batch)?
+            } else {
+                let last_logits = thinker.forward_last_logits_with_paged_cache(
+                    &position_ids,
+                    &inputs_embeds,
+                    &cache,
+                    &input_metadata,
+                    last_token_indices.as_slice(),
+                )?;
+                let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
+                drop(last_logits);
+                next_ids
+            }
         };
         drop(inputs_embeds);
         drop(last_token_indices);
@@ -995,14 +1038,12 @@ pub fn paged_batch_prefill(
             })
             .collect::<Result<Vec<_>>>()?;
         drop(input_metadata);
-        (last_logits, prompt_lens_i64)
+        (next_ids, prompt_lens_i64)
     };
     drop(input_ids_t);
     drop(attention_mask_t);
     drop(position_ids);
 
-    let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
-    drop(last_logits);
     let finished: Vec<bool> = next_ids
         .iter()
         .map(|id| config.eos_token_ids.contains(id))
@@ -1046,7 +1087,7 @@ pub fn paged_batch_prefill_shared(
         .map(|row| row.iter().filter(|&&v| v != 0).count())
         .collect();
     let token_capacities = prefill_token_capacities(config, &prompt_lens_usize)?;
-    let (cache, block_tables) = {
+    let (cache, block_tables, prefill_next_id_chunk_size) = {
         let mut runtime_guard = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
@@ -1062,7 +1103,11 @@ pub fn paged_batch_prefill_shared(
             }
         }
         let block_tables = runtime_guard.block_tables_for(&request_ids)?;
-        (runtime_guard.cache_clone(), block_tables)
+        (
+            runtime_guard.cache_clone(),
+            block_tables,
+            prefill_chunked_argmax_size(&runtime_guard),
+        )
     };
 
     let result = paged_batch_prefill_with_allocated(
@@ -1076,6 +1121,7 @@ pub fn paged_batch_prefill_shared(
         attention_mask,
         audio_features,
         config,
+        prefill_next_id_chunk_size,
     );
 
     match result {
@@ -1104,6 +1150,7 @@ fn paged_batch_prefill_with_allocated(
     attention_mask: &[&[u32]],
     audio_features: Option<&Tensor>,
     config: &PagedBatchConfig,
+    prefill_next_id_chunk_size: usize,
 ) -> Result<PagedBatchState> {
     let batch = input_ids.len();
     if config.eos_token_ids.is_empty() {
@@ -1186,7 +1233,7 @@ fn paged_batch_prefill_with_allocated(
 
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
     let use_packed_cuda_prefill = device.is_cuda() && cuda_packed_prefill_enabled();
-    let (last_logits, prompt_lens_i64) = if use_packed_cuda_prefill {
+    let (next_ids, prompt_lens_i64) = if use_packed_cuda_prefill {
         let total_tokens: usize = prompt_lens_usize.iter().sum();
         let mut packed_ids = Vec::with_capacity(total_tokens);
         let mut packed_audio_features: Vec<Tensor> = Vec::new();
@@ -1258,15 +1305,29 @@ fn paged_batch_prefill_with_allocated(
         if offset != total_tokens {
             bail!("packed prompt total mismatch: lens_total={offset} total_tokens={total_tokens}");
         }
-        let last_logits = {
+        let next_ids = {
             let _linear_prefill_guard = set_linear_is_prefill(true);
-            thinker.forward_last_logits_packed_prefill_with_paged_cache(
+            if let Some(next_ids) = thinker.forward_last_next_ids_packed_prefill_with_paged_cache(
                 &packed_position_ids,
                 &packed_inputs_embeds,
                 cache,
                 &input_metadata,
                 last_token_indices.as_slice(),
-            )?
+                prefill_next_id_chunk_size,
+            )? {
+                next_token_ids_from_decode_output(DecodeStepOutput::NextIds(next_ids), batch)?
+            } else {
+                let last_logits = thinker.forward_last_logits_packed_prefill_with_paged_cache(
+                    &packed_position_ids,
+                    &packed_inputs_embeds,
+                    cache,
+                    &input_metadata,
+                    last_token_indices.as_slice(),
+                )?;
+                let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
+                drop(last_logits);
+                next_ids
+            }
         };
         drop(packed_inputs_embeds);
         drop(packed_position_ids);
@@ -1281,7 +1342,7 @@ fn paged_batch_prefill_with_allocated(
             })
             .collect::<Result<Vec<_>>>()?;
         drop(input_metadata);
-        (last_logits, prompt_lens_i64)
+        (next_ids, prompt_lens_i64)
     } else {
         let inputs_embeds = thinker.inputs_embeds_with_audio_features(
             &input_ids_t,
@@ -1314,15 +1375,29 @@ fn paged_batch_prefill_with_allocated(
                 .ok_or_else(|| anyhow::anyhow!("last token index overflow at batch {row}"))?;
             last_token_indices.push(idx);
         }
-        let last_logits = {
+        let next_ids = {
             let _linear_prefill_guard = set_linear_is_prefill(true);
-            thinker.forward_last_logits_with_paged_cache(
+            if let Some(next_ids) = thinker.forward_last_next_ids_with_paged_cache(
                 &position_ids,
                 &inputs_embeds,
                 cache,
                 &input_metadata,
                 last_token_indices.as_slice(),
-            )?
+                prefill_next_id_chunk_size,
+            )? {
+                next_token_ids_from_decode_output(DecodeStepOutput::NextIds(next_ids), batch)?
+            } else {
+                let last_logits = thinker.forward_last_logits_with_paged_cache(
+                    &position_ids,
+                    &inputs_embeds,
+                    cache,
+                    &input_metadata,
+                    last_token_indices.as_slice(),
+                )?;
+                let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
+                drop(last_logits);
+                next_ids
+            }
         };
         drop(inputs_embeds);
         drop(last_token_indices);
@@ -1336,14 +1411,12 @@ fn paged_batch_prefill_with_allocated(
             })
             .collect::<Result<Vec<_>>>()?;
         drop(input_metadata);
-        (last_logits, prompt_lens_i64)
+        (next_ids, prompt_lens_i64)
     };
     drop(input_ids_t);
     drop(attention_mask_t);
     drop(position_ids);
 
-    let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
-    drop(last_logits);
     let finished: Vec<bool> = next_ids
         .iter()
         .map(|id| config.eos_token_ids.contains(id))
@@ -1571,9 +1644,8 @@ fn paged_batch_decode_forward(
                 Ok(output) => {
                     return Ok(match output.kind {
                         DecodeGraphOutputKind::Logits => DecodeStepOutput::Logits(output.tensor),
-                        DecodeGraphOutputKind::NextIds => DecodeStepOutput::NextIds(output.tensor),
-                        DecodeGraphOutputKind::NextIdCandidates => {
-                            DecodeStepOutput::NextIdCandidates(output.tensor)
+                        DecodeGraphOutputKind::NextIds | DecodeGraphOutputKind::ChunkedNextIds => {
+                            DecodeStepOutput::NextIds(output.tensor)
                         }
                     });
                 }
@@ -1589,6 +1661,17 @@ fn paged_batch_decode_forward(
                 }
             }
         }
+    }
+
+    if let Some(next_ids) = paged_batch_decode_next_ids_without_graph(
+        thinker,
+        runtime.cache(),
+        input_ids_new,
+        position_ids_new,
+        input_metadata,
+        prefill_chunked_argmax_size(runtime),
+    )? {
+        return Ok(DecodeStepOutput::NextIds(next_ids));
     }
 
     Ok(DecodeStepOutput::Logits(
@@ -1631,8 +1714,8 @@ fn paged_batch_decode_forward_shared(
                             DecodeGraphOutputKind::NextIds => {
                                 DecodeStepOutput::NextIds(output.tensor)
                             }
-                            DecodeGraphOutputKind::NextIdCandidates => {
-                                DecodeStepOutput::NextIdCandidates(output.tensor)
+                            DecodeGraphOutputKind::ChunkedNextIds => {
+                                DecodeStepOutput::NextIds(output.tensor)
                             }
                         }),
                         Err(err) => {
@@ -1659,6 +1742,23 @@ fn paged_batch_decode_forward_shared(
         }
     }
 
+    let decode_next_id_chunk_size = {
+        let runtime_guard = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        prefill_chunked_argmax_size(&runtime_guard)
+    };
+    if let Some(next_ids) = paged_batch_decode_next_ids_without_graph(
+        thinker,
+        cache,
+        input_ids_new,
+        position_ids_new,
+        input_metadata,
+        decode_next_id_chunk_size,
+    )? {
+        return Ok(DecodeStepOutput::NextIds(next_ids));
+    }
+
     Ok(DecodeStepOutput::Logits(
         paged_batch_decode_forward_without_graph(
             thinker,
@@ -1668,6 +1768,24 @@ fn paged_batch_decode_forward_shared(
             input_metadata,
         )?,
     ))
+}
+
+fn paged_batch_decode_next_ids_without_graph(
+    thinker: &ThinkerForConditionalGeneration,
+    cache: &PagedKvCache,
+    input_ids_new: &Tensor,
+    position_ids_new: &Tensor,
+    input_metadata: &PagedInputMetadata,
+    chunk_size: usize,
+) -> Result<Option<Tensor>> {
+    let _linear_decode_guard = set_linear_is_prefill(false);
+    thinker.forward_chunked_next_ids_with_paged_cache(
+        input_ids_new,
+        position_ids_new,
+        cache,
+        input_metadata,
+        chunk_size,
+    )
 }
 
 fn next_token_ids_from_decode_output(
@@ -1683,46 +1801,11 @@ fn next_token_ids_from_decode_output(
             let ids = next_ids.to_vec1::<u32>()?;
             if ids.len() != active_batch {
                 bail!(
-                    "CUDA graph next-id output length mismatch: got {} expected {active_batch}",
+                    "decode next-id output length mismatch: got {} expected {active_batch}",
                     ids.len()
                 );
             }
             Ok(ids)
-        }
-        DecodeStepOutput::NextIdCandidates(candidates) => {
-            let dims = candidates.dims();
-            if dims.len() != 3 || dims[0] != 2 || dims[1] != active_batch {
-                bail!(
-                    "CUDA graph chunked argmax candidates shape mismatch: got {dims:?}, expected [2,{active_batch},chunks]"
-                );
-            }
-            let chunks = dims[2];
-            let values = candidates.i(0usize)?.to_vec2::<f32>()?;
-            let ids = candidates.i(1usize)?.to_vec2::<f32>()?;
-            let mut next = Vec::with_capacity(active_batch);
-            for row in 0..active_batch {
-                let mut best_value = f32::NEG_INFINITY;
-                let mut best_id = 0u32;
-                for chunk in 0..chunks {
-                    let value = values
-                        .get(row)
-                        .and_then(|row_values| row_values.get(chunk))
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing chunked argmax value row={row} chunk={chunk}")
-                        })?;
-                    if value > best_value {
-                        best_value = value;
-                        best_id = ids
-                            .get(row)
-                            .and_then(|row_ids| row_ids.get(chunk))
-                            .copied()
-                            .unwrap_or(0.0) as u32;
-                    }
-                }
-                next.push(best_id);
-            }
-            Ok(next)
         }
     }
 }
@@ -1746,7 +1829,7 @@ fn paged_batch_decode_forward_without_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{PagedBatchState, decode_step_required_tokens};
+    use super::{DecodeStepOutput, PagedBatchState, decode_step_required_tokens};
 
     #[test]
     fn active_indices_skips_finished_rows() {
@@ -1772,6 +1855,14 @@ mod tests {
         assert_eq!(decode_step_required_tokens(31, 0)?, 32);
         assert_eq!(decode_step_required_tokens(32, 0)?, 33);
         assert_eq!(decode_step_required_tokens(64, 31)?, 96);
+        Ok(())
+    }
+
+    #[test]
+    fn next_ids_decode_output_converts_to_u32_vec() -> anyhow::Result<()> {
+        let next_ids = candle_core::Tensor::new(&[7f32, 11f32], &candle_core::Device::Cpu)?;
+        let ids = super::next_token_ids_from_decode_output(DecodeStepOutput::NextIds(next_ids), 2)?;
+        assert_eq!(ids, vec![7, 11]);
         Ok(())
     }
 }

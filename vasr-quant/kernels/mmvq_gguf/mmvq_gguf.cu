@@ -727,6 +727,8 @@ mmvq_core_impl(const void *__restrict__ vx, const block_q8_1 *__restrict__ y,
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
   const int row0 = rows_per_cuda_block * blockIdx.x;
+  const block_q8_1 *y_base = y + blockIdx.y * ncols_dst * stride_col_y;
+  dst_t *dst_base = dst + blockIdx.y * ncols_dst * stride_col_dst;
   const int blocks_per_row_x = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
@@ -745,7 +747,7 @@ mmvq_core_impl(const void *__restrict__ vx, const block_q8_1 *__restrict__ y,
         const int row = row0 + i;
         const int weight_kbx = row * blocks_per_row_x + kbx;
         tmp[j][i] +=
-            vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], weight_kbx, kqs);
+            vec_dot_q_cuda(vx, &y_base[j * stride_col_y + kby], weight_kbx, kqs);
       }
     }
   }
@@ -780,7 +782,81 @@ mmvq_core_impl(const void *__restrict__ vx, const block_q8_1 *__restrict__ y,
     if (threadIdx.x < rows_per_cuda_block &&
         (rows_per_cuda_block == 1 ||
          uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
-      dst[j * stride_col_dst + row0 + threadIdx.x] = (dst_t)tmp[j][threadIdx.x];
+      dst_base[j * stride_col_dst + row0 + threadIdx.x] = (dst_t)tmp[j][threadIdx.x];
+    }
+  }
+}
+
+template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst>
+static __device__ void mmvq_core_fused_activation_impl(
+    const void *__restrict__ vx, const block_q8_1 *__restrict__ y,
+    const dst_t *__restrict__ bias, dst_t *__restrict__ dst, const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst, const int activation) {
+
+  constexpr int nwarps = mmvq_nwarps_plain_for(ncols_dst);
+  constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_plain_for(ncols_dst);
+
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const block_q8_1 *y_base = y + blockIdx.y * ncols_dst * stride_col_y;
+  dst_t *dst_base = dst + blockIdx.y * ncols_dst * stride_col_dst;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+  float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+  for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (tid % (qi / vdr));
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        const int row = row0 + i;
+        const int weight_kbx = row * blocks_per_row_x + kbx;
+        tmp[j][i] +=
+            vec_dot_q_cuda(vx, &y_base[j * stride_col_y + kby], weight_kbx, kqs);
+      }
+    }
+  }
+
+  __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst]
+                             [rows_per_cuda_block][WARP_SIZE];
+
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        tmp_shared[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
+  }
+
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+      for (int l = 0; l < nwarps - 1; ++l) {
+        tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+      }
+      tmp[j][i] = warp_reduce_sum_f32(tmp[j][i]);
+    }
+    if (threadIdx.x < rows_per_cuda_block &&
+        (rows_per_cuda_block == 1 ||
+         uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
+      const int row = row0 + threadIdx.x;
+      const float bias_val = bias == nullptr ? 0.0f : (float)bias[row];
+      dst_base[j * stride_col_dst + row0 + threadIdx.x] =
+          (dst_t)apply_glu_activation(tmp[j][threadIdx.x] + bias_val, activation);
     }
   }
 }
@@ -798,6 +874,8 @@ static __device__ void mmvq_core_fused_glu_impl(
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
   const int row0 = rows_per_cuda_block * blockIdx.x;
+  const block_q8_1 *y_base = y + blockIdx.y * ncols_dst * stride_col_y;
+  dst_t *dst_base = dst + blockIdx.y * ncols_dst * stride_col_dst;
   const int blocks_per_row_x = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
@@ -815,7 +893,7 @@ static __device__ void mmvq_core_fused_glu_impl(
       for (int i = 0; i < rows_per_cuda_block; ++i) {
         const int row = row0 + i;
         const int weight_kbx = row * blocks_per_row_x + kbx;
-        const block_q8_1 *yj = &y[j * stride_col_y + kby];
+        const block_q8_1 *yj = &y_base[j * stride_col_y + kby];
         tmp_gate[j][i] += vec_dot_q_cuda(vx_gate, yj, weight_kbx, kqs);
         tmp_up[j][i] += vec_dot_q_cuda(vx_up, yj, weight_kbx, kqs);
       }
@@ -861,7 +939,7 @@ static __device__ void mmvq_core_fused_glu_impl(
       const dst_t up_val = (dst_t)tmp_up[j][threadIdx.x];
       const dst_t activated =
           (dst_t)apply_glu_activation((float)gate_val, activation);
-      dst[j * stride_col_dst + row0 + threadIdx.x] = activated * up_val;
+      dst_base[j * stride_col_dst + row0 + threadIdx.x] = activated * up_val;
     }
   }
 }
@@ -871,6 +949,8 @@ template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
 static __device__ void mmvq_core_fused_qkv_impl(
     const void *__restrict__ vx_q, const void *__restrict__ vx_k,
     const void *__restrict__ vx_v, const block_q8_1 *__restrict__ y,
+    const dst_t *__restrict__ q_bias, const dst_t *__restrict__ k_bias,
+    const dst_t *__restrict__ v_bias,
     dst_t *__restrict__ q_dst, dst_t *__restrict__ k_dst,
     dst_t *__restrict__ v_dst, const int ncols_x, const int nrows_q,
     const int nrows_k, const int nrows_v, const int stride_col_y) {
@@ -879,6 +959,7 @@ static __device__ void mmvq_core_fused_qkv_impl(
   constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_fused_qkv_for(ncols_dst);
 
   const void *vx;
+  const dst_t *bias;
   dst_t *dst;
   int nrows_x;
   int row_block;
@@ -889,16 +970,19 @@ static __device__ void mmvq_core_fused_qkv_impl(
     if (block < q_blocks) {
       row_block = block;
       vx = vx_q;
+      bias = q_bias;
       dst = q_dst;
       nrows_x = nrows_q;
     } else if (block < q_blocks + k_blocks) {
       row_block = block - q_blocks;
       vx = vx_k;
+      bias = k_bias;
       dst = k_dst;
       nrows_x = nrows_k;
     } else {
       row_block = block - q_blocks - k_blocks;
       vx = vx_v;
+      bias = v_bias;
       dst = v_dst;
       nrows_x = nrows_v;
     }
@@ -906,20 +990,24 @@ static __device__ void mmvq_core_fused_qkv_impl(
     row_block = blockIdx.x;
     if (blockIdx.y == 0) {
       vx = vx_q;
+      bias = q_bias;
       dst = q_dst;
       nrows_x = nrows_q;
     } else if (blockIdx.y == 1) {
       vx = vx_k;
+      bias = k_bias;
       dst = k_dst;
       nrows_x = nrows_k;
     } else {
       vx = vx_v;
+      bias = v_bias;
       dst = v_dst;
       nrows_x = nrows_v;
     }
   }
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const block_q8_1 *y_base = y + blockIdx.z * ncols_dst * stride_col_y;
   const int row0 = rows_per_cuda_block * row_block;
   if (row0 >= nrows_x) {
     return;
@@ -945,7 +1033,7 @@ static __device__ void mmvq_core_fused_qkv_impl(
         }
         const int weight_kbx = row * blocks_per_row_x + kbx;
         tmp[j][i] +=
-            vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], weight_kbx, kqs);
+            vec_dot_q_cuda(vx, &y_base[j * stride_col_y + kby], weight_kbx, kqs);
       }
     }
   }
@@ -980,7 +1068,10 @@ static __device__ void mmvq_core_fused_qkv_impl(
     if (threadIdx.x < rows_per_cuda_block &&
         (rows_per_cuda_block == 1 ||
          uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
-      dst[j * nrows_x + row0 + threadIdx.x] = (dst_t)tmp[j][threadIdx.x];
+      const int row = row0 + threadIdx.x;
+      const float bias_val = bias == nullptr ? 0.0f : (float)bias[row];
+      dst_t *dst_base = dst + blockIdx.z * ncols_dst * nrows_x;
+      dst_base[j * nrows_x + row] = (dst_t)(tmp[j][threadIdx.x] + bias_val);
     }
   }
 }
@@ -1006,6 +1097,22 @@ static __device__ void mmvq_core_fused_qkv_impl(
                           stride_col_y, stride_col_dst);                       \
   }
 
+#define MMVQ_FUSED_ACT_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, \
+                             dst_tag, dst_c_type, ncols)                       \
+  extern "C" __global__ void __launch_bounds__(                                \
+      mmvq_nwarps_plain_for(ncols) * WARP_SIZE, 1)                             \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda##ncols(                     \
+          const void *__restrict__ vx, const void *__restrict__ vy,            \
+          const dst_c_type *__restrict__ bias, dst_c_type *__restrict__ dst,   \
+          const int ncols_x, const int nrows_x,                                \
+          const int stride_col_y, const int stride_col_dst,                    \
+          const int activation) {                                              \
+    mmvq_core_fused_activation_impl<dst_c_type, qk_val, qi_val, block_q_t,     \
+                                    vdr_val, vec_dot, ncols>(                  \
+        vx, (const block_q8_1 *)vy, bias, dst, ncols_x, nrows_x, stride_col_y, \
+        stride_col_dst, activation);                                           \
+  }
+
 #define MMVQ_FUSED_GLU_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, \
                              dst_tag, dst_c_type, ncols)                       \
   extern "C" __global__ void __launch_bounds__(                                \
@@ -1028,14 +1135,18 @@ static __device__ void mmvq_core_fused_qkv_impl(
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda##ncols(                     \
           const void *__restrict__ vx_q, const void *__restrict__ vx_k,        \
           const void *__restrict__ vx_v, const void *__restrict__ vy,          \
+          const dst_c_type *__restrict__ q_bias,                               \
+          const dst_c_type *__restrict__ k_bias,                               \
+          const dst_c_type *__restrict__ v_bias,                               \
           dst_c_type *__restrict__ q_dst, dst_c_type *__restrict__ k_dst,      \
           dst_c_type *__restrict__ v_dst, const int ncols_x,                   \
           const int nrows_q, const int nrows_k, const int nrows_v,             \
           const int stride_col_y) {                                            \
     mmvq_core_fused_qkv_impl<dst_c_type, qk_val, qi_val, block_q_t, vdr_val,   \
                              vec_dot, ncols>(                                  \
-        vx_q, vx_k, vx_v, (const block_q8_1 *)vy, q_dst, k_dst, v_dst,         \
-        ncols_x, nrows_q, nrows_k, nrows_v, stride_col_y);                     \
+        vx_q, vx_k, vx_v, (const block_q8_1 *)vy, q_bias, k_bias, v_bias,     \
+        q_dst, k_dst, v_dst, ncols_x, nrows_q, nrows_k, nrows_v,              \
+        stride_col_y);                                                         \
   }
 
 // -- plain entries for all 10 supported quant types, batch sizes 1..8, bf16 +
@@ -1181,6 +1292,23 @@ MMVQ_FUSED_GLU_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
 MMVQ_FUSED_GLU_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
                      vec_dot_q8_0_q8_1, f32, float, 8)
 
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 1)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 2)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 3)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 4)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 5)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 6)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 7)
+MMVQ_FUSED_ACT_ENTRY(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
+                     vec_dot_q8_0_q8_1, bf16, __nv_bfloat16, 8)
+
 #define MMVQ_FUSED_QKV_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
   MMVQ_FUSED_QKV_BATCH_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,   \
@@ -1313,14 +1441,166 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
   reinterpret_cast<half &>(y[ib].ds.y) = (half)sum;
 }
 
+extern "C" __global__ void q8_0_lm_head_candidates_kernel(
+    const block_q8_0 *__restrict__ weight, const block_q8_1 *__restrict__ y,
+    float *__restrict__ dst, int ncols_x, int nrows_x, int stride_col_y,
+    int batch_size, int chunk_size, int chunks) {
+  const int row = (int)blockIdx.x;
+  const int chunk = (int)blockIdx.y;
+  if (row >= batch_size || chunk >= chunks) {
+    return;
+  }
+
+  const int vocab_start = chunk * chunk_size;
+  const int vocab_end = min(vocab_start + chunk_size, nrows_x);
+  const int blocks_per_weight_row = ncols_x / QK8_0;
+  const block_q8_1 *y_row = y + row * stride_col_y;
+
+  float best_value = -INFINITY;
+  int best_id = vocab_start;
+
+  for (int vocab = vocab_start + threadIdx.x; vocab < vocab_end;
+       vocab += blockDim.x) {
+    const block_q8_0 *w_row = weight + vocab * blocks_per_weight_row;
+    float acc = 0.0f;
+    for (int block = 0; block < blocks_per_weight_row; ++block) {
+      const block_q8_0 *w_block = w_row + block;
+      const block_q8_1 *y_block = y_row + block;
+      int sumi = 0;
+#pragma unroll
+      for (int i = 0; i < QK8_0 / 4; ++i) {
+        const int w_qs = get_int_from_int8(w_block->qs, i);
+        const int y_qs = get_int_from_int8(y_block->qs, i);
+        sumi = ggml_cuda_dp4a(w_qs, y_qs, sumi);
+      }
+      acc += sumi * __half2float(w_block->d) * __half2float(y_block->ds.x);
+    }
+    if (acc > best_value) {
+      best_value = acc;
+      best_id = vocab;
+    }
+  }
+
+  __shared__ float shared_values[256];
+  __shared__ int shared_ids[256];
+  shared_values[threadIdx.x] = best_value;
+  shared_ids[threadIdx.x] = best_id;
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      const float other_value = shared_values[threadIdx.x + offset];
+      const int other_id = shared_ids[threadIdx.x + offset];
+      if (other_value > shared_values[threadIdx.x]) {
+        shared_values[threadIdx.x] = other_value;
+        shared_ids[threadIdx.x] = other_id;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    const int out_index = row * chunks + chunk;
+    dst[out_index] = shared_values[0];
+    dst[batch_size * chunks + out_index] = (float)shared_ids[0];
+  }
+}
+
+extern "C" void launch_q8_0_lm_head_candidates(
+    const void *weight, const void *y, void *dst, int ncols_x, int nrows_x,
+    int stride_col_y, int batch_size, int chunk_size, int chunks, void *stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  dim3 grid((unsigned int)batch_size, (unsigned int)chunks, 1);
+  dim3 block(256, 1, 1);
+  q8_0_lm_head_candidates_kernel<<<grid, block, 0, s>>>(
+      (const block_q8_0 *)weight, (const block_q8_1 *)y, (float *)dst, ncols_x,
+      nrows_x, stride_col_y, batch_size, chunk_size, chunks);
+}
+
+extern "C" __global__ void q8_0_lm_head_candidates_reduce_kernel(
+    const float *__restrict__ candidates, float *__restrict__ dst,
+    int batch_size, int chunks) {
+  const int row = (int)blockIdx.x;
+  if (row >= batch_size || chunks <= 0) {
+    return;
+  }
+
+  float best_value = -INFINITY;
+  unsigned int best_id = 0;
+  const int row_offset = row * chunks;
+  const int ids_offset = batch_size * chunks + row_offset;
+
+  for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+    const float value = candidates[row_offset + chunk];
+    const unsigned int id = (unsigned int)candidates[ids_offset + chunk];
+    if (value > best_value) {
+      best_value = value;
+      best_id = id;
+    }
+  }
+
+  __shared__ float shared_values[256];
+  __shared__ unsigned int shared_ids[256];
+  shared_values[threadIdx.x] = best_value;
+  shared_ids[threadIdx.x] = best_id;
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      const float other_value = shared_values[threadIdx.x + offset];
+      const unsigned int other_id = shared_ids[threadIdx.x + offset];
+      if (other_value > shared_values[threadIdx.x]) {
+        shared_values[threadIdx.x] = other_value;
+        shared_ids[threadIdx.x] = other_id;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    dst[row] = (float)shared_ids[0];
+  }
+}
+
+extern "C" void launch_q8_0_lm_head_candidates_reduce(
+    const void *candidates, void *dst, int batch_size, int chunks,
+    void *stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  dim3 grid((unsigned int)batch_size, 1, 1);
+  dim3 block(256, 1, 1);
+  q8_0_lm_head_candidates_reduce_kernel<<<grid, block, 0, s>>>(
+      (const float *)candidates, (float *)dst, batch_size, chunks);
+}
+
 // Host-side launchers used by `mistralrs-quant/src/gguf/ffi.rs`.
+
+#define MMVQ_LAUNCH_PLAIN_FULL8(kernel, vx, vy, dst, stride_col_y, stride_col_dst, \
+                                ncols_x, nrows_x, s, rows_per_block, nwarps)    \
+  do {                                                                          \
+    const int full_chunks = b_size / 8;                                          \
+    if (full_chunks > 0) {                                                       \
+      const unsigned int nblocks =                                              \
+          (unsigned int)(((nrows_x) + (rows_per_block)-1) / (rows_per_block));  \
+      dim3 grid(nblocks, (unsigned int)full_chunks, 1);                         \
+      dim3 block(WARP_SIZE, (nwarps), 1);                                       \
+      kernel<<<grid, block, 0, (s)>>>(vx, (vy), (dst), (ncols_x),               \
+                                      (nrows_x), (stride_col_y),                \
+                                      (stride_col_dst));                         \
+    }                                                                           \
+  } while (0)
 
 #define MMVQ_LAUNCHER_PLAIN(tag, dst_tag, dst_c_type)                          \
   extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_plain(                  \
       const void *vx, const void *vy, void *dst, int ncols_x, int nrows_x,     \
       int stride_col_y, int stride_col_dst, int b_size, void *stream) {        \
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
-    for (int col0 = 0; col0 < b_size; col0 += 8) {                             \
+    const unsigned int full8_rows_per_block = 2;                                \
+    const unsigned int full8_nwarps = 2;                                        \
+    MMVQ_LAUNCH_PLAIN_FULL8(mmvq_gguf_##tag##_##dst_tag##_plain_cuda8, vx,     \
+                            (const block_q8_1 *)vy, (dst_c_type *)dst,         \
+                            stride_col_y, stride_col_dst, ncols_x, nrows_x, s, \
+                            full8_rows_per_block, full8_nwarps);               \
+    for (int col0 = (b_size / 8) * 8; col0 < b_size; col0 += 8) {              \
       const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
       const unsigned int rows_per_block =                                      \
           (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_PLAIN : 2;             \
@@ -1391,7 +1671,18 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
       int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,          \
       int b_size, int activation, void *stream) {                              \
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
-    for (int col0 = 0; col0 < b_size; col0 += 8) {                             \
+    const int full_chunks = b_size / 8;                                        \
+    if (full_chunks > 0) {                                                     \
+      const unsigned int rows_per_block = 2;                                   \
+      const unsigned int nblocks =                                             \
+          (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);     \
+      dim3 grid(nblocks, (unsigned int)full_chunks, 1);                        \
+      dim3 block(WARP_SIZE, 2, 1);                                             \
+      mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda8<<<grid, block, 0, s>>>(    \
+          vx_gate, vx_up, (const block_q8_1 *)vy, (dst_c_type *)dst, ncols_x,  \
+          nrows_x, stride_col_y, stride_col_dst, activation);                  \
+    }                                                                          \
+    for (int col0 = full_chunks * 8; col0 < b_size; col0 += 8) {              \
       const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
       const unsigned int rows_per_block =                                      \
           (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_FUSED_GLU : 2;         \
@@ -1456,90 +1747,224 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
     }                                                                          \
   }
 
+#define MMVQ_LAUNCHER_FUSED_ACT(tag, dst_tag, dst_c_type)                      \
+  extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_fused_act(              \
+      const void *vx, const void *vy, const void *bias, void *dst, int ncols_x, int nrows_x, \
+      int stride_col_y, int stride_col_dst, int b_size, int activation,        \
+      void *stream) {                                                          \
+    cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
+    const int full_chunks = b_size / 8;                                        \
+    if (full_chunks > 0) {                                                     \
+      const unsigned int rows_per_block = 2;                                   \
+      const unsigned int nblocks =                                             \
+          (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);     \
+      dim3 grid(nblocks, (unsigned int)full_chunks, 1);                        \
+      dim3 block(WARP_SIZE, 2, 1);                                             \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda8<<<grid, block, 0, s>>>(    \
+          vx, (const block_q8_1 *)vy, (const dst_c_type *)bias,                \
+          (dst_c_type *)dst, ncols_x, nrows_x, stride_col_y, stride_col_dst,   \
+          activation);                                                         \
+    }                                                                          \
+    for (int col0 = full_chunks * 8; col0 < b_size; col0 += 8) {              \
+      const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
+      const unsigned int rows_per_block =                                      \
+          (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_PLAIN : 2;             \
+      const unsigned int nblocks =                                             \
+          (unsigned int)((nrows_x + rows_per_block - 1) / rows_per_block);     \
+      unsigned int nwarps;                                                     \
+      if (cols == 1) {                                                         \
+        nwarps = MMVQ_NWARPS_SINGLE_COL_PLAIN;                                 \
+      } else if (cols <= 4) {                                                  \
+        nwarps = 4;                                                            \
+      } else {                                                                 \
+        nwarps = 2;                                                            \
+      }                                                                        \
+      dim3 grid(nblocks, 1, 1);                                                \
+      dim3 block(WARP_SIZE, nwarps, 1);                                        \
+      const block_q8_1 *vy_col = ((const block_q8_1 *)vy) + col0 * stride_col_y; \
+      dst_c_type *dst_col = ((dst_c_type *)dst) + col0 * stride_col_dst;       \
+      switch (cols) {                                                          \
+    case 1:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda1<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 2:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda2<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 3:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda3<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 4:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda4<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 5:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda5<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 6:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda6<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 7:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda7<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    case 8:                                                                    \
+      mmvq_gguf_##tag##_##dst_tag##_fused_act_cuda8<<<grid, block, 0, s>>>(    \
+          vx, vy_col, (const dst_c_type *)bias, dst_col, ncols_x, nrows_x,     \
+          stride_col_y,                                                        \
+          stride_col_dst, activation);                                         \
+      break;                                                                   \
+    default:                                                                   \
+      break;                                                                   \
+      }                                                                        \
+    }                                                                          \
+  }
+
 #define MMVQ_LAUNCHER_FUSED_QKV(tag, dst_tag, dst_c_type)                      \
   extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_fused_qkv(              \
       const void *vx_q, const void *vx_k, const void *vx_v, const void *vy,    \
+      const void *q_bias, const void *k_bias, const void *v_bias,              \
       void *q_dst, void *k_dst, void *v_dst, int ncols_x, int nrows_q,         \
       int nrows_k, int nrows_v, int stride_col_y, int b_size, void *stream) {  \
-    const unsigned int rows_per_block =                                        \
-        (b_size <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_FUSED_QKV : 2;         \
-    int max_nrows = nrows_q > nrows_k ? nrows_q : nrows_k;                     \
-    max_nrows = max_nrows > nrows_v ? max_nrows : nrows_v;                     \
-    int min_nrows = nrows_q < nrows_k ? nrows_q : nrows_k;                     \
-    min_nrows = min_nrows < nrows_v ? min_nrows : nrows_v;                     \
-    const bool use_packed =                                                    \
-        max_nrows >= MMVQ_FUSED_QKV_PACKED_MIN_ROW_RATIO * min_nrows;          \
-    const unsigned int q_blocks =                                               \
-        (unsigned int)((nrows_q + rows_per_block - 1) / rows_per_block);       \
-    const unsigned int k_blocks =                                               \
-        (unsigned int)((nrows_k + rows_per_block - 1) / rows_per_block);       \
-    const unsigned int v_blocks =                                               \
-        (unsigned int)((nrows_v + rows_per_block - 1) / rows_per_block);       \
-    const unsigned int nblocks = use_packed                                    \
-        ? q_blocks + k_blocks + v_blocks                                       \
-        : (unsigned int)((max_nrows + rows_per_block - 1) / rows_per_block);   \
-    unsigned int nwarps;                                                       \
-    if (b_size == 1) {                                                         \
-      nwarps = MMVQ_NWARPS_SINGLE_COL_FUSED_QKV;                               \
-    } else if (b_size <= 4) {                                                  \
-      nwarps = 4;                                                              \
-    } else {                                                                   \
-      nwarps = 2;                                                              \
-    }                                                                          \
-    dim3 grid(nblocks, use_packed ? 1 : 3, 1);                                 \
-    dim3 block(WARP_SIZE, nwarps, 1);                                          \
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
-    switch (b_size) {                                                          \
+    const int full_chunks = b_size / 8;                                        \
+    if (full_chunks > 0) {                                                     \
+      const unsigned int rows_per_block = 2;                                   \
+      int max_nrows = nrows_q > nrows_k ? nrows_q : nrows_k;                   \
+      max_nrows = max_nrows > nrows_v ? max_nrows : nrows_v;                   \
+      int min_nrows = nrows_q < nrows_k ? nrows_q : nrows_k;                   \
+      min_nrows = min_nrows < nrows_v ? min_nrows : nrows_v;                   \
+      const bool use_packed =                                                  \
+          max_nrows >= MMVQ_FUSED_QKV_PACKED_MIN_ROW_RATIO * min_nrows;        \
+      const unsigned int q_blocks =                                            \
+          (unsigned int)((nrows_q + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int k_blocks =                                            \
+          (unsigned int)((nrows_k + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int v_blocks =                                            \
+          (unsigned int)((nrows_v + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int nblocks = use_packed                                  \
+          ? q_blocks + k_blocks + v_blocks                                     \
+          : (unsigned int)((max_nrows + rows_per_block - 1) / rows_per_block); \
+      dim3 grid(nblocks, use_packed ? 1 : 3, (unsigned int)full_chunks);       \
+      dim3 block(WARP_SIZE, 2, 1);                                             \
+      mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda8<<<grid, block, 0, s>>>(    \
+          vx_q, vx_k, vx_v, (const block_q8_1 *)vy,                            \
+          (const dst_c_type *)q_bias, (const dst_c_type *)k_bias,              \
+          (const dst_c_type *)v_bias, (dst_c_type *)q_dst,                     \
+          (dst_c_type *)k_dst, (dst_c_type *)v_dst, ncols_x, nrows_q,          \
+          nrows_k, nrows_v, stride_col_y);                                     \
+    }                                                                          \
+    for (int col0 = full_chunks * 8; col0 < b_size; col0 += 8) {              \
+      const int cols = (b_size - col0) < 8 ? (b_size - col0) : 8;              \
+      const unsigned int rows_per_block =                                      \
+          (cols <= 1) ? MMVQ_ROWS_PER_BLOCK_SINGLE_COL_FUSED_QKV : 2;         \
+      int max_nrows = nrows_q > nrows_k ? nrows_q : nrows_k;                   \
+      max_nrows = max_nrows > nrows_v ? max_nrows : nrows_v;                   \
+      int min_nrows = nrows_q < nrows_k ? nrows_q : nrows_k;                   \
+      min_nrows = min_nrows < nrows_v ? min_nrows : nrows_v;                   \
+      const bool use_packed =                                                  \
+          max_nrows >= MMVQ_FUSED_QKV_PACKED_MIN_ROW_RATIO * min_nrows;        \
+      const unsigned int q_blocks =                                            \
+          (unsigned int)((nrows_q + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int k_blocks =                                            \
+          (unsigned int)((nrows_k + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int v_blocks =                                            \
+          (unsigned int)((nrows_v + rows_per_block - 1) / rows_per_block);     \
+      const unsigned int nblocks = use_packed                                  \
+          ? q_blocks + k_blocks + v_blocks                                     \
+          : (unsigned int)((max_nrows + rows_per_block - 1) / rows_per_block); \
+      unsigned int nwarps;                                                     \
+      if (cols == 1) {                                                         \
+        nwarps = MMVQ_NWARPS_SINGLE_COL_FUSED_QKV;                             \
+      } else if (cols <= 4) {                                                  \
+        nwarps = 4;                                                            \
+      } else {                                                                 \
+        nwarps = 2;                                                            \
+      }                                                                        \
+      dim3 grid(nblocks, use_packed ? 1 : 3, 1);                               \
+      dim3 block(WARP_SIZE, nwarps, 1);                                        \
+      const block_q8_1 *vy_col = ((const block_q8_1 *)vy) + col0 * stride_col_y; \
+      dst_c_type *q_dst_col = ((dst_c_type *)q_dst) + col0 * nrows_q;          \
+      dst_c_type *k_dst_col = ((dst_c_type *)k_dst) + col0 * nrows_k;          \
+      dst_c_type *v_dst_col = ((dst_c_type *)v_dst) + col0 * nrows_v;          \
+      switch (cols) {                                                          \
     case 1:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda1<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 2:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda2<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 3:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda3<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 4:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda4<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 5:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda5<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 6:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda6<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 7:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda7<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     case 8:                                                                    \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda8<<<grid, block, 0, s>>>(    \
-          vx_q, vx_k, vx_v, vy, (dst_c_type *)q_dst, (dst_c_type *)k_dst,      \
-          (dst_c_type *)v_dst, ncols_x, nrows_q, nrows_k, nrows_v,             \
+          vx_q, vx_k, vx_v, vy_col, (const dst_c_type *)q_bias,                \
+          (const dst_c_type *)k_bias, (const dst_c_type *)v_bias, q_dst_col,   \
+          k_dst_col, v_dst_col, ncols_x, nrows_q, nrows_k, nrows_v,            \
           stride_col_y);                                                       \
       break;                                                                   \
     default:                                                                   \
       break;                                                                   \
+      }                                                                        \
     }                                                                          \
   }
 
@@ -1577,6 +2002,7 @@ MMVQ_LAUNCHER_PLAIN(q5_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q6_k, f32, float)
 
 MMVQ_LAUNCHER_FUSED_GLU(q8_0, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_FUSED_ACT(q8_0, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_FUSED_GLU(q8_0, f16, half)
 MMVQ_LAUNCHER_FUSED_GLU(q8_0, f32, float)
 

@@ -182,6 +182,7 @@ impl ThinkerForConditionalGeneration {
             &cfg.audio_config,
             vb.pp("audio_tower"),
             audio_use_flash_attn,
+            isq,
         )?;
         let text_model = ThinkerTextModel::load(
             &cfg.text_config,
@@ -342,6 +343,33 @@ impl ThinkerForConditionalGeneration {
     }
 
     #[cfg(feature = "paged-attn")]
+    pub fn forward_last_next_ids_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+        last_token_flat_indices: &[usize],
+        chunk_size: usize,
+    ) -> Result<Option<Tensor>> {
+        if !self.lm_head.supports_chunked_argmax_next_ids() {
+            return Ok(None);
+        }
+        let hidden_states = self.text_model.forward_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        let last_hidden =
+            gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
+        drop(hidden_states);
+        Ok(self
+            .lm_head
+            .forward_chunked_argmax_next_ids(&last_hidden, chunk_size)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
     pub fn forward_packed_prefill_embeds_with_paged_cache(
         &self,
         position_ids: &Tensor,
@@ -377,6 +405,33 @@ impl ThinkerForConditionalGeneration {
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
         Ok(self.lm_head.forward(&last_hidden)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_last_next_ids_packed_prefill_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+        last_token_flat_indices: &[usize],
+        chunk_size: usize,
+    ) -> Result<Option<Tensor>> {
+        if !self.lm_head.supports_chunked_argmax_next_ids() {
+            return Ok(None);
+        }
+        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        let last_hidden =
+            gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
+        drop(hidden_states);
+        Ok(self
+            .lm_head
+            .forward_chunked_argmax_next_ids(&last_hidden, chunk_size)?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -738,18 +793,17 @@ impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration
         )
     }
 
-    fn forward_next_id_candidates_with_paged_cache(
+    fn forward_chunked_next_ids_with_paged_cache(
         &self,
         input_ids: &Tensor,
         position_ids: &Tensor,
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
+        chunk_size: usize,
     ) -> Result<Option<Tensor>> {
-        let chunk_size = std::env::var("VASR_CUDA_GRAPH_CHUNKED_ARGMAX_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(4096);
+        if !self.lm_head.supports_chunked_argmax_next_ids() {
+            return Ok(None);
+        }
         let inputs_embeds = self.embed_tokens(input_ids)?;
         let hidden_states = self.text_model.forward_with_paged_cache(
             position_ids,
@@ -759,6 +813,6 @@ impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration
         )?;
         Ok(self
             .lm_head
-            .forward_chunked_argmax_candidates(&hidden_states, chunk_size)?)
+            .forward_chunked_argmax_next_ids(&hidden_states, chunk_size)?)
     }
 }

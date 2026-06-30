@@ -9,8 +9,8 @@ use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::cuda_graph::{
-    CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats, DecodeCudaGraph,
-    DecodeGraphOutputKind, bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
+    CUDA_DECODE_GRAPH_MAX_GRAPHS, CudaGraphPrewarmStats, DecodeCudaGraph, DecodeGraphOutputKind,
+    bytes_to_mib, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
     cuda_graph_default_block_table_cols, cuda_graph_prewarm_batch_limit, cuda_memory_snapshot,
     pad_decode_batch_to_max,
 };
@@ -37,6 +37,10 @@ pub struct PagedCacheConfig {
     pub memory: PagedCacheMemory,
     #[cfg(feature = "cuda-graph")]
     pub cuda_graph_context_tokens: Option<usize>,
+    #[cfg(feature = "cuda-graph")]
+    pub cuda_graph_chunked_argmax: bool,
+    #[cfg(feature = "cuda-graph")]
+    pub cuda_graph_chunked_argmax_size: usize,
 }
 
 impl Default for PagedCacheConfig {
@@ -49,6 +53,10 @@ impl Default for PagedCacheConfig {
             },
             #[cfg(feature = "cuda-graph")]
             cuda_graph_context_tokens: None,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax: crate::cuda_graph::cuda_graph_chunked_argmax_enabled(),
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax_size: crate::cuda_graph::cuda_graph_chunked_argmax_size(),
         }
     }
 }
@@ -85,6 +93,110 @@ pub fn bytes_per_paged_block(
     elems
         .checked_mul(dtype_bytes)
         .ok_or_else(|| candle_core::Error::Msg("paged block byte count overflow".into()))
+}
+
+#[cfg(feature = "cuda-graph")]
+fn align_up(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+#[cfg(feature = "cuda-graph")]
+fn paged_attention_v2_workspace_bytes(
+    num_seqs: usize,
+    num_heads: usize,
+    head_size: usize,
+    max_num_partitions: usize,
+    dtype: DType,
+) -> usize {
+    let tmp_out_bytes = num_seqs
+        .saturating_mul(num_heads)
+        .saturating_mul(max_num_partitions)
+        .saturating_mul(head_size)
+        .saturating_mul(dtype.size_in_bytes());
+    let exp_sums_bytes = num_seqs
+        .saturating_mul(num_heads)
+        .saturating_mul(max_num_partitions)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let exp_sums_offset = align_up(tmp_out_bytes, 16);
+    let max_logits_offset = align_up(exp_sums_offset.saturating_add(exp_sums_bytes), 16);
+    max_logits_offset.saturating_add(exp_sums_bytes)
+}
+
+#[cfg(feature = "cuda-graph")]
+fn should_use_paged_attention_v2(
+    num_seqs: usize,
+    num_heads: usize,
+    max_num_partitions: usize,
+    block_size: usize,
+) -> bool {
+    let partition_size = 512usize;
+    !(max_num_partitions == 1 || num_seqs.saturating_mul(num_heads) > 512)
+        || partition_size % block_size != 0
+}
+
+#[cfg(feature = "cuda-graph")]
+fn max_prewarm_paged_attention_v2_workspace_bytes(
+    cache: &PagedKvCache,
+    prewarm_batches: &[usize],
+    block_table_cols: usize,
+) -> Result<usize> {
+    let (key_cache, _) = cache.key_value_cache(0)?;
+    let (_, num_heads, head_size_chunks, _, key_pack) = key_cache.dims5()?;
+    let head_size = head_size_chunks.saturating_mul(key_pack);
+    let max_context_len = block_table_cols.saturating_mul(cache.block_size());
+    let max_num_partitions = max_context_len.div_ceil(512);
+    let dtype = key_cache.dtype();
+    let mut max_bytes = 0usize;
+    for &batch in prewarm_batches {
+        if should_use_paged_attention_v2(batch, num_heads, max_num_partitions, cache.block_size()) {
+            max_bytes = max_bytes.max(paged_attention_v2_workspace_bytes(
+                batch,
+                num_heads,
+                head_size,
+                max_num_partitions,
+                dtype,
+            ));
+        }
+    }
+    Ok(max_bytes)
+}
+
+#[cfg(feature = "cuda-graph")]
+fn max_runtime_paged_attention_v2_workspace_bytes(cache: &PagedKvCache) -> Result<usize> {
+    let (key_cache, _) = cache.key_value_cache(0)?;
+    let (_, _, head_size_chunks, _, key_pack) = key_cache.dims5()?;
+    let head_size = head_size_chunks.saturating_mul(key_pack);
+    let max_context_len = cache
+        .num_blocks()
+        .saturating_sub(1)
+        .saturating_mul(cache.block_size());
+    let max_num_partitions = max_context_len.div_ceil(512);
+    let dtype = key_cache.dtype();
+
+    // The v2 kernel only runs when num_seqs * num_attention_heads <= 512
+    // (unless block size forces it). Use that product limit directly so this
+    // stays correct without threading model-specific attention-head counts
+    // through the cache runtime.
+    const MAX_V2_HEAD_PRODUCT: usize = 512;
+    let tmp_out_bytes = MAX_V2_HEAD_PRODUCT
+        .saturating_mul(max_num_partitions)
+        .saturating_mul(head_size)
+        .saturating_mul(dtype.size_in_bytes());
+    let exp_sums_bytes = MAX_V2_HEAD_PRODUCT
+        .saturating_mul(max_num_partitions)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let exp_sums_offset = align_up(tmp_out_bytes, 16);
+    let max_logits_offset = align_up(exp_sums_offset.saturating_add(exp_sums_bytes), 16);
+    Ok(max_logits_offset.saturating_add(exp_sums_bytes))
+}
+
+#[cfg(feature = "cuda-graph")]
+fn paged_attention_v2_reserve_floor_bytes() -> usize {
+    std::env::var("VASR_PAGED_ATTN_V2_WORKSPACE_RESERVE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|mib| mib.saturating_mul(1024 * 1024))
+        .unwrap_or(64 * 1024 * 1024)
 }
 
 #[cfg(feature = "cuda")]
@@ -409,6 +521,10 @@ pub struct PagedCacheRuntime {
     #[cfg(feature = "cuda-graph")]
     cuda_graph_block_table_cols: usize,
     #[cfg(feature = "cuda-graph")]
+    cuda_graph_chunked_argmax: bool,
+    #[cfg(feature = "cuda-graph")]
+    cuda_graph_chunked_argmax_size: usize,
+    #[cfg(feature = "cuda-graph")]
     cuda_decode_graphs_disabled: bool,
     #[cfg(feature = "cuda-graph")]
     cuda_decode_graph_disabled_keys: HashSet<CudaDecodeGraphKey>,
@@ -475,6 +591,10 @@ impl PagedCacheRuntime {
             #[cfg(feature = "cuda-graph")]
             cuda_graph_block_table_cols,
             #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax: config.cuda_graph_chunked_argmax,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax_size: config.cuda_graph_chunked_argmax_size,
+            #[cfg(feature = "cuda-graph")]
             cuda_decode_graphs_disabled: false,
             #[cfg(feature = "cuda-graph")]
             cuda_decode_graph_disabled_keys: HashSet::new(),
@@ -507,6 +627,11 @@ impl PagedCacheRuntime {
         let mut stats = self.stats.clone();
         stats.free_blocks = self.manager.free_blocks();
         stats
+    }
+
+    #[cfg(feature = "cuda-graph")]
+    pub fn cuda_graph_chunked_argmax_size(&self) -> usize {
+        self.cuda_graph_chunked_argmax_size
     }
 
     #[cfg(feature = "cuda-graph")]
@@ -656,8 +781,13 @@ impl PagedCacheRuntime {
                 .map_err(|err| {
                     candle_core::Error::Msg(format!("CUDA decode graph replay failed: {err}"))
                 })?;
+            let batch_dim = match graph.output_kind() {
+                DecodeGraphOutputKind::Logits
+                | DecodeGraphOutputKind::NextIds
+                | DecodeGraphOutputKind::ChunkedNextIds => 0,
+            };
             let tensor = logits
-                .narrow(0, 0, actual_batch)
+                .narrow(batch_dim, 0, actual_batch)
                 .map_err(|err| candle_core::Error::from(err))?;
             Ok(CudaDecodeGraphOutput {
                 tensor,
@@ -687,6 +817,8 @@ impl PagedCacheRuntime {
             &padded_ids,
             &padded_pos,
             &padded_meta,
+            self.cuda_graph_chunked_argmax,
+            self.cuda_graph_chunked_argmax_size,
         )
         .map_err(|err| {
             candle_core::Error::Msg(format!(
@@ -702,7 +834,7 @@ impl PagedCacheRuntime {
             let delta = used_after.saturating_sub(used_before);
             tracing::info!(
                 target: "vasr_transcribe::serve",
-                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} graphs={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB",
+                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} output={output_kind:?} graphs={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB",
                 self.cuda_decode_graphs.len(),
                 bytes_to_mib(delta),
                 bytes_to_mib(used_before),
@@ -713,12 +845,17 @@ impl PagedCacheRuntime {
         } else {
             tracing::info!(
                 target: "vasr_transcribe::serve",
-                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} graphs={}",
+                "CUDA decode graph captured batch={graph_batch} fixed_block_table_cols={graph_cols} output={output_kind:?} graphs={}",
                 self.cuda_decode_graphs.len()
             );
         }
+        let batch_dim = match output_kind {
+            DecodeGraphOutputKind::Logits
+            | DecodeGraphOutputKind::NextIds
+            | DecodeGraphOutputKind::ChunkedNextIds => 0,
+        };
         let tensor = warmup_logits
-            .narrow(0, 0, actual_batch)
+            .narrow(batch_dim, 0, actual_batch)
             .map_err(|err| candle_core::Error::from(err))?;
         Ok(CudaDecodeGraphOutput {
             tensor,
@@ -778,6 +915,29 @@ impl PagedCacheRuntime {
             cuda_graph_batch_buckets(limit)
         };
         prewarm_batches.reverse();
+        let graph_v2_workspace_bytes = max_prewarm_paged_attention_v2_workspace_bytes(
+            &self.cache,
+            &prewarm_batches,
+            graph_block_table_cols,
+        )?;
+        let runtime_v2_workspace_bytes =
+            max_runtime_paged_attention_v2_workspace_bytes(&self.cache)?;
+        let reserve_floor_bytes = paged_attention_v2_reserve_floor_bytes();
+        let v2_workspace_bytes = graph_v2_workspace_bytes
+            .max(runtime_v2_workspace_bytes)
+            .max(reserve_floor_bytes);
+        crate::reserve_paged_attention_v2_workspace(device, v2_workspace_bytes)?;
+        if v2_workspace_bytes > 0 {
+            tracing::info!(
+                target: "vasr_transcribe::serve",
+                "CUDA paged-attn v2 workspace reserved | bytes={:.2}MiB runtime={:.2}MiB graph={:.2}MiB floor={:.2}MiB batches={:?} fixed_block_table_cols={graph_block_table_cols}",
+                bytes_to_mib(v2_workspace_bytes),
+                bytes_to_mib(runtime_v2_workspace_bytes),
+                bytes_to_mib(graph_v2_workspace_bytes),
+                bytes_to_mib(reserve_floor_bytes),
+                prewarm_batches,
+            );
+        }
         for batch in prewarm_batches {
             let graph = DecodeCudaGraph::capture_batch_warmup(
                 thinker,
@@ -785,6 +945,8 @@ impl PagedCacheRuntime {
                 batch,
                 graph_block_table_cols,
                 device,
+                self.cuda_graph_chunked_argmax,
+                self.cuda_graph_chunked_argmax_size,
             )
             .map_err(|err| {
                 candle_core::Error::Msg(format!(
@@ -801,7 +963,12 @@ impl PagedCacheRuntime {
             let used_after = after.used();
             let delta = used_after.saturating_sub(used_before);
             tracing::info!(
-                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} kv_blocks={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB (nano-vLLM-style fixed block-table replay)",
+                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} output={} kv_blocks={} mem_delta={:.2}MiB used_before={:.2}MiB used_after={:.2}MiB free_after={:.2}MiB total={:.2}MiB (nano-vLLM-style fixed block-table replay)",
+                if self.cuda_graph_chunked_argmax {
+                    "ChunkedNextIds"
+                } else {
+                    "Logits/NextIds"
+                },
                 self.cache.num_blocks(),
                 bytes_to_mib(delta),
                 bytes_to_mib(used_before),
@@ -811,7 +978,12 @@ impl PagedCacheRuntime {
             );
         } else {
             tracing::info!(
-                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} kv_blocks={} (nano-vLLM-style fixed block-table replay)",
+                "CUDA decode graph pre-captured {captured} graph buckets up to max_batch={limit} requested_max_batch={requested_limit} fixed_block_table_cols={graph_block_table_cols} output={} kv_blocks={} (nano-vLLM-style fixed block-table replay)",
+                if self.cuda_graph_chunked_argmax {
+                    "ChunkedNextIds"
+                } else {
+                    "Logits/NextIds"
+                },
                 self.cache.num_blocks()
             );
         }
@@ -912,6 +1084,8 @@ mod tests {
                 block_size: 16,
                 memory: PagedCacheMemory::Blocks(8),
                 cuda_graph_context_tokens: None,
+                cuda_graph_chunked_argmax: false,
+                cuda_graph_chunked_argmax_size: 4096,
             },
         )?;
         runtime.set_cuda_graph_max_batch_for_test(20);
@@ -963,6 +1137,8 @@ mod tests {
                 block_size: 16,
                 memory: PagedCacheMemory::Blocks(8),
                 cuda_graph_context_tokens: None,
+                cuda_graph_chunked_argmax: false,
+                cuda_graph_chunked_argmax_size: 4096,
             },
         )?;
         runtime.set_cuda_graph_max_batch_for_test(20);

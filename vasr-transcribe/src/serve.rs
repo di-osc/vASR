@@ -10,8 +10,11 @@ use crate::runtime::{
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
-use clap::Args;
-use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
+use clap::{ArgAction, Args};
+use vasr::models::qwen3asr::model::isq_linear::{
+    isq_layer_counts, isq_quantize_time_us, reset_isq_layer_counts, reset_isq_quantize_time,
+    resolve_isq_display, resolve_isq_dtype,
+};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
@@ -35,6 +38,8 @@ const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
 #[cfg(feature = "paged-attn")]
 const DEFAULT_DECODE_TOKENS_PER_SEC: f64 = 4.25;
 const DEFAULT_DECODE_MIN_TOKENS: usize = 128;
+#[cfg(feature = "cuda")]
+const DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB: usize = 256;
 #[cfg(feature = "paged-attn")]
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
 #[cfg(feature = "paged-attn")]
@@ -56,7 +61,7 @@ pub struct CommonModelArgs {
     #[arg(long, default_value = "auto", env = "VASR_DEVICE")]
     pub device: String,
 
-    /// Enable in-situ quantization, for example q8_0.
+    /// Enable in-situ quantization, for example 8 or q8_0.
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
 
@@ -90,6 +95,33 @@ pub struct CommonModelArgs {
         env = "VASR_KV_PEAK_RATIO"
     )]
     pub kv_peak_ratio: f32,
+
+    /// Capture CUDA decode graphs with chunked Q8 lm_head next-id output. Automatically enabled for --isq 8.
+    #[cfg(feature = "cuda-graph")]
+    #[arg(long = "cuda-graph-chunked-argmax", default_value_t = false)]
+    pub cuda_graph_chunked_argmax: bool,
+
+    /// Vocabulary chunk size used by CUDA graph chunked lm_head argmax.
+    #[cfg(feature = "cuda-graph")]
+    #[arg(long = "cuda-graph-chunked-argmax-size", default_value_t = 4096)]
+    pub cuda_graph_chunked_argmax_size: usize,
+
+    /// Use MMQ for large-batch Q8 prefill lm_head next-id. Disable to compare with chunked candidates.
+    #[cfg(feature = "cuda")]
+    #[arg(
+        long = "q8-prefill-lm-head-mmq",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub q8_prefill_lm_head_mmq: bool,
+
+    /// Maximum temporary logits MiB for large-batch Q8 prefill lm_head MMQ. 0 disables the limit.
+    #[cfg(feature = "cuda")]
+    #[arg(
+        long = "q8-prefill-lm-head-mmq-max-logits-mib",
+        default_value_t = DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB
+    )]
+    pub q8_prefill_lm_head_mmq_max_logits_mib: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -307,20 +339,31 @@ fn worker_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> PipelineWo
 mod tests {
     use super::*;
 
-    #[test]
-    fn pipeline_defaults_match_validated_vad_batch_bounds() {
-        let pipeline = TranscribePipelineArgs {
-            model: CommonModelArgs {
-                model: DEFAULT_ASR_MODEL.to_string(),
-                cache_dir: vasr::modelscope_cache_dir(),
-                device: "auto".to_string(),
-                isq: None,
-                max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-                max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
-                decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
-                decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
-                kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
-            },
+    fn default_model_args() -> CommonModelArgs {
+        CommonModelArgs {
+            model: DEFAULT_ASR_MODEL.to_string(),
+            cache_dir: vasr::modelscope_cache_dir(),
+            device: "auto".to_string(),
+            isq: None,
+            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
+            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
+            kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax: false,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax_size: 4096,
+            #[cfg(feature = "cuda")]
+            q8_prefill_lm_head_mmq: true,
+            #[cfg(feature = "cuda")]
+            q8_prefill_lm_head_mmq_max_logits_mib: DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB,
+        }
+    }
+
+    fn default_pipeline_args() -> TranscribePipelineArgs {
+        TranscribePipelineArgs {
+            model: default_model_args(),
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             num_load_workers: 0,
             num_vad_workers: 0,
@@ -331,7 +374,12 @@ mod tests {
                 vad_min_silence_ms: 800,
                 vad_max_segment_sec: 30.0,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn pipeline_defaults_match_validated_vad_batch_bounds() {
+        let pipeline = default_pipeline_args();
 
         let opts = asr_options_from_pipeline(&pipeline, None);
         assert_eq!(opts.max_new_tokens, 0);
@@ -342,15 +390,8 @@ mod tests {
     #[test]
     fn max_num_seqs_must_be_positive_for_kv_sizing() {
         let args = CommonModelArgs {
-            model: DEFAULT_ASR_MODEL.to_string(),
-            cache_dir: vasr::modelscope_cache_dir(),
-            device: "auto".to_string(),
-            isq: None,
             max_num_seqs: 0,
-            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
-            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
-            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
-            kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
+            ..default_model_args()
         };
 
         let error = validate_model_args(&args).expect_err("max_num_seqs=0 should fail");
@@ -360,19 +401,48 @@ mod tests {
     #[test]
     fn kv_peak_ratio_must_be_valid() {
         let args = CommonModelArgs {
-            model: DEFAULT_ASR_MODEL.to_string(),
-            cache_dir: vasr::modelscope_cache_dir(),
-            device: "auto".to_string(),
-            isq: None,
-            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
-            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
-            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
             kv_peak_ratio: 1.5,
+            ..default_model_args()
         };
 
         let error = validate_model_args(&args).expect_err("kv_peak_ratio=1.5 should fail");
         assert!(error.to_string().contains("--kv-peak-ratio"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn q8_prefill_lm_head_mmq_defaults_enabled() {
+        let args = default_model_args();
+        assert!(args.q8_prefill_lm_head_mmq);
+        assert_eq!(
+            args.q8_prefill_lm_head_mmq_max_logits_mib,
+            DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB
+        );
+    }
+
+    #[cfg(feature = "cuda-graph")]
+    #[test]
+    fn isq8_auto_enables_chunked_argmax_detection() {
+        assert!(!isq_resolves_to_q8(None));
+        assert!(isq_resolves_to_q8(Some("8")));
+        assert!(isq_resolves_to_q8(Some("auto")));
+        assert!(!isq_resolves_to_q8(Some("q8_0;skip=lm_head")));
+        assert!(!isq_resolves_to_q8(Some("q6_k")));
+        assert!(!isq_resolves_to_q8(Some("q4_k")));
+    }
+
+    #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+    #[test]
+    fn isq8_auto_enables_chunked_argmax_in_paged_cache_config() -> anyhow::Result<()> {
+        let mut pipeline = default_pipeline_args();
+        pipeline.model.isq = Some("q8_0".to_string());
+        let (config, _) = build_paged_cache_config(&pipeline, Some("Chinese"))?;
+        assert!(config.cuda_graph_chunked_argmax);
+
+        pipeline.model.isq = Some("q6_k".to_string());
+        let (config, _) = build_paged_cache_config(&pipeline, Some("Chinese"))?;
+        assert!(!config.cuda_graph_chunked_argmax);
+        Ok(())
     }
 
     #[cfg(feature = "paged-attn")]
@@ -457,7 +527,28 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !args.kv_peak_ratio.is_finite() || !(0.0..=1.0).contains(&args.kv_peak_ratio) {
         bail!("--kv-peak-ratio must be finite and between 0.0 and 1.0");
     }
+    #[cfg(feature = "cuda-graph")]
+    if args.cuda_graph_chunked_argmax_size == 0 {
+        bail!("--cuda-graph-chunked-argmax-size must be greater than zero");
+    }
     Ok(())
+}
+
+#[cfg(feature = "cuda-graph")]
+fn isq_resolves_to_q8(isq: Option<&str>) -> bool {
+    let Some(isq) = isq else {
+        return false;
+    };
+    if isq
+        .split([';', ':', ','])
+        .skip(1)
+        .any(|part| part.to_ascii_lowercase().contains("lm_head"))
+    {
+        return false;
+    }
+    resolve_isq_dtype(isq, &Device::Cpu)
+        .map(|resolved| resolved.dtype() == candle_core::quantized::GgmlDType::Q8_0)
+        .unwrap_or(false)
 }
 
 fn resolve_asr_model_id(model: &str) -> &str {
@@ -507,6 +598,11 @@ fn build_paged_cache_config(
             cuda_graph_context_tokens: Some(cuda_graph_context_tokens(
                 sizing.peak_blocks_per_seq * KV_BLOCK_SIZE,
             )),
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax: pipeline.model.cuda_graph_chunked_argmax
+                || isq_resolves_to_q8(pipeline.model.isq.as_deref()),
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax_size: pipeline.model.cuda_graph_chunked_argmax_size,
         },
         sizing,
     ))
@@ -720,6 +816,8 @@ fn dtype_label(dtype: DType) -> &'static str {
 
 fn log_model_loaded(
     elapsed_seconds: f64,
+    isq_quant_seconds: Option<f64>,
+    isq_layer_counts: Option<(usize, usize, usize)>,
     params_bytes: Option<usize>,
     kv_cache_bytes: Option<usize>,
     kv_cache_tokens: Option<usize>,
@@ -750,6 +848,12 @@ fn log_model_loaded(
             )
         })
         .unwrap_or_else(|| "0.00GiB/0seqs/0tok".to_string());
+    let isq_quant = isq_quant_seconds
+        .map(|seconds| format!(" isq_quant={seconds:.3}s"))
+        .unwrap_or_default();
+    let isq_layers = isq_layer_counts
+        .map(|(audio, text, other)| format!(" isq_layers=audio:{audio},text:{text},other:{other}"))
+        .unwrap_or_default();
     let fixed_bytes = params_bytes
         .unwrap_or(0)
         .saturating_add(kv_cache_bytes.unwrap_or(0))
@@ -763,7 +867,7 @@ fn log_model_loaded(
             let gpu_used_pct = percentage(gpu_used, memory.total);
             tracing::info!(
                 target: "vasr_transcribe::serve",
-                "loaded model | {elapsed_seconds:.3}s params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
+                "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
                 bytes_to_gib(gpu_used),
                 bytes_to_gib(memory.total),
                 bytes_to_gib(memory.free),
@@ -780,7 +884,7 @@ fn log_model_loaded(
 
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "loaded model | {elapsed_seconds:.3}s params={params} kv={kv_cache} graph={cuda_graph}"
+        "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph}"
     );
     tracing::debug!(
         target: "vasr_transcribe::serve",
@@ -861,6 +965,28 @@ fn load_asr_model_for_pipeline(
     vasr::set_cache_dir(args.cache_dir.clone());
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
+    #[cfg(feature = "cuda")]
+    {
+        let max_logits_bytes = args
+            .q8_prefill_lm_head_mmq_max_logits_mib
+            .saturating_mul(1024 * 1024);
+        vasr::models::qwen3asr::model::set_q8_prefill_lm_head_mmq_enabled(
+            args.q8_prefill_lm_head_mmq,
+        );
+        vasr::models::qwen3asr::model::set_q8_prefill_lm_head_mmq_max_logits_bytes(
+            max_logits_bytes,
+        );
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "Q8 prefill lm_head MMQ path {} | max_logits={}MiB",
+            if args.q8_prefill_lm_head_mmq {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            args.q8_prefill_lm_head_mmq_max_logits_mib,
+        );
+    }
     #[cfg(feature = "paged-attn")]
     let (paged_cache_config, kv_cache_sizing) = build_paged_cache_config(pipeline, language)?;
     let load_options = LoadOptions {
@@ -907,8 +1033,15 @@ fn load_asr_model_for_pipeline(
         args.isq
     );
     let model_load_start = Instant::now();
+    reset_isq_layer_counts();
+    reset_isq_quantize_time();
     let qwen3_asr =
         Qwen3ASR::from_pretrained(resolve_asr_model_id(&args.model), &device, &load_options)?;
+    let isq_quant_seconds = args
+        .isq
+        .as_ref()
+        .map(|_| isq_quantize_time_us() as f64 / 1_000_000.0);
+    let quantized_layer_counts = args.isq.as_ref().map(|_| isq_layer_counts());
     let params_bytes = match qwen3_asr.weights_memory_stats(dtype) {
         Ok(stats) => Some(stats.parameter_bytes),
         Err(err) => {
@@ -994,22 +1127,11 @@ fn load_asr_model_for_pipeline(
         }
     }
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-    if let Some(threshold_mib) = std::env::var("VASR_CUDA_MEMPOOL_RELEASE_THRESHOLD_MIB")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        let threshold_bytes = threshold_mib.saturating_mul(1024 * 1024);
-        vasr::vasr_paged_attn::cuda_graph::cuda_set_default_mem_pool_release_threshold(
-            &device,
-            threshold_bytes,
-        );
-        tracing::info!(
-            target: "vasr_transcribe::serve",
-            "CUDA mempool release threshold set | threshold={threshold_mib}MiB"
-        );
-    }
+    configure_cuda_mempool_release_threshold(&device);
     log_model_loaded(
         model_load_start.elapsed().as_secs_f64(),
+        isq_quant_seconds,
+        quantized_layer_counts,
         params_bytes,
         kv_cache_bytes,
         kv_cache_tokens,
@@ -1028,6 +1150,31 @@ fn load_asr_model_for_pipeline(
     } else {
         Ok(base_asr)
     }
+}
+
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+fn configure_cuda_mempool_release_threshold(device: &Device) {
+    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_RELEASE_THRESHOLD").is_some() {
+        tracing::debug!(
+            target: "vasr_transcribe::serve",
+            "CUDA mempool release threshold left unchanged"
+        );
+        return;
+    }
+    let threshold_mib = std::env::var("VASR_CUDA_MEMPOOL_RELEASE_THRESHOLD_MIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let threshold_bytes = threshold_mib.saturating_mul(1024 * 1024);
+    vasr::vasr_paged_attn::cuda_graph::cuda_set_device_mem_pool_release_threshold(
+        device,
+        threshold_bytes,
+    );
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "CUDA mempool release threshold set | threshold={threshold_mib}MiB"
+    );
+    vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(device);
 }
 
 fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {

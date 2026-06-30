@@ -1878,139 +1878,160 @@ impl AsrBatchScheduler {
         let mut decode_debug = ContinuousDecodeDebug::default();
         let mut async_debug = AsyncContinuousDebug::default();
 
-        loop {
-            while let Ok(message) = message_rx.try_recv() {
-                let message = message?;
-                let sequence_count = message.sequences.len();
-                apply_prefill_stage_message(
-                    message,
-                    &mut outputs,
+        let result = (|| -> Result<Vec<Vec<u32>>> {
+            loop {
+                while let Ok(message) = message_rx.try_recv() {
+                    let message = message?;
+                    let sequence_count = message.sequences.len();
+                    apply_prefill_stage_message(
+                        message,
+                        &mut outputs,
+                        &mut prefilled,
+                        &mut source_closed,
+                        #[cfg(feature = "timing")]
+                        &mut timings,
+                    );
+                    async_debug.record_message(sequence_count, prefilled.len());
+                }
+
+                {
+                    let mut runtime_guard = runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                    decode_debug.record_finished(running.as_slice());
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                    );
+                }
+                attach_prefilled_to_running(
                     &mut prefilled,
-                    &mut source_closed,
+                    running.as_mut_slice(),
                     #[cfg(feature = "timing")]
                     &mut timings,
                 );
-                async_debug.record_message(sequence_count, prefilled.len());
-            }
+                async_debug.record_prefilled_queue(prefilled.len());
 
-            {
-                let mut runtime_guard = runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-                decode_debug.record_finished(running.as_slice());
-                free_finished_running(
+                let mut active_steps: Vec<(usize, usize)> = Vec::new();
+                for (slot_idx, entry) in running.iter().enumerate() {
+                    if let Some(entry) = entry {
+                        if !entry.slot.finished {
+                            active_steps.push((slot_idx, entry.slot.decode_step));
+                        }
+                    }
+                }
+
+                decode_running_step_groups(
                     running.as_mut_slice(),
-                    outputs.as_mut_slice(),
-                    &mut runtime_guard,
-                );
-            }
-            attach_prefilled_to_running(
-                &mut prefilled,
-                running.as_mut_slice(),
-                #[cfg(feature = "timing")]
-                &mut timings,
-            );
-            async_debug.record_prefilled_queue(prefilled.len());
+                    active_steps.as_slice(),
+                    thinker,
+                    device,
+                    runtime,
+                    eos_token_ids,
+                    &mut decode_debug,
+                    #[cfg(feature = "timing")]
+                    &mut timings,
+                )?;
 
-            let mut active_steps: Vec<(usize, usize)> = Vec::new();
-            for (slot_idx, entry) in running.iter().enumerate() {
-                if let Some(entry) = entry {
-                    if !entry.slot.finished {
-                        active_steps.push((slot_idx, entry.slot.decode_step));
-                    }
+                {
+                    let mut runtime_guard = runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+                    decode_debug.record_finished(running.as_slice());
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                    );
                 }
-            }
-
-            decode_running_step_groups(
-                running.as_mut_slice(),
-                active_steps.as_slice(),
-                thinker,
-                device,
-                runtime,
-                eos_token_ids,
-                &mut decode_debug,
-                #[cfg(feature = "timing")]
-                &mut timings,
-            )?;
-
-            {
-                let mut runtime_guard = runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-                decode_debug.record_finished(running.as_slice());
-                free_finished_running(
+                attach_prefilled_to_running(
+                    &mut prefilled,
                     running.as_mut_slice(),
-                    outputs.as_mut_slice(),
-                    &mut runtime_guard,
+                    #[cfg(feature = "timing")]
+                    &mut timings,
                 );
-            }
-            attach_prefilled_to_running(
-                &mut prefilled,
-                running.as_mut_slice(),
-                #[cfg(feature = "timing")]
-                &mut timings,
-            );
-            async_debug.record_prefilled_queue(prefilled.len());
+                async_debug.record_prefilled_queue(prefilled.len());
 
-            let has_running = running.iter().any(|entry| entry.is_some());
-            if source_closed && prefilled.is_empty() && !has_running {
-                match message_rx.try_recv() {
-                    Ok(message) => {
-                        let message = message?;
-                        let sequence_count = message.sequences.len();
-                        apply_prefill_stage_message(
-                            message,
-                            &mut outputs,
-                            &mut prefilled,
-                            &mut source_closed,
-                            #[cfg(feature = "timing")]
-                            &mut timings,
-                        );
-                        async_debug.record_message(sequence_count, prefilled.len());
-                        continue;
+                let has_running = running.iter().any(|entry| entry.is_some());
+                if source_closed && prefilled.is_empty() && !has_running {
+                    match message_rx.try_recv() {
+                        Ok(message) => {
+                            let message = message?;
+                            let sequence_count = message.sequences.len();
+                            apply_prefill_stage_message(
+                                message,
+                                &mut outputs,
+                                &mut prefilled,
+                                &mut source_closed,
+                                #[cfg(feature = "timing")]
+                                &mut timings,
+                            );
+                            async_debug.record_message(sequence_count, prefilled.len());
+                            continue;
+                        }
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                            break;
+                        }
                     }
-                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-                        break;
+                }
+                if prefilled.is_empty() && !has_running {
+                    async_debug.record_empty_recv_wait();
+                    match message_rx.recv_timeout(DYNAMIC_SOURCE_WAIT) {
+                        Ok(message) => {
+                            let message = message?;
+                            let sequence_count = message.sequences.len();
+                            apply_prefill_stage_message(
+                                message,
+                                &mut outputs,
+                                &mut prefilled,
+                                &mut source_closed,
+                                #[cfg(feature = "timing")]
+                                &mut timings,
+                            );
+                            async_debug.record_message(sequence_count, prefilled.len());
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            async_debug.record_timeout_wait();
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            source_closed = true;
+                        }
                     }
                 }
             }
-            if prefilled.is_empty() && !has_running {
-                async_debug.record_empty_recv_wait();
-                match message_rx.recv_timeout(DYNAMIC_SOURCE_WAIT) {
-                    Ok(message) => {
-                        let message = message?;
-                        let sequence_count = message.sequences.len();
-                        apply_prefill_stage_message(
-                            message,
-                            &mut outputs,
-                            &mut prefilled,
-                            &mut source_closed,
-                            #[cfg(feature = "timing")]
-                            &mut timings,
-                        );
-                        async_debug.record_message(sequence_count, prefilled.len());
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        async_debug.record_timeout_wait();
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        source_closed = true;
-                    }
-                }
-            }
-        }
 
-        decode_debug.log_summary(max_slots);
-        log_cuda_mem_debug(device, "decode_done");
-        async_debug.log_summary();
-        {
-            let mut runtime_guard = runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            decode_debug.log_summary(max_slots);
+            log_cuda_mem_debug(device, "decode_done");
+            async_debug.log_summary();
+            Ok(std::mem::take(&mut outputs))
+        })();
+
+        let cleanup_result = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))
+            .map(|mut runtime_guard| {
+                let running_count = running.iter().filter(|entry| entry.is_some()).count();
+                let prefilled_count = prefilled.len();
+                if result.is_err() && (running_count > 0 || prefilled_count > 0) {
+                    tracing::warn!(
+                        target: "vasr_transcribe::pipeline",
+                        "cleaning paged KV after async decode error | running={running_count} prefilled={prefilled_count}",
+                    );
+                }
             free_all_running(&mut runtime_guard, running.as_mut_slice());
             free_all_prefilled(&mut runtime_guard, &mut prefilled);
+            });
+        if let Err(error) = cleanup_result {
+            if result.is_ok() {
+                return Err(error);
+            }
+            tracing::error!(
+                target: "vasr_transcribe::pipeline",
+                "failed to cleanup paged KV after async decode error: {error:#}",
+            );
         }
-        Ok(outputs)
+        result
     }
 }
 

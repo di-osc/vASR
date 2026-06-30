@@ -30,14 +30,21 @@ pub trait PagedCudaDecodeForward {
         Ok(logits.squeeze(1)?.argmax(1usize)?)
     }
 
-    fn forward_next_id_candidates_with_paged_cache(
+    fn forward_chunked_next_ids_with_paged_cache(
         &self,
         input_ids: &Tensor,
         position_ids: &Tensor,
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
+        chunk_size: usize,
     ) -> Result<Option<Tensor>> {
-        let _ = (input_ids, position_ids, paged_cache, input_metadata);
+        let _ = (
+            input_ids,
+            position_ids,
+            paged_cache,
+            input_metadata,
+            chunk_size,
+        );
         Ok(None)
     }
 }

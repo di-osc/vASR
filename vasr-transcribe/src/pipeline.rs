@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
+#[cfg(feature = "paged-attn")]
+use vasr::models::qwen3asr::model::paged_cache_runtime::PagedCacheStats;
 use vasr::models::qwen3asr::{
     AudioFeatureEncodeTimings, AudioInput, EncodedAsrBatch, Qwen3ASR, qwen_outputs_to_timelines,
     qwen_transcribe_options,
@@ -256,12 +258,16 @@ pub struct StageSpan {
 }
 
 impl StageSpan {
-    fn new(start: Instant, end: Instant) -> Self {
+    pub(crate) fn new(start: Instant, end: Instant) -> Self {
         Self { start, end }
     }
 
-    fn try_new(start: Instant, end: Instant) -> Option<Self> {
+    pub(crate) fn try_new(start: Instant, end: Instant) -> Option<Self> {
         (end >= start).then_some(Self { start, end })
+    }
+
+    pub(crate) fn seconds(self) -> f64 {
+        self.end.duration_since(self.start).as_secs_f64()
     }
 }
 
@@ -456,6 +462,36 @@ impl AsyncTranscribePipeline {
 #[derive(Clone)]
 pub struct GlobalAsyncTranscribePipeline {
     submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
+    offline: Arc<OfflinePipeline>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineMemorySnapshot {
+    #[cfg(feature = "paged-attn")]
+    pub paged_cache: Option<PagedCacheStats>,
+    #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+    pub cuda_decode_graphs: Option<usize>,
+    #[cfg(feature = "cuda-graph")]
+    pub cuda_memory: Option<PipelineCudaMemorySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "cuda-graph")]
+pub struct PipelineCudaMemorySnapshot {
+    pub used_bytes: usize,
+    pub free_bytes: usize,
+    pub total_bytes: usize,
+    pub pool_used_bytes: Option<usize>,
+    pub pool_reserved_bytes: Option<usize>,
+    pub default_pool_used_bytes: Option<usize>,
+    pub default_pool_reserved_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "cuda-graph")]
+pub struct PipelineCudaTrimSnapshot {
+    pub before: Option<PipelineCudaMemorySnapshot>,
+    pub after: Option<PipelineCudaMemorySnapshot>,
 }
 
 struct GlobalTranscribeRequest {
@@ -504,6 +540,21 @@ struct StageProgress {
     run_span: Option<StageSpan>,
     queue_span: Option<StageSpan>,
     audio_seconds: f64,
+}
+
+#[cfg(feature = "cuda-graph")]
+fn snapshot_qwen_cuda_memory(model: &Qwen3ASR) -> Option<PipelineCudaMemorySnapshot> {
+    vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(model.device()).map(|memory| {
+        PipelineCudaMemorySnapshot {
+            used_bytes: memory.used(),
+            free_bytes: memory.free,
+            total_bytes: memory.total,
+            pool_used_bytes: memory.pool_used_current,
+            pool_reserved_bytes: memory.pool_reserved_current,
+            default_pool_used_bytes: memory.default_pool_used_current,
+            default_pool_reserved_bytes: memory.default_pool_reserved_current,
+        }
+    })
 }
 
 impl GlobalAsyncTranscribePipeline {
@@ -576,7 +627,7 @@ impl GlobalAsyncTranscribePipeline {
             vad_stats,
         );
         spawn_asr_worker(
-            offline,
+            Arc::clone(&offline),
             parallel_options.asr_options.clone(),
             parallel_options.asr_options.max_batch_audio_sec,
             vad_to_asr_rx,
@@ -589,7 +640,29 @@ impl GlobalAsyncTranscribePipeline {
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
-        Self { submit_tx }
+        Self { submit_tx, offline }
+    }
+
+    pub fn memory_snapshot(&self) -> PipelineMemorySnapshot {
+        let qwen = self.offline.asr.as_any().downcast_ref::<Qwen3ASR>();
+        PipelineMemorySnapshot {
+            #[cfg(feature = "paged-attn")]
+            paged_cache: qwen.and_then(Qwen3ASR::paged_cache_stats),
+            #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+            cuda_decode_graphs: qwen.and_then(Qwen3ASR::cuda_decode_graph_count),
+            #[cfg(feature = "cuda-graph")]
+            cuda_memory: qwen.and_then(snapshot_qwen_cuda_memory),
+        }
+    }
+
+    #[cfg(feature = "cuda-graph")]
+    pub fn trim_cuda_mempool(&self) -> Option<PipelineCudaTrimSnapshot> {
+        let qwen = self.offline.asr.as_any().downcast_ref::<Qwen3ASR>()?;
+        let before = snapshot_qwen_cuda_memory(qwen);
+        vasr::vasr_quant::trim_cuda_workspaces();
+        vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen.device());
+        let after = snapshot_qwen_cuda_memory(qwen);
+        Some(PipelineCudaTrimSnapshot { before, after })
     }
 
     pub async fn run(&self, inputs: Vec<TranscribeInput>) -> Vec<TranscribeItemOutcome> {
@@ -1446,7 +1519,8 @@ fn record_request_decode_stage(
     request_id: PipelineRequestId,
     decode_span: StageSpan,
     prefill_span: Option<StageSpan>,
-    queue_span: Option<StageSpan>,
+    prefill_queue_span: Option<StageSpan>,
+    decode_queue_span: Option<StageSpan>,
     audio_seconds: f64,
     segment_count: usize,
 ) {
@@ -1454,26 +1528,18 @@ fn record_request_decode_stage(
         let Some(request) = pending.get_mut(&request_id) else {
             return;
         };
-        let (decode_run_span, decode_queue_span) = if let Some(prefill_span) = prefill_span {
-            (
-                StageSpan::try_new(prefill_span.end, decode_span.end).or(Some(decode_span)),
-                None,
-            )
-        } else {
-            (Some(decode_span), queue_span)
-        };
         if let Some(prefill_span) = prefill_span {
             request.stages.prefill.run_span = Some(merge_optional_span(
                 request.stages.prefill.run_span,
                 Some(prefill_span),
             ));
             request.stages.prefill.queue_span =
-                merge_stage_span(request.stages.prefill.queue_span, queue_span);
+                merge_stage_span(request.stages.prefill.queue_span, prefill_queue_span);
             request.stages.prefill.audio_seconds += audio_seconds;
         }
         request.stages.decode.run_span = Some(merge_optional_span(
             request.stages.decode.run_span,
-            decode_run_span,
+            Some(decode_span),
         ));
         request.stages.decode.queue_span =
             merge_stage_span(request.stages.decode.queue_span, decode_queue_span);
@@ -1518,8 +1584,10 @@ fn record_request_decode_stages(
     let Some(pending_requests) = pending_requests else {
         return;
     };
-    let mut by_request: HashMap<PipelineRequestId, (f64, usize, Option<StageSpan>)> =
-        HashMap::new();
+    let mut by_request: HashMap<
+        PipelineRequestId,
+        (f64, usize, Option<StageSpan>, Option<StageSpan>),
+    > = HashMap::new();
     for segment in segments {
         let Some(request_item) = segment.request_item else {
             continue;
@@ -1527,19 +1595,36 @@ fn record_request_decode_stages(
         let entry = by_request.entry(request_item.request_id).or_default();
         entry.0 += segment.waveform.duration_seconds();
         entry.1 += 1;
-        let queue_span = segment
-            .spans
-            .audio_encoder
-            .and_then(|encode| StageSpan::try_new(encode.end, decode_span.start));
-        entry.2 = merge_stage_span(entry.2, queue_span);
+        let (prefill_queue_span, decode_queue_span) = if let Some(prefill_span) = prefill_span {
+            (
+                segment
+                    .spans
+                    .audio_encoder
+                    .and_then(|encode| StageSpan::try_new(encode.end, prefill_span.start)),
+                StageSpan::try_new(prefill_span.end, decode_span.start),
+            )
+        } else {
+            (
+                None,
+                segment
+                    .spans
+                    .audio_encoder
+                    .and_then(|encode| StageSpan::try_new(encode.end, decode_span.start)),
+            )
+        };
+        entry.2 = merge_stage_span(entry.2, prefill_queue_span);
+        entry.3 = merge_stage_span(entry.3, decode_queue_span);
     }
-    for (request_id, (audio_seconds, segment_count, queue_span)) in by_request {
+    for (request_id, (audio_seconds, segment_count, prefill_queue_span, decode_queue_span)) in
+        by_request
+    {
         record_request_decode_stage(
             pending_requests,
             request_id,
             decode_span,
             prefill_span,
-            queue_span,
+            prefill_queue_span,
+            decode_queue_span,
             audio_seconds,
             segment_count,
         );
@@ -1558,14 +1643,15 @@ fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgr
     let wall_seconds = merge_stage_span(progress.queue_span, progress.run_span)
         .map(|span| span.end.duration_since(span.start).as_secs_f64())
         .unwrap_or_default();
-    let speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
+    let speed = progress.audio_seconds / run_seconds.max(f64::EPSILON);
+    let e2e_speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
     let audio_label = match stage {
         "load" | "vad" => "input_audio",
         _ => "speech_audio",
     };
     tracing::info!(
         target: "vasr_transcribe::pipeline",
-        "{} {:<7} {:<5} | {}={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | wait={:>6.3}s | speed={:>6.1}x",
+        "{} {:<7} {:<5} | {}={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | queue={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         stage,
         "DONE",
@@ -1574,7 +1660,8 @@ fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgr
         wall_seconds,
         run_seconds,
         queue_seconds,
-        speed
+        speed,
+        e2e_speed
     );
 }
 
@@ -2312,7 +2399,11 @@ fn spawn_segment_encoder_worker(
                 let offline = Arc::clone(&offline);
                 let asr_options = asr_options.clone();
                 let segments = request.segments;
-                move || run_segment_asr_encode(&offline, &segments, &asr_options)
+                move || {
+                    let result = run_segment_asr_encode(&offline, &segments, &asr_options);
+                    trim_asr_cuda_mempool(offline.asr.as_ref());
+                    result
+                }
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
@@ -2688,7 +2779,12 @@ async fn handle_dynamic_segment_prefilled_session(
     let batch = tokio::task::spawn_blocking({
         let asr = Arc::clone(&offline.asr);
         let asr_options = asr_options.clone();
-        move || run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options)
+        move || {
+            let result =
+                run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options);
+            trim_asr_cuda_mempool(asr.as_ref());
+            result
+        }
     })
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
@@ -2928,6 +3024,7 @@ fn run_segment_asr_prefill_dynamic_worker(
         }
         Ok(())
     })();
+    trim_qwen_cuda_mempool(qwen3);
     if let Err(error) = run {
         let _ = message_tx.send(Err(error));
     }
@@ -3213,7 +3310,11 @@ async fn handle_merged_segment_encoded_batch(
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
             let asr_options = asr_options.clone();
-            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
+            move || {
+                let result = run_segment_asr_decode(asr.as_ref(), batch, &asr_options);
+                trim_asr_cuda_mempool(asr.as_ref());
+                result
+            }
         })
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
@@ -3235,7 +3336,11 @@ async fn handle_merged_segment_encoded_batch(
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
             let asr_options = asr_options.clone();
-            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
+            move || {
+                let result = run_segment_asr_decode(asr.as_ref(), batch, &asr_options);
+                trim_asr_cuda_mempool(asr.as_ref());
+                result
+            }
         })
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
@@ -3765,20 +3870,29 @@ fn run_raw_asr_inference(
 ) -> Result<(Vec<Timeline>, Option<TranscribeItemTiming>)> {
     #[cfg(feature = "timing")]
     if let Some(qwen3) = offline.asr.as_any().downcast_ref::<Qwen3ASR>() {
-        let runtime_options = qwen_transcribe_options(asr_options);
-        let audio = waveforms
-            .iter()
-            .map(|waveform| AudioInput::Waveform {
-                samples: &waveform.samples,
-                sample_rate: waveform.sample_rate,
-            })
-            .collect::<Vec<_>>();
-        let (outputs, timings) = Qwen3ASR::transcribe_timed(qwen3, audio, runtime_options)?;
-        let timing = transcribe_timing_seconds(&timings);
-        return Ok((qwen_outputs_to_timelines(outputs, waveforms)?, Some(timing)));
+        let result = (|| -> Result<(Vec<Timeline>, Option<TranscribeItemTiming>)> {
+            let runtime_options = qwen_transcribe_options(asr_options);
+            let audio = waveforms
+                .iter()
+                .map(|waveform| AudioInput::Waveform {
+                    samples: &waveform.samples,
+                    sample_rate: waveform.sample_rate,
+                })
+                .collect::<Vec<_>>();
+            let (outputs, timings) = Qwen3ASR::transcribe_timed(qwen3, audio, runtime_options)?;
+            let timing = transcribe_timing_seconds(&timings);
+            Ok((qwen_outputs_to_timelines(outputs, waveforms)?, Some(timing)))
+        })();
+        trim_qwen_cuda_mempool(qwen3);
+        return result;
     }
 
-    Ok((offline.asr.transcribe(waveforms, asr_options)?, None))
+    let result = offline
+        .asr
+        .transcribe(waveforms, asr_options)
+        .map(|timelines| (timelines, None));
+    trim_asr_cuda_mempool(offline.asr.as_ref());
+    result
 }
 
 fn run_segment_asr_encode(
@@ -3819,6 +3933,31 @@ fn run_segment_asr_encode(
         timings,
     })
 }
+
+#[cfg(feature = "cuda-graph")]
+fn trim_asr_cuda_mempool(asr: &dyn crate::runtime::model::AsrModel) {
+    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_some() {
+        return;
+    }
+    if let Some(qwen3) = asr.as_any().downcast_ref::<Qwen3ASR>() {
+        trim_qwen_cuda_mempool(qwen3);
+    }
+}
+
+#[cfg(not(feature = "cuda-graph"))]
+fn trim_asr_cuda_mempool(_asr: &dyn crate::runtime::model::AsrModel) {}
+
+#[cfg(feature = "cuda-graph")]
+fn trim_qwen_cuda_mempool(qwen3: &Qwen3ASR) {
+    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_some() {
+        return;
+    }
+    vasr::vasr_quant::trim_cuda_workspaces();
+    vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.device());
+}
+
+#[cfg(not(feature = "cuda-graph"))]
+fn trim_qwen_cuda_mempool(_qwen3: &Qwen3ASR) {}
 
 #[cfg(feature = "timing")]
 fn run_segment_asr_decode(

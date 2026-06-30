@@ -12,9 +12,9 @@ use qwen3asr::config::AsrConfig;
 use qwen3asr::model::{AsrModel, weights::LoadOptions};
 use qwen3asr::processor::AsrProcessor;
 use qwen3asr::processor::asr_processor::PreparedInputs;
-use vasr_data::audio::input::AudioInput;
-use vasr_data::Waveform;
 use vasr::asr::qwen3asr;
+use vasr_data::Waveform;
+use vasr_data::audio::input::AudioInput;
 
 use super::processor::ForcedAlignProcessor;
 

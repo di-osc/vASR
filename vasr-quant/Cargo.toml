@@ -8,6 +8,7 @@ description = "In-situ quantization and platform-specific matmul kernels for VAS
 
 [dependencies]
 candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-kernels = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
 candle-metal-kernels = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
@@ -21,6 +22,7 @@ default = []
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = [
   "candle-core/cuda",
+  "dep:candle-kernels",
   "candle-nn/cuda",
   "dep:bindgen_cuda",
 ]

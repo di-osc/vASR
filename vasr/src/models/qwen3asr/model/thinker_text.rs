@@ -586,6 +586,26 @@ impl ThinkerTextAttention {
         })
     }
 
+    fn project_qkv(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(qkv) = isq_linear::try_fused_q8_qkv(
+                &self.q_proj,
+                &self.k_proj,
+                &self.v_proj,
+                hidden_states,
+            )? {
+                return Ok(qkv);
+            }
+        }
+
+        Ok((
+            self.q_proj.forward(hidden_states)?,
+            self.k_proj.forward(hidden_states)?,
+            self.v_proj.forward(hidden_states)?,
+        ))
+    }
+
     fn forward(
         &self,
         hidden_states: &Tensor,
@@ -596,9 +616,7 @@ impl ThinkerTextAttention {
     ) -> Result<Tensor> {
         let (batch, seq_len, _hidden) = hidden_states.dims3()?;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let (q, k, v) = self.project_qkv(hidden_states)?;
         let (q, k, v) = if seq_len == 1 {
             let q = q.reshape((batch, self.num_attention_heads, seq_len, self.head_dim))?;
             let k = k.reshape((batch, self.num_key_value_heads, seq_len, self.head_dim))?;
@@ -753,9 +771,7 @@ impl ThinkerTextAttention {
         let (batch, seq_len, _hidden) = hidden_states.dims3()?;
         let (kv_cache, layer_idx) = layer_cache;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let (q, k, v) = self.project_qkv(hidden_states)?;
         let (q, k, v) = if seq_len == 1 {
             let q = q.reshape((batch, self.num_attention_heads, seq_len, self.head_dim))?;
             let k = k.reshape((batch, self.num_key_value_heads, seq_len, self.head_dim))?;
@@ -1003,9 +1019,7 @@ impl ThinkerTextAttention {
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("paged attention is not initialized".into()))?;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let (q, k, v) = self.project_qkv(hidden_states)?;
         let (q, k, v) = if seq_len == 1 {
             let q = q.reshape((batch, self.num_attention_heads, seq_len, self.head_dim))?;
             let k = k.reshape((batch, self.num_key_value_heads, seq_len, self.head_dim))?;
@@ -1241,9 +1255,7 @@ impl ThinkerTextAttention {
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("paged attention is not initialized".into()))?;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let (q, k, v) = self.project_qkv(hidden_states)?;
         let q = q
             .reshape((total_tokens, self.num_attention_heads, self.head_dim))?
             .unsqueeze(0)?

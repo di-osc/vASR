@@ -25,6 +25,22 @@ pub use cuda_graph::{
 #[cfg(feature = "paged-attn")]
 pub use mistralrs_paged_attn;
 
+#[cfg(all(feature = "cuda-paged-attn", target_family = "unix"))]
+pub fn reserve_paged_attention_v2_workspace(
+    device: &candle_core::Device,
+    bytes: usize,
+) -> candle_core::Result<()> {
+    mistralrs_paged_attn::reserve_paged_attention_v2_workspace(device, bytes)
+}
+
+#[cfg(not(all(feature = "cuda-paged-attn", target_family = "unix")))]
+pub fn reserve_paged_attention_v2_workspace(
+    _device: &candle_core::Device,
+    _bytes: usize,
+) -> candle_core::Result<()> {
+    Ok(())
+}
+
 #[cfg(feature = "metal-paged-attn")]
 pub use metal::{
     dense_attention_varlen_prefill, pack_kv_for_varlen_prefill, pack_query_for_varlen_prefill,

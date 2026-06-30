@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 #[cfg(feature = "timing")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "metal")]
 use candle_core::quantized::k_quants;
@@ -18,9 +18,19 @@ use mistralrs_quant::{AfqBits, AfqGroupSize, AfqLayer, QuantMethod, QuantMethodC
 
 #[cfg(feature = "timing")]
 static ISQ_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static ISQ_AUDIO_LINEAR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ISQ_TEXT_LINEAR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ISQ_OTHER_LINEAR_COUNT: AtomicUsize = AtomicUsize::new(0);
 static AFQ_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "metal")]
 static METAL_ISQ_DISABLED_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IsqModuleKind {
+    Audio,
+    Text,
+    Other,
+}
 
 thread_local! {
     static LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
@@ -52,11 +62,26 @@ pub fn linear_is_prefill() -> bool {
 #[cfg(feature = "timing")]
 pub fn reset_isq_quantize_time() {
     ISQ_QUANTIZE_US.store(0, Ordering::Relaxed);
+    reset_isq_layer_counts();
 }
 
 #[cfg(feature = "timing")]
 pub fn isq_quantize_time_us() -> u64 {
     ISQ_QUANTIZE_US.load(Ordering::Relaxed)
+}
+
+pub fn reset_isq_layer_counts() {
+    ISQ_AUDIO_LINEAR_COUNT.store(0, Ordering::Relaxed);
+    ISQ_TEXT_LINEAR_COUNT.store(0, Ordering::Relaxed);
+    ISQ_OTHER_LINEAR_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn isq_layer_counts() -> (usize, usize, usize) {
+    (
+        ISQ_AUDIO_LINEAR_COUNT.load(Ordering::Relaxed),
+        ISQ_TEXT_LINEAR_COUNT.load(Ordering::Relaxed),
+        ISQ_OTHER_LINEAR_COUNT.load(Ordering::Relaxed),
+    )
 }
 
 #[derive(Clone)]
@@ -197,6 +222,9 @@ pub struct QLinear {
     bias: Option<Tensor>,
     output_dtype: DType,
     dtype: GgmlDType,
+    #[cfg(feature = "cuda")]
+    module_kind: IsqModuleKind,
+    module_path: Arc<str>,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -224,6 +252,7 @@ impl std::fmt::Debug for QLinear {
         f.debug_struct("QLinear")
             .field("dtype", &self.dtype)
             .field("output_dtype", &self.output_dtype)
+            .field("module_path", &self.module_path)
             .finish_non_exhaustive()
     }
 }
@@ -267,6 +296,7 @@ impl LinearX {
 
         #[cfg(feature = "paged-attn")]
         if let Some(bits) = spec.afq {
+            record_isq_linear(module_path);
             return Self::new_afq(linear, bits, target_device);
         }
 
@@ -275,18 +305,30 @@ impl LinearX {
             .ok_or_else(|| candle_core::Error::Msg("missing ISQ dtype".to_string()))?;
         let weight = linear.weight();
         let output_dtype = weight.dtype();
-        let bias = linear.bias().cloned();
+        let bias = linear
+            .bias()
+            .map(|b| b.to_dtype(output_dtype)?.to_device(target_device))
+            .transpose()?;
         let dtype = compatible_dtype(weight, requested);
 
         let Some(dtype) = dtype else {
-            let linear = linear_to_device(linear, target_device)?;
-            return Ok(Self::Linear(linear));
+            candle_core::bail!(
+                "ISQ `{}` cannot quantize linear `{}` with weight shape {:?}: input dimension is not divisible by block size {}",
+                ggml_dtype_name(requested),
+                module_path,
+                weight.dims(),
+                requested.block_size()
+            );
         };
 
         #[cfg(feature = "timing")]
         let start_quantize = std::time::Instant::now();
-        let qtensor = QTensor::quantize(weight, dtype)?;
-        let qtensor = qtensor_to_device(qtensor, target_device)?;
+        let qtensor = if weight.device().is_cpu() && !target_device.is_cpu() {
+            QTensor::quantize_onto(weight, dtype, target_device)?
+        } else {
+            let qtensor = QTensor::quantize(weight, dtype)?;
+            qtensor_to_device(qtensor, target_device)?
+        };
         let matmul = QMatMul::from_qtensor(qtensor)?;
         #[cfg(feature = "timing")]
         ISQ_QUANTIZE_US.fetch_add(
@@ -296,11 +338,17 @@ impl LinearX {
                 .min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+        record_isq_linear(module_path);
+        #[cfg(feature = "cuda")]
+        let module_kind = isq_module_kind(module_path);
         Ok(Self::QLinear(QLinear {
             matmul: Arc::new(matmul),
             bias,
             output_dtype,
             dtype,
+            #[cfg(feature = "cuda")]
+            module_kind,
+            module_path: Arc::from(module_path),
         }))
     }
 
@@ -313,43 +361,31 @@ impl LinearX {
         }
     }
 
-    pub fn forward_chunked_argmax_candidates(
+    pub fn forward_chunked_argmax_next_ids(
         &self,
         x: &Tensor,
         chunk_size: usize,
     ) -> Result<Option<Tensor>> {
-        let Self::Linear(linear) = self else {
-            return Ok(None);
-        };
-        if linear.bias().is_some() || chunk_size == 0 {
+        #[cfg(not(feature = "cuda"))]
+        let _ = x;
+        if chunk_size == 0 {
             return Ok(None);
         }
-        let weight = linear.weight();
-        let (out_dim, _in_dim) = weight.dims2()?;
-        let mut chunks = Vec::new();
-        let mut start = 0usize;
-        while start < out_dim {
-            let len = (out_dim - start).min(chunk_size);
-            let chunk_weight = weight.narrow(0, start, len)?;
-            let chunk_linear = Linear::new(chunk_weight, None);
-            let logits = chunk_linear.forward(x)?;
-            let logits = match logits.dims() {
-                [_, 1, _] => logits.squeeze(1)?,
-                [_, _] => logits,
-                dims => {
-                    candle_core::bail!(
-                        "chunked argmax expects logits shape (batch,vocab_chunk) or (batch,1,vocab_chunk), got {dims:?}"
-                    );
-                }
-            };
-            let values = logits.max(1)?.to_dtype(DType::F32)?;
-            let ids = logits.argmax(1usize)?.to_dtype(DType::F32)?;
-            let offset = Tensor::new(start as f32, x.device())?;
-            let ids = ids.broadcast_add(&offset)?;
-            chunks.push(Tensor::stack(&[values, ids], 0)?);
-            start = start.saturating_add(len);
+        #[cfg(feature = "cuda")]
+        if let Self::QLinear(qlinear) = self {
+            if let Some(next_ids) = qlinear.forward_q8_lm_head_next_ids(x, chunk_size)? {
+                return Ok(Some(next_ids));
+            }
         }
-        Ok(Some(Tensor::stack(chunks.as_slice(), 2)?))
+        Ok(None)
+    }
+
+    pub fn supports_chunked_argmax_next_ids(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if let Self::QLinear(qlinear) = self {
+            return qlinear.supports_q8_lm_head_next_ids();
+        }
+        false
     }
 }
 
@@ -397,6 +433,86 @@ impl QLinear {
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
     }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
+            let kind = if self.module_path.as_ref().ends_with("lm_head") {
+                crate::q8_mmvq::PlainKind::LmHead
+            } else {
+                match self.module_kind {
+                    IsqModuleKind::Audio => crate::q8_mmvq::PlainKind::Audio,
+                    IsqModuleKind::Text | IsqModuleKind::Other if linear_is_prefill() => {
+                        crate::q8_mmvq::PlainKind::Prefill
+                    }
+                    IsqModuleKind::Text | IsqModuleKind::Other => crate::q8_mmvq::PlainKind::Decode,
+                }
+            };
+            let can_run_q8_mmvq = match kind {
+                crate::q8_mmvq::PlainKind::Audio => crate::q8_mmvq::can_run_plain(qtensor, x),
+                crate::q8_mmvq::PlainKind::Prefill => crate::q8_mmvq::can_run_plain(qtensor, x),
+                crate::q8_mmvq::PlainKind::Decode => crate::q8_mmvq::can_run_decode(qtensor, x),
+                crate::q8_mmvq::PlainKind::LmHead => crate::q8_mmvq::can_run_plain(qtensor, x),
+            };
+            if can_run_q8_mmvq {
+                let mut ys = crate::q8_mmvq::plain(qtensor, x, kind)?;
+                if let Some(bias) = &self.bias {
+                    ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
+                }
+                return Ok(ys);
+            }
+            if qtensor.dtype() == GgmlDType::Q8_0 && qtensor.device().is_cuda() {
+                candle_core::bail!(
+                    "CUDA Q8_0 linear is not covered by q8_mmvq fast path: module={} kind={kind:?} input_shape={:?} input_dtype={:?}",
+                    self.module_path,
+                    x.dims(),
+                    x.dtype()
+                );
+            }
+        }
+
+        let xs = if x.dtype() == DType::F32 {
+            x.clone()
+        } else {
+            x.to_dtype(DType::F32)?
+        };
+        let mut ys = self.matmul.as_ref().forward(&xs)?;
+        if let Some(bias) = &self.bias {
+            ys = ys.broadcast_add(&bias.to_dtype(DType::F32)?.to_device(x.device())?)?;
+        }
+        if self.output_dtype == DType::F32 {
+            Ok(ys)
+        } else {
+            ys.to_dtype(self.output_dtype)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_q8_lm_head_next_ids(&self, x: &Tensor, chunk_size: usize) -> Result<Option<Tensor>> {
+        if !self.module_path.as_ref().ends_with("lm_head") || self.bias.is_some() {
+            return Ok(None);
+        }
+        let QMatMul::QTensor(weight) = self.matmul.as_ref() else {
+            return Ok(None);
+        };
+        let kind = if linear_is_prefill() {
+            crate::q8_mmvq::NextIdKind::Prefill
+        } else {
+            crate::q8_mmvq::NextIdKind::Decode
+        };
+        crate::q8_mmvq::lm_head_next_ids_q8_0(weight, x, chunk_size, kind)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn supports_q8_lm_head_next_ids(&self) -> bool {
+        if !self.module_path.as_ref().ends_with("lm_head") || self.bias.is_some() {
+            return false;
+        }
+        let QMatMul::QTensor(weight) = self.matmul.as_ref() else {
+            return false;
+        };
+        weight.dtype() == GgmlDType::Q8_0 && weight.device().is_cuda()
+    }
 }
 
 #[cfg(feature = "paged-attn")]
@@ -412,13 +528,13 @@ pub fn try_fused_q8_silu_gate_up(
     up: &IsqLinear,
     x: &Tensor,
 ) -> Result<Option<Tensor>> {
+    if linear_is_prefill() {
+        return Ok(None);
+    }
     let (LinearX::QLinear(gate), LinearX::QLinear(up)) = (gate, up) else {
         return Ok(None);
     };
     if gate.bias.is_some() || up.bias.is_some() {
-        return Ok(None);
-    }
-    if linear_is_prefill() {
         return Ok(None);
     }
     let (QMatMul::QTensor(gate_q), QMatMul::QTensor(up_q)) =
@@ -430,6 +546,79 @@ pub fn try_fused_q8_silu_gate_up(
         return Ok(None);
     }
     Ok(Some(crate::q8_mmvq::fused_glu_silu(gate_q, up_q, x)?))
+}
+
+#[cfg(feature = "cuda")]
+pub fn try_fused_q8_gelu_erf(linear: &IsqLinear, x: &Tensor) -> Result<Option<Tensor>> {
+    let LinearX::QLinear(linear) = linear else {
+        return Ok(None);
+    };
+    let QMatMul::QTensor(weight) = linear.matmul.as_ref() else {
+        return Ok(None);
+    };
+    if !crate::q8_mmvq::can_run_plain(weight, x) || x.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    Ok(Some(crate::q8_mmvq::fused_gelu_erf(
+        weight,
+        linear.bias.as_ref(),
+        x,
+    )?))
+}
+
+#[cfg(feature = "cuda")]
+pub fn try_fused_q8_qkv(
+    q: &IsqLinear,
+    k: &IsqLinear,
+    v: &IsqLinear,
+    x: &Tensor,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    if q8_fused_qkv_disabled() {
+        return Ok(None);
+    }
+    if linear_is_prefill() {
+        return Ok(None);
+    }
+    let (LinearX::QLinear(q), LinearX::QLinear(k), LinearX::QLinear(v)) = (q, k, v) else {
+        return Ok(None);
+    };
+    let (QMatMul::QTensor(q_w), QMatMul::QTensor(k_w), QMatMul::QTensor(v_w)) =
+        (q.matmul.as_ref(), k.matmul.as_ref(), v.matmul.as_ref())
+    else {
+        return Ok(None);
+    };
+    if q.module_kind != k.module_kind || q.module_kind != v.module_kind {
+        return Ok(None);
+    }
+    if matches!(q.module_kind, IsqModuleKind::Audio) {
+        let flat_batch = x.dims()[..x.dims().len().saturating_sub(1)]
+            .iter()
+            .product::<usize>();
+        if flat_batch > 8 {
+            return Ok(None);
+        }
+    }
+    if !crate::q8_mmvq::can_run_fused_qkv(q_w, k_w, v_w, x) {
+        return Ok(None);
+    }
+    let (q_y, k_y, v_y) = crate::q8_mmvq::fused_qkv(
+        q_w,
+        k_w,
+        v_w,
+        q.bias.as_ref(),
+        k.bias.as_ref(),
+        v.bias.as_ref(),
+        x,
+    )?;
+    Ok(Some((q_y, k_y, v_y)))
+}
+
+#[cfg(feature = "cuda")]
+fn q8_fused_qkv_disabled() -> bool {
+    matches!(
+        std::env::var("VASR_Q8_DISABLE_FUSED_QKV").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON")
+    )
 }
 
 #[cfg(feature = "metal-paged-attn")]
@@ -454,46 +643,7 @@ pub fn try_fused_afq_silu_gate_up(
 
 impl candle_core::Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
-            let can_run_q8_mmvq = if linear_is_prefill() {
-                crate::q8_mmvq::can_run(qtensor, x)
-            } else {
-                crate::q8_mmvq::can_run_decode(qtensor, x)
-            };
-            if can_run_q8_mmvq {
-                let mut ys = crate::q8_mmvq::plain(qtensor, x)?;
-                if let Some(bias) = &self.bias {
-                    ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
-                }
-                return Ok(ys);
-            }
-            if qtensor.dtype() == GgmlDType::Q8_0
-                && qtensor.device().is_cuda()
-                && !linear_is_prefill()
-            {
-                candle_core::bail!(
-                    "CUDA Q8_0 linear is not covered by q8_mmvq fast path: input_shape={:?} input_dtype={:?}",
-                    x.dims(),
-                    x.dtype()
-                );
-            }
-        }
-
-        let xs = if x.dtype() == DType::F32 {
-            x.clone()
-        } else {
-            x.to_dtype(DType::F32)?
-        };
-        let mut ys = self.matmul.as_ref().forward(&xs)?;
-        if let Some(bias) = &self.bias {
-            ys = ys.broadcast_add(&bias.to_dtype(DType::F32)?.to_device(x.device())?)?;
-        }
-        if self.output_dtype == DType::F32 {
-            Ok(ys)
-        } else {
-            ys.to_dtype(self.output_dtype)
-        }
+        QLinear::forward(self, x)
     }
 }
 
@@ -777,6 +927,30 @@ fn split_skip_values(values: &str) -> impl Iterator<Item = String> + '_ {
         .map(ToOwned::to_owned)
 }
 
+fn record_isq_linear(module_path: &str) {
+    match isq_module_kind(module_path) {
+        IsqModuleKind::Audio => {
+            ISQ_AUDIO_LINEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        IsqModuleKind::Text => {
+            ISQ_TEXT_LINEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        IsqModuleKind::Other => {
+            ISQ_OTHER_LINEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn isq_module_kind(module_path: &str) -> IsqModuleKind {
+    if module_path.contains("audio_tower") {
+        IsqModuleKind::Audio
+    } else if module_path.contains(".model.") || module_path.ends_with("lm_head") {
+        IsqModuleKind::Text
+    } else {
+        IsqModuleKind::Other
+    }
+}
+
 #[cfg(feature = "paged-attn")]
 fn afq_bits_name(bits: AfqBits) -> &'static str {
     match bits {
@@ -832,8 +1006,6 @@ fn compatible_dtype(weight: &Tensor, requested: GgmlDType) -> Option<GgmlDType> 
     let last_dim = weight.dim(candle_core::D::Minus1).ok()?;
     if last_dim % requested.block_size() == 0 {
         Some(requested)
-    } else if last_dim % GgmlDType::Q8_0.block_size() == 0 {
-        Some(GgmlDType::Q8_0)
     } else {
         None
     }
@@ -874,6 +1046,43 @@ mod tests {
             ResolvedIsq::Ggml(GgmlDType::Q8_0)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_isq8_quantizes_audio_text_and_lm_head_paths() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+
+        for (module_path, want_kind) in [
+            (
+                "thinker.audio_tower.layers.0.self_attn.q_proj",
+                super::IsqModuleKind::Audio,
+            ),
+            (
+                "thinker.model.layers.0.self_attn.q_proj",
+                super::IsqModuleKind::Text,
+            ),
+            ("thinker.lm_head", super::IsqModuleKind::Text),
+        ] {
+            assert_eq!(super::isq_module_kind(module_path), want_kind);
+            let weight =
+                candle_core::Tensor::zeros((4usize, 32usize), candle_core::DType::F32, &device)?;
+            let linear = candle_nn::Linear::new(weight, None);
+            let linear = IsqLinear::new_with_module_path(linear, Some("8"), &device, module_path)?;
+            assert!(
+                matches!(linear, LinearX::QLinear(_)),
+                "{module_path} should be quantized for --isq 8"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_q8_prefill_lm_head_mmq_toggle_is_callable() {
+        crate::set_q8_prefill_lm_head_mmq_enabled(false);
+        crate::set_q8_prefill_lm_head_mmq_max_logits_bytes(128 * 1024 * 1024);
+        crate::set_q8_prefill_lm_head_mmq_enabled(true);
+        crate::set_q8_prefill_lm_head_mmq_max_logits_bytes(256 * 1024 * 1024);
     }
 
     #[test]
@@ -946,17 +1155,121 @@ mod tests {
         use candle_core::Module;
 
         let device = candle_core::Device::new_cuda(0)?;
-        let weight = candle_core::Tensor::randn(0f32, 0.02f32, (64usize, 128usize), &device)?
-            .to_dtype(candle_core::DType::BF16)?;
+        let weight = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (64usize, 128usize),
+            &candle_core::Device::Cpu,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
         let linear = candle_nn::Linear::new(weight, None);
-        let linear = IsqLinear::new(linear, Some("q8_0"), &device)?;
+        let linear = IsqLinear::new_with_module_path(
+            linear,
+            Some("q8_0"),
+            &device,
+            "thinker.audio_tower.layers.0.fc1",
+        )?;
         let LinearX::QLinear(qlinear) = linear else {
             anyhow::bail!("expected QLinear");
         };
-        let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, 1usize, 128usize), &device)?
+        for rows in [1usize, 8, 9, 32, 128, 512] {
+            super::super::q8_mmvq::reset_fast_path_stats();
+            let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, rows, 128usize), &device)?
+                .to_dtype(candle_core::DType::BF16)?;
+
+            let fast = qlinear.forward(&x)?.to_dtype(candle_core::DType::F32)?;
+            let fallback = qlinear
+                .matmul
+                .as_ref()
+                .forward(&x.to_dtype(candle_core::DType::F32)?)?
+                .to_dtype(candle_core::DType::BF16)?
+                .to_dtype(candle_core::DType::F32)?;
+            let diff = (fast - fallback)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(
+                diff < 0.05,
+                "q8 mmvq fast path diverged from fallback for rows={rows}: max abs diff {diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_q8_mmvq_large_shapes_match_fallback_on_cuda() -> anyhow::Result<()> {
+        use candle_core::Module;
+
+        let device = candle_core::Device::new_cuda(0)?;
+        for (out_dim, in_dim, rows) in [
+            (2048usize, 2048usize, 512usize),
+            (4096usize, 2048usize, 512usize),
+            (2048usize, 4096usize, 512usize),
+            (5120usize, 1280usize, 1024usize),
+            (1280usize, 5120usize, 1024usize),
+        ] {
+            let weight = candle_core::Tensor::randn(0f32, 0.02f32, (out_dim, in_dim), &device)?
+                .to_dtype(candle_core::DType::BF16)?;
+            let linear = IsqLinear::new_with_module_path(
+                candle_nn::Linear::new(weight, None),
+                Some("q8_0"),
+                &device,
+                "thinker.model.layers.0.mlp.down_proj",
+            )?;
+            let LinearX::QLinear(qlinear) = linear else {
+                anyhow::bail!("expected QLinear");
+            };
+            super::super::q8_mmvq::reset_fast_path_stats();
+            let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, rows, in_dim), &device)?
+                .to_dtype(candle_core::DType::BF16)?;
+
+            let fast = qlinear.forward(&x)?.to_dtype(candle_core::DType::F32)?;
+            let fallback = qlinear
+                .matmul
+                .as_ref()
+                .forward(&x.to_dtype(candle_core::DType::F32)?)?
+                .to_dtype(candle_core::DType::BF16)?
+                .to_dtype(candle_core::DType::F32)?;
+            let diff = (fast - fallback)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(
+                diff < 0.08,
+                "q8 mmvq fast path diverged from fallback for shape out={out_dim} in={in_dim} rows={rows}: max abs diff {diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_q8_mmq_prefill_matches_fallback_on_cuda() -> anyhow::Result<()> {
+        use candle_core::Module;
+
+        let device = candle_core::Device::new_cuda(0)?;
+        let weight = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (256usize, 256usize),
+            &candle_core::Device::Cpu,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
+        let linear = IsqLinear::new_with_module_path(
+            candle_nn::Linear::new(weight, None),
+            Some("q8_0"),
+            &device,
+            "thinker.model.layers.0.mlp.down_proj",
+        )?;
+        let LinearX::QLinear(qlinear) = linear else {
+            anyhow::bail!("expected QLinear");
+        };
+        super::super::q8_mmvq::reset_fast_path_stats();
+        let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, 64usize, 256usize), &device)?
             .to_dtype(candle_core::DType::BF16)?;
 
+        let _guard = set_linear_is_prefill(true);
         let fast = qlinear.forward(&x)?.to_dtype(candle_core::DType::F32)?;
+        let stats = super::super::q8_mmvq::fast_path_stats();
+        anyhow::ensure!(
+            stats.mmq_prefill_calls > 0,
+            "expected MMQ prefill path to run, got stats={stats:?}"
+        );
         let fallback = qlinear
             .matmul
             .as_ref()
@@ -965,8 +1278,8 @@ mod tests {
             .to_dtype(candle_core::DType::F32)?;
         let diff = (fast - fallback)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(
-            diff < 0.05,
-            "q8 mmvq fast path diverged from fallback: max abs diff {diff}"
+            diff < 0.08,
+            "q8 mmq prefill path diverged from fallback: max abs diff {diff}"
         );
         Ok(())
     }
@@ -989,23 +1302,33 @@ mod tests {
             Some("q8_0"),
             &device,
         )?;
-        let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, 1usize, 128usize), &device)?
-            .to_dtype(candle_core::DType::BF16)?;
+        for rows in [1usize, 8] {
+            let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, rows, 128usize), &device)?
+                .to_dtype(candle_core::DType::BF16)?;
 
-        let fused = try_fused_q8_silu_gate_up(&gate, &up, &x)?
-            .ok_or_else(|| anyhow::anyhow!("expected fused q8 gate/up path"))?
-            .to_dtype(candle_core::DType::F32)?;
-        let gate_y = gate.forward(&x)?;
-        let up_y = up.forward(&x)?;
-        let unfused = candle_nn::ops::silu(&gate_y)?
-            .broadcast_mul(&up_y)?
-            .to_dtype(candle_core::DType::F32)?;
+            let fused = try_fused_q8_silu_gate_up(&gate, &up, &x)?
+                .ok_or_else(|| anyhow::anyhow!("expected fused q8 gate/up path"))?
+                .to_dtype(candle_core::DType::F32)?;
+            let gate_y = gate.forward(&x)?;
+            let up_y = up.forward(&x)?;
+            let unfused = candle_nn::ops::silu(&gate_y)?
+                .broadcast_mul(&up_y)?
+                .to_dtype(candle_core::DType::F32)?;
 
-        let diff = (fused - unfused)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(
-            diff < 0.05,
-            "q8 fused gate/up path diverged from unfused: max abs diff {diff}"
-        );
+            let diff = (fused - unfused)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(
+                diff < 0.05,
+                "q8 fused gate/up path diverged from unfused for rows={rows}: max abs diff {diff}"
+            );
+        }
+        for rows in [9usize, 32, 128, 512] {
+            let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, rows, 128usize), &device)?
+                .to_dtype(candle_core::DType::BF16)?;
+            assert!(
+                try_fused_q8_silu_gate_up(&gate, &up, &x)?.is_none(),
+                "q8 fused gate/up should stay on MMVQ-sized decode batches; rows={rows} should fall back to ordinary Q8 Linear/MMQ"
+            );
+        }
         Ok(())
     }
 }

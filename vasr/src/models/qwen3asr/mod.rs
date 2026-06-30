@@ -102,6 +102,12 @@ impl Qwen3ASR {
                     },
                     #[cfg(feature = "cuda-graph")]
                     cuda_graph_context_tokens: None,
+                    #[cfg(feature = "cuda-graph")]
+                    cuda_graph_chunked_argmax:
+                        vasr_paged_attn::cuda_graph::cuda_graph_chunked_argmax_enabled(),
+                    #[cfg(feature = "cuda-graph")]
+                    cuda_graph_chunked_argmax_size:
+                        vasr_paged_attn::cuda_graph::cuda_graph_chunked_argmax_size(),
                 });
             Some(Arc::new(std::sync::Mutex::new(
                 vasr_paged_attn::PagedCacheRuntime::new(
@@ -169,6 +175,16 @@ impl Qwen3ASR {
         self.paged_cache
             .as_ref()
             .and_then(|runtime| runtime.lock().ok().map(|runtime| runtime.stats()))
+    }
+
+    #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+    pub fn cuda_decode_graph_count(&self) -> Option<usize> {
+        self.paged_cache.as_ref().and_then(|runtime| {
+            runtime
+                .lock()
+                .ok()
+                .map(|runtime| runtime.cuda_decode_graph_count())
+        })
     }
 
     /// Pre-capture a vLLM-style padded CUDA decode graph at max_batch.

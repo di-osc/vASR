@@ -14,7 +14,24 @@ pub mod thinker;
 pub mod thinker_text;
 pub mod weights;
 
+pub use vasr_quant::Q8FastPathStats;
 pub use vasr_quant::isq_linear;
+
+pub fn reset_q8_fast_path_stats() {
+    vasr_quant::reset_q8_fast_path_stats();
+}
+
+pub fn q8_fast_path_stats() -> Q8FastPathStats {
+    vasr_quant::q8_fast_path_stats()
+}
+
+pub fn set_q8_prefill_lm_head_mmq_enabled(enabled: bool) {
+    vasr_quant::set_q8_prefill_lm_head_mmq_enabled(enabled);
+}
+
+pub fn set_q8_prefill_lm_head_mmq_max_logits_bytes(bytes: usize) {
+    vasr_quant::set_q8_prefill_lm_head_mmq_max_logits_bytes(bytes);
+}
 
 #[cfg(feature = "paged-attn")]
 pub mod paged_kv_cache {

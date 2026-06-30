@@ -2,11 +2,21 @@ fn main() {
     #[cfg(feature = "cuda")]
     {
         println!("cargo:rerun-if-changed=kernels/mmvq_gguf/mmvq_gguf.cu");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_common.cuh");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_gguf.cuh");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_mma.cuh");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_vecdotq.cuh");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_quantize.cu");
+        println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_instance_q8_0.cu");
 
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let out_file = out_dir.join("libqwen3_asr_q8_mmvq.a");
         bindgen_cuda::Builder::default()
-            .kernel_paths(vec!["kernels/mmvq_gguf/mmvq_gguf.cu"])
+            .kernel_paths(vec![
+                "kernels/mmvq_gguf/mmvq_gguf.cu",
+                "kernels/mmq_gguf/mmq_quantize.cu",
+                "kernels/mmq_gguf/mmq_instance_q8_0.cu",
+            ])
             .arg("-std=c++17")
             .arg("-O3")
             .arg("-U__CUDA_NO_HALF_OPERATORS__")
