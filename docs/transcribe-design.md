@@ -386,6 +386,21 @@ rtf                          batch_wall_seconds / total_audio_duration_seconds�
 
 handler 通常返回 HTTP 200，并通过 `data[].is_bad` 表达 item 级错误。JSON 解析、body 超限等错误会在进入 transcribe handler 之前由 Axum 处理。
 
+## AudioSource 映射
+
+`AudioSource` 是 runtime 内部输入抽象，不是 HTTP API 或 msgpack 的持久化 schema。
+
+```text
+HTTP url                  -> AudioSource::Url
+HTTP b64_str              -> AudioSource::Base64
+本地音频文件              -> AudioSource::Path
+msgpack AudioAsset::Uri   -> AudioSource::Url 或 AudioSource::Path
+msgpack AudioAsset::Embedded.bytes -> AudioSource::EncodedBytes
+msgpack waveform_cache    -> AudioSource::Waveform
+```
+
+`AudioSource::EncodedBytes` 表示完整音频文件 bytes，例如 mp3、wav、flac、ogg 等，进入 loader 后由 Symphonia 解码。它不是裸 PCM。内部已经解码好的音频应使用 `AudioSource::Waveform`。
+
 ## 服务日志
 
 `RUST_LOG=info` 下，服务日志只保留核心信息：

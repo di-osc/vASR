@@ -49,13 +49,7 @@ impl AudioLoader {
                 }
             }
             AudioSource::Base64(b64) => decode::decode_base64_waveform(b64)?,
-            AudioSource::Bytes(bytes) => {
-                let mut pcm = Vec::with_capacity(bytes.len() / 2);
-                for chunk in bytes.chunks_exact(2) {
-                    pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-                }
-                Waveform::from_i16_pcm(&pcm, SAMPLE_RATE_HZ)
-            }
+            AudioSource::EncodedBytes(bytes) => decode::decode_bytes_waveform(bytes.clone())?,
             AudioSource::Waveform(waveform) => waveform.clone(),
         };
         Ok(waveform)

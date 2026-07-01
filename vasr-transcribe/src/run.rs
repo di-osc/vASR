@@ -6,7 +6,6 @@ use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use clap::Args;
 use vasr_data::{AudioAsset, AudioSource, VasrRecord, VasrRecordList};
 
@@ -286,10 +285,7 @@ fn audio_source_from_record(record: &VasrRecord) -> Result<AudioSource> {
                 Ok(AudioSource::Url(uri.clone()))
             }
         }
-        AudioAsset::Embedded { bytes, .. } => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            Ok(AudioSource::Base64(encoded))
-        }
+        AudioAsset::Embedded { bytes, .. } => Ok(AudioSource::EncodedBytes(bytes.clone())),
     }
 }
 
@@ -494,6 +490,39 @@ mod tests {
         assert_eq!(items[0].service_path, dir.join("call-1"));
         assert_eq!(items[0].output_path, dir.join("call-1"));
         assert_eq!(items[0].source, AudioSource::Path(audio));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_run_inputs_maps_embedded_audio_to_encoded_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "vasr-run-embedded-record-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let input = dir.join("records.vasr.msgpack");
+
+        let bytes = b"encoded-audio".to_vec();
+        let records = VasrRecordList::new(vec![VasrRecord::new(
+            AudioAsset::Embedded {
+                bytes: bytes.clone(),
+                format: PersistedAudioFormat {
+                    sample_rate: Some(16_000),
+                    channels: Some(1),
+                    encoding: AudioEncoding::Mp3,
+                },
+                duration: None,
+                sha256: None,
+            },
+            Timeline::new("embedded-call"),
+        )]);
+        records.write_msgpack(&input).expect("write records");
+
+        let items = collect_run_inputs(&input, false).expect("collect vasr records");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, AudioSource::EncodedBytes(bytes));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -36,6 +36,6 @@ pub enum AudioSource {
     Path(PathBuf),
     Url(String),
     Base64(String),
-    Bytes(Vec<u8>),
+    EncodedBytes(Vec<u8>),
     Waveform(Waveform),
 }

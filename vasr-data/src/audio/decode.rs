@@ -110,11 +110,7 @@ pub fn decode_base64(b64: &str) -> Result<(Vec<f32>, u32)> {
 
 #[cfg(feature = "audio-loading")]
 pub fn decode_base64_waveform(b64: &str) -> Result<crate::Waveform> {
-    use std::io::Cursor;
-
     use base64::Engine;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::io::MediaSourceStream;
 
     let data = if b64.contains(',') && b64.trim().starts_with("data:") {
         b64.split(',')
@@ -128,7 +124,17 @@ pub fn decode_base64_waveform(b64: &str) -> Result<crate::Waveform> {
         .decode(data)
         .map_err(|e| anyhow::anyhow!("base64 decode error: {e}"))?;
 
-    let cursor = Cursor::new(bytes);
+    decode_bytes_waveform(bytes)
+}
+
+#[cfg(feature = "audio-loading")]
+pub fn decode_bytes_waveform(bytes: impl Into<Vec<u8>>) -> Result<crate::Waveform> {
+    use std::io::Cursor;
+
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::io::MediaSourceStream;
+
+    let cursor = Cursor::new(bytes.into());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
     let (samples, sr, channels) = decode_audio_stream(mss, Hint::new())?;
     Ok(crate::Waveform::try_new_with_channels(
@@ -146,6 +152,11 @@ pub fn decode_base64(_b64: &str) -> Result<(Vec<f32>, u32)> {
 #[cfg(not(feature = "audio-loading"))]
 pub fn decode_base64_waveform(_b64: &str) -> Result<crate::Waveform> {
     bail!("decode_base64_waveform requires the `audio-loading` feature")
+}
+
+#[cfg(not(feature = "audio-loading"))]
+pub fn decode_bytes_waveform(_bytes: impl Into<Vec<u8>>) -> Result<crate::Waveform> {
+    bail!("decode_bytes_waveform requires the `audio-loading` feature")
 }
 
 #[cfg(feature = "audio-loading")]
@@ -229,7 +240,7 @@ fn decode_audio_stream(
 
 #[cfg(all(test, feature = "audio-loading"))]
 mod tests {
-    use super::{decode_path, decode_path_waveform};
+    use super::{decode_bytes_waveform, decode_path, decode_path_waveform};
     use crate::Waveform;
     use std::io::Write;
 
@@ -300,6 +311,24 @@ mod tests {
         assert!((samples[0] - 0.5).abs() < 1e-6, "{:?}", samples);
         assert!((samples[1] - 0.125).abs() < 1e-6, "{:?}", samples);
         assert_eq!(waveform.channels, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_bytes_waveform_decodes_encoded_audio_bytes() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "vasr-encoded-bytes-{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ));
+        write_pcm16_wav(&path, 16_000, 1, &[0, 16_384, -16_384])?;
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path).ok();
+
+        let waveform = decode_bytes_waveform(bytes)?;
+
+        assert_eq!(waveform.sample_rate, 16_000);
+        assert_eq!(waveform.channels, 1);
+        assert_eq!(waveform.samples.len(), 3);
         Ok(())
     }
 

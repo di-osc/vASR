@@ -1376,7 +1376,7 @@ enum AudioSourceDedupKey {
     Path(PathBuf),
     Url(String),
     Base64(String),
-    Bytes(Vec<u8>),
+    EncodedBytes(Vec<u8>),
     LocalFileContent { len: u64, hash: u64 },
 }
 
@@ -1421,7 +1421,7 @@ fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey> {
             Some(AudioSourceDedupKey::Url(url.clone()))
         }
         AudioSource::Base64(encoded) => Some(AudioSourceDedupKey::Base64(encoded.clone())),
-        AudioSource::Bytes(bytes) => Some(AudioSourceDedupKey::Bytes(bytes.clone())),
+        AudioSource::EncodedBytes(bytes) => Some(AudioSourceDedupKey::EncodedBytes(bytes.clone())),
         AudioSource::Waveform(_) => None,
     }
 }
