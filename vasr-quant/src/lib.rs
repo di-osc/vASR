@@ -1,15 +1,15 @@
-//! In-situ quantization (ISQ/AFQ) and decode matmul fast paths for VASR.
+//! In-situ quantization (ISQ) and decode matmul fast paths for VASR.
 
 pub mod isq_linear;
-#[cfg(feature = "metal-paged-attn")]
-mod metal_argmax;
 #[cfg(feature = "cuda")]
 mod q8_mmvq;
+#[cfg(feature = "cuda")]
+mod rotary;
 
-#[cfg(feature = "metal-paged-attn")]
-pub use metal_argmax::{MetalArgmaxScratch, argmax_token_id};
 #[cfg(feature = "cuda")]
 pub use q8_mmvq::FastPathStats as Q8FastPathStats;
+#[cfg(feature = "cuda")]
+pub use rotary::apply_rotary_qk;
 
 #[cfg(not(feature = "cuda"))]
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,14 +131,6 @@ impl Q8FastPathStats {
         }
     }
 }
-
-// Re-export mistralrs_quant rotary kernels for Metal/CUDA accelerated RoPE
-#[cfg(any(
-    feature = "metal-paged-attn",
-    feature = "cuda-paged-attn",
-    feature = "cuda-quant"
-))]
-pub use mistralrs_quant::rotary::apply_rotary_qk;
 
 #[cfg(feature = "cuda")]
 pub fn trim_cuda_workspaces() {

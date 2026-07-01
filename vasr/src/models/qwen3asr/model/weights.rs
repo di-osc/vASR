@@ -12,12 +12,14 @@ use candle_nn::var_builder::SimpleBackend;
 use serde::Deserialize;
 
 use crate::config::AsrConfig;
+use crate::utils::progress::Progress;
 
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub dtype: candle_core::DType,
     pub use_flash_attn: bool,
     pub isq: Option<String>,
+    pub progress: Progress,
     #[cfg(feature = "paged-attn")]
     pub paged_cache: Option<crate::model::paged_cache_runtime::PagedCacheConfig>,
 }
@@ -28,6 +30,7 @@ impl Default for LoadOptions {
             dtype: candle_core::DType::F32,
             use_flash_attn: false,
             isq: None,
+            progress: Progress::disabled(),
             #[cfg(feature = "paged-attn")]
             paged_cache: None,
         }
@@ -60,6 +63,7 @@ pub(crate) fn load_model_from_pretrained(
         device,
         opts.use_flash_attn,
         opts.isq.as_deref(),
+        &opts.progress,
     )?;
 
     Ok((
@@ -190,8 +194,8 @@ fn validate_load_options(device: &Device, opts: &LoadOptions) -> Result<()> {
     }
 
     match opts.dtype {
-        candle_core::DType::F16 | candle_core::DType::BF16 => {}
-        other => bail!("flash-attn requires dtype f16/bf16, got {other:?}"),
+        candle_core::DType::BF16 => {}
+        other => bail!("vasr-flash-attn requires dtype bf16, got {other:?}"),
     }
 
     Ok(())

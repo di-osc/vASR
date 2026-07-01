@@ -11,10 +11,6 @@ use candle_core::quantized::k_quants;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
-#[cfg(feature = "metal-paged-attn")]
-use mistralrs_quant::GluActivationType;
-#[cfg(feature = "paged-attn")]
-use mistralrs_quant::{AfqBits, AfqGroupSize, AfqLayer, QuantMethod, QuantMethodConfig};
 
 #[cfg(feature = "timing")]
 static ISQ_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
@@ -88,8 +84,6 @@ pub fn isq_layer_counts() -> (usize, usize, usize) {
 pub enum LinearX {
     Linear(Linear),
     QLinear(QLinear),
-    #[cfg(feature = "paged-attn")]
-    AfqLinear(AfqLinear),
 }
 
 pub type IsqLinear = LinearX;
@@ -112,8 +106,6 @@ pub enum IsqBits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedIsq {
     Ggml(GgmlDType),
-    #[cfg(feature = "paged-attn")]
-    Afq(AfqBits),
     AfqFallback {
         requested: &'static str,
         fallback: GgmlDType,
@@ -124,15 +116,6 @@ impl ResolvedIsq {
     pub fn dtype(self) -> GgmlDType {
         match self {
             Self::Ggml(dtype) => dtype,
-            #[cfg(feature = "paged-attn")]
-            Self::Afq(bits) => match bits {
-                AfqBits::Two => GgmlDType::Q2K,
-                AfqBits::Three => GgmlDType::Q3K,
-                AfqBits::Four => GgmlDType::Q4K,
-                AfqBits::Six => GgmlDType::Q6K,
-                AfqBits::Eight => GgmlDType::Q8_0,
-                AfqBits::Mxfp4 => GgmlDType::Q4_0,
-            },
             Self::AfqFallback { fallback, .. } => fallback,
         }
     }
@@ -140,8 +123,6 @@ impl ResolvedIsq {
     pub fn display_name(self) -> String {
         match self {
             Self::Ggml(dtype) => ggml_dtype_name(dtype).to_string(),
-            #[cfg(feature = "paged-attn")]
-            Self::Afq(bits) => afq_bits_name(bits).to_string(),
             Self::AfqFallback {
                 requested,
                 fallback,
@@ -155,42 +136,27 @@ impl ResolvedIsq {
 impl IsqBits {
     pub fn resolve(self, device: &Device) -> ResolvedIsq {
         match (self, device.is_metal()) {
-            #[cfg(feature = "paged-attn")]
-            (Self::Two, true) => ResolvedIsq::Afq(AfqBits::Two),
-            #[cfg(feature = "paged-attn")]
-            (Self::Three, true) => ResolvedIsq::Afq(AfqBits::Three),
-            #[cfg(feature = "paged-attn")]
-            (Self::Four, true) => ResolvedIsq::Afq(AfqBits::Four),
-            #[cfg(feature = "paged-attn")]
-            (Self::Six, true) => ResolvedIsq::Afq(AfqBits::Six),
-            #[cfg(feature = "paged-attn")]
-            (Self::Eight, true) => ResolvedIsq::Afq(AfqBits::Eight),
-            #[cfg(not(feature = "paged-attn"))]
             (Self::Two, true) => ResolvedIsq::AfqFallback {
                 requested: "afq2",
                 fallback: GgmlDType::Q2K,
             },
             (Self::Two, false) => ResolvedIsq::Ggml(GgmlDType::Q2K),
-            #[cfg(not(feature = "paged-attn"))]
             (Self::Three, true) => ResolvedIsq::AfqFallback {
                 requested: "afq3",
                 fallback: GgmlDType::Q3K,
             },
             (Self::Three, false) => ResolvedIsq::Ggml(GgmlDType::Q3K),
-            #[cfg(not(feature = "paged-attn"))]
             (Self::Four, true) => ResolvedIsq::AfqFallback {
                 requested: "afq4",
                 fallback: GgmlDType::Q4K,
             },
             (Self::Four, false) => ResolvedIsq::Ggml(GgmlDType::Q4K),
             (Self::Five, _) => ResolvedIsq::Ggml(GgmlDType::Q5K),
-            #[cfg(not(feature = "paged-attn"))]
             (Self::Six, true) => ResolvedIsq::AfqFallback {
                 requested: "afq6",
                 fallback: GgmlDType::Q6K,
             },
             (Self::Six, false) => ResolvedIsq::Ggml(GgmlDType::Q6K),
-            #[cfg(not(feature = "paged-attn"))]
             (Self::Eight, true) => ResolvedIsq::AfqFallback {
                 requested: "afq8",
                 fallback: GgmlDType::Q8_0,
@@ -227,22 +193,11 @@ pub struct QLinear {
     module_path: Arc<str>,
 }
 
-#[cfg(feature = "paged-attn")]
-#[derive(Clone)]
-pub struct AfqLinear {
-    inner: Arc<AfqLayer>,
-    bias: Option<Tensor>,
-    output_dtype: DType,
-    bits: AfqBits,
-}
-
 impl std::fmt::Debug for LinearX {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Linear(linear) => f.debug_tuple("Linear").field(linear).finish(),
             Self::QLinear(linear) => f.debug_tuple("QLinear").field(linear).finish(),
-            #[cfg(feature = "paged-attn")]
-            Self::AfqLinear(linear) => f.debug_tuple("AfqLinear").field(linear).finish(),
         }
     }
 }
@@ -253,16 +208,6 @@ impl std::fmt::Debug for QLinear {
             .field("dtype", &self.dtype)
             .field("output_dtype", &self.output_dtype)
             .field("module_path", &self.module_path)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-impl std::fmt::Debug for AfqLinear {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AfqLinear")
-            .field("bits", &self.bits)
-            .field("output_dtype", &self.output_dtype)
             .finish_non_exhaustive()
     }
 }
@@ -292,12 +237,6 @@ impl LinearX {
         if spec.disable_quantization {
             let linear = linear_to_device(linear, target_device)?;
             return Ok(Self::Linear(linear));
-        }
-
-        #[cfg(feature = "paged-attn")]
-        if let Some(bits) = spec.afq {
-            record_isq_linear(module_path);
-            return Self::new_afq(linear, bits, target_device);
         }
 
         let requested = spec
@@ -356,8 +295,6 @@ impl LinearX {
         match self {
             Self::Linear(linear) => linear.forward(x),
             Self::QLinear(linear) => linear.forward(x),
-            #[cfg(feature = "paged-attn")]
-            Self::AfqLinear(linear) => linear.forward(x),
         }
     }
 
@@ -386,40 +323,6 @@ impl LinearX {
             return qlinear.supports_q8_lm_head_next_ids();
         }
         false
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-impl LinearX {
-    fn new_afq(linear: Linear, bits: AfqBits, target_device: &Device) -> Result<Self> {
-        #[cfg(feature = "timing")]
-        let start_quantize = std::time::Instant::now();
-        let weight = linear.weight().to_device(target_device)?;
-        let bias = linear
-            .bias()
-            .map(|b| b.to_device(target_device))
-            .transpose()?;
-        let output_dtype = weight.dtype();
-        let inner = AfqLayer::new(QuantMethodConfig::Afq {
-            weight,
-            bias: None,
-            bits,
-            group_size: AfqGroupSize::default(),
-        })?;
-        #[cfg(feature = "timing")]
-        ISQ_QUANTIZE_US.fetch_add(
-            start_quantize
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
-        Ok(Self::AfqLinear(AfqLinear {
-            inner: Arc::new(inner),
-            bias,
-            output_dtype,
-            bits,
-        }))
     }
 }
 
@@ -512,13 +415,6 @@ impl QLinear {
             return false;
         };
         weight.dtype() == GgmlDType::Q8_0 && weight.device().is_cuda()
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-impl AfqLinear {
-    pub fn bias(&self) -> Option<&Tensor> {
-        self.bias.as_ref()
     }
 }
 
@@ -621,44 +517,9 @@ fn q8_fused_qkv_disabled() -> bool {
     )
 }
 
-#[cfg(feature = "metal-paged-attn")]
-pub fn try_fused_afq_silu_gate_up(
-    gate: &IsqLinear,
-    up: &IsqLinear,
-    x: &Tensor,
-) -> Result<Option<Tensor>> {
-    let (LinearX::AfqLinear(gate), LinearX::AfqLinear(up)) = (gate, up) else {
-        return Ok(None);
-    };
-    if gate.bias.is_some() || up.bias.is_some() {
-        return Ok(None);
-    }
-    mistralrs_quant::try_fused_gate_up_metal(
-        x,
-        gate.inner.as_ref(),
-        up.inner.as_ref(),
-        GluActivationType::Silu,
-    )
-}
-
 impl candle_core::Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         QLinear::forward(self, x)
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-impl candle_core::Module for AfqLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut ys = self.inner.forward(x)?;
-        if let Some(bias) = &self.bias {
-            ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
-        }
-        if ys.dtype() == self.output_dtype {
-            Ok(ys)
-        } else {
-            ys.to_dtype(self.output_dtype)
-        }
     }
 }
 
@@ -786,37 +647,22 @@ pub fn resolve_isq_dtype(value: &str, device: &Device) -> Result<ResolvedIsq> {
         "q4k" | "q4_k" => Ok(ResolvedIsq::Ggml(GgmlDType::Q4K)),
         "q5k" | "q5_k" => Ok(ResolvedIsq::Ggml(GgmlDType::Q5K)),
         "q6k" | "q6_k" => Ok(ResolvedIsq::Ggml(GgmlDType::Q6K)),
-        #[cfg(feature = "paged-attn")]
-        "afq2" => Ok(ResolvedIsq::Afq(AfqBits::Two)),
-        #[cfg(feature = "paged-attn")]
-        "afq3" => Ok(ResolvedIsq::Afq(AfqBits::Three)),
-        #[cfg(feature = "paged-attn")]
-        "afq4" => Ok(ResolvedIsq::Afq(AfqBits::Four)),
-        #[cfg(feature = "paged-attn")]
-        "afq6" => Ok(ResolvedIsq::Afq(AfqBits::Six)),
-        #[cfg(feature = "paged-attn")]
-        "afq8" => Ok(ResolvedIsq::Afq(AfqBits::Eight)),
-        #[cfg(not(feature = "paged-attn"))]
         "afq2" => Ok(ResolvedIsq::AfqFallback {
             requested: "afq2",
             fallback: GgmlDType::Q2K,
         }),
-        #[cfg(not(feature = "paged-attn"))]
         "afq3" => Ok(ResolvedIsq::AfqFallback {
             requested: "afq3",
             fallback: GgmlDType::Q3K,
         }),
-        #[cfg(not(feature = "paged-attn"))]
         "afq4" => Ok(ResolvedIsq::AfqFallback {
             requested: "afq4",
             fallback: GgmlDType::Q4K,
         }),
-        #[cfg(not(feature = "paged-attn"))]
         "afq6" => Ok(ResolvedIsq::AfqFallback {
             requested: "afq6",
             fallback: GgmlDType::Q6K,
         }),
-        #[cfg(not(feature = "paged-attn"))]
         "afq8" => Ok(ResolvedIsq::AfqFallback {
             requested: "afq8",
             fallback: GgmlDType::Q8_0,
@@ -838,25 +684,13 @@ pub fn resolve_isq_display(value: &str, device: &Device) -> Result<String> {
 #[derive(Debug, Clone)]
 struct IsqSpec {
     dtype: Option<GgmlDType>,
-    #[cfg(feature = "paged-attn")]
-    afq: Option<AfqBits>,
     disable_quantization: bool,
     modules_to_not_convert: Vec<String>,
 }
 
 fn parse_isq_spec(value: &str, device: &Device) -> Result<IsqSpec> {
     let resolved = resolve_isq_dtype(value, device)?;
-    #[cfg(not(feature = "paged-attn"))]
     let dtype = Some(resolved.dtype());
-    #[cfg(feature = "paged-attn")]
-    let mut dtype = Some(resolved.dtype());
-    #[cfg(feature = "paged-attn")]
-    let mut afq = None;
-    #[cfg(feature = "paged-attn")]
-    if let ResolvedIsq::Afq(bits) = resolved {
-        dtype = None;
-        afq = Some(bits);
-    }
     #[cfg(not(feature = "metal"))]
     let disable_quantization = false;
     #[cfg(feature = "metal")]
@@ -912,8 +746,6 @@ fn parse_isq_spec(value: &str, device: &Device) -> Result<IsqSpec> {
     modules_to_not_convert.dedup();
     Ok(IsqSpec {
         dtype,
-        #[cfg(feature = "paged-attn")]
-        afq,
         disable_quantization,
         modules_to_not_convert,
     })
@@ -948,18 +780,6 @@ fn isq_module_kind(module_path: &str) -> IsqModuleKind {
         IsqModuleKind::Text
     } else {
         IsqModuleKind::Other
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-fn afq_bits_name(bits: AfqBits) -> &'static str {
-    match bits {
-        AfqBits::Two => "afq2",
-        AfqBits::Three => "afq3",
-        AfqBits::Four => "afq4",
-        AfqBits::Six => "afq6",
-        AfqBits::Eight => "afq8",
-        AfqBits::Mxfp4 => "mxfp4",
     }
 }
 

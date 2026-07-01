@@ -8,6 +8,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_vecdotq.cuh");
         println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_quantize.cu");
         println!("cargo:rerun-if-changed=kernels/mmq_gguf/mmq_instance_q8_0.cu");
+        println!("cargo:rerun-if-changed=kernels/rotary/cuda_compat.h");
+        println!("cargo:rerun-if-changed=kernels/rotary/rotary.cu");
 
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let out_file = out_dir.join("libqwen3_asr_q8_mmvq.a");
@@ -16,6 +18,7 @@ fn main() {
                 "kernels/mmvq_gguf/mmvq_gguf.cu",
                 "kernels/mmq_gguf/mmq_quantize.cu",
                 "kernels/mmq_gguf/mmq_instance_q8_0.cu",
+                "kernels/rotary/rotary.cu",
             ])
             .arg("-std=c++17")
             .arg("-O3")

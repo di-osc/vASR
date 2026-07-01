@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::{ArgAction, Args};
+use indicatif::{ProgressBar, ProgressStyle};
 use vasr::models::qwen3asr::model::isq_linear::{
     isq_layer_counts, isq_quantize_time_us, reset_isq_layer_counts, reset_isq_quantize_time,
     resolve_isq_display, resolve_isq_dtype,
@@ -22,6 +23,7 @@ use vasr::models::qwen3asr::model::paged_cache_runtime::{
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::processor::{chat_template, feat_lengths, tokenizer::Tokenizer};
 use vasr::models::qwen3asr::{LoadOptions, Qwen3ASR};
+use vasr::utils::progress::{Progress, ProgressEvent, ProgressHandle, ProgressSink, ProgressTask};
 use vasr_data::AudioLoader;
 
 use crate::pipeline::{
@@ -42,6 +44,54 @@ const DEFAULT_PROFILE_WINDOW_SECS: f64 = 5.0;
 const DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB: usize = 256;
 #[cfg(feature = "paged-attn")]
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
+
+struct IndicatifProgressSink;
+
+impl ProgressSink for IndicatifProgressSink {
+    fn start(&self, event: ProgressEvent) -> ProgressHandle {
+        let total = event.total.unwrap_or(0);
+        if total == 0 {
+            return ProgressHandle::disabled();
+        }
+        let progress = ProgressBar::new(total);
+        let style = ProgressStyle::with_template(
+            "{msg}: [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("##-");
+        progress.set_style(style);
+        progress.set_message(progress_message(&event));
+        ProgressHandle::new(Box::new(IndicatifProgressTask { progress }))
+    }
+}
+
+struct IndicatifProgressTask {
+    progress: ProgressBar,
+}
+
+impl ProgressTask for IndicatifProgressTask {
+    fn inc(&self, n: u64) {
+        self.progress.inc(n);
+    }
+
+    fn finish(&self) {
+        self.progress.finish_and_clear();
+    }
+}
+
+fn progress_message(event: &ProgressEvent) -> String {
+    match (event.model, event.phase) {
+        ("qwen3-asr", "load.audio_layers") => "Loading Qwen3-ASR audio layers".to_string(),
+        ("qwen3-asr", "load.text_layers") => "Loading Qwen3-ASR repeating layers".to_string(),
+        ("qwen3-asr", "quantize.audio_layers") => {
+            "Loading Qwen3-ASR audio layers for quantization".to_string()
+        }
+        ("qwen3-asr", "quantize.text_layers") => {
+            "Loading Qwen3-ASR repeating layers for quantization".to_string()
+        }
+        _ => format!("{} {}", event.model, event.phase),
+    }
+}
 #[cfg(feature = "paged-attn")]
 const ASR_FEATURE_HOP_LENGTH: usize = 160;
 #[cfg(feature = "paged-attn")]
@@ -176,14 +226,14 @@ pub struct TranscribePipelineArgs {
     )]
     pub num_vad_workers: usize,
 
-    /// Disable periodic service pipeline performance table.
+    /// Enable periodic service pipeline performance table.
     #[arg(
-        long = "no-profile",
+        long = "profile",
         default_value_t = false,
         action = ArgAction::SetTrue,
-        env = "VASR_NO_PROFILE"
+        env = "VASR_PROFILE"
     )]
-    pub no_profile: bool,
+    pub profile: bool,
 
     /// Service pipeline performance table window in seconds.
     #[arg(
@@ -352,7 +402,7 @@ fn worker_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> PipelineWo
     PipelineWorkerOptions {
         num_load_workers: pipeline.num_load_workers,
         num_vad_workers: pipeline.num_vad_workers,
-        profile: !pipeline.no_profile,
+        profile: pipeline.profile,
         profile_window: std::time::Duration::from_secs_f64(pipeline.profile_window),
     }
 }
@@ -389,7 +439,7 @@ mod tests {
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             num_load_workers: 0,
             num_vad_workers: 0,
-            no_profile: false,
+            profile: false,
             profile_window: DEFAULT_PROFILE_WINDOW_SECS,
             vad: VadCliArgs {
                 vad_device: "cpu".to_string(),
@@ -800,6 +850,43 @@ fn log_kv_cache_sizing(sizing: &KvCacheSizing) {
     );
 }
 
+fn log_model_load_start(args: &CommonModelArgs, device: &Device) -> Result<()> {
+    let model_id = resolve_asr_model_id(&args.model);
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "Loading Qwen3-ASR model `{}` from cache `{}` on {}.",
+        model_id,
+        args.cache_dir.display(),
+        device_label(device)
+    );
+
+    if let Some(isq) = args.isq.as_deref() {
+        let isq_display = resolve_isq_display(isq, device)?;
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "Quantizing model weights to {isq_display}."
+        );
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "Loading model weights for quantization."
+        );
+        tracing::debug!(
+            target: "vasr_transcribe::serve",
+            "ISQ selected is {} (requested={}, backend={}).",
+            isq_display,
+            isq,
+            device_label(device)
+        );
+    } else {
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "Loading model weights."
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(any(feature = "metal", feature = "cuda"))]
 fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
     let sizing = match config.memory {
@@ -1017,6 +1104,7 @@ fn load_asr_model_for_pipeline(
         dtype,
         use_flash_attn: device.is_cuda(),
         isq: args.isq.clone(),
+        progress: Progress::new(Arc::new(IndicatifProgressSink)),
         #[cfg(feature = "paged-attn")]
         paged_cache: Some(paged_cache_config),
     };
@@ -1037,25 +1125,9 @@ fn load_asr_model_for_pipeline(
         dtype_label(dtype),
     );
     tracing::debug!(target: "vasr_transcribe::serve", "model kind=qwen3-asr adapters=none");
-    if let Some(isq) = args.isq.as_deref() {
-        tracing::debug!(
-            target: "vasr_transcribe::serve",
-            "ISQ selected is {} (requested={}, backend={}).",
-            resolve_isq_display(isq, &device)?,
-            isq,
-            device_label(&device)
-        );
-    }
     #[cfg(feature = "paged-attn")]
     log_kv_cache_sizing(&kv_cache_sizing);
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "Loading Qwen3-ASR model `{}` from cache `{}` on {} (isq={:?}).",
-        resolve_asr_model_id(&args.model),
-        args.cache_dir.display(),
-        device_label(&device),
-        args.isq
-    );
+    log_model_load_start(args, &device)?;
     let model_load_start = Instant::now();
     reset_isq_layer_counts();
     reset_isq_quantize_time();

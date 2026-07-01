@@ -4,6 +4,7 @@ pub mod error;
 pub mod layers;
 pub mod models;
 pub mod traits;
+pub mod utils;
 
 pub use vasr_data::audio;
 

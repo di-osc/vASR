@@ -66,6 +66,7 @@ fn main() -> Result<()> {
             isq,
             #[cfg(feature = "paged-attn")]
             paged_cache: None,
+            ..LoadOptions::default()
         },
     )
     .context("failed to load model")?;

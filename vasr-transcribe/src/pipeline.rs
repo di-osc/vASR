@@ -72,7 +72,7 @@ impl Default for PipelineWorkerOptions {
         Self {
             num_load_workers: 0,
             num_vad_workers: 0,
-            profile: true,
+            profile: false,
             profile_window: COMPONENT_THROUGHPUT_LOG_INTERVAL,
         }
     }
@@ -99,6 +99,7 @@ struct LoaderStageStats {
     failed: usize,
     audio_seconds: f64,
     compute_seconds: f64,
+    worker_compute_seconds: HashMap<usize, f64>,
     wall_seconds: f64,
 }
 
@@ -108,6 +109,7 @@ struct LoaderTaskStats {
     failed: usize,
     audio_seconds: f64,
     compute_seconds: f64,
+    worker_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -182,6 +184,7 @@ struct VadStageStats {
     audio_seconds: f64,
     speech_seconds: f64,
     compute_seconds: f64,
+    worker_compute_seconds: HashMap<usize, f64>,
     send_wait_seconds: f64,
     wall_seconds: f64,
 }
@@ -195,6 +198,7 @@ struct VadTaskStats {
     audio_seconds: f64,
     speech_seconds: f64,
     compute_seconds: f64,
+    worker_id: usize,
     send_wait_seconds: f64,
     wall_seconds: f64,
 }
@@ -222,15 +226,16 @@ struct AsrStageStats {
     decode_steps: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LoaderStageStatsSnapshot {
     jobs: usize,
     failed: usize,
     audio_seconds: f64,
     compute_seconds: f64,
+    worker_compute_seconds: HashMap<usize, f64>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct VadStageStatsSnapshot {
     jobs: usize,
     failed: usize,
@@ -239,6 +244,7 @@ struct VadStageStatsSnapshot {
     audio_seconds: f64,
     speech_seconds: f64,
     compute_seconds: f64,
+    worker_compute_seconds: HashMap<usize, f64>,
     send_wait_seconds: f64,
 }
 
@@ -875,23 +881,28 @@ fn spawn_global_loader_worker(
     tokio::spawn(async move {
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
+        let mut free_workers = (0..max_in_flight).rev().collect::<Vec<_>>();
         loop {
             tokio::select! {
-                job = load_job_rx.recv(), if tasks.len() < max_in_flight => {
+                job = load_job_rx.recv(), if tasks.len() < max_in_flight && !free_workers.is_empty() => {
                     match job {
-                        Some(job) => spawn_global_loader_task(&mut tasks, loader.clone(), Arc::clone(&next_job_id), job),
+                        Some(job) => {
+                            let worker_id = free_workers.pop().unwrap_or(0);
+                            spawn_global_loader_task(&mut tasks, loader.clone(), Arc::clone(&next_job_id), job, worker_id);
+                        }
                         None => break,
                     }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(result) = result {
-                        send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &pending_requests, &job_routes, &stats).await?;
+                        let worker_id = send_global_loaded_result(result, &loaded_queue_memory, &loader_to_vad_tx, &pending_requests, &job_routes, &stats).await?;
+                        free_workers.push(worker_id);
                     }
                 }
             }
         }
         while let Some(result) = tasks.join_next().await {
-            send_global_loaded_result(
+            let worker_id = send_global_loaded_result(
                 result,
                 &loaded_queue_memory,
                 &loader_to_vad_tx,
@@ -900,6 +911,7 @@ fn spawn_global_loader_worker(
                 &stats,
             )
             .await?;
+            free_workers.push(worker_id);
         }
         Ok(())
     })
@@ -913,6 +925,7 @@ fn spawn_global_loader_task(
     loader: AudioLoader,
     next_job_id: Arc<AtomicU64>,
     job: GlobalLoadJob,
+    worker_id: usize,
 ) {
     tasks.spawn(async move {
         let start = Instant::now();
@@ -926,6 +939,7 @@ fn spawn_global_loader_task(
         let loader_span = StageSpan::new(start, Instant::now());
         let mut stats = LoaderTaskStats {
             compute_seconds,
+            worker_id,
             ..Default::default()
         };
         let message = match loaded {
@@ -1013,7 +1027,7 @@ async fn send_global_loaded_result(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     job_routes: &Arc<Mutex<HashMap<usize, RequestItemRef>>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
-) -> Result<()> {
+) -> Result<usize> {
     let (mut message, task_stats) = result.unwrap_or_else(|error| {
         (
             Err(TranscribeItemOutcome {
@@ -1031,10 +1045,11 @@ async fn send_global_loaded_result(
             },
         )
     });
+    let worker_id = task_stats.worker_id;
     record_loader_task_stats(stats, &task_stats);
     if let Ok(jobs) = &mut message {
         if jobs.is_empty() {
-            return Ok(());
+            return Ok(worker_id);
         }
         if let Some(request_item) = jobs[0].request_item {
             let span = jobs[0].spans.loader.unwrap_or_else(|| {
@@ -1080,11 +1095,12 @@ async fn send_global_loaded_result(
                     .send(Ok(job))
                     .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
             }
-            Ok(())
+            Ok(worker_id)
         }
         Err(outcome) => loader_to_vad_tx
             .send(Err(outcome))
-            .map_err(|_| anyhow::anyhow!("loaded channel closed")),
+            .map_err(|_| anyhow::anyhow!("loaded channel closed"))
+            .map(|_| worker_id),
     }
 }
 
@@ -1917,15 +1933,26 @@ fn spawn_loader_worker(
         let wall_start = Instant::now();
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
+        let mut free_workers = (0..max_in_flight).rev().collect::<Vec<_>>();
         for input in inputs {
-            spawn_loader_task(&mut tasks, loader.clone(), input);
             if tasks.len() >= max_in_flight {
-                send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
-                    .await?;
+                if let Some(worker_id) =
+                    send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
+                        .await?
+                {
+                    free_workers.push(worker_id);
+                }
             }
+            let worker_id = free_workers.pop().unwrap_or(tasks.len());
+            spawn_loader_task(&mut tasks, loader.clone(), input, worker_id);
         }
         while !tasks.is_empty() {
-            send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats).await?;
+            if let Some(worker_id) =
+                send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
+                    .await?
+            {
+                free_workers.push(worker_id);
+            }
         }
         if let Ok(mut stats) = stats.lock() {
             stats.wall_seconds = wall_start.elapsed().as_secs_f64();
@@ -1942,6 +1969,7 @@ fn spawn_loader_task(
     )>,
     loader: AudioLoader,
     input: TranscribeInput,
+    worker_id: usize,
 ) {
     tasks.spawn(async move {
         let start = Instant::now();
@@ -1956,6 +1984,7 @@ fn spawn_loader_task(
         let loader_span = StageSpan::new(start, Instant::now());
         let mut stats = LoaderTaskStats {
             compute_seconds,
+            worker_id,
             ..Default::default()
         };
         let message = match loaded {
@@ -2034,7 +2063,7 @@ async fn send_next_loaded(
     loaded_queue_memory: &LoadedQueueMemoryBudget,
     loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
-) -> Result<()> {
+) -> Result<Option<usize>> {
     let (mut message, task_stats) = match tasks.join_next().await {
         Some(Ok(result)) => result,
         Some(Err(error)) => (
@@ -2052,8 +2081,9 @@ async fn send_next_loaded(
                 ..Default::default()
             },
         ),
-        None => return Ok(()),
+        None => return Ok(None),
     };
+    let worker_id = task_stats.worker_id;
     record_loader_task_stats(stats, &task_stats);
     if let Ok(jobs) = &mut message {
         for job in jobs {
@@ -2068,11 +2098,12 @@ async fn send_next_loaded(
                     .send(Ok(job))
                     .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
             }
-            Ok(())
+            Ok(Some(worker_id))
         }
         Err(outcome) => loader_to_vad_tx
             .send(Err(outcome))
-            .map_err(|_| anyhow::anyhow!("loaded channel closed")),
+            .map_err(|_| anyhow::anyhow!("loaded channel closed"))
+            .map(|_| Some(worker_id)),
     }
 }
 
@@ -2090,9 +2121,16 @@ fn spawn_vad_worker(
         let wall_start = Instant::now();
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
+        let mut free_workers = (0..max_in_flight).rev().collect::<Vec<_>>();
         while let Some(message) = loader_to_vad_rx.recv().await {
             match message {
                 Ok(job) => {
+                    if tasks.len() >= max_in_flight {
+                        if let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await {
+                            free_workers.push(worker_id);
+                        }
+                    }
+                    let worker_id = free_workers.pop().unwrap_or(tasks.len());
                     spawn_vad_task(
                         &mut tasks,
                         Arc::clone(&offline),
@@ -2101,10 +2139,8 @@ fn spawn_vad_worker(
                         vad_to_asr_queue_memory.clone(),
                         pending_requests.clone(),
                         job,
+                        worker_id,
                     );
-                    if tasks.len() >= max_in_flight {
-                        let _ = send_next_vad_task(&mut tasks, &stats).await;
-                    }
                 }
                 Err(outcome) => {
                     let mut send_wait_seconds = 0.0;
@@ -2119,7 +2155,9 @@ fn spawn_vad_worker(
             }
         }
         while !tasks.is_empty() {
-            let _ = send_next_vad_task(&mut tasks, &stats).await;
+            if let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await {
+                free_workers.push(worker_id);
+            }
         }
         if let Ok(mut stats) = stats.lock() {
             stats.wall_seconds = wall_start.elapsed().as_secs_f64();
@@ -2136,6 +2174,7 @@ fn spawn_vad_task(
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     job: LoadedJob,
+    worker_id: usize,
 ) {
     tasks.spawn(async move {
         let stage_start = Instant::now();
@@ -2268,6 +2307,7 @@ fn spawn_vad_task(
                     audio_seconds,
                     speech_seconds,
                     compute_seconds,
+                    worker_id,
                     send_wait_seconds,
                     wall_seconds: stage_start.elapsed().as_secs_f64(),
                     ..Default::default()
@@ -2315,6 +2355,7 @@ fn spawn_vad_task(
                     failed: 1,
                     audio_seconds,
                     compute_seconds,
+                    worker_id,
                     send_wait_seconds,
                     wall_seconds: stage_start.elapsed().as_secs_f64(),
                     ..Default::default()
@@ -2362,6 +2403,7 @@ fn spawn_vad_task(
                     failed: 1,
                     audio_seconds,
                     compute_seconds,
+                    worker_id,
                     send_wait_seconds,
                     wall_seconds: stage_start.elapsed().as_secs_f64(),
                     ..Default::default()
@@ -2392,13 +2434,14 @@ async fn send_vad_to_asr_timed(
 async fn send_next_vad_task(
     tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
     stats: &Arc<Mutex<VadStageStats>>,
-) -> Result<(), TranscribeItemOutcome> {
+) -> Result<Option<usize>, TranscribeItemOutcome> {
     match tasks.join_next().await {
         Some(Ok(result)) => {
+            let worker_id = result.as_ref().ok().map(|task_stats| task_stats.worker_id);
             if let Ok(task_stats) = &result {
                 record_vad_task_stats(stats, task_stats);
             }
-            result.map(|_| ())
+            result.map(|_| worker_id)
         }
         Some(Err(error)) => Err(TranscribeItemOutcome {
             index: 0,
@@ -2409,7 +2452,7 @@ async fn send_next_vad_task(
             spans: TranscribeItemSpans::default(),
             bad_component: Some("vad"),
         }),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
@@ -4702,6 +4745,10 @@ fn record_loader_task_stats(stats: &Arc<Mutex<LoaderStageStats>>, task: &LoaderT
         stats.failed += task.failed;
         stats.audio_seconds += task.audio_seconds;
         stats.compute_seconds += task.compute_seconds;
+        *stats
+            .worker_compute_seconds
+            .entry(task.worker_id)
+            .or_default() += task.compute_seconds;
     }
 }
 
@@ -4714,6 +4761,10 @@ fn record_vad_task_stats(stats: &Arc<Mutex<VadStageStats>>, task: &VadTaskStats)
         stats.audio_seconds += task.audio_seconds;
         stats.speech_seconds += task.speech_seconds;
         stats.compute_seconds += task.compute_seconds;
+        *stats
+            .worker_compute_seconds
+            .entry(task.worker_id)
+            .or_default() += task.compute_seconds;
         stats.send_wait_seconds += task.send_wait_seconds;
         stats.wall_seconds += task.wall_seconds;
     }
@@ -4804,8 +4855,8 @@ fn spawn_component_throughput_reporter(
             let vad = snapshot_vad_stats(&vad_stats);
             let asr = snapshot_asr_stats(&asr_stats);
 
-            let loader_delta = loader_delta(last_loader, loader);
-            let vad_delta = vad_delta(last_vad, vad);
+            let loader_delta = loader_delta(last_loader.clone(), loader.clone());
+            let vad_delta = vad_delta(last_vad.clone(), vad.clone());
             let asr_delta = asr_delta(last_asr, asr);
             last_loader = loader;
             last_vad = vad;
@@ -4845,6 +4896,7 @@ fn snapshot_loader_stats(stats: &Arc<Mutex<LoaderStageStats>>) -> LoaderStageSta
             failed: stats.failed,
             audio_seconds: stats.audio_seconds,
             compute_seconds: stats.compute_seconds,
+            worker_compute_seconds: stats.worker_compute_seconds.clone(),
         })
         .unwrap_or_default()
 }
@@ -4860,6 +4912,7 @@ fn snapshot_vad_stats(stats: &Arc<Mutex<VadStageStats>>) -> VadStageStatsSnapsho
             audio_seconds: stats.audio_seconds,
             speech_seconds: stats.speech_seconds,
             compute_seconds: stats.compute_seconds,
+            worker_compute_seconds: stats.worker_compute_seconds.clone(),
             send_wait_seconds: stats.send_wait_seconds,
         })
         .unwrap_or_default()
@@ -4901,6 +4954,10 @@ fn loader_delta(
         failed: after.failed.saturating_sub(before.failed),
         audio_seconds: (after.audio_seconds - before.audio_seconds).max(0.0),
         compute_seconds: (after.compute_seconds - before.compute_seconds).max(0.0),
+        worker_compute_seconds: worker_compute_delta(
+            before.worker_compute_seconds,
+            after.worker_compute_seconds,
+        ),
     }
 }
 
@@ -4913,8 +4970,29 @@ fn vad_delta(before: VadStageStatsSnapshot, after: VadStageStatsSnapshot) -> Vad
         audio_seconds: (after.audio_seconds - before.audio_seconds).max(0.0),
         speech_seconds: (after.speech_seconds - before.speech_seconds).max(0.0),
         compute_seconds: (after.compute_seconds - before.compute_seconds).max(0.0),
+        worker_compute_seconds: worker_compute_delta(
+            before.worker_compute_seconds,
+            after.worker_compute_seconds,
+        ),
         send_wait_seconds: (after.send_wait_seconds - before.send_wait_seconds).max(0.0),
     }
+}
+
+fn worker_compute_delta(
+    before: HashMap<usize, f64>,
+    after: HashMap<usize, f64>,
+) -> HashMap<usize, f64> {
+    after
+        .into_iter()
+        .map(|(worker_id, seconds)| {
+            let before_seconds = before.get(&worker_id).copied().unwrap_or_default();
+            (worker_id, (seconds - before_seconds).max(0.0))
+        })
+        .collect()
+}
+
+fn max_worker_compute_seconds(worker_seconds: &HashMap<usize, f64>) -> f64 {
+    worker_seconds.values().copied().fold(0.0, f64::max)
 }
 
 fn asr_delta(before: AsrStageStatsSnapshot, after: AsrStageStatsSnapshot) -> AsrStageStatsSnapshot {
@@ -4950,32 +5028,33 @@ fn log_component_throughput_window(
     asr: AsrStageStatsSnapshot,
 ) {
     let decode_audio = asr.decode_audio_seconds;
+    let loader_elapsed = max_worker_compute_seconds(&loader.worker_compute_seconds);
+    let vad_elapsed = max_worker_compute_seconds(&vad.worker_compute_seconds);
     let table = render_titled_table(
         format!("Service {service_id} Perf | window={window_seconds:.1}s"),
-        ["stage", "count", "audio", "worker", "speed", "detail"],
+        ["stage", "count", "audio", "elapsed", "speed", "detail"],
         [
             vec![
                 "load".to_string(),
                 format!("job={}", loader.jobs),
                 format_seconds(loader.audio_seconds),
-                format_seconds(loader.compute_seconds),
-                format_speed(loader.audio_seconds, loader.compute_seconds),
+                format_seconds(loader_elapsed),
+                format_speed(loader.audio_seconds, loader_elapsed),
                 format!("bad={}", loader.failed),
             ],
             vec![
                 "vad".to_string(),
                 format!("job={}", vad.jobs),
                 format_seconds(vad.audio_seconds),
-                format_seconds(vad.compute_seconds),
-                format_speed(vad.audio_seconds, vad.compute_seconds),
+                format_seconds(vad_elapsed),
+                format_speed(vad.audio_seconds, vad_elapsed),
                 format!(
-                    "speech={} speech_ratio={} seg={} bad={} no_speech={} send_wait={}",
+                    "speech={} ratio={} seg={} bad={} no_speech={}",
                     format_seconds(vad.speech_seconds),
                     format_percent(vad.speech_seconds, vad.audio_seconds),
                     vad.segments,
                     vad.failed,
-                    vad.no_speech,
-                    format_seconds(vad.send_wait_seconds)
+                    vad.no_speech
                 ),
             ],
             vec![

@@ -92,40 +92,7 @@ fn should_use_paged_attention(device: &Device, _batch: usize) -> bool {
 }
 
 fn argmax_token_id(logits: &Tensor) -> Result<u32> {
-    #[cfg(feature = "metal-paged-attn")]
-    if logits.device().is_metal()
-        && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none()
-        && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
-    {
-        return Ok(vasr_quant::argmax_token_id(logits)?);
-    }
-
     Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
-}
-
-#[cfg(feature = "metal-paged-attn")]
-fn metal_argmax_scratch_for_device(device: &Device) -> Option<vasr_quant::MetalArgmaxScratch> {
-    if device.is_metal() && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none() {
-        Some(vasr_quant::MetalArgmaxScratch::new())
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "metal-paged-attn")]
-fn argmax_token_id_with_scratch(
-    logits: &Tensor,
-    scratch: Option<&mut vasr_quant::MetalArgmaxScratch>,
-) -> Result<u32> {
-    if let Some(scratch) = scratch {
-        if logits.device().is_metal()
-            && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none()
-            && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
-        {
-            return Ok(scratch.argmax_token_id(logits)?);
-        }
-    }
-    argmax_token_id(logits)
 }
 
 #[cfg(feature = "timing")]
@@ -489,8 +456,6 @@ pub fn greedy_generate_cached(
         Some(Tensor::ones((1usize, 1usize), DType::U32, device)?)
     };
     let mut attention_mask_total = attention_mask_t;
-    #[cfg(feature = "metal-paged-attn")]
-    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
     let _linear_decode_guard = set_linear_is_prefill(false);
 
     for step in 0..max_new_tokens {
@@ -533,9 +498,6 @@ pub fn greedy_generate_cached(
         };
         next_id = {
             let step_logits = logits_new.i((0usize, 0usize))?;
-            #[cfg(feature = "metal-paged-attn")]
-            let next = argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?;
-            #[cfg(not(feature = "metal-paged-attn"))]
             let next = argmax_token_id(&step_logits)?;
             next
         };
@@ -943,8 +905,6 @@ fn greedy_generate_cached_batch_impl(
     let mut decode_forward_us = 0u64;
     #[cfg(feature = "timing")]
     let mut decode_argmax_us = 0u64;
-    #[cfg(feature = "metal-paged-attn")]
-    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
     let mut decode_active_slots_by_step: Vec<(usize, usize)> = Vec::new();
     let mut decode_finished_slots_by_step: BTreeMap<usize, usize> = BTreeMap::new();
     let _linear_decode_guard = set_linear_is_prefill(false);
@@ -1038,16 +998,7 @@ fn greedy_generate_cached_batch_impl(
         let start_argmax = std::time::Instant::now();
         let next = if batch == 1 {
             let step_logits = logits_new.i((0usize, 0usize))?;
-            let next = {
-                #[cfg(feature = "metal-paged-attn")]
-                {
-                    argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?
-                }
-                #[cfg(not(feature = "metal-paged-attn"))]
-                {
-                    argmax_token_id(&step_logits)?
-                }
-            };
+            let next = argmax_token_id(&step_logits)?;
             vec![next]
         } else {
             argmax_token_ids_from_logits(&logits_new.squeeze(1)?, batch)?
@@ -1213,18 +1164,9 @@ fn greedy_generate_paged(
             &input_metadata,
         )?
     };
-    #[cfg(feature = "metal-paged-attn")]
-    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
     let mut next_id = {
         let last_logits = logits.i((0usize, seq_len.saturating_sub(1)))?;
-        #[cfg(feature = "metal-paged-attn")]
-        {
-            argmax_token_id_with_scratch(&last_logits, metal_argmax_scratch.as_mut())?
-        }
-        #[cfg(not(feature = "metal-paged-attn"))]
-        {
-            argmax_token_id(&last_logits)?
-        }
+        argmax_token_id(&last_logits)?
     };
 
     #[cfg(feature = "timing")]
@@ -1331,16 +1273,7 @@ fn greedy_generate_paged(
         #[cfg(feature = "timing")]
         let start_argmax = std::time::Instant::now();
         let step_logits = logits_new.i((0usize, 0usize))?;
-        next_id = {
-            #[cfg(feature = "metal-paged-attn")]
-            {
-                argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?
-            }
-            #[cfg(not(feature = "metal-paged-attn"))]
-            {
-                argmax_token_id(&step_logits)?
-            }
-        };
+        next_id = argmax_token_id(&step_logits)?;
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
             t.decode_argmax_us = t

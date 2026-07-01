@@ -1,5 +1,7 @@
 //! PagedAttention KV cache, block manager, and CUDA decode graph helpers.
 
+#[cfg(all(feature = "cuda-paged-attn", target_family = "unix"))]
+mod cuda;
 #[cfg(feature = "cuda-graph")]
 pub mod cuda_graph;
 pub mod decode_forward;
@@ -22,15 +24,20 @@ pub use cuda_graph::{
     CUDA_DECODE_GRAPH_CONTEXT_TOKENS, CUDA_DECODE_GRAPH_MAX_BATCH, DecodeGraphOutputKind,
 };
 
-#[cfg(feature = "paged-attn")]
-pub use mistralrs_paged_attn;
+#[cfg(all(feature = "cuda-paged-attn", target_family = "unix"))]
+pub use cuda::{gather_kv_cache, paged_attention, reshape_and_cache};
+#[cfg(all(
+    feature = "metal-paged-attn",
+    not(all(feature = "cuda-paged-attn", target_family = "unix"))
+))]
+pub use metal::paged::{gather_kv_cache, paged_attention, reshape_and_cache};
 
 #[cfg(all(feature = "cuda-paged-attn", target_family = "unix"))]
 pub fn reserve_paged_attention_v2_workspace(
     device: &candle_core::Device,
     bytes: usize,
 ) -> candle_core::Result<()> {
-    mistralrs_paged_attn::reserve_paged_attention_v2_workspace(device, bytes)
+    cuda::reserve_paged_attention_v2_workspace(device, bytes)
 }
 
 #[cfg(not(all(feature = "cuda-paged-attn", target_family = "unix")))]

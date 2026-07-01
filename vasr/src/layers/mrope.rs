@@ -2,11 +2,6 @@
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 
-/// Whether to use the mistralrs Metal/CUDA rotary kernel for seq_len==1 decode.
-fn use_accelerated_rotary(device: &Device) -> bool {
-    device.is_metal() || device.is_cuda()
-}
-
 /// Multimodal rotary embedding generator for 3D positions.
 ///
 /// `position_ids` is shaped `(3, batch, seq_len)` where the leading dimension
@@ -133,8 +128,6 @@ fn compute_default_inv_freq(head_dim: usize, rope_theta: f64, device: &Device) -
 
 /// Apply multimodal rotary position embedding for 3D positions.
 ///
-/// For seq_len==1 on Metal/CUDA devices, uses the accelerated `mistralrs_quant::rotary`
-/// kernel instead of the Candle fallback.
 fn apply_multimodal_rotary_pos_emb(
     q: &Tensor,
     k: &Tensor,
@@ -144,11 +137,12 @@ fn apply_multimodal_rotary_pos_emb(
     interleaved: bool,
 ) -> Result<(Tensor, Tensor)> {
     // seq_len==1 fast path: only the first modality is needed for decode.
-    // If the accelerator is disabled, keep the same first-modality semantics
-    // instead of falling through to the full 3-modality prefill path.
+    // Keep first-modality semantics instead of falling through to the full
+    // 3-modality prefill path.
     if q.dim(2).unwrap_or(0) == 1 {
-        if use_accelerated_rotary(q.device()) {
-            return apply_multimodal_rotary_pos_emb_seq_one(q, k, cos, sin, interleaved);
+        #[cfg(feature = "cuda")]
+        if q.device().is_cuda() {
+            return apply_multimodal_rotary_pos_emb_seq_one_cuda(q, k, cos, sin, interleaved);
         }
         return apply_rope_batched_generic(q, k, cos, sin);
     }
@@ -160,59 +154,22 @@ fn apply_multimodal_rotary_pos_emb(
     }
 }
 
-/// Seq-len-1 fast path: use the accelerated rotary kernel for single-token decode.
-///
-/// For mRoPE with seq_len==1, only the first (temporal) modality matters.
-/// We extract that slice and feed it to `mistralrs_quant::rotary::apply_rotary_qk`.
-fn apply_multimodal_rotary_pos_emb_seq_one(
+#[cfg(feature = "cuda")]
+fn apply_multimodal_rotary_pos_emb_seq_one_cuda(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
     interleaved: bool,
 ) -> Result<(Tensor, Tensor)> {
-    // cos/sin can be either:
-    //   (3, batch, 1, half_dim)  — full mRoPE from `forward()`
-    //   (batch, 1, half_dim)     — single modality from `build_cache_first_modality()`
-    // Normalize to (batch, half_dim).
     let (cos_first, sin_first) = if cos.rank() == 4 && cos.dim(0)? == 3 {
-        // Full 3-modality: extract first (temporal) modality
-        (
-            cos.i(0)?.squeeze(1)?, // (batch, half_dim)
-            sin.i(0)?.squeeze(1)?, // (batch, half_dim)
-        )
+        (cos.i(0)?.squeeze(1)?, sin.i(0)?.squeeze(1)?)
     } else {
-        // Already single modality: just squeeze the seq dim
-        (
-            cos.squeeze(1)?, // (batch, half_dim)
-            sin.squeeze(1)?, // (batch, half_dim)
-        )
+        (cos.squeeze(1)?, sin.squeeze(1)?)
     };
 
-    // Decode-one uses the first-modality half-dimension RoPE embedding, matching
-    // `apply_rope_batched_generic`/`rotate_half` regardless of the prefill mRoPE
-    // section interleaving layout.
-    let is_neox = true;
     let _ = interleaved;
-
-    #[cfg(any(
-        feature = "metal-paged-attn",
-        feature = "cuda-paged-attn",
-        feature = "cuda-quant"
-    ))]
-    {
-        vasr_quant::apply_rotary_qk(q, k, &cos_first, &sin_first, is_neox)
-    }
-    #[cfg(not(any(
-        feature = "metal-paged-attn",
-        feature = "cuda-paged-attn",
-        feature = "cuda-quant"
-    )))]
-    {
-        // Fallback to Candle-based RoPE for CPU or non-accelerated builds
-        let _ = (cos_first, sin_first, is_neox);
-        apply_rope_batched_generic(q, k, cos, sin)
-    }
+    vasr_quant::apply_rotary_qk(q, k, &cos_first, &sin_first, true)
 }
 
 fn apply_rope_batched_generic(
@@ -487,153 +444,6 @@ mod tests {
         let k_diff = (k_standard - k_one)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(q_diff < 1e-6, "q diff {q_diff}");
         assert!(k_diff < 1e-6, "k diff {k_diff}");
-        Ok(())
-    }
-
-    #[cfg(feature = "metal-paged-attn")]
-    #[test]
-    fn test_metal_accelerated_seq_one_matches_generic() -> anyhow::Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let head_dim = 128usize;
-        let rope = MultimodalRope::new(head_dim, 1024, 10000.0, vec![24, 20, 20], false, &device)?;
-
-        let batch = 3usize;
-        let heads = 4usize;
-        let seq_len = 1usize;
-        let x = candle_core::Tensor::zeros(
-            (batch, 1, seq_len, head_dim),
-            candle_core::DType::F32,
-            &device,
-        )?;
-        let pos = candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
-        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
-        let (cos, sin) = rope.build_cache_first_modality(&x, &position_ids)?;
-
-        let q =
-            candle_core::Tensor::randn(0f32, 0.02f32, (batch, heads, seq_len, head_dim), &device)?;
-        let k =
-            candle_core::Tensor::randn(0f32, 0.02f32, (batch, heads, seq_len, head_dim), &device)?;
-
-        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
-        let (q_accel, k_accel) = vasr_quant::apply_rotary_qk(&q, &k, &cos, &sin, true)?;
-
-        let q_diff = (q_generic - q_accel)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        let k_diff = (k_generic - k_accel)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        assert!(q_diff < 1e-5, "q diff {q_diff}");
-        assert!(k_diff < 1e-5, "k diff {k_diff}");
-        Ok(())
-    }
-
-    #[cfg(feature = "metal-paged-attn")]
-    #[test]
-    fn test_metal_accelerated_seq_one_matches_generic_bf16_gqa() -> anyhow::Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let head_dim = 128usize;
-        let rope = MultimodalRope::new(head_dim, 1024, 10000.0, vec![24, 20, 20], false, &device)?;
-
-        let batch = 3usize;
-        let q_heads = 16usize;
-        let k_heads = 8usize;
-        let seq_len = 1usize;
-        let x = candle_core::Tensor::zeros(
-            (batch, 1, seq_len, head_dim),
-            candle_core::DType::BF16,
-            &device,
-        )?;
-        let pos = candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
-        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
-        let (cos, sin) = rope.build_cache_first_modality(&x, &position_ids)?;
-
-        let q = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, q_heads, seq_len, head_dim),
-            &device,
-        )?
-        .to_dtype(candle_core::DType::BF16)?;
-        let k = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, k_heads, seq_len, head_dim),
-            &device,
-        )?
-        .to_dtype(candle_core::DType::BF16)?;
-
-        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
-        let (q_accel, k_accel) = vasr_quant::apply_rotary_qk(&q, &k, &cos, &sin, true)?;
-
-        let q_diff = (q_generic.to_dtype(candle_core::DType::F32)?
-            - q_accel.to_dtype(candle_core::DType::F32)?)?
-        .abs()?
-        .max_all()?
-        .to_scalar::<f32>()?;
-        let k_diff = (k_generic.to_dtype(candle_core::DType::F32)?
-            - k_accel.to_dtype(candle_core::DType::F32)?)?
-        .abs()?
-        .max_all()?
-        .to_scalar::<f32>()?;
-        assert!(q_diff < 1e-2, "q diff {q_diff}");
-        assert!(k_diff < 1e-2, "k diff {k_diff}");
-        Ok(())
-    }
-
-    #[cfg(feature = "metal-paged-attn")]
-    #[test]
-    fn test_metal_accelerated_seq_one_interleaved_matches_generic() -> anyhow::Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let head_dim = 128usize;
-        let rope = MultimodalRope::new(head_dim, 1024, 10000.0, vec![24, 20, 20], false, &device)?;
-
-        let batch = 2usize;
-        let q_heads = 16usize;
-        let k_heads = 8usize;
-        let seq_len = 1usize;
-        let x = candle_core::Tensor::zeros(
-            (batch, 1, seq_len, head_dim),
-            candle_core::DType::BF16,
-            &device,
-        )?;
-        let pos = candle_core::Tensor::from_vec(vec![70i64, 71], (batch, seq_len), &device)?;
-        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
-        let (cos, sin) = rope.build_cache_first_modality(&x, &position_ids)?;
-
-        let q = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, q_heads, seq_len, head_dim),
-            &device,
-        )?
-        .to_dtype(candle_core::DType::BF16)?;
-        let k = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, k_heads, seq_len, head_dim),
-            &device,
-        )?
-        .to_dtype(candle_core::DType::BF16)?;
-
-        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
-        let (q_accel, k_accel) =
-            super::apply_multimodal_rotary_pos_emb_seq_one(&q, &k, &cos, &sin, true)?;
-
-        let q_diff = (q_generic.to_dtype(candle_core::DType::F32)?
-            - q_accel.to_dtype(candle_core::DType::F32)?)?
-        .abs()?
-        .max_all()?
-        .to_scalar::<f32>()?;
-        let k_diff = (k_generic.to_dtype(candle_core::DType::F32)?
-            - k_accel.to_dtype(candle_core::DType::F32)?)?
-        .abs()?
-        .max_all()?
-        .to_scalar::<f32>()?;
-        assert!(q_diff < 1e-2, "q diff {q_diff}");
-        assert!(k_diff < 1e-2, "k diff {k_diff}");
         Ok(())
     }
 }

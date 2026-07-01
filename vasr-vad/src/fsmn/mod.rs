@@ -142,12 +142,12 @@ impl FsmnVadModel {
         options: &VadOptions,
     ) -> Result<FsmnVadDetection> {
         let mut timing = FsmnVadTiming::default();
-        let pcm_start = Instant::now();
-        let pcm = samples_f32_to_i16(&waveform.samples);
-        timing.add_pcm(pcm_start.elapsed());
 
         let frontend_start = Instant::now();
-        let feats = self.weights.frontend.extract_features_from_pcm(&pcm)?;
+        let feats = self
+            .weights
+            .frontend
+            .extract_features_from_normalized_f32(&waveform.samples)?;
         timing.frontend_seconds += frontend_start.elapsed().as_secs_f64();
 
         let total_frames = feats.shape()[0];
@@ -527,6 +527,7 @@ struct FsmnVadBlock {
     linear: Linear,
     affine: Linear,
     conv_left_weight: Tensor,
+    conv_left_weight_cpu: Option<Vec<f32>>,
 }
 
 impl FsmnVadBlock {
@@ -537,28 +538,113 @@ impl FsmnVadBlock {
             .pp("fsmn_block")
             .pp("conv_left")
             .get((FSMN_VAD_PROJ_DIM, 1, 20, 1), "weight")?;
+        let conv_left_weight_cpu = if conv_left_weight.device().is_cpu() {
+            Some(conv_left_weight.flatten_all()?.to_vec1::<f32>()?)
+        } else {
+            None
+        };
         Ok(Self {
             linear: linear_layer,
             affine,
             conv_left_weight,
+            conv_left_weight_cpu,
         })
     }
 
     fn forward(&self, input: &Tensor, cache: &Tensor) -> Result<(Tensor, Tensor)> {
         let x = self.linear.forward(input)?;
-        let x_per = x.unsqueeze(1)?.permute((0, 3, 2, 1))?;
-        let y_left = Tensor::cat(&[cache, &x_per], 2)?;
-        let y_left_t = y_left.dim(2)?;
-        let new_cache = y_left
-            .narrow(2, y_left_t - FSMN_VAD_CACHE_FRAMES, FSMN_VAD_CACHE_FRAMES)?
-            .contiguous()?
-            .detach();
-        let y_left = fsmn_depthwise_conv_left(&y_left, &self.conv_left_weight)?;
-        let out = x_per.add(&y_left)?;
-        let out = out.permute((0, 3, 2, 1))?.squeeze(1)?;
+        let (out, new_cache) = if let Some(kernel) = &self.conv_left_weight_cpu
+            && x.device().is_cpu()
+            && cache.device().is_cpu()
+        {
+            fsmn_block_memory_cpu(&x, cache, kernel)?
+        } else {
+            let x_per = x.unsqueeze(1)?.permute((0, 3, 2, 1))?;
+            let y_left = Tensor::cat(&[cache, &x_per], 2)?;
+            let y_left_t = y_left.dim(2)?;
+            let new_cache = y_left
+                .narrow(2, y_left_t - FSMN_VAD_CACHE_FRAMES, FSMN_VAD_CACHE_FRAMES)?
+                .contiguous()?
+                .detach();
+            let y_left = fsmn_depthwise_conv_left(
+                &y_left,
+                &self.conv_left_weight,
+                &self.conv_left_weight_cpu,
+            )?;
+            let out = x_per.add(&y_left)?;
+            let out = out.permute((0, 3, 2, 1))?.squeeze(1)?;
+            (out, new_cache)
+        };
         let out = self.affine.forward(&out)?.relu()?;
         Ok((out, new_cache))
     }
+}
+
+fn fsmn_block_memory_cpu(
+    projected: &Tensor,
+    cache: &Tensor,
+    kernel: &[f32],
+) -> Result<(Tensor, Tensor)> {
+    let (batch, frames, channels) = projected.dims3()?;
+    if batch != 1 {
+        bail!("FSMN CPU memory expects batch=1, got {batch}");
+    }
+    if channels != FSMN_VAD_PROJ_DIM {
+        bail!("FSMN CPU memory expects {FSMN_VAD_PROJ_DIM} channels, got {channels}");
+    }
+    if cache.dims() != [1, channels, FSMN_VAD_CACHE_FRAMES, 1] {
+        bail!("unexpected FSMN cache shape: {:?}", cache.dims());
+    }
+    if kernel.len() != channels * FSMN_VAD_CONV_KERNEL {
+        bail!("unexpected FSMN kernel length: {}", kernel.len());
+    }
+
+    let input = projected.flatten_all()?.to_vec1::<f32>()?;
+    let cache = cache.flatten_all()?.to_vec1::<f32>()?;
+    let mut out = vec![0f32; frames * channels];
+    let mut new_cache = vec![0f32; channels * FSMN_VAD_CACHE_FRAMES];
+
+    out.copy_from_slice(&input);
+    for frame in 0..frames {
+        let out_base = frame * channels;
+        for k in 0..FSMN_VAD_CONV_KERNEL {
+            let source_time = frame + k;
+            if source_time < FSMN_VAD_CACHE_FRAMES {
+                for channel in 0..channels {
+                    out[out_base + channel] += cache[channel * FSMN_VAD_CACHE_FRAMES + source_time]
+                        * kernel[channel * FSMN_VAD_CONV_KERNEL + k];
+                }
+            } else {
+                let input_base = (source_time - FSMN_VAD_CACHE_FRAMES) * channels;
+                for channel in 0..channels {
+                    out[out_base + channel] +=
+                        input[input_base + channel] * kernel[channel * FSMN_VAD_CONV_KERNEL + k];
+                }
+            }
+        }
+    }
+
+    let combined_len = FSMN_VAD_CACHE_FRAMES + frames;
+    for channel in 0..channels {
+        let cache_base = channel * FSMN_VAD_CACHE_FRAMES;
+        for j in 0..FSMN_VAD_CACHE_FRAMES {
+            let source_time = combined_len - FSMN_VAD_CACHE_FRAMES + j;
+            new_cache[cache_base + j] = if source_time < FSMN_VAD_CACHE_FRAMES {
+                cache[cache_base + source_time]
+            } else {
+                input[(source_time - FSMN_VAD_CACHE_FRAMES) * channels + channel]
+            };
+        }
+    }
+
+    Ok((
+        Tensor::from_vec(out, (1usize, frames, channels), projected.device())?,
+        Tensor::from_vec(
+            new_cache,
+            (1usize, channels, FSMN_VAD_CACHE_FRAMES, 1usize),
+            projected.device(),
+        )?,
+    ))
 }
 
 const FSMN_VAD_CONV_KERNEL: usize = 20;
@@ -566,7 +652,11 @@ const FSMN_VAD_CONV_KERNEL: usize = 20;
 /// Depthwise time convolution for FSMN left context.
 /// Implemented with `unfold` + multiply-accumulate so CPU and CUDA stay numerically aligned.
 /// Candle's grouped `conv2d` is incorrect on CUDA for this kernel shape.
-fn fsmn_depthwise_conv_left(y_left: &Tensor, weight: &Tensor) -> Result<Tensor> {
+fn fsmn_depthwise_conv_left(
+    y_left: &Tensor,
+    weight: &Tensor,
+    weight_cpu: &Option<Vec<f32>>,
+) -> Result<Tensor> {
     let (batch, channels, time, width) = y_left.dims4()?;
     if batch != 1 {
         bail!("FSMN depthwise conv expects batch=1, got {batch}");
@@ -588,10 +678,46 @@ fn fsmn_depthwise_conv_left(y_left: &Tensor, weight: &Tensor) -> Result<Tensor> 
         bail!("unexpected FSMN conv weight shape: {weight_dims:?}");
     }
 
+    if y_left.device().is_cpu()
+        && let Some(weight_cpu) = weight_cpu
+    {
+        return fsmn_depthwise_conv_left_cpu(y_left, weight_cpu, channels, time);
+    }
+
     let windows = y_left.unfold(2, FSMN_VAD_CONV_KERNEL, 1)?;
     let kernel = weight.reshape((1, channels, 1, 1, FSMN_VAD_CONV_KERNEL))?;
     let out = windows.broadcast_mul(&kernel)?.sum_keepdim(4)?.squeeze(4)?;
     Ok(out)
+}
+
+fn fsmn_depthwise_conv_left_cpu(
+    y_left: &Tensor,
+    kernel: &[f32],
+    channels: usize,
+    time: usize,
+) -> Result<Tensor> {
+    let input = y_left.flatten_all()?.to_vec1::<f32>()?;
+    let out_time = time - FSMN_VAD_CONV_KERNEL + 1;
+    let mut out = vec![0f32; channels * out_time];
+
+    for channel in 0..channels {
+        let input_base = channel * time;
+        let kernel_base = channel * FSMN_VAD_CONV_KERNEL;
+        let out_base = channel * out_time;
+        for t in 0..out_time {
+            let mut sum = 0f32;
+            for k in 0..FSMN_VAD_CONV_KERNEL {
+                sum += input[input_base + t + k] * kernel[kernel_base + k];
+            }
+            out[out_base + t] = sum;
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        out,
+        (1usize, channels, out_time, 1usize),
+        y_left.device(),
+    )?)
 }
 
 pub struct FsmnVadSession {
@@ -988,6 +1114,16 @@ impl WavFrontend {
         let waveform = samples
             .iter()
             .map(|&sample| f32::from(sample))
+            .collect::<Vec<_>>();
+        let fbank = self.compute_fbank_features(&waveform)?;
+        let lfr = self.apply_lfr(&fbank);
+        Ok(self.apply_cmvn(&lfr))
+    }
+
+    fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<Array2<f32>> {
+        let waveform = samples
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
             .collect::<Vec<_>>();
         let fbank = self.compute_fbank_features(&waveform)?;
         let lfr = self.apply_lfr(&fbank);

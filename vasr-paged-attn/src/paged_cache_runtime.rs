@@ -904,7 +904,7 @@ impl PagedCacheRuntime {
             });
         }
         let mut captured = 0usize;
-        // Capture the widest graph first. mistralrs paged-attn v2 uses a
+        // Capture the widest graph first. Paged-attn v2 uses a
         // process-global workspace that grows with batch size; growing it after
         // a smaller graph has been captured would invalidate the pointer stored
         // in that CUDA graph.

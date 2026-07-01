@@ -429,7 +429,7 @@ msgpack waveform_cache    -> AudioSource::Waveform
 周期 PERF 表由 serve 参数控制：
 
 ```text
---no-profile              关闭周期 profile 表；默认开启。
+--profile                 开启周期 profile 表；默认关闭。
 --profile-window <secs>   profile 统计窗口，单位秒；默认 5.0。
 ```
 

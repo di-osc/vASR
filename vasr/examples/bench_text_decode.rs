@@ -81,6 +81,7 @@ fn main() -> Result<()> {
             isq,
             #[cfg(feature = "paged-attn")]
             paged_cache: Some(default_paged_cache_config(&device)),
+            ..LoadOptions::default()
         },
     )?;
     let load_ms = start_load.elapsed().as_secs_f64() * 1000.0;

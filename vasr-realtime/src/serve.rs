@@ -213,6 +213,7 @@ fn build_paged_cache_config(
     Ok(PagedCacheConfig {
         block_size: 32,
         memory,
+        ..PagedCacheConfig::default()
     })
 }
 
@@ -276,6 +277,7 @@ fn load_asr_model(
         isq: args.isq.clone(),
         #[cfg(any(feature = "metal", feature = "cuda"))]
         paged_cache: Some(paged_cache_config),
+        ..LoadOptions::default()
     };
 
     tracing::info!(

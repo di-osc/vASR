@@ -1,4 +1,5 @@
 pub mod kernels;
+pub(crate) mod paged;
 pub mod varlen_prefill;
 
 pub use varlen_prefill::{

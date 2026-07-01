@@ -3,7 +3,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 
 #[cfg(feature = "flash-attn")]
-use candle_flash_attn::{flash_attn, flash_attn_varlen};
+use vasr_flash_attn::{flash_attn, flash_attn_varlen};
 
 /// Repeat key/value heads to match the query head count (GQA/MQA).
 ///

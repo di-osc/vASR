@@ -14,6 +14,7 @@ use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
 use crate::model::thinker_text::ThinkerTextModel;
+use crate::utils::progress::Progress;
 
 pub fn get_rope_index(attention_mask: &Tensor) -> Result<(Tensor, Tensor)> {
     let (batch, seq_len) = attention_mask
@@ -144,6 +145,7 @@ impl ThinkerForConditionalGeneration {
         device: &candle_core::Device,
         use_flash_attn: bool,
         isq: Option<&str>,
+        progress: &Progress,
     ) -> Result<Self> {
         let audio_token_id = cfg
             .audio_token_id
@@ -183,6 +185,7 @@ impl ThinkerForConditionalGeneration {
             vb.pp("audio_tower"),
             audio_use_flash_attn,
             isq,
+            progress,
         )?;
         let text_model = ThinkerTextModel::load(
             &cfg.text_config,
@@ -190,6 +193,7 @@ impl ThinkerForConditionalGeneration {
             device,
             use_flash_attn,
             isq,
+            progress,
         )?;
 
         let lm_head = if cfg.text_config.tie_word_embeddings {

@@ -1,4 +1,4 @@
-//! Paged KV cache metadata and storage for mistral.rs paged-attention backed decoding.
+//! Paged KV cache metadata and storage for paged-attention backed decoding.
 
 use candle_core::{DType, Device, Result, Tensor};
 

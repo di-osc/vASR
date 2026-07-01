@@ -16,9 +16,10 @@ use crate::config::AudioEncoderConfig;
 use crate::model::cuda_mem_debug::log_cuda_mem;
 use crate::model::isq_linear::{self, IsqLinear};
 use crate::processor::feat_lengths::feat_extract_output_length;
+use crate::utils::progress::{Progress, ProgressEvent};
 
 #[cfg(feature = "flash-attn")]
-use candle_flash_attn::flash_attn_varlen;
+use vasr_flash_attn::flash_attn_varlen;
 
 const LAYER_NORM_EPS: f64 = 1e-5;
 
@@ -387,9 +388,9 @@ impl AudioAttention {
                     );
                 }
                 match hidden_states.dtype() {
-                    DType::F16 | DType::BF16 => {}
+                    DType::BF16 => {}
                     other => {
-                        candle_core::bail!("flash-attn requires dtype f16/bf16, got {other:?}")
+                        candle_core::bail!("vasr-flash-attn requires dtype bf16, got {other:?}")
                     }
                 }
 
@@ -658,6 +659,7 @@ impl AudioTower {
         vb: VarBuilder,
         use_flash_attn: bool,
         isq: Option<&str>,
+        progress: &Progress,
     ) -> Result<Self> {
         let device = vb.device().clone();
 
@@ -691,6 +693,16 @@ impl AudioTower {
             isq_linear::linear_no_bias(conv_out_in, cfg.d_model, vb.pp("conv_out"), isq)?;
 
         let mut layers = Vec::with_capacity(cfg.encoder_layers);
+        let phase = if isq.is_some() {
+            "quantize.audio_layers"
+        } else {
+            "load.audio_layers"
+        };
+        let progress = progress.start(ProgressEvent::layers(
+            "qwen3-asr",
+            phase,
+            cfg.encoder_layers,
+        ));
         for i in 0..cfg.encoder_layers {
             layers.push(AudioEncoderLayer::load(
                 cfg,
@@ -698,7 +710,9 @@ impl AudioTower {
                 use_flash_attn,
                 isq,
             )?);
+            progress.inc(1);
         }
+        progress.finish();
 
         let ln_post = layer_norm(
             cfg.d_model,
@@ -1317,7 +1331,7 @@ mod tests {
             downsample_hidden_size: 2,
         };
         let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
-        let tower = AudioTower::load(&cfg, vb, false, None)?;
+        let tower = AudioTower::load(&cfg, vb, false, None, &Progress::disabled())?;
 
         let batch = 2usize;
         let mel = cfg.num_mel_bins;
@@ -1380,7 +1394,7 @@ mod tests {
             downsample_hidden_size: 2,
         };
         let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
-        let tower = AudioTower::load(&cfg, vb, false, None)?;
+        let tower = AudioTower::load(&cfg, vb, false, None, &Progress::disabled())?;
 
         let batch = 3usize;
         let mel = cfg.num_mel_bins;

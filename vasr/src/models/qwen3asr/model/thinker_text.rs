@@ -12,6 +12,7 @@ use crate::layers::MultimodalRope;
 use crate::model::attention;
 use crate::model::isq_linear::{self, IsqLinear};
 use crate::model::kv_cache::KVCache;
+use crate::utils::progress::{Progress, ProgressEvent};
 
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
@@ -19,7 +20,7 @@ use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
     feature = "paged-attn",
     any(feature = "cuda-paged-attn", feature = "metal-paged-attn")
 ))]
-use vasr_paged_attn::mistralrs_paged_attn;
+use vasr_paged_attn::{gather_kv_cache, paged_attention, reshape_and_cache};
 
 #[cfg(feature = "paged-attn")]
 #[derive(Clone)]
@@ -39,7 +40,7 @@ impl std::fmt::Debug for PagedAttentionHandle {
 use candle_core::{DType, Device};
 
 #[cfg(feature = "flash-attn")]
-use candle_flash_attn::{flash_attn, flash_attn_varlen};
+use vasr_flash_attn::{flash_attn, flash_attn_varlen};
 
 const DEFAULT_MROPE_SECTION: [usize; 3] = [24, 20, 20];
 
@@ -224,7 +225,7 @@ fn run_paged_prefill_attention_fallback(
         .cu_seqlens_kv
         .as_ref()
         .ok_or_else(|| candle_core::Error::Msg("paged metadata missing cu_seqlens_kv".into()))?;
-    let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+    let (k_gathered, v_gathered) = gather_kv_cache(
         key_cache,
         value_cache,
         Some(&paged_attn.k_scale),
@@ -473,15 +474,6 @@ impl Module for ThinkerTextMlp {
                 return self.down_proj.forward(&hidden);
             }
         }
-        #[cfg(feature = "metal-paged-attn")]
-        if matches!(self.hidden_act.as_str(), "silu" | "swish") {
-            if let Some(hidden) =
-                isq_linear::try_fused_afq_silu_gate_up(&self.gate_proj, &self.up_proj, xs)?
-            {
-                return self.down_proj.forward(&hidden);
-            }
-        }
-
         let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
         let gate = match self.hidden_act.as_str() {
@@ -1072,7 +1064,7 @@ impl ThinkerTextAttention {
         .detach();
         #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
         {
-            mistralrs_paged_attn::reshape_and_cache(
+            reshape_and_cache(
                 &k_flat,
                 &v_flat,
                 Some(&paged_attn.k_scale),
@@ -1097,7 +1089,7 @@ impl ThinkerTextAttention {
                     self.num_attention_heads,
                     self.head_dim,
                 ))?)?;
-                mistralrs_paged_attn::paged_attention(
+                paged_attention(
                     &q_flat,
                     Some(&paged_attn.k_scale),
                     Some(&paged_attn.v_scale),
@@ -1288,7 +1280,7 @@ impl ThinkerTextAttention {
         .detach();
         #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
         {
-            mistralrs_paged_attn::reshape_and_cache(
+            reshape_and_cache(
                 &k_flat,
                 &v_flat,
                 Some(&paged_attn.k_scale),
@@ -1308,7 +1300,7 @@ impl ThinkerTextAttention {
         let cu_kv = input_metadata.cu_seqlens_kv.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("packed prefill missing cu_seqlens_kv".into())
         })?;
-        let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+        let (k_gathered, v_gathered) = gather_kv_cache(
             key_cache,
             value_cache,
             Some(&paged_attn.k_scale),
@@ -1500,10 +1492,21 @@ impl ThinkerTextModel {
         device: &candle_core::Device,
         use_flash_attn: bool,
         isq: Option<&str>,
+        progress: &Progress,
     ) -> Result<Self> {
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let phase = if isq.is_some() {
+            "quantize.text_layers"
+        } else {
+            "load.text_layers"
+        };
+        let progress = progress.start(ProgressEvent::layers(
+            "qwen3-asr",
+            phase,
+            cfg.num_hidden_layers,
+        ));
         for idx in 0..cfg.num_hidden_layers {
             layers.push(ThinkerTextDecoderLayer::load(
                 cfg,
@@ -1512,7 +1515,9 @@ impl ThinkerTextModel {
                 use_flash_attn,
                 isq,
             )?);
+            progress.inc(1);
         }
+        progress.finish();
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let rotary_emb = load_multimodal_rope(cfg, device)?;
