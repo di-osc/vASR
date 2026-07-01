@@ -75,7 +75,11 @@ impl FsmnVadModel {
         device: &Device,
     ) -> Result<Self> {
         let model_dir = match path {
-            Some(path) => path.as_ref().to_path_buf(),
+            Some(path) => {
+                let model_dir = path.as_ref().to_path_buf();
+                validate_fsmn_vad_model_dir(&model_dir)?;
+                model_dir
+            }
             None => download_fsmn_vad()?,
         };
         let weights = Arc::new(FsmnVadWeights::load_on_device(&model_dir, device)?);
@@ -1079,15 +1083,60 @@ impl WavFrontend {
 fn download_fsmn_vad() -> Result<PathBuf> {
     let cache = vasr_hub::cache_dir();
     let target = cache.join(FSMN_VAD_REPO);
-    if target.exists() {
+    if fsmn_vad_cache_complete(&target)? {
+        tracing::info!(
+            target: "vasr_vad::fsmn",
+            "FSMN VAD cache is complete at {}, using local files",
+            target.display()
+        );
         return Ok(target);
+    }
+    if target.exists() {
+        tracing::warn!(
+            target: "vasr_vad::fsmn",
+            "FSMN VAD cache is incomplete at {}, downloading/repairing from ModelScope",
+            target.display()
+        );
     }
     block_on_async(vasr_hub::modelscope::download::download_model(
         FSMN_VAD_REPO,
         &cache,
     ))
     .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    validate_fsmn_vad_model_dir(&target)?;
     Ok(target)
+}
+
+fn fsmn_vad_cache_complete(model_dir: &Path) -> Result<bool> {
+    if !model_dir.is_dir() {
+        return Ok(false);
+    }
+    Ok(nonempty_file(&model_dir.join("model.pt"))? && nonempty_file(&model_dir.join("am.mvn"))?)
+}
+
+fn validate_fsmn_vad_model_dir(model_dir: &Path) -> Result<()> {
+    if !model_dir.is_dir() {
+        bail!(
+            "FSMN VAD model path is not a directory: {}",
+            model_dir.display()
+        );
+    }
+    if fsmn_vad_cache_complete(model_dir)? {
+        return Ok(());
+    }
+    bail!(
+        "FSMN VAD model directory is incomplete: {} (expected non-empty model.pt and am.mvn)",
+        model_dir.display()
+    );
+}
+
+fn nonempty_file(path: &Path) -> Result<bool> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    Ok(meta.is_file() && meta.len() > 0)
 }
 
 fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
@@ -1133,6 +1182,53 @@ fn speech_annotation(start: usize, end: usize, status: AnnotationStatus) -> Anno
 mod tests {
     use super::legacy_vad_segmenter::VadSegmenter;
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_dir(prefix: &str) -> Result<PathBuf> {
+        let mut dir = std::env::temp_dir();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("system time before unix epoch: {e:?}"))?;
+        dir.push(format!("{prefix}_{}", now.as_nanos()));
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn write_minimal_fsmn_vad(dir: &Path) -> Result<()> {
+        fs::write(dir.join("model.pt"), [1u8])?;
+        fs::write(dir.join("am.mvn"), [1u8])?;
+        Ok(())
+    }
+
+    #[test]
+    fn fsmn_vad_cache_complete_accepts_required_files() -> Result<()> {
+        let dir = unique_tmp_dir("fsmn_vad_complete")?;
+        write_minimal_fsmn_vad(&dir)?;
+
+        assert!(fsmn_vad_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn fsmn_vad_cache_complete_rejects_missing_cmvn() -> Result<()> {
+        let dir = unique_tmp_dir("fsmn_vad_missing_cmvn")?;
+        fs::write(dir.join("model.pt"), [1u8])?;
+
+        assert!(!fsmn_vad_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn fsmn_vad_cache_complete_rejects_empty_model() -> Result<()> {
+        let dir = unique_tmp_dir("fsmn_vad_empty_model")?;
+        write_minimal_fsmn_vad(&dir)?;
+        fs::write(dir.join("model.pt"), [])?;
+
+        assert!(!fsmn_vad_cache_complete(&dir)?);
+        Ok(())
+    }
 
     #[test]
     fn segmenter_keeps_sessions_independent() {

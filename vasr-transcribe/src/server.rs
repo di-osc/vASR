@@ -173,6 +173,7 @@ async fn handle_transcribe(
     let wall = start.elapsed().as_secs_f64();
     let active = active_spans_seconds(active_spans).min(wall).max(0.0);
     let wait = (wall - active).max(0.0);
+    let elapsed = wall;
     let num_items = data.len();
     let bad = data.iter().filter(|item| item.is_bad).count();
     let performance = InferencePerformance {
@@ -197,7 +198,7 @@ async fn handle_transcribe(
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s active={:>6.3}s idle={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
+        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s active={:>6.3}s queue={:>6.3}s wall={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         "request",
         "DONE",
@@ -207,11 +208,12 @@ async fn handle_transcribe(
         request_stats.mono,
         request_stats.stereo,
         request_stats.channels,
-        performance.batch_wall_seconds,
+        elapsed,
         active,
         wait,
+        performance.batch_wall_seconds,
         performance.total_audio_duration_seconds / active.max(f64::EPSILON),
-        performance.speedup
+        performance.total_audio_duration_seconds / performance.batch_wall_seconds.max(f64::EPSILON)
     );
     #[cfg(feature = "cuda-graph")]
     maybe_trim_cuda_after_request(&request_id, &service);
@@ -953,8 +955,10 @@ pub fn build_transcribe_service(
         .memory_snapshot()
         .cuda_memory
         .map(|memory| memory.used_bytes);
+    let service_id = format!("transcribe-{}", uuid::Uuid::new_v4().simple());
+    pipeline.set_service_id(service_id.clone());
     Arc::new(TranscribeService {
-        service_id: format!("transcribe-{}", uuid::Uuid::new_v4().simple()),
+        service_id,
         pipeline,
         active_requests: AtomicUsize::new(0),
         #[cfg(feature = "cuda-graph")]

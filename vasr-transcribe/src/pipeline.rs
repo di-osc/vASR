@@ -34,6 +34,7 @@ use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 
 use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
+use crate::table::render_titled_table;
 
 const FALLBACK_STAGE_PARALLELISM: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
@@ -43,6 +44,7 @@ const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
 const ASR_ENCODER_BATCH_COLLECT_WAIT_MS: u64 = 10;
 const ASR_PREFILL_COALESCE_WAIT_MS: u64 = 20;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
+const COMPONENT_THROUGHPUT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 fn dynamic_staged_asr_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_DYNAMIC_STAGED_ASR").is_none()
@@ -61,6 +63,8 @@ fn asr_prefill_coalesce_wait() -> Duration {
 pub struct PipelineWorkerOptions {
     pub num_load_workers: usize,
     pub num_vad_workers: usize,
+    pub profile: bool,
+    pub profile_window: Duration,
 }
 
 impl Default for PipelineWorkerOptions {
@@ -68,6 +72,8 @@ impl Default for PipelineWorkerOptions {
         Self {
             num_load_workers: 0,
             num_vad_workers: 0,
+            profile: true,
+            profile_window: COMPONENT_THROUGHPUT_LOG_INTERVAL,
         }
     }
 }
@@ -195,6 +201,49 @@ struct VadTaskStats {
 
 #[derive(Debug, Default)]
 struct AsrStageStats {
+    batches: usize,
+    jobs: usize,
+    segments: usize,
+    audio_seconds: f64,
+    wall_seconds: f64,
+    encode_batches: usize,
+    encode_segments: usize,
+    encode_audio_seconds: f64,
+    encode_seconds: f64,
+    decode_batches: usize,
+    decode_segments: usize,
+    decode_audio_seconds: f64,
+    decode_seconds: f64,
+    audio_encoder_seconds: f64,
+    prefill_seconds: f64,
+    prefill_tokens: usize,
+    decode_model_seconds: f64,
+    decode_tokens: usize,
+    decode_steps: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LoaderStageStatsSnapshot {
+    jobs: usize,
+    failed: usize,
+    audio_seconds: f64,
+    compute_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VadStageStatsSnapshot {
+    jobs: usize,
+    failed: usize,
+    no_speech: usize,
+    segments: usize,
+    audio_seconds: f64,
+    speech_seconds: f64,
+    compute_seconds: f64,
+    send_wait_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AsrStageStatsSnapshot {
     batches: usize,
     jobs: usize,
     segments: usize,
@@ -463,6 +512,7 @@ impl AsyncTranscribePipeline {
 pub struct GlobalAsyncTranscribePipeline {
     submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
     offline: Arc<OfflinePipeline>,
+    service_id: Arc<Mutex<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -535,10 +585,12 @@ struct RequestStageProgress {
     decode: StageProgress,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 struct StageProgress {
     run_span: Option<StageSpan>,
     queue_span: Option<StageSpan>,
+    active_spans: Vec<StageSpan>,
+    queue_spans: Vec<StageSpan>,
     audio_seconds: f64,
 }
 
@@ -569,6 +621,8 @@ impl GlobalAsyncTranscribePipeline {
             asr_options,
             vad_options,
         };
+        let profile = worker_options.profile;
+        let profile_window = worker_options.profile_window;
         let worker_options = worker_options.resolved();
         let loader_parallelism = worker_options.load_workers;
         let vad_parallelism = worker_options.vad_workers;
@@ -593,9 +647,20 @@ impl GlobalAsyncTranscribePipeline {
         let job_routes = Arc::new(Mutex::new(HashMap::new()));
         let next_request_id = Arc::new(AtomicU64::new(1));
         let next_job_id = Arc::new(AtomicU64::new(1));
+        let service_id = Arc::new(Mutex::new(String::from("service")));
         let loader_stats = Arc::new(Mutex::new(LoaderStageStats::default()));
         let vad_stats = Arc::new(Mutex::new(VadStageStats::default()));
         let asr_stats = Arc::new(Mutex::new(AsrStageStats::default()));
+
+        if profile {
+            spawn_component_throughput_reporter(
+                Arc::clone(&service_id),
+                Arc::clone(&loader_stats),
+                Arc::clone(&vad_stats),
+                Arc::clone(&asr_stats),
+                profile_window,
+            );
+        }
 
         spawn_global_submit_worker(
             submit_rx,
@@ -640,7 +705,17 @@ impl GlobalAsyncTranscribePipeline {
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
-        Self { submit_tx, offline }
+        Self {
+            submit_tx,
+            offline,
+            service_id,
+        }
+    }
+
+    pub fn set_service_id(&self, service_id: String) {
+        if let Ok(mut current) = self.service_id.lock() {
+            *current = service_id;
+        }
     }
 
     pub fn memory_snapshot(&self) -> PipelineMemorySnapshot {
@@ -1413,6 +1488,7 @@ fn record_request_load_stage(
             request.stages.load.run_span,
             Some(span),
         ));
+        request.stages.load.active_spans.push(span);
         request.stages.load.audio_seconds += audio_seconds;
         if loaded_jobs > 1 {
             request.stages.vad_remaining += loaded_jobs - 1;
@@ -1420,7 +1496,7 @@ fn record_request_load_stage(
         request.stages.load_remaining = request.stages.load_remaining.saturating_sub(1);
         if request.stages.load_remaining == 0 && !request.stages.load_logged {
             request.stages.load_logged = true;
-            log_request_stage(&request.log_id, "load", request.stages.load);
+            log_request_stage(&request.log_id, "load", &request.stages.load);
         }
     }
 }
@@ -1440,13 +1516,17 @@ fn record_request_vad_stage(
         request.stages.vad.run_span =
             Some(merge_optional_span(request.stages.vad.run_span, Some(span)));
         request.stages.vad.queue_span = merge_stage_span(request.stages.vad.queue_span, queue_span);
+        request.stages.vad.active_spans.push(span);
+        if let Some(queue_span) = queue_span {
+            request.stages.vad.queue_spans.push(queue_span);
+        }
         request.stages.vad.audio_seconds += audio_seconds;
         request.stages.encode_remaining += segment_count;
         request.stages.decode_remaining += segment_count;
         request.stages.vad_remaining = request.stages.vad_remaining.saturating_sub(1);
         if request.stages.vad_remaining == 0 && !request.stages.vad_logged {
             request.stages.vad_logged = true;
-            log_request_stage(&request.log_id, "vad", request.stages.vad);
+            log_request_stage(&request.log_id, "vad", &request.stages.vad);
             log_ready_downstream_stages(request);
         }
     }
@@ -1470,6 +1550,10 @@ fn record_request_encode_stage(
         ));
         request.stages.encode.queue_span =
             merge_stage_span(request.stages.encode.queue_span, queue_span);
+        request.stages.encode.active_spans.push(span);
+        if let Some(queue_span) = queue_span {
+            request.stages.encode.queue_spans.push(queue_span);
+        }
         request.stages.encode.audio_seconds += audio_seconds;
         request.stages.encode_remaining = request
             .stages
@@ -1535,6 +1619,10 @@ fn record_request_decode_stage(
             ));
             request.stages.prefill.queue_span =
                 merge_stage_span(request.stages.prefill.queue_span, prefill_queue_span);
+            request.stages.prefill.active_spans.push(prefill_span);
+            if let Some(prefill_queue_span) = prefill_queue_span {
+                request.stages.prefill.queue_spans.push(prefill_queue_span);
+            }
             request.stages.prefill.audio_seconds += audio_seconds;
         }
         request.stages.decode.run_span = Some(merge_optional_span(
@@ -1543,6 +1631,10 @@ fn record_request_decode_stage(
         ));
         request.stages.decode.queue_span =
             merge_stage_span(request.stages.decode.queue_span, decode_queue_span);
+        request.stages.decode.active_spans.push(decode_span);
+        if let Some(decode_queue_span) = decode_queue_span {
+            request.stages.decode.queue_spans.push(decode_queue_span);
+        }
         request.stages.decode.audio_seconds += audio_seconds;
         request.stages.decode_remaining = request
             .stages
@@ -1561,7 +1653,7 @@ fn log_ready_downstream_stages(request: &mut PendingGlobalRequest) {
         && !request.stages.encode_logged
     {
         request.stages.encode_logged = true;
-        log_request_stage(&request.log_id, "encode", request.stages.encode);
+        log_request_stage(&request.log_id, "encode", &request.stages.encode);
     }
     if request.stages.decode_remaining == 0
         && request.stages.decode.run_span.is_some()
@@ -1569,9 +1661,9 @@ fn log_ready_downstream_stages(request: &mut PendingGlobalRequest) {
     {
         request.stages.decode_logged = true;
         if request.stages.prefill.run_span.is_some() {
-            log_request_stage(&request.log_id, "prefill", request.stages.prefill);
+            log_request_stage(&request.log_id, "prefill", &request.stages.prefill);
         }
-        log_request_stage(&request.log_id, "decode", request.stages.decode);
+        log_request_stage(&request.log_id, "decode", &request.stages.decode);
     }
 }
 
@@ -1631,35 +1723,31 @@ fn record_request_decode_stages(
     }
 }
 
-fn log_request_stage(request_id: &str, stage: &'static str, progress: StageProgress) {
-    let run_seconds = progress
-        .run_span
-        .map(|span| span.end.duration_since(span.start).as_secs_f64())
-        .unwrap_or_default();
-    let queue_seconds = progress
-        .queue_span
-        .map(|span| span.end.duration_since(span.start).as_secs_f64())
-        .unwrap_or_default();
+fn log_request_stage(request_id: &str, stage: &'static str, progress: &StageProgress) {
+    let active_seconds = merged_spans_seconds(progress.active_spans.clone());
+    let queue_seconds = merged_spans_seconds(progress.queue_spans.clone());
     let wall_seconds = merge_stage_span(progress.queue_span, progress.run_span)
         .map(|span| span.end.duration_since(span.start).as_secs_f64())
         .unwrap_or_default();
-    let speed = progress.audio_seconds / run_seconds.max(f64::EPSILON);
-    let e2e_speed = progress.audio_seconds / wall_seconds.max(f64::EPSILON);
+    let elapsed_seconds = active_seconds + queue_seconds;
+    let speed = progress.audio_seconds / active_seconds.max(f64::EPSILON);
+    let e2e_speed = progress.audio_seconds / elapsed_seconds.max(f64::EPSILON);
     let audio_label = match stage {
         "load" | "vad" => "input_audio",
         _ => "speech_audio",
     };
-    tracing::info!(
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
-        "{} {:<7} {:<5} | {}={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | queue={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
+        "{} {:<7} {:<5} | {}={:>6.1}s | elapsed={:>6.3}s | active={:>6.3}s | queue={:>6.3}s wall={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         stage,
         "DONE",
         audio_label,
         progress.audio_seconds,
-        wall_seconds,
-        run_seconds,
+        elapsed_seconds,
+        active_seconds,
         queue_seconds,
+        wall_seconds,
         speed,
         e2e_speed
     );
@@ -2058,11 +2146,9 @@ fn spawn_vad_task(
         let job_channel = job.channel;
         let job_timing = job.timing;
         let mut spans = job.spans;
-        let vad_span = StageSpan::new(stage_start, Instant::now());
         let vad_queue_span = spans
             .loader
-            .and_then(|loader| StageSpan::try_new(loader.end, vad_span.start));
-        spans.vad = Some(vad_span);
+            .and_then(|loader| StageSpan::try_new(loader.end, stage_start));
         let prepared = tokio::task::spawn_blocking({
             let offline = Arc::clone(&offline);
             let waveform = job.waveform.clone();
@@ -2071,6 +2157,8 @@ fn spawn_vad_task(
         })
         .await;
         let compute_seconds = stage_start.elapsed().as_secs_f64();
+        let vad_span = StageSpan::new(stage_start, Instant::now());
+        spans.vad = Some(vad_span);
         timing.vad_seconds += compute_seconds;
         let mut send_wait_seconds = 0.0;
 
@@ -4483,6 +4571,26 @@ fn merge_stage_span(left: Option<StageSpan>, right: Option<StageSpan>) -> Option
     }
 }
 
+fn merged_spans_seconds(mut spans: Vec<StageSpan>) -> f64 {
+    if spans.is_empty() {
+        return 0.0;
+    }
+    spans.sort_by_key(|span| span.start);
+    let mut total = 0.0;
+    let mut current = spans[0];
+    for span in spans.into_iter().skip(1) {
+        if span.start <= current.end {
+            if span.end > current.end {
+                current.end = span.end;
+            }
+        } else {
+            total += current.seconds();
+            current = span;
+        }
+    }
+    total + current.seconds()
+}
+
 fn prefill_span_from_decode(
     decode_span: StageSpan,
     timing: Option<TranscribeItemTiming>,
@@ -4669,6 +4777,266 @@ fn record_asr_batch_stats(
         stats.audio_seconds += audio_seconds;
         stats.wall_seconds += wall_seconds;
     }
+}
+
+fn spawn_component_throughput_reporter(
+    service_id: Arc<Mutex<String>>,
+    loader_stats: Arc<Mutex<LoaderStageStats>>,
+    vad_stats: Arc<Mutex<VadStageStats>>,
+    asr_stats: Arc<Mutex<AsrStageStats>>,
+    interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        let mut last_instant = Instant::now();
+        let mut last_loader = snapshot_loader_stats(&loader_stats);
+        let mut last_vad = snapshot_vad_stats(&vad_stats);
+        let mut last_asr = snapshot_asr_stats(&asr_stats);
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let window_seconds = now.duration_since(last_instant).as_secs_f64();
+            last_instant = now;
+
+            let loader = snapshot_loader_stats(&loader_stats);
+            let vad = snapshot_vad_stats(&vad_stats);
+            let asr = snapshot_asr_stats(&asr_stats);
+
+            let loader_delta = loader_delta(last_loader, loader);
+            let vad_delta = vad_delta(last_vad, vad);
+            let asr_delta = asr_delta(last_asr, asr);
+            last_loader = loader;
+            last_vad = vad;
+            last_asr = asr;
+
+            if loader_delta.jobs == 0
+                && loader_delta.failed == 0
+                && vad_delta.jobs == 0
+                && vad_delta.failed == 0
+                && asr_delta.encode_batches == 0
+                && asr_delta.decode_batches == 0
+                && asr_delta.batches == 0
+            {
+                continue;
+            }
+
+            let service_id = service_id
+                .lock()
+                .map(|service_id| service_id.clone())
+                .unwrap_or_else(|_| String::from("service"));
+            log_component_throughput_window(
+                &service_id,
+                window_seconds,
+                loader_delta,
+                vad_delta,
+                asr_delta,
+            );
+        }
+    })
+}
+
+fn snapshot_loader_stats(stats: &Arc<Mutex<LoaderStageStats>>) -> LoaderStageStatsSnapshot {
+    stats
+        .lock()
+        .map(|stats| LoaderStageStatsSnapshot {
+            jobs: stats.jobs,
+            failed: stats.failed,
+            audio_seconds: stats.audio_seconds,
+            compute_seconds: stats.compute_seconds,
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_vad_stats(stats: &Arc<Mutex<VadStageStats>>) -> VadStageStatsSnapshot {
+    stats
+        .lock()
+        .map(|stats| VadStageStatsSnapshot {
+            jobs: stats.jobs,
+            failed: stats.failed,
+            no_speech: stats.no_speech,
+            segments: stats.segments,
+            audio_seconds: stats.audio_seconds,
+            speech_seconds: stats.speech_seconds,
+            compute_seconds: stats.compute_seconds,
+            send_wait_seconds: stats.send_wait_seconds,
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_asr_stats(stats: &Arc<Mutex<AsrStageStats>>) -> AsrStageStatsSnapshot {
+    stats
+        .lock()
+        .map(|stats| AsrStageStatsSnapshot {
+            batches: stats.batches,
+            jobs: stats.jobs,
+            segments: stats.segments,
+            audio_seconds: stats.audio_seconds,
+            wall_seconds: stats.wall_seconds,
+            encode_batches: stats.encode_batches,
+            encode_segments: stats.encode_segments,
+            encode_audio_seconds: stats.encode_audio_seconds,
+            encode_seconds: stats.encode_seconds,
+            decode_batches: stats.decode_batches,
+            decode_segments: stats.decode_segments,
+            decode_audio_seconds: stats.decode_audio_seconds,
+            decode_seconds: stats.decode_seconds,
+            audio_encoder_seconds: stats.audio_encoder_seconds,
+            prefill_seconds: stats.prefill_seconds,
+            prefill_tokens: stats.prefill_tokens,
+            decode_model_seconds: stats.decode_model_seconds,
+            decode_tokens: stats.decode_tokens,
+            decode_steps: stats.decode_steps,
+        })
+        .unwrap_or_default()
+}
+
+fn loader_delta(
+    before: LoaderStageStatsSnapshot,
+    after: LoaderStageStatsSnapshot,
+) -> LoaderStageStatsSnapshot {
+    LoaderStageStatsSnapshot {
+        jobs: after.jobs.saturating_sub(before.jobs),
+        failed: after.failed.saturating_sub(before.failed),
+        audio_seconds: (after.audio_seconds - before.audio_seconds).max(0.0),
+        compute_seconds: (after.compute_seconds - before.compute_seconds).max(0.0),
+    }
+}
+
+fn vad_delta(before: VadStageStatsSnapshot, after: VadStageStatsSnapshot) -> VadStageStatsSnapshot {
+    VadStageStatsSnapshot {
+        jobs: after.jobs.saturating_sub(before.jobs),
+        failed: after.failed.saturating_sub(before.failed),
+        no_speech: after.no_speech.saturating_sub(before.no_speech),
+        segments: after.segments.saturating_sub(before.segments),
+        audio_seconds: (after.audio_seconds - before.audio_seconds).max(0.0),
+        speech_seconds: (after.speech_seconds - before.speech_seconds).max(0.0),
+        compute_seconds: (after.compute_seconds - before.compute_seconds).max(0.0),
+        send_wait_seconds: (after.send_wait_seconds - before.send_wait_seconds).max(0.0),
+    }
+}
+
+fn asr_delta(before: AsrStageStatsSnapshot, after: AsrStageStatsSnapshot) -> AsrStageStatsSnapshot {
+    AsrStageStatsSnapshot {
+        batches: after.batches.saturating_sub(before.batches),
+        jobs: after.jobs.saturating_sub(before.jobs),
+        segments: after.segments.saturating_sub(before.segments),
+        audio_seconds: (after.audio_seconds - before.audio_seconds).max(0.0),
+        wall_seconds: (after.wall_seconds - before.wall_seconds).max(0.0),
+        encode_batches: after.encode_batches.saturating_sub(before.encode_batches),
+        encode_segments: after.encode_segments.saturating_sub(before.encode_segments),
+        encode_audio_seconds: (after.encode_audio_seconds - before.encode_audio_seconds).max(0.0),
+        encode_seconds: (after.encode_seconds - before.encode_seconds).max(0.0),
+        decode_batches: after.decode_batches.saturating_sub(before.decode_batches),
+        decode_segments: after.decode_segments.saturating_sub(before.decode_segments),
+        decode_audio_seconds: (after.decode_audio_seconds - before.decode_audio_seconds).max(0.0),
+        decode_seconds: (after.decode_seconds - before.decode_seconds).max(0.0),
+        audio_encoder_seconds: (after.audio_encoder_seconds - before.audio_encoder_seconds)
+            .max(0.0),
+        prefill_seconds: (after.prefill_seconds - before.prefill_seconds).max(0.0),
+        prefill_tokens: after.prefill_tokens.saturating_sub(before.prefill_tokens),
+        decode_model_seconds: (after.decode_model_seconds - before.decode_model_seconds).max(0.0),
+        decode_tokens: after.decode_tokens.saturating_sub(before.decode_tokens),
+        decode_steps: after.decode_steps.saturating_sub(before.decode_steps),
+    }
+}
+
+fn log_component_throughput_window(
+    service_id: &str,
+    window_seconds: f64,
+    loader: LoaderStageStatsSnapshot,
+    vad: VadStageStatsSnapshot,
+    asr: AsrStageStatsSnapshot,
+) {
+    let decode_audio = asr.decode_audio_seconds;
+    let table = render_titled_table(
+        format!("Service {service_id} Perf | window={window_seconds:.1}s"),
+        ["stage", "count", "audio", "worker", "speed", "detail"],
+        [
+            vec![
+                "load".to_string(),
+                format!("job={}", loader.jobs),
+                format_seconds(loader.audio_seconds),
+                format_seconds(loader.compute_seconds),
+                format_speed(loader.audio_seconds, loader.compute_seconds),
+                format!("bad={}", loader.failed),
+            ],
+            vec![
+                "vad".to_string(),
+                format!("job={}", vad.jobs),
+                format_seconds(vad.audio_seconds),
+                format_seconds(vad.compute_seconds),
+                format_speed(vad.audio_seconds, vad.compute_seconds),
+                format!(
+                    "speech={} speech_ratio={} seg={} bad={} no_speech={} send_wait={}",
+                    format_seconds(vad.speech_seconds),
+                    format_percent(vad.speech_seconds, vad.audio_seconds),
+                    vad.segments,
+                    vad.failed,
+                    vad.no_speech,
+                    format_seconds(vad.send_wait_seconds)
+                ),
+            ],
+            vec![
+                "encode".to_string(),
+                format!("bat={}", asr.encode_batches),
+                format_seconds(asr.encode_audio_seconds),
+                format_seconds(asr.encode_seconds),
+                format_speed(asr.encode_audio_seconds, asr.encode_seconds),
+                format!("seg={}", asr.encode_segments),
+            ],
+            vec![
+                "prefill".to_string(),
+                format!("bat={}", asr.decode_batches),
+                format_seconds(decode_audio),
+                format_seconds(asr.prefill_seconds),
+                format_speed(decode_audio, asr.prefill_seconds),
+                format!(
+                    "tok={} tok/s={} seg={}",
+                    asr.prefill_tokens,
+                    format_rate(asr.prefill_tokens, asr.prefill_seconds),
+                    asr.decode_segments
+                ),
+            ],
+            vec![
+                "decode".to_string(),
+                format!("bat={}", asr.decode_batches),
+                format_seconds(decode_audio),
+                format_seconds(asr.decode_model_seconds),
+                format_speed(decode_audio, asr.decode_model_seconds),
+                format!(
+                    "tok={} tok/s={} step={} seg={}",
+                    asr.decode_tokens,
+                    format_rate(asr.decode_tokens, asr.decode_model_seconds),
+                    asr.decode_steps,
+                    asr.decode_segments
+                ),
+            ],
+        ],
+    );
+
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "\n{}",
+        table
+    );
+}
+
+fn format_seconds(seconds: f64) -> String {
+    format!("{seconds:.2}s")
+}
+
+fn format_speed(audio_seconds: f64, compute_seconds: f64) -> String {
+    format!("{:.1}x", audio_seconds / compute_seconds.max(f64::EPSILON))
+}
+
+fn format_percent(numerator: f64, denominator: f64) -> String {
+    format!("{:.1}%", numerator * 100.0 / denominator.max(f64::EPSILON))
+}
+
+fn format_rate(count: usize, seconds: f64) -> String {
+    format!("{:.0}", count as f64 / seconds.max(f64::EPSILON))
 }
 
 fn log_loader_summary(stats: &LoaderStageStats) {
@@ -5517,6 +5885,18 @@ mod tests {
         let empty_audio = stage_metrics(0.0, 2.0);
         assert_eq!(empty_audio.speedup, 0.0);
         assert_eq!(empty_audio.rtf, 0.0);
+    }
+
+    #[test]
+    fn merged_spans_seconds_counts_overlaps_once() {
+        let base = Instant::now();
+        let spans = vec![
+            StageSpan::new(base, base + Duration::from_secs(2)),
+            StageSpan::new(base + Duration::from_secs(1), base + Duration::from_secs(3)),
+            StageSpan::new(base + Duration::from_secs(5), base + Duration::from_secs(6)),
+        ];
+
+        assert_eq!(merged_spans_seconds(spans), 4.0);
     }
 
     #[test]

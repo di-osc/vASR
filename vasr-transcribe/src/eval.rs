@@ -6,9 +6,10 @@ use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use clap::{ArgAction, Args, ValueEnum};
-use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use serde::Serialize;
 use vasr_data::{AudioAsset, CerStats, VasrRecord, VasrRecordList, normalize_for_cer};
+
+use crate::table::render_table;
 
 #[derive(Debug, Args)]
 pub struct EvalArgs {
@@ -203,53 +204,45 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
 }
 
 fn print_eval_summary_table(summary: &Summary, items: usize) {
-    let mut table = summary_table();
-    table.add_rows([
-        vec!["items".to_string(), items.to_string()],
-        vec![
-            "elapsed".to_string(),
-            format!("{:.3}s", summary.wall_seconds),
+    let table = render_table(
+        ["metric", "value"],
+        [
+            vec!["items".to_string(), items.to_string()],
+            vec![
+                "elapsed".to_string(),
+                format!("{:.3}s", summary.wall_seconds),
+            ],
+            vec![
+                "audio".to_string(),
+                format!("{:.1}s", summary.audio_seconds),
+            ],
+            vec![
+                "speed".to_string(),
+                format!("{:.1}x", summary.speedup_audio_seconds_per_second),
+            ],
+            vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
+            vec![
+                "cer weighted".to_string(),
+                format!("{:.6}", summary.cer_weighted),
+            ],
+            vec![
+                "cer average".to_string(),
+                format!("{:.6}", summary.cer_average),
+            ],
+            vec![
+                "accuracy".to_string(),
+                format!("{:.2}%", summary.accuracy_percent),
+            ],
+            vec!["correct".to_string(), summary.correct.to_string()],
+            vec!["insertions".to_string(), summary.insertions.to_string()],
+            vec!["deletions".to_string(), summary.deletions.to_string()],
+            vec![
+                "substitutions".to_string(),
+                summary.substitutions.to_string(),
+            ],
         ],
-        vec![
-            "audio".to_string(),
-            format!("{:.1}s", summary.audio_seconds),
-        ],
-        vec![
-            "speed".to_string(),
-            format!("{:.1}x", summary.speedup_audio_seconds_per_second),
-        ],
-        vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
-        vec![
-            "cer weighted".to_string(),
-            format!("{:.6}", summary.cer_weighted),
-        ],
-        vec![
-            "cer average".to_string(),
-            format!("{:.6}", summary.cer_average),
-        ],
-        vec![
-            "accuracy".to_string(),
-            format!("{:.2}%", summary.accuracy_percent),
-        ],
-        vec!["correct".to_string(), summary.correct.to_string()],
-        vec!["insertions".to_string(), summary.insertions.to_string()],
-        vec!["deletions".to_string(), summary.deletions.to_string()],
-        vec![
-            "substitutions".to_string(),
-            summary.substitutions.to_string(),
-        ],
-    ]);
+    );
     println!("\n{table}\n");
-}
-
-fn summary_table() -> Table {
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["metric", "value"]);
-    table
 }
 
 fn format_mono(mono: Option<bool>) -> &'static str {

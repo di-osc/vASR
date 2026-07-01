@@ -6,6 +6,7 @@ pub mod run;
 mod runtime;
 pub mod serve;
 pub mod server;
+mod table;
 
 pub use eval::{EvalArgs, run_eval};
 pub use perf::{PerfArgs, run_perf};

@@ -215,9 +215,17 @@ where
 fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     let cache = crate::modelscope_cache_dir();
     let target = cache.join(repo_id);
-    if target.exists() {
+    if qwen3_asr_local_cache_complete(&target)? {
         tracing::info!(
-            "Model `{repo_id}` found at {}, validating cache",
+            "Qwen3-ASR model `{repo_id}` cache is complete at {}, using local files",
+            target.display()
+        );
+        return Ok(target);
+    }
+
+    if target.exists() {
+        tracing::warn!(
+            "Qwen3-ASR model `{repo_id}` cache is incomplete at {}, downloading/repairing from ModelScope",
             target.display()
         );
     } else {
@@ -225,12 +233,15 @@ fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     }
     block_on_async(crate::download::download_model(repo_id, &cache))
         .with_context(|| format!("failed to download model {repo_id:?} from ModelScope"))?;
+    validate_qwen3_asr_local_model_dir(&target)?;
     Ok(target)
 }
 
 fn resolve_model_dir(model_id_or_path: &str) -> Result<PathBuf> {
     let path = Path::new(model_id_or_path);
     if path.exists() {
+        validate_qwen3_asr_local_model_dir(path)
+            .with_context(|| format!("invalid local Qwen3-ASR model directory {path:?}"))?;
         return Ok(path.to_path_buf());
     }
 
@@ -245,6 +256,80 @@ fn load_config_json(model_dir: &Path) -> Result<AsrConfig> {
     let cfg: AsrConfig = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse config.json from {config_path:?}"))?;
     Ok(cfg)
+}
+
+fn qwen3_asr_local_cache_complete(model_dir: &Path) -> Result<bool> {
+    if !model_dir.is_dir() {
+        return Ok(false);
+    }
+
+    let config_path = model_dir.join("config.json");
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    load_config_json(model_dir)?;
+
+    if !qwen3_asr_tokenizer_files_present(model_dir) {
+        return Ok(false);
+    }
+
+    qwen3_asr_weight_files_complete(model_dir)
+}
+
+fn validate_qwen3_asr_local_model_dir(model_dir: &Path) -> Result<()> {
+    if !model_dir.is_dir() {
+        bail!("model path is not a directory: {model_dir:?}");
+    }
+
+    load_config_json(model_dir)?;
+    validate_qwen3_asr_tokenizer_files(model_dir)?;
+    validate_qwen3_asr_weight_files(model_dir)?;
+    Ok(())
+}
+
+fn validate_qwen3_asr_tokenizer_files(model_dir: &Path) -> Result<()> {
+    if qwen3_asr_tokenizer_files_present(model_dir) {
+        return Ok(());
+    }
+    bail!("missing tokenizer files in {model_dir:?}: expected tokenizer.json or vocab.json");
+}
+
+fn qwen3_asr_tokenizer_files_present(model_dir: &Path) -> bool {
+    model_dir.join("tokenizer.json").is_file() || model_dir.join("vocab.json").is_file()
+}
+
+fn validate_qwen3_asr_weight_files(model_dir: &Path) -> Result<()> {
+    if qwen3_asr_weight_files_complete(model_dir)? {
+        return Ok(());
+    }
+    bail!("missing or empty safetensors weights in {model_dir:?}");
+}
+
+fn qwen3_asr_weight_files_complete(model_dir: &Path) -> Result<bool> {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if index_path.is_file() {
+        let shards = shard_filenames_from_index(&index_path)?;
+        for shard in shards {
+            if !nonempty_file(&model_dir.join(shard))? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    nonempty_file(&model_dir.join("model.safetensors"))
+}
+
+fn nonempty_file(path: &Path) -> Result<bool> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat file {path:?}")),
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    Ok(meta.len() > 0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,7 +486,7 @@ fn ensure_weights_files(_model_id_or_path: &str, model_dir: &Path) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{is_isq_linear_tensor, shard_filenames_from_index};
+    use super::{is_isq_linear_tensor, qwen3_asr_local_cache_complete, shard_filenames_from_index};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -414,6 +499,43 @@ mod tests {
         dir.push(format!("{prefix}_{}", now.as_nanos()));
         fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    fn write_minimal_local_model(
+        dir: &std::path::Path,
+        tokenizer: bool,
+        sharded: bool,
+    ) -> anyhow::Result<()> {
+        fs::write(
+            dir.join("config.json"),
+            serde_json::json!({
+                "model_type": "qwen3_asr",
+                "thinker_config": {
+                    "model_type": "qwen3_asr_thinker",
+                    "audio_config": {},
+                    "text_config": {}
+                }
+            })
+            .to_string(),
+        )?;
+        if tokenizer {
+            fs::write(dir.join("tokenizer.json"), "{}")?;
+        }
+        if sharded {
+            fs::write(
+                dir.join("model.safetensors.index.json"),
+                serde_json::json!({
+                    "weight_map": {
+                        "thinker.lm_head.weight": "model-00001-of-00001.safetensors"
+                    }
+                })
+                .to_string(),
+            )?;
+            fs::write(dir.join("model-00001-of-00001.safetensors"), [1u8])?;
+        } else {
+            fs::write(dir.join("model.safetensors"), [1u8])?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -519,6 +641,55 @@ mod tests {
         if got != want {
             anyhow::bail!("unexpected weights paths: got={got:?} want={want:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_asr_local_cache_complete_accepts_single_file_model() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_complete_single")?;
+        write_minimal_local_model(&dir, true, false)?;
+
+        assert!(qwen3_asr_local_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_asr_local_cache_complete_accepts_sharded_model() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_complete_sharded")?;
+        write_minimal_local_model(&dir, true, true)?;
+
+        assert!(qwen3_asr_local_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_asr_local_cache_complete_rejects_missing_tokenizer() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_missing_tokenizer")?;
+        write_minimal_local_model(&dir, false, false)?;
+
+        assert!(!qwen3_asr_local_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_asr_local_cache_complete_rejects_empty_weights() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_empty_weights")?;
+        write_minimal_local_model(&dir, true, false)?;
+        fs::write(dir.join("model.safetensors"), [])?;
+
+        assert!(!qwen3_asr_local_cache_complete(&dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_asr_local_cache_complete_errors_on_invalid_config() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_invalid_config")?;
+        write_minimal_local_model(&dir, true, false)?;
+        fs::write(dir.join("config.json"), "{not-json")?;
+
+        let err = qwen3_asr_local_cache_complete(&dir)
+            .expect_err("invalid config should not be treated as an incomplete cache");
+        assert!(err.to_string().contains("failed to parse config.json"));
         Ok(())
     }
 }

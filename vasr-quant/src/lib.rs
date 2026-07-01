@@ -40,6 +40,8 @@ pub struct Q8FastPathStats {
     pub fused_act_rows: u64,
     pub fused_qkv_calls: u64,
     pub fused_qkv_rows: u64,
+    pub mmq_fused_qkv_calls: u64,
+    pub mmq_fused_qkv_rows: u64,
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -120,6 +122,12 @@ impl Q8FastPathStats {
                 .fused_qkv_calls
                 .saturating_sub(baseline.fused_qkv_calls),
             fused_qkv_rows: self.fused_qkv_rows.saturating_sub(baseline.fused_qkv_rows),
+            mmq_fused_qkv_calls: self
+                .mmq_fused_qkv_calls
+                .saturating_sub(baseline.mmq_fused_qkv_calls),
+            mmq_fused_qkv_rows: self
+                .mmq_fused_qkv_rows
+                .saturating_sub(baseline.mmq_fused_qkv_rows),
         }
     }
 }

@@ -4,12 +4,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args};
-use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
+use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse, table::render_table};
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
@@ -423,71 +422,63 @@ fn progress_bar(total: usize) -> ProgressBar {
 }
 
 fn print_perf_summary_table(summary: &PerfSummary) {
-    let mut table = summary_table();
-    table.add_rows([
-        vec!["items".to_string(), summary.items.to_string()],
-        vec!["bad items".to_string(), summary.bad_items.to_string()],
-        vec!["requests".to_string(), summary.requests.to_string()],
-        vec![
-            "successful".to_string(),
-            summary.successful_requests.to_string(),
+    let table = render_table(
+        ["metric", "value"],
+        [
+            vec!["items".to_string(), summary.items.to_string()],
+            vec!["bad items".to_string(), summary.bad_items.to_string()],
+            vec!["requests".to_string(), summary.requests.to_string()],
+            vec![
+                "successful".to_string(),
+                summary.successful_requests.to_string(),
+            ],
+            vec!["failed".to_string(), summary.failed_requests.to_string()],
+            vec!["batch size".to_string(), summary.batch_size.to_string()],
+            vec!["concurrency".to_string(), summary.concurrency.to_string()],
+            vec![
+                "elapsed".to_string(),
+                format!("{:.3}s", summary.wall_seconds),
+            ],
+            vec![
+                "audio".to_string(),
+                format!("{:.1}s", summary.audio_seconds),
+            ],
+            vec![
+                "speed".to_string(),
+                format!("{:.1}x", summary.audio_seconds_per_second),
+            ],
+            vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
+            vec![
+                "requests/s".to_string(),
+                format!("{:.3}", summary.requests_per_second),
+            ],
+            vec![
+                "items/s".to_string(),
+                format!("{:.3}", summary.items_per_second),
+            ],
+            vec![
+                "latency p50".to_string(),
+                format!("{:.3}s", summary.latency_p50_seconds),
+            ],
+            vec![
+                "latency p90".to_string(),
+                format!("{:.3}s", summary.latency_p90_seconds),
+            ],
+            vec![
+                "latency p95".to_string(),
+                format!("{:.3}s", summary.latency_p95_seconds),
+            ],
+            vec![
+                "latency p99".to_string(),
+                format!("{:.3}s", summary.latency_p99_seconds),
+            ],
+            vec![
+                "latency max".to_string(),
+                format!("{:.3}s", summary.latency_max_seconds),
+            ],
         ],
-        vec!["failed".to_string(), summary.failed_requests.to_string()],
-        vec!["batch size".to_string(), summary.batch_size.to_string()],
-        vec!["concurrency".to_string(), summary.concurrency.to_string()],
-        vec![
-            "elapsed".to_string(),
-            format!("{:.3}s", summary.wall_seconds),
-        ],
-        vec![
-            "audio".to_string(),
-            format!("{:.1}s", summary.audio_seconds),
-        ],
-        vec![
-            "speed".to_string(),
-            format!("{:.1}x", summary.audio_seconds_per_second),
-        ],
-        vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
-        vec![
-            "requests/s".to_string(),
-            format!("{:.3}", summary.requests_per_second),
-        ],
-        vec![
-            "items/s".to_string(),
-            format!("{:.3}", summary.items_per_second),
-        ],
-        vec![
-            "latency p50".to_string(),
-            format!("{:.3}s", summary.latency_p50_seconds),
-        ],
-        vec![
-            "latency p90".to_string(),
-            format!("{:.3}s", summary.latency_p90_seconds),
-        ],
-        vec![
-            "latency p95".to_string(),
-            format!("{:.3}s", summary.latency_p95_seconds),
-        ],
-        vec![
-            "latency p99".to_string(),
-            format!("{:.3}s", summary.latency_p99_seconds),
-        ],
-        vec![
-            "latency max".to_string(),
-            format!("{:.3}s", summary.latency_max_seconds),
-        ],
-    ]);
+    );
     println!("\n{table}\n");
-}
-
-fn summary_table() -> Table {
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["metric", "value"]);
-    table
 }
 
 fn save_report(path: &Path, report: &PerfReport<'_>) -> Result<()> {

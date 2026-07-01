@@ -35,9 +35,9 @@ const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 const KV_BLOCK_SIZE: usize = 32;
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
 const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
-#[cfg(feature = "paged-attn")]
 const DEFAULT_DECODE_TOKENS_PER_SEC: f64 = 4.25;
 const DEFAULT_DECODE_MIN_TOKENS: usize = 128;
+const DEFAULT_PROFILE_WINDOW_SECS: f64 = 5.0;
 #[cfg(feature = "cuda")]
 const DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB: usize = 256;
 #[cfg(feature = "paged-attn")]
@@ -176,6 +176,23 @@ pub struct TranscribePipelineArgs {
     )]
     pub num_vad_workers: usize,
 
+    /// Disable periodic service pipeline performance table.
+    #[arg(
+        long = "no-profile",
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        env = "VASR_NO_PROFILE"
+    )]
+    pub no_profile: bool,
+
+    /// Service pipeline performance table window in seconds.
+    #[arg(
+        long = "profile-window",
+        default_value_t = DEFAULT_PROFILE_WINDOW_SECS,
+        env = "VASR_PROFILE_WINDOW"
+    )]
+    pub profile_window: f64,
+
     #[command(flatten)]
     pub vad: VadCliArgs,
 }
@@ -285,6 +302,9 @@ pub fn build_global_transcribe_pipeline(
 
 pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {
     validate_model_args(&pipeline.model)?;
+    if pipeline.profile_window <= 0.0 || !pipeline.profile_window.is_finite() {
+        bail!("--profile-window must be a positive finite number");
+    }
     validate_vad_args(&pipeline.vad)
 }
 
@@ -332,6 +352,8 @@ fn worker_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> PipelineWo
     PipelineWorkerOptions {
         num_load_workers: pipeline.num_load_workers,
         num_vad_workers: pipeline.num_vad_workers,
+        profile: !pipeline.no_profile,
+        profile_window: std::time::Duration::from_secs_f64(pipeline.profile_window),
     }
 }
 
@@ -367,6 +389,8 @@ mod tests {
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             num_load_workers: 0,
             num_vad_workers: 0,
+            no_profile: false,
+            profile_window: DEFAULT_PROFILE_WINDOW_SECS,
             vad: VadCliArgs {
                 vad_device: "cpu".to_string(),
                 vad_threshold: 0.6,
@@ -976,13 +1000,13 @@ fn load_asr_model_for_pipeline(
         vasr::models::qwen3asr::model::set_q8_prefill_lm_head_mmq_max_logits_bytes(
             max_logits_bytes,
         );
-        tracing::info!(
+        tracing::debug!(
             target: "vasr_transcribe::serve",
-            "Q8 prefill lm_head MMQ path {} | max_logits={}MiB",
+            "q8 prefill lm_head mmq config | enabled={} max_logits={}MiB",
             if args.q8_prefill_lm_head_mmq {
-                "enabled"
+                "true"
             } else {
-                "disabled"
+                "false"
             },
             args.q8_prefill_lm_head_mmq_max_logits_mib,
         );
