@@ -8,7 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse, table::render_table};
+use crate::{
+    AudioInputDto, InferenceData, TranscribeRequest, TranscribeResponse, table::render_table,
+};
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
@@ -53,10 +55,12 @@ pub struct PerfArgs {
 struct PerfRequestResult {
     request_index: usize,
     batch_size: usize,
+    inputs: Vec<AudioInputDto>,
     latency_seconds: f64,
     ok: bool,
     bad_items: usize,
     audio_seconds: f64,
+    data: Vec<InferenceData>,
     error: Option<String>,
 }
 
@@ -288,6 +292,7 @@ async fn run_one_request(
     retries: usize,
 ) -> Result<PerfRequestResult> {
     let batch_size = request.inputs.len();
+    let inputs = request.inputs.clone();
     let mut last_error = None;
     for attempt in 0..retries {
         let start = Instant::now();
@@ -299,13 +304,16 @@ async fn run_one_request(
                     .await
                     .context("failed to decode transcribe response JSON")?;
                 let bad_items = response.data.iter().filter(|item| item.is_bad).count();
+                let audio_seconds = response.inference_performance.total_audio_duration_seconds;
                 return Ok(PerfRequestResult {
                     request_index,
                     batch_size,
+                    inputs,
                     latency_seconds,
                     ok: true,
                     bad_items,
-                    audio_seconds: response.inference_performance.total_audio_duration_seconds,
+                    audio_seconds,
+                    data: response.data,
                     error: None,
                 });
             }
@@ -330,10 +338,12 @@ async fn run_one_request(
     Ok(PerfRequestResult {
         request_index,
         batch_size,
+        inputs,
         latency_seconds: 0.0,
         ok: false,
         bad_items: batch_size,
         audio_seconds: 0.0,
+        data: Vec::new(),
         error: Some(
             last_error
                 .map(|error| error.to_string())

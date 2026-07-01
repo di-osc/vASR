@@ -202,6 +202,7 @@ impl FsmnVadModel {
                 range: TimeRange::new(DurationMs(start), DurationMs(end)),
                 probability: options.threshold,
             })
+            .filter(|segment| segment_duration_ms(segment) >= options.min_speech_ms)
             .collect::<Vec<_>>();
         let segments = self.split_segments_for_asr(waveform, &raw_segments, options)?;
 

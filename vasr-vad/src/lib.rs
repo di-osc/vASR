@@ -1,8 +1,10 @@
 //! Voice activity detection models and traits.
 
+pub mod firered;
 pub mod fsmn;
 pub mod traits;
 
+pub use firered::{FireRedVadDetection, FireRedVadModel, FireRedVadTiming};
 pub use fsmn::{FsmnVadDetection, FsmnVadModel, FsmnVadTiming};
 pub use traits::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
