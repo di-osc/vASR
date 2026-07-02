@@ -7,6 +7,9 @@ mod cuda_build {
         path::{Path, PathBuf},
     };
 
+    const CUTLASS_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
+    const CUTLASS_COMMIT_ENV: &str = "VASR_CUTLASS_COMMIT";
+
     const KERNEL_FILES: &[&str] = &[
         "kernels/flash_api.cu",
         "kernels/flash_fwd_hdim64_bf16_sm80.cu",
@@ -54,6 +57,7 @@ mod cuda_build {
     pub fn build() -> anyhow::Result<()> {
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-env-changed=VASR_FLASH_ATTN_BUILD_DIR");
+        println!("cargo:rerun-if-env-changed={CUTLASS_COMMIT_ENV}");
 
         for kernel_file in KERNEL_FILES {
             println!("cargo:rerun-if-changed={kernel_file}");
@@ -71,27 +75,16 @@ mod cuda_build {
             )
         })?;
 
-        let manifest_dir =
-            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR")?);
-        let workspace_dir = manifest_dir
-            .parent()
-            .context("vasr-flash-attn must live under the workspace root")?;
-        let cutlass_include = workspace_dir.join("cutlass/include");
-        if !cutlass_include.exists() {
-            anyhow::bail!(
-                "missing CUTLASS include dir {}; initialize the cutlass submodule",
-                cutlass_include.display()
-            );
-        }
-
         let header_hash_arg = format!(
             "-DVASR_FLASH_ATTN_HEADER_HASH=0x{:016x}",
             header_hash(Path::new("kernels"))?
         );
+        let cutlass_commit =
+            std::env::var(CUTLASS_COMMIT_ENV).unwrap_or_else(|_| CUTLASS_COMMIT.to_string());
         let builder = KernelBuilder::new()
             .source_files(KERNEL_FILES)
             .out_dir(&build_dir)
-            .include_path(cutlass_include)
+            .with_cutlass(Some(&cutlass_commit))
             .arg("-std=c++17")
             .arg("-O3")
             .arg("-U__CUDA_NO_HALF_OPERATORS__")
