@@ -923,18 +923,9 @@ fn validate_firered_vad_model_dir(model_dir: &Path) -> Result<()> {
 }
 
 fn default_firered_vad_model_dir() -> Result<PathBuf> {
-    let candidates = [
-        vasr_hub::cache_dir().join(FIRERED_VAD_REPO).join("VAD"),
-        PathBuf::from("/workspace/data/models/xukaituo/FireRedVAD/VAD"),
-        PathBuf::from("/workspace/data/models/asr/xukaituo/FireRedVAD/VAD"),
-        PathBuf::from("/workspace/data/models/FireRedTeam/FireRedVAD/VAD"),
-        PathBuf::from("/workspace/data/models/asr/FireRedTeam/FireRedVAD/VAD"),
-    ];
-    if let Some(path) = candidates
-        .into_iter()
-        .find(|path| validate_firered_vad_model_dir(path).is_ok())
-    {
-        return Ok(path);
+    let target = vasr_hub::cache_dir().join(FIRERED_VAD_REPO).join("VAD");
+    if validate_firered_vad_model_dir(&target).is_ok() {
+        return Ok(target);
     }
 
     let cache = vasr_hub::cache_dir();
