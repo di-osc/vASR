@@ -12,6 +12,11 @@ pub struct FsmnVadModel {
     inner: model_vad::FsmnVadModel,
 }
 
+#[derive(Debug, Clone)]
+pub struct FireRedVadModel {
+    inner: model_vad::FireRedVadModel,
+}
+
 impl FsmnVadModel {
     pub fn from_pretrained(path: Option<impl AsRef<Path>>) -> Result<Self> {
         Ok(Self {
@@ -25,6 +30,21 @@ impl FsmnVadModel {
     ) -> Result<Self> {
         Ok(Self {
             inner: model_vad::FsmnVadModel::from_pretrained_on_device(path, device)?,
+        })
+    }
+
+    pub fn model_dir(&self) -> &Path {
+        self.inner.model_dir()
+    }
+}
+
+impl FireRedVadModel {
+    pub fn from_pretrained_on_device(
+        path: Option<impl AsRef<Path>>,
+        device: &Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: model_vad::FireRedVadModel::from_pretrained_on_device(path, device)?,
         })
     }
 
@@ -48,6 +68,19 @@ impl VadModel for FsmnVadModel {
     }
 }
 
+impl VadModel for FireRedVadModel {
+    fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
+        Ok(self
+            .inner
+            .detect(waveform, &model_options(options))
+            .map(model_segments)?)
+    }
+
+    fn new_stream(&self, _options: &VadOptions) -> Result<Box<dyn StreamingVadSession>> {
+        anyhow::bail!("FireRedVAD native implementation currently supports offline VAD only")
+    }
+}
+
 struct FsmnVadStream {
     inner: Box<dyn model_vad::StreamingVadSession>,
 }
@@ -68,6 +101,7 @@ fn model_options(options: &VadOptions) -> model_vad::VadOptions {
         min_speech_ms: options.min_speech_ms,
         min_silence_ms: options.min_silence_ms,
         max_segment_ms: options.max_segment_ms,
+        pad_ms: options.pad_ms,
     }
 }
 

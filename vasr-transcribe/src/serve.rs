@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, ScheduledAsrModel,
-    VadModel, VadOptions, auto_dtype, device_label, resolve_device,
+    AsrModel, AsrOptions, FireRedVadModel, FsmnVadModel, InferenceScheduler, OfflinePipeline,
+    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
@@ -176,23 +176,31 @@ pub struct CommonModelArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct VadCliArgs {
-    /// FSMN VAD device: auto, cpu, cuda.
+    /// VAD model: firered or fsmn.
+    #[arg(long = "vad-model", default_value = "firered", env = "VASR_VAD_MODEL")]
+    pub vad_model: String,
+
+    /// VAD device: auto, cpu, cuda.
     #[arg(long = "vad-device", default_value = "cpu", env = "VASR_VAD_DEVICE")]
     pub vad_device: String,
 
-    /// FSMN VAD speech probability threshold (`speech_noise_thres`).
+    /// VAD speech probability threshold in (0, 1].
     #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
     pub vad_threshold: f32,
 
-    /// Minimum speech duration in milliseconds before a segment is confirmed.
+    /// Minimum speech duration in milliseconds before a segment is confirmed; must be > 0.
     #[arg(long, default_value_t = 250, env = "VASR_VAD_MIN_SPEECH_MS")]
     pub vad_min_speech_ms: u64,
 
-    /// Minimum trailing silence in milliseconds before ending a speech segment.
+    /// Minimum trailing silence in milliseconds before ending a speech segment; must be > 0.
     #[arg(long, default_value_t = 800, env = "VASR_VAD_MIN_SILENCE_MS")]
     pub vad_min_silence_ms: u64,
 
-    /// Maximum offline VAD segment duration in seconds before ASR.
+    /// Symmetric padding in milliseconds added to detected speech segments before ASR; 0 disables padding.
+    #[arg(long = "vad-pad-ms", default_value_t = 0, env = "VASR_VAD_PAD_MS")]
+    pub vad_pad_ms: u64,
+
+    /// Maximum offline VAD segment duration in seconds before ASR; must be finite and > 0.
     #[arg(
         long = "vad-max-segment-sec",
         default_value_t = 30.0,
@@ -364,20 +372,35 @@ fn build_offline_pipeline(
 ) -> Result<Arc<OfflinePipeline>> {
     let vad_load_start = Instant::now();
     let vad_device = resolve_vad_device(vad_args.vad_device.as_str())?;
-    let vad = load_fsmn_vad(&vad_device)?;
+    let vad_model = vad_args.vad_model.trim().to_ascii_lowercase();
+    let (vad, model_dir): (Arc<dyn VadModel>, std::path::PathBuf) = match vad_model.as_str() {
+        "fsmn" => {
+            let vad = load_fsmn_vad(&vad_device)?;
+            let model_dir = vad.model_dir().to_path_buf();
+            (Arc::new(vad) as Arc<dyn VadModel>, model_dir)
+        }
+        "firered" => {
+            let vad = load_firered_vad(&vad_device)?;
+            let model_dir = vad.model_dir().to_path_buf();
+            (Arc::new(vad) as Arc<dyn VadModel>, model_dir)
+        }
+        other => bail!("--vad-model must be fsmn or firered; got {other:?}"),
+    };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "loaded vad | {:.3}s model=fsmn device={}",
+        "loaded vad | {:.3}s model={} device={}",
         vad_load_start.elapsed().as_secs_f64(),
+        vad_model,
         device_label(&vad_device),
     );
     tracing::debug!(
         target: "vasr_transcribe::serve",
-        "FSMN VAD model loaded from `{}`.",
-        vad.model_dir().display()
+        "{} VAD model loaded from `{}`.",
+        vad_model,
+        model_dir.display()
     );
     Ok(Arc::new(OfflinePipeline {
-        vad: Some(Arc::new(vad) as Arc<dyn VadModel>),
+        vad: Some(vad),
         asr,
     }))
 }
@@ -442,10 +465,12 @@ mod tests {
             profile: false,
             profile_window: DEFAULT_PROFILE_WINDOW_SECS,
             vad: VadCliArgs {
+                vad_model: "firered".to_string(),
                 vad_device: "cpu".to_string(),
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 800,
+                vad_pad_ms: 0,
                 vad_max_segment_sec: 30.0,
             },
         }
@@ -575,6 +600,7 @@ fn vad_options_from_args(vad: &VadCliArgs) -> VadOptions {
         min_speech_ms: vad.vad_min_speech_ms,
         min_silence_ms: vad.vad_min_silence_ms,
         max_segment_ms: (vad.vad_max_segment_sec * 1000.0).round() as u64,
+        pad_ms: vad.vad_pad_ms,
     }
 }
 
@@ -1013,12 +1039,16 @@ fn percentage(bytes: usize, total: usize) -> f64 {
 }
 
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
+    match vad.vad_model.trim().to_ascii_lowercase().as_str() {
+        "fsmn" | "firered" => {}
+        other => bail!("--vad-model must be fsmn or firered; got {other:?}"),
+    }
     match vad.vad_device.trim().to_ascii_lowercase().as_str() {
         "auto" | "cpu" | "cuda" | "gpu" => {}
         other => bail!("--vad-device must be auto, cpu, or cuda; got {other:?}"),
     }
-    if !(0.0..=1.0).contains(&vad.vad_threshold) {
-        bail!("--vad-threshold must be between 0.0 and 1.0");
+    if !vad.vad_threshold.is_finite() || vad.vad_threshold <= 0.0 || vad.vad_threshold > 1.0 {
+        bail!("--vad-threshold must be finite and in (0, 1]");
     }
     if vad.vad_min_speech_ms == 0 {
         bail!("--vad-min-speech-ms must be greater than zero");
@@ -1318,6 +1348,10 @@ fn resolve_vad_device(value: &str) -> Result<Device> {
 
 fn load_fsmn_vad(device: &Device) -> Result<FsmnVadModel> {
     FsmnVadModel::from_pretrained_on_device(None::<&std::path::Path>, device)
+}
+
+fn load_firered_vad(device: &Device) -> Result<FireRedVadModel> {
+    FireRedVadModel::from_pretrained_on_device(None::<&std::path::Path>, device)
 }
 
 async fn health() -> Json<serde_json::Value> {

@@ -11,6 +11,8 @@ pub struct VadOptions {
     pub min_silence_ms: u64,
     /// Maximum offline VAD segment duration before ASR slicing.
     pub max_segment_ms: u64,
+    /// Symmetric padding added to detected speech segments before ASR.
+    pub pad_ms: u64,
 }
 
 impl Default for VadOptions {
@@ -20,6 +22,7 @@ impl Default for VadOptions {
             min_speech_ms: 250,
             min_silence_ms: 500,
             max_segment_ms: 30_000,
+            pad_ms: 0,
         }
     }
 }

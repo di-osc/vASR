@@ -143,6 +143,7 @@ fn firered_options() -> VadOptions {
         min_speech_ms: 200,
         min_silence_ms: 200,
         max_segment_ms: 20_000,
+        pad_ms: 0,
     }
 }
 

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use vasr_data::{
-    Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, Timeline, Waveform, normalize_audio_input,
+    Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, TimeRange, Timeline, Waveform,
+    normalize_audio_input,
 };
 
 use crate::runtime::model::{AsrModel, AsrOptions, VadModel, VadOptions, VadSegment};
@@ -72,7 +73,11 @@ impl OfflinePipeline {
             return Ok(VadPreparation::Disabled);
         };
         let vad_waveform = prepare_waveform_for_vad(waveform)?;
-        let segments = vad.detect(&vad_waveform, vad_options)?;
+        let segments = pad_vad_segments(
+            vad.detect(&vad_waveform, vad_options)?,
+            vad_options.pad_ms,
+            waveform.duration_ms().round() as u64,
+        );
         if segments.is_empty() {
             return Ok(VadPreparation::NoSpeech);
         }
@@ -131,6 +136,19 @@ impl OfflinePipeline {
         }
         Ok(annotations)
     }
+}
+
+fn pad_vad_segments(mut segments: Vec<VadSegment>, pad_ms: u64, audio_ms: u64) -> Vec<VadSegment> {
+    if pad_ms == 0 {
+        return segments;
+    }
+    for segment in &mut segments {
+        segment.range = TimeRange::new(
+            DurationMs(segment.range.start.0.saturating_sub(pad_ms)),
+            DurationMs(segment.range.end.0.saturating_add(pad_ms).min(audio_ms)),
+        );
+    }
+    segments
 }
 
 pub fn offset_annotations(annotations: Vec<Annotation>, offset: DurationMs) -> Vec<Annotation> {
@@ -226,6 +244,30 @@ mod tests {
         assert_eq!(prepared.slices[0].sample_rate, 48_000);
         assert_eq!(prepared.slices[0].channels, 2);
         assert_eq!(prepared.slices[0].duration_ms(), 500.0);
+        Ok(())
+    }
+
+    #[test]
+    fn vad_stage_applies_padding_before_slicing() -> Result<()> {
+        let pipeline = OfflinePipeline {
+            vad: Some(Arc::new(RecordingVad::default())),
+            asr: Arc::new(NoopAsr),
+        };
+        let waveform = Waveform::new(vec![0.0; 16_000], 16_000);
+        let prepared = pipeline.prepare_vad_stage(
+            &waveform,
+            &VadOptions {
+                pad_ms: 100,
+                ..VadOptions::default()
+            },
+        )?;
+
+        let VadPreparation::Speech(prepared) = prepared else {
+            panic!("expected speech");
+        };
+        assert_eq!(prepared.segments[0].range.start.0, 0);
+        assert_eq!(prepared.segments[0].range.end.0, 600);
+        assert_eq!(prepared.slices[0].duration_ms(), 600.0);
         Ok(())
     }
 }
