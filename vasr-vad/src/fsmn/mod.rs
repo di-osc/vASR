@@ -7,15 +7,18 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
+use gemm::Parallelism;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use ndarray::{Array1, Array2, s};
+use rayon::prelude::*;
 use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
     TimeRange, Timeline, Waveform,
 };
 
+use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
 mod e2e;
@@ -171,9 +174,9 @@ impl FsmnVadModel {
             let feat_chunk = feats
                 .slice(s![frame_offset..frame_offset + step, ..])
                 .to_owned();
-            let frame_scores = self
-                .weights
-                .forward_frame_scores(&feat_chunk, &mut caches)?;
+            let frame_scores =
+                self.weights
+                    .forward_frame_scores(&feat_chunk, &mut caches, options.num_threads)?;
             let wave_start = frame_offset * FSMN_VAD_FRAME_SHIFT_SAMPLES;
             let wave_end = if is_final {
                 waveform.samples.len()
@@ -415,6 +418,7 @@ struct FsmnVadWeights {
     out_linear1: Linear,
     out_linear2: Linear,
     device: Device,
+    cpu: Option<FsmnCpuWeights>,
 }
 
 impl std::fmt::Debug for FsmnVadWeights {
@@ -453,6 +457,17 @@ impl FsmnVadWeights {
         for i in 0..FSMN_VAD_LAYERS {
             fsmn_blocks.push(FsmnVadBlock::new(encoder_vb.pp("fsmn").pp(i))?);
         }
+        let cpu = if device.is_cpu() {
+            Some(FsmnCpuWeights::from_layers(
+                &in_linear1,
+                &in_linear2,
+                &fsmn_blocks,
+                &out_linear1,
+                &out_linear2,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             frontend,
@@ -462,6 +477,7 @@ impl FsmnVadWeights {
             out_linear1,
             out_linear2,
             device: device.clone(),
+            cpu,
         })
     }
 
@@ -480,6 +496,7 @@ impl FsmnVadWeights {
         &self,
         feats: &Array2<f32>,
         caches: &mut [Tensor],
+        num_threads: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let t = feats.shape()[0];
         let d = feats.shape()[1];
@@ -488,6 +505,11 @@ impl FsmnVadWeights {
         }
         if t == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(cpu) = &self.cpu
+            && self.device.is_cpu()
+        {
+            return cpu.forward_frame_scores(feats, caches, num_threads);
         }
 
         let speech = Tensor::from_vec(
@@ -522,6 +544,277 @@ impl FsmnVadWeights {
             })
             .collect())
     }
+}
+
+struct FsmnCpuWeights {
+    in_linear1: FsmnCpuLinear,
+    in_linear2: FsmnCpuLinear,
+    blocks: Vec<FsmnCpuBlock>,
+    out_linear1: FsmnCpuLinear,
+    out_linear2: FsmnCpuLinear,
+}
+
+struct FsmnCpuBlock {
+    linear: FsmnCpuLinear,
+    affine: FsmnCpuLinear,
+    conv_left_weight: Vec<f32>,
+}
+
+struct FsmnCpuLinear {
+    weight_t: Vec<f32>,
+    bias: Option<Vec<f32>>,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+impl FsmnCpuWeights {
+    fn from_layers(
+        in_linear1: &Linear,
+        in_linear2: &Linear,
+        blocks: &[FsmnVadBlock],
+        out_linear1: &Linear,
+        out_linear2: &Linear,
+    ) -> Result<Self> {
+        Ok(Self {
+            in_linear1: FsmnCpuLinear::from_linear(in_linear1)?,
+            in_linear2: FsmnCpuLinear::from_linear(in_linear2)?,
+            blocks: blocks
+                .iter()
+                .map(FsmnCpuBlock::from_block)
+                .collect::<Result<Vec<_>>>()?,
+            out_linear1: FsmnCpuLinear::from_linear(out_linear1)?,
+            out_linear2: FsmnCpuLinear::from_linear(out_linear2)?,
+        })
+    }
+
+    fn forward_frame_scores(
+        &self,
+        feats: &Array2<f32>,
+        caches: &mut [Tensor],
+        num_threads: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let frames = feats.shape()[0];
+        let mut cpu_caches = tensor_caches_to_cpu(caches)?;
+        let scores = run_with_vad_threads(num_threads, || {
+            self.forward_frame_scores_cpu(feats, &mut cpu_caches)
+        })??;
+        for (cache, cpu_cache) in caches.iter_mut().zip(cpu_caches.into_iter()) {
+            *cache = Tensor::from_vec(
+                cpu_cache,
+                (1usize, FSMN_VAD_PROJ_DIM, FSMN_VAD_CACHE_FRAMES, 1usize),
+                &Device::Cpu,
+            )?;
+        }
+        if scores.len() != frames {
+            bail!(
+                "FSMN CPU fast path returned {} frames for {frames} input frames",
+                scores.len()
+            );
+        }
+        Ok(scores)
+    }
+
+    fn forward_frame_scores_cpu(
+        &self,
+        feats: &Array2<f32>,
+        caches: &mut [Vec<f32>],
+    ) -> Result<Vec<Vec<f32>>> {
+        let frames = feats.shape()[0];
+        let feats = feats
+            .as_slice()
+            .ok_or_else(|| anyhow::anyhow!("FSMN features must be contiguous"))?;
+        let mut x = self.in_linear1.forward(feats, frames, false);
+        x = self.in_linear2.forward(&x, frames, true);
+        for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
+            x = block.forward(x, frames, cache)?;
+        }
+        x = self.out_linear1.forward(&x, frames, false);
+        x = self.out_linear2.forward(&x, frames, false);
+        Ok(softmax_rows(&x, frames, self.out_linear2.out_dim))
+    }
+}
+
+impl FsmnCpuBlock {
+    fn from_block(block: &FsmnVadBlock) -> Result<Self> {
+        let conv_left_weight = block
+            .conv_left_weight_cpu
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("FSMN CPU block missing conv weights"))?;
+        Ok(Self {
+            linear: FsmnCpuLinear::from_linear(&block.linear)?,
+            affine: FsmnCpuLinear::from_linear(&block.affine)?,
+            conv_left_weight,
+        })
+    }
+
+    fn forward(&self, input: Vec<f32>, frames: usize, cache: &mut Vec<f32>) -> Result<Vec<f32>> {
+        let projected = self.linear.forward(&input, frames, false);
+        let memory = fsmn_block_memory_vec(&projected, cache, &self.conv_left_weight, frames)?;
+        Ok(self.affine.forward(&memory, frames, true))
+    }
+}
+
+impl FsmnCpuLinear {
+    fn from_linear(linear: &Linear) -> Result<Self> {
+        let dims = linear.weight().dims();
+        if dims.len() != 2 {
+            bail!("FSMN VAD linear weight must be 2D, got {dims:?}");
+        }
+        let out_dim = dims[0];
+        let in_dim = dims[1];
+        let weight = linear.weight().flatten_all()?.to_vec1::<f32>()?;
+        let mut weight_t = vec![0.0; weight.len()];
+        for out_idx in 0..out_dim {
+            for in_idx in 0..in_dim {
+                weight_t[in_idx * out_dim + out_idx] = weight[out_idx * in_dim + in_idx];
+            }
+        }
+        Ok(Self {
+            weight_t,
+            bias: linear
+                .bias()
+                .map(|bias| bias.flatten_all()?.to_vec1::<f32>())
+                .transpose()?,
+            in_dim,
+            out_dim,
+        })
+    }
+
+    fn forward(&self, input: &[f32], rows: usize, relu: bool) -> Vec<f32> {
+        let mut out = vec![0.0; rows * self.out_dim];
+        let threads = rayon::current_num_threads();
+        unsafe {
+            gemm::gemm(
+                rows,
+                self.out_dim,
+                self.in_dim,
+                out.as_mut_ptr(),
+                1,
+                self.out_dim as isize,
+                false,
+                input.as_ptr(),
+                1,
+                self.in_dim as isize,
+                self.weight_t.as_ptr(),
+                1,
+                self.out_dim as isize,
+                0.0,
+                1.0,
+                false,
+                false,
+                false,
+                if threads > 1 {
+                    Parallelism::Rayon(threads)
+                } else {
+                    Parallelism::None
+                },
+            );
+        }
+        if let Some(bias) = &self.bias {
+            out.par_chunks_mut(self.out_dim).for_each(|row| {
+                for idx in 0..self.out_dim {
+                    row[idx] += bias[idx];
+                }
+            });
+        }
+        if relu {
+            out.par_iter_mut().for_each(|value| {
+                if *value < 0.0 {
+                    *value = 0.0;
+                }
+            });
+        }
+        out
+    }
+}
+
+fn tensor_caches_to_cpu(caches: &[Tensor]) -> Result<Vec<Vec<f32>>> {
+    caches
+        .iter()
+        .map(|cache| {
+            if cache.dims() != [1, FSMN_VAD_PROJ_DIM, FSMN_VAD_CACHE_FRAMES, 1] {
+                bail!("unexpected FSMN cache shape: {:?}", cache.dims());
+            }
+            Ok(cache.flatten_all()?.to_vec1::<f32>()?)
+        })
+        .collect()
+}
+
+fn fsmn_block_memory_vec(
+    input: &[f32],
+    cache: &mut Vec<f32>,
+    kernel: &[f32],
+    frames: usize,
+) -> Result<Vec<f32>> {
+    if input.len() != frames * FSMN_VAD_PROJ_DIM {
+        bail!("unexpected FSMN input length: {}", input.len());
+    }
+    if cache.len() != FSMN_VAD_PROJ_DIM * FSMN_VAD_CACHE_FRAMES {
+        bail!("unexpected FSMN cache length: {}", cache.len());
+    }
+    if kernel.len() != FSMN_VAD_PROJ_DIM * FSMN_VAD_CONV_KERNEL {
+        bail!("unexpected FSMN kernel length: {}", kernel.len());
+    }
+
+    let channels = FSMN_VAD_PROJ_DIM;
+    let old_cache = cache.clone();
+    let mut out = input.to_vec();
+    out.par_chunks_mut(channels)
+        .enumerate()
+        .for_each(|(frame, dst)| {
+            for k in 0..FSMN_VAD_CONV_KERNEL {
+                let source_time = frame + k;
+                if source_time < FSMN_VAD_CACHE_FRAMES {
+                    for channel in 0..channels {
+                        dst[channel] += old_cache[channel * FSMN_VAD_CACHE_FRAMES + source_time]
+                            * kernel[channel * FSMN_VAD_CONV_KERNEL + k];
+                    }
+                } else {
+                    let input_base = (source_time - FSMN_VAD_CACHE_FRAMES) * channels;
+                    for channel in 0..channels {
+                        dst[channel] += input[input_base + channel]
+                            * kernel[channel * FSMN_VAD_CONV_KERNEL + k];
+                    }
+                }
+            }
+        });
+
+    let combined_len = FSMN_VAD_CACHE_FRAMES + frames;
+    cache
+        .par_chunks_mut(FSMN_VAD_CACHE_FRAMES)
+        .enumerate()
+        .for_each(|(channel, dst)| {
+            for (j, value) in dst.iter_mut().enumerate() {
+                let source_time = combined_len - FSMN_VAD_CACHE_FRAMES + j;
+                *value = if source_time < FSMN_VAD_CACHE_FRAMES {
+                    old_cache[channel * FSMN_VAD_CACHE_FRAMES + source_time]
+                } else {
+                    input[(source_time - FSMN_VAD_CACHE_FRAMES) * channels + channel]
+                };
+            }
+        });
+    Ok(out)
+}
+
+fn softmax_rows(logits: &[f32], rows: usize, cols: usize) -> Vec<Vec<f32>> {
+    (0..rows)
+        .into_par_iter()
+        .map(|row_idx| {
+            let row = &logits[row_idx * cols..(row_idx + 1) * cols];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut out = row
+                .iter()
+                .map(|value| (*value - max).exp())
+                .collect::<Vec<_>>();
+            let sum = out.iter().sum::<f32>();
+            if sum != 0.0 {
+                for value in &mut out {
+                    *value /= sum;
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 struct FsmnVadBlock {
@@ -821,9 +1114,11 @@ impl FsmnVadSession {
         self.timing.frontend_seconds += frontend_start.elapsed().as_secs_f64();
 
         let forward_start = Instant::now();
-        let frame_scores = self
-            .weights
-            .forward_frame_scores(&feats, &mut self.caches)?;
+        let frame_scores = self.weights.forward_frame_scores(
+            &feats,
+            &mut self.caches,
+            self.vad_options.num_threads,
+        )?;
         self.timing.forward_seconds += forward_start.elapsed().as_secs_f64();
         self.timing.chunks += 1;
 
@@ -1524,8 +1819,8 @@ mod tests {
 
         let mut cpu_caches = cpu.zero_caches()?;
         let mut cuda_caches = cuda.zero_caches()?;
-        let cpu_scores = cpu.forward_frame_scores(&feats, &mut cpu_caches)?;
-        let cuda_scores = cuda.forward_frame_scores(&feats, &mut cuda_caches)?;
+        let cpu_scores = cpu.forward_frame_scores(&feats, &mut cpu_caches, 0)?;
+        let cuda_scores = cuda.forward_frame_scores(&feats, &mut cuda_caches, 0)?;
         assert_eq!(cpu_scores.len(), cuda_scores.len());
 
         let mut max_diff = 0.0f32;
@@ -1551,6 +1846,96 @@ mod tests {
         assert!(
             max_diff < 1e-4,
             "CPU/CUDA forward scores diverged: max_diff={max_diff}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_frame_scores_cpu_fast_path_matches_candle_path() -> Result<()> {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let model_dir = [
+            PathBuf::from("/workspace/data/models/asr").join(FSMN_VAD_REPO),
+            workspace.join(".cache/fsmn-vad"),
+            vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+        ]
+        .into_iter()
+        .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
+        let wav = workspace.join("assets/vad_example.wav");
+        let Some(model_dir) = model_dir else {
+            return Ok(());
+        };
+        if !wav.exists() {
+            return Ok(());
+        }
+
+        let mut weights = FsmnVadWeights::load_on_device(&model_dir, &Device::Cpu)?;
+        let waveform = load_pcm16_wav(&wav)?;
+        let feats = weights
+            .frontend
+            .extract_features_from_normalized_f32(&waveform.samples)?;
+
+        let mut fast_caches = weights.zero_caches()?;
+        let fast_scores = weights.forward_frame_scores(&feats, &mut fast_caches, 1)?;
+        let cpu = weights
+            .cpu
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing FSMN CPU fast path weights"))?;
+        let mut candle_caches = weights.zero_caches()?;
+        let candle_scores = weights.forward_frame_scores(&feats, &mut candle_caches, 1)?;
+        weights.cpu = Some(cpu);
+
+        assert_eq!(fast_scores.len(), candle_scores.len());
+        let mut max_diff = 0.0f32;
+        for (fast_frame, candle_frame) in fast_scores.iter().zip(candle_scores.iter()) {
+            assert_eq!(fast_frame.len(), candle_frame.len());
+            for (fast, candle) in fast_frame.iter().zip(candle_frame.iter()) {
+                max_diff = max_diff.max((fast - candle).abs());
+            }
+        }
+        assert!(
+            max_diff < 1e-4,
+            "FSMN CPU fast path diverged from Candle path: max_diff={max_diff}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detect_segments_cpu_fast_path_matches_candle_path() -> Result<()> {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let model_dir = [
+            PathBuf::from("/workspace/data/models/asr").join(FSMN_VAD_REPO),
+            workspace.join(".cache/fsmn-vad"),
+            vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+        ]
+        .into_iter()
+        .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
+        let wav = workspace.join("assets/vad_example.wav");
+        let Some(model_dir) = model_dir else {
+            return Ok(());
+        };
+        if !wav.exists() {
+            return Ok(());
+        }
+
+        let waveform = load_pcm16_wav(&wav)?;
+        let options = VadOptions {
+            num_threads: 1,
+            ..VadOptions::default()
+        };
+        let fast = FsmnVadModel {
+            weights: Arc::new(FsmnVadWeights::load_on_device(&model_dir, &Device::Cpu)?),
+            model_dir: model_dir.clone(),
+        };
+        let mut candle_weights = FsmnVadWeights::load_on_device(&model_dir, &Device::Cpu)?;
+        candle_weights.cpu = None;
+        let candle = FsmnVadModel {
+            weights: Arc::new(candle_weights),
+            model_dir,
+        };
+
+        assert_eq!(
+            fast.detect_with_timing(&waveform, &options)?.segments,
+            candle.detect_with_timing(&waveform, &options)?.segments
         );
         Ok(())
     }

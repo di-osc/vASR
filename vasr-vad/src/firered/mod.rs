@@ -13,6 +13,7 @@ use ndarray::Array2;
 use rayon::prelude::*;
 use vasr_data::{DurationMs, TimeRange, Waveform};
 
+use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
 const FIRERED_SAMPLE_RATE: u32 = 16_000;
@@ -103,7 +104,7 @@ impl FireRedVadModel {
         }
 
         let forward_start = Instant::now();
-        let probs = self.weights.forward_probs(&feats)?;
+        let probs = self.weights.forward_probs(&feats, options.num_threads)?;
         timing.forward_seconds = forward_start.elapsed().as_secs_f64();
 
         let post_start = Instant::now();
@@ -241,14 +242,14 @@ impl FireRedVadWeights {
         })
     }
 
-    fn forward_probs(&self, feats: &Array2<f32>) -> Result<Vec<f32>> {
+    fn forward_probs(&self, feats: &Array2<f32>, num_threads: usize) -> Result<Vec<f32>> {
         let frames = feats.shape()[0];
         let dim = feats.shape()[1];
         if dim != FIRERED_INPUT_DIM {
             bail!("FireRedVAD expects feature dim {FIRERED_INPUT_DIM}, got {dim}");
         }
         if let Some(cpu) = &self.cpu {
-            return cpu.forward_probs(feats);
+            return run_with_vad_threads(num_threads, || cpu.forward_probs(feats))?;
         }
         let x = Tensor::from_vec(
             feats.iter().copied().collect::<Vec<_>>(),
@@ -395,10 +396,7 @@ impl CpuLinear {
 
     fn forward(&self, input: &[f32], rows: usize, relu: bool) -> Vec<f32> {
         let mut out = vec![0.0; rows * self.out_dim];
-        let threads = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_else(|| rayon::current_num_threads());
+        let threads = rayon::current_num_threads();
         unsafe {
             gemm::gemm(
                 rows,

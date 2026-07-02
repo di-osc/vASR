@@ -29,7 +29,7 @@ enum Command {
     Run(RunTranscribeArgs),
     /// Evaluate service CER with a labeled vASR MessagePack dataset.
     Eval(EvalArgs),
-    /// Measure the fastest completion time for a URL set.
+    /// Measure the fastest completion time for an audio source set.
     Perf(PerfArgs),
 }
 

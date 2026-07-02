@@ -19,5 +19,6 @@ mod tests {
         assert_eq!(opts.min_silence_ms, 500);
         assert_eq!(opts.max_segment_ms, 30_000);
         assert_eq!(opts.pad_ms, 0);
+        assert_eq!(opts.num_threads, 0);
     }
 }

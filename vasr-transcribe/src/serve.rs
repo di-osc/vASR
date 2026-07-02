@@ -177,7 +177,7 @@ pub struct CommonModelArgs {
 #[derive(Debug, Clone, Args)]
 pub struct VadCliArgs {
     /// VAD model: firered or fsmn.
-    #[arg(long = "vad-model", default_value = "firered", env = "VASR_VAD_MODEL")]
+    #[arg(long = "vad-model", default_value = "fsmn", env = "VASR_VAD_MODEL")]
     pub vad_model: String,
 
     /// VAD device: auto, cpu, cuda.
@@ -200,6 +200,14 @@ pub struct VadCliArgs {
     #[arg(long = "vad-pad-ms", default_value_t = 0, env = "VASR_VAD_PAD_MS")]
     pub vad_pad_ms: u64,
 
+    /// CPU threads used inside VAD model kernels; 0 uses all available Rayon worker threads.
+    #[arg(
+        long = "vad-num-threads",
+        default_value_t = 0,
+        env = "VASR_VAD_NUM_THREADS"
+    )]
+    pub vad_num_threads: usize,
+
     /// Maximum offline VAD segment duration in seconds before ASR; must be finite and > 0.
     #[arg(
         long = "vad-max-segment-sec",
@@ -221,7 +229,7 @@ pub struct TranscribePipelineArgs {
     /// Number of audio load workers. 0 uses all available CPU cores.
     #[arg(
         long = "num-load-workers",
-        default_value_t = 0,
+        default_value_t = 1,
         env = "VASR_NUM_LOAD_WORKERS"
     )]
     pub num_load_workers: usize,
@@ -229,7 +237,7 @@ pub struct TranscribePipelineArgs {
     /// Number of VAD workers. 0 uses all available CPU cores.
     #[arg(
         long = "num-vad-workers",
-        default_value_t = 0,
+        default_value_t = 1,
         env = "VASR_NUM_VAD_WORKERS"
     )]
     pub num_vad_workers: usize,
@@ -460,17 +468,18 @@ mod tests {
         TranscribePipelineArgs {
             model: default_model_args(),
             max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
-            num_load_workers: 0,
-            num_vad_workers: 0,
+            num_load_workers: 1,
+            num_vad_workers: 1,
             profile: false,
             profile_window: DEFAULT_PROFILE_WINDOW_SECS,
             vad: VadCliArgs {
-                vad_model: "firered".to_string(),
+                vad_model: "fsmn".to_string(),
                 vad_device: "cpu".to_string(),
                 vad_threshold: 0.6,
                 vad_min_speech_ms: 250,
                 vad_min_silence_ms: 800,
                 vad_pad_ms: 0,
+                vad_num_threads: 0,
                 vad_max_segment_sec: 30.0,
             },
         }
@@ -601,6 +610,7 @@ fn vad_options_from_args(vad: &VadCliArgs) -> VadOptions {
         min_silence_ms: vad.vad_min_silence_ms,
         max_segment_ms: (vad.vad_max_segment_sec * 1000.0).round() as u64,
         pad_ms: vad.vad_pad_ms,
+        num_threads: vad.vad_num_threads,
     }
 }
 

@@ -144,6 +144,7 @@ fn firered_options() -> VadOptions {
         min_silence_ms: 200,
         max_segment_ms: 20_000,
         pad_ms: 0,
+        num_threads: 0,
     }
 }
 

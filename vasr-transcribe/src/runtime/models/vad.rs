@@ -102,6 +102,7 @@ fn model_options(options: &VadOptions) -> model_vad::VadOptions {
         min_silence_ms: options.min_silence_ms,
         max_segment_ms: options.max_segment_ms,
         pad_ms: options.pad_ms,
+        num_threads: options.num_threads,
     }
 }
 

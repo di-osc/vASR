@@ -28,7 +28,7 @@ use crate::model::paged_batch_engine::{
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
 #[cfg(feature = "cuda-graph")]
-use vasr_paged_attn::cuda_graph::{cuda_memory_snapshot, cuda_trim_device_mem_pools};
+use vasr_paged_attn::cuda_graph::cuda_memory_snapshot;
 use vasr_paged_attn::{PagedCacheRuntime, SharedPagedCacheRuntime};
 
 #[cfg(feature = "timing")]
@@ -80,57 +80,6 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
             mem.free as f64 / (1024.0 * 1024.0 * 1024.0),
             mem.total as f64 / (1024.0 * 1024.0 * 1024.0),
         );
-    }
-    let _ = device;
-}
-
-fn maybe_trim_cuda_after_prefill(device: &Device, allocated_kv_blocks: usize) {
-    if std::env::var_os("VASR_TRIM_CUDA_MEMPOOL_AFTER_PREFILL").is_none() {
-        return;
-    }
-    let min_blocks = std::env::var("VASR_TRIM_CUDA_PREFILL_MIN_BLOCKS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    if allocated_kv_blocks < min_blocks {
-        return;
-    }
-    #[cfg(feature = "cuda-graph")]
-    cuda_trim_device_mem_pools(device);
-    let _ = device;
-}
-
-fn maybe_trim_cuda_before_prefill(device: &Device, allocated_kv_blocks: usize) {
-    if std::env::var_os("VASR_TRIM_CUDA_MEMPOOL_BEFORE_PREFILL").is_none() {
-        return;
-    }
-    let min_blocks = std::env::var("VASR_TRIM_CUDA_PREFILL_MIN_BLOCKS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    if allocated_kv_blocks < min_blocks {
-        return;
-    }
-    #[cfg(feature = "cuda-graph")]
-    cuda_trim_device_mem_pools(device);
-    let _ = device;
-}
-
-fn maybe_trim_cuda_above_target(device: &Device, env_key: &str) {
-    let Some(target_mib) = std::env::var(env_key)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-    else {
-        return;
-    };
-    #[cfg(feature = "cuda-graph")]
-    {
-        let target_bytes = target_mib.saturating_mul(1024 * 1024);
-        if let Some(mem) = cuda_memory_snapshot(device) {
-            if mem.used() > target_bytes {
-                cuda_trim_device_mem_pools(device);
-            }
-        }
     }
     let _ = device;
 }
@@ -821,7 +770,6 @@ fn decode_running_step_groups(
 
         #[cfg(feature = "timing")]
         let start_decode = std::time::Instant::now();
-        maybe_trim_cuda_above_target(device, "VASR_TRIM_CUDA_MEMPOOL_BEFORE_DECODE_TARGET_MIB");
         paged_batch_decode_slots_at_step_shared(
             thinker,
             device,
@@ -830,7 +778,6 @@ fn decode_running_step_groups(
             step,
             eos_token_ids,
         )?;
-        maybe_trim_cuda_above_target(device, "VASR_TRIM_CUDA_MEMPOOL_AFTER_DECODE_TARGET_MIB");
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
             t.decode_us = t
@@ -1134,7 +1081,6 @@ impl AsrBatchScheduler {
             allocated_kv_blocks,
             free_blocks,
         );
-        maybe_trim_cuda_before_prefill(device, allocated_kv_blocks);
         let wave_audio = concat_prepared_audio(
             audio_features,
             audio_offsets,
@@ -1169,7 +1115,6 @@ impl AsrBatchScheduler {
             }
         };
         drop(wave_audio);
-        maybe_trim_cuda_after_prefill(device, allocated_kv_blocks);
         #[cfg(feature = "timing")]
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
@@ -1276,7 +1221,6 @@ impl AsrBatchScheduler {
             allocated_kv_blocks,
             free_blocks,
         );
-        maybe_trim_cuda_before_prefill(device, allocated_kv_blocks);
         let wave_audio = concat_prepared_audio(
             audio_features,
             audio_offsets,
@@ -1310,7 +1254,6 @@ impl AsrBatchScheduler {
             }
         };
         drop(wave_audio);
-        maybe_trim_cuda_after_prefill(device, allocated_kv_blocks);
         #[cfg(feature = "timing")]
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
@@ -1493,10 +1436,6 @@ impl AsrBatchScheduler {
 
                         #[cfg(feature = "timing")]
                         let start_decode = std::time::Instant::now();
-                        maybe_trim_cuda_above_target(
-                            device,
-                            "VASR_TRIM_CUDA_MEMPOOL_BEFORE_DECODE_TARGET_MIB",
-                        );
                         paged_batch_decode_slots_at_step(
                             thinker,
                             device,
@@ -1505,10 +1444,6 @@ impl AsrBatchScheduler {
                             step,
                             eos_token_ids,
                         )?;
-                        maybe_trim_cuda_above_target(
-                            device,
-                            "VASR_TRIM_CUDA_MEMPOOL_AFTER_DECODE_TARGET_MIB",
-                        );
                         #[cfg(feature = "timing")]
                         if let Some(t) = timings.as_deref_mut() {
                             t.decode_us = t

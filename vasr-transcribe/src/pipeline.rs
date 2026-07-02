@@ -70,8 +70,8 @@ pub struct PipelineWorkerOptions {
 impl Default for PipelineWorkerOptions {
     fn default() -> Self {
         Self {
-            num_load_workers: 0,
-            num_vad_workers: 0,
+            num_load_workers: 1,
+            num_vad_workers: 1,
             profile: false,
             profile_window: COMPONENT_THROUGHPUT_LOG_INTERVAL,
         }
@@ -1741,11 +1741,11 @@ fn record_request_decode_stages(
 
 fn log_request_stage(request_id: &str, stage: &'static str, progress: &StageProgress) {
     let active_seconds = merged_spans_seconds(progress.active_spans.clone());
-    let queue_seconds = merged_spans_seconds(progress.queue_spans.clone());
     let wall_seconds = merge_stage_span(progress.queue_span, progress.run_span)
         .map(|span| span.end.duration_since(span.start).as_secs_f64())
         .unwrap_or_default();
-    let elapsed_seconds = active_seconds + queue_seconds;
+    let queue_seconds = (wall_seconds - active_seconds).max(0.0);
+    let elapsed_seconds = wall_seconds;
     let speed = progress.audio_seconds / active_seconds.max(f64::EPSILON);
     let e2e_speed = progress.audio_seconds / elapsed_seconds.max(f64::EPSILON);
     let audio_label = match stage {
@@ -2530,11 +2530,7 @@ fn spawn_segment_encoder_worker(
                 let offline = Arc::clone(&offline);
                 let asr_options = asr_options.clone();
                 let segments = request.segments;
-                move || {
-                    let result = run_segment_asr_encode(&offline, &segments, &asr_options);
-                    trim_asr_cuda_mempool(offline.asr.as_ref());
-                    result
-                }
+                move || run_segment_asr_encode(&offline, &segments, &asr_options)
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
@@ -2910,12 +2906,7 @@ async fn handle_dynamic_segment_prefilled_session(
     let batch = tokio::task::spawn_blocking({
         let asr = Arc::clone(&offline.asr);
         let asr_options = asr_options.clone();
-        move || {
-            let result =
-                run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options);
-            trim_asr_cuda_mempool(asr.as_ref());
-            result
-        }
+        move || run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options)
     })
     .await
     .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
@@ -3155,7 +3146,6 @@ fn run_segment_asr_prefill_dynamic_worker(
         }
         Ok(())
     })();
-    trim_qwen_cuda_mempool(qwen3);
     if let Err(error) = run {
         let _ = message_tx.send(Err(error));
     }
@@ -3441,11 +3431,7 @@ async fn handle_merged_segment_encoded_batch(
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
             let asr_options = asr_options.clone();
-            move || {
-                let result = run_segment_asr_decode(asr.as_ref(), batch, &asr_options);
-                trim_asr_cuda_mempool(asr.as_ref());
-                result
-            }
+            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
         })
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
@@ -3467,11 +3453,7 @@ async fn handle_merged_segment_encoded_batch(
         Ok(batch) => tokio::task::spawn_blocking({
             let asr = Arc::clone(&offline.asr);
             let asr_options = asr_options.clone();
-            move || {
-                let result = run_segment_asr_decode(asr.as_ref(), batch, &asr_options);
-                trim_asr_cuda_mempool(asr.as_ref());
-                result
-            }
+            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
         })
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
@@ -4014,16 +3996,13 @@ fn run_raw_asr_inference(
             let timing = transcribe_timing_seconds(&timings);
             Ok((qwen_outputs_to_timelines(outputs, waveforms)?, Some(timing)))
         })();
-        trim_qwen_cuda_mempool(qwen3);
         return result;
     }
 
-    let result = offline
+    offline
         .asr
         .transcribe(waveforms, asr_options)
-        .map(|timelines| (timelines, None));
-    trim_asr_cuda_mempool(offline.asr.as_ref());
-    result
+        .map(|timelines| (timelines, None))
 }
 
 fn run_segment_asr_encode(
@@ -4064,31 +4043,6 @@ fn run_segment_asr_encode(
         timings,
     })
 }
-
-#[cfg(feature = "cuda-graph")]
-fn trim_asr_cuda_mempool(asr: &dyn crate::runtime::model::AsrModel) {
-    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_some() {
-        return;
-    }
-    if let Some(qwen3) = asr.as_any().downcast_ref::<Qwen3ASR>() {
-        trim_qwen_cuda_mempool(qwen3);
-    }
-}
-
-#[cfg(not(feature = "cuda-graph"))]
-fn trim_asr_cuda_mempool(_asr: &dyn crate::runtime::model::AsrModel) {}
-
-#[cfg(feature = "cuda-graph")]
-fn trim_qwen_cuda_mempool(qwen3: &Qwen3ASR) {
-    if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_some() {
-        return;
-    }
-    vasr::vasr_quant::trim_cuda_workspaces();
-    vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen3.device());
-}
-
-#[cfg(not(feature = "cuda-graph"))]
-fn trim_qwen_cuda_mempool(_qwen3: &Qwen3ASR) {}
 
 #[cfg(feature = "timing")]
 fn run_segment_asr_decode(

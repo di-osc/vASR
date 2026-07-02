@@ -13,6 +13,8 @@ pub struct VadOptions {
     pub max_segment_ms: u64,
     /// Symmetric padding added to detected speech segments before ASR.
     pub pad_ms: u64,
+    /// CPU worker threads for VAD internals; 0 uses Rayon default.
+    pub num_threads: usize,
 }
 
 impl Default for VadOptions {
@@ -23,6 +25,7 @@ impl Default for VadOptions {
             min_silence_ms: 500,
             max_segment_ms: 30_000,
             pad_ms: 0,
+            num_threads: 0,
         }
     }
 }
@@ -43,4 +46,17 @@ pub trait StreamingVadSession: Send {
     fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<Annotation>>;
 
     fn finish(&mut self) -> Result<Vec<Annotation>>;
+}
+
+pub(crate) fn run_with_vad_threads<T>(num_threads: usize, f: impl FnOnce() -> T + Send) -> Result<T>
+where
+    T: Send,
+{
+    if num_threads == 0 {
+        return Ok(f());
+    }
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()?
+        .install(f))
 }

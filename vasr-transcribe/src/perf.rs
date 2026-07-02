@@ -14,7 +14,7 @@ use crate::{
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
-    /// Text file containing one audio URL per line.
+    /// Text file containing one audio file path or URL per line.
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
@@ -26,9 +26,13 @@ pub struct PerfArgs {
     #[arg(long, default_value_t = 0)]
     concurrency: usize,
 
-    /// Number of audio URLs per request.
+    /// Number of audio sources per request.
     #[arg(long = "batch-size", default_value_t = 1)]
     batch_size: usize,
+
+    /// Process at most this many audio sources, preserving input order.
+    #[arg(long)]
+    limit: Option<usize>,
 
     /// Override mono mode for every request item. Omit to let the server decide.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -104,9 +108,12 @@ struct PerfRunReport {
 
 pub async fn run_perf(args: PerfArgs) -> Result<()> {
     validate_args(&args)?;
-    let urls = read_urls(&args.input)?;
-    if urls.is_empty() {
-        bail!("input contains no URLs: {}", args.input.display());
+    let mut sources = read_audio_sources(&args.input)?;
+    if sources.is_empty() {
+        bail!("input contains no audio sources: {}", args.input.display());
+    }
+    if let Some(limit) = args.limit {
+        sources.truncate(limit);
     }
     let concurrency = resolve_concurrency(args.concurrency);
     let batch_size = args.batch_size;
@@ -120,7 +127,7 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     println!(
         "perf START | input={} items={} server={} batch={} concurrency={} mono={}",
         args.input.display(),
-        urls.len(),
+        sources.len(),
         args.server,
         batch_size,
         concurrency,
@@ -129,7 +136,7 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     let run = run_one_perf_trial(
         &client,
         &args.server,
-        &urls,
+        &sources,
         concurrency,
         batch_size,
         args.mono,
@@ -160,7 +167,7 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
             timestamp,
             input: &args.input.to_string_lossy(),
             service_url: &args.server,
-            items: urls.len(),
+            items: sources.len(),
             summary,
             requests: run.requests,
         },
@@ -182,7 +189,7 @@ fn validate_args(args: &PerfArgs) -> Result<()> {
     Ok(())
 }
 
-fn read_urls(path: &Path) -> Result<Vec<String>> {
+fn read_audio_sources(path: &Path) -> Result<Vec<String>> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(text
@@ -213,13 +220,13 @@ fn format_mono(mono: Option<bool>) -> &'static str {
 async fn run_one_perf_trial(
     client: &reqwest::Client,
     server: &str,
-    urls: &[String],
+    sources: &[String],
     concurrency: usize,
     batch_size: usize,
     mono: Option<bool>,
     retries: usize,
 ) -> Result<PerfRunReport> {
-    let batches = build_batches(urls, batch_size, mono);
+    let batches = build_batches(sources, batch_size, mono);
     let total_requests = batches.len();
     let progress = progress_bar(total_requests);
     let start = Instant::now();
@@ -267,13 +274,18 @@ async fn run_one_perf_trial(
     })
 }
 
-fn build_batches(urls: &[String], batch_size: usize, mono: Option<bool>) -> Vec<TranscribeRequest> {
-    urls.chunks(batch_size)
+fn build_batches(
+    sources: &[String],
+    batch_size: usize,
+    mono: Option<bool>,
+) -> Vec<TranscribeRequest> {
+    sources
+        .chunks(batch_size)
         .map(|chunk| {
             let inputs = chunk
                 .iter()
-                .map(|url| AudioInputDto {
-                    url: Some(url.clone()),
+                .map(|source| AudioInputDto {
+                    url: Some(source.clone()),
                     b64_str: None,
                     mono,
                     hotword: None,
