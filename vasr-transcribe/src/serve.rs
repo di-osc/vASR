@@ -12,14 +12,14 @@ use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::{ArgAction, Args};
 use indicatif::{ProgressBar, ProgressStyle};
+#[cfg(feature = "cuda-graph")]
+use vasr::models::qwen3asr::model::isq_linear::resolve_isq_dtype;
 use vasr::models::qwen3asr::model::isq_linear::{
     isq_layer_counts, isq_quantize_time_us, reset_isq_layer_counts, reset_isq_quantize_time,
-    resolve_isq_display, resolve_isq_dtype,
+    resolve_isq_display,
 };
 #[cfg(any(feature = "metal", feature = "cuda"))]
-use vasr::models::qwen3asr::model::paged_cache_runtime::{
-    PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
-};
+use vasr::models::qwen3asr::model::paged_cache_runtime::{PagedCacheConfig, PagedCacheMemory};
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::processor::{chat_template, feat_lengths, tokenizer::Tokenizer};
 use vasr::models::qwen3asr::{LoadOptions, Qwen3ASR};
@@ -222,10 +222,6 @@ pub struct TranscribePipelineArgs {
     #[command(flatten)]
     pub model: CommonModelArgs,
 
-    /// Maximum total segment audio seconds per ASR micro-batch. Set 0 to disable.
-    #[arg(long, default_value_t = 60.0, env = "VASR_MAX_BATCH_AUDIO_SEC")]
-    pub max_batch_audio_sec: f32,
-
     /// Number of audio load workers. 0 uses all available CPU cores.
     #[arg(
         long = "num-load-workers",
@@ -381,16 +377,14 @@ fn build_offline_pipeline(
     let vad_load_start = Instant::now();
     let vad_device = resolve_vad_device(vad_args.vad_device.as_str())?;
     let vad_model = vad_args.vad_model.trim().to_ascii_lowercase();
-    let (vad, model_dir): (Arc<dyn VadModel>, std::path::PathBuf) = match vad_model.as_str() {
+    let vad: Arc<dyn VadModel> = match vad_model.as_str() {
         "fsmn" => {
             let vad = load_fsmn_vad(&vad_device)?;
-            let model_dir = vad.model_dir().to_path_buf();
-            (Arc::new(vad) as Arc<dyn VadModel>, model_dir)
+            Arc::new(vad) as Arc<dyn VadModel>
         }
         "firered" => {
             let vad = load_firered_vad(&vad_device)?;
-            let model_dir = vad.model_dir().to_path_buf();
-            (Arc::new(vad) as Arc<dyn VadModel>, model_dir)
+            Arc::new(vad) as Arc<dyn VadModel>
         }
         other => bail!("--vad-model must be fsmn or firered; got {other:?}"),
     };
@@ -400,12 +394,6 @@ fn build_offline_pipeline(
         vad_load_start.elapsed().as_secs_f64(),
         vad_model,
         device_label(&vad_device),
-    );
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "{} VAD model loaded from `{}`.",
-        vad_model,
-        model_dir.display()
     );
     Ok(Arc::new(OfflinePipeline {
         vad: Some(vad),
@@ -421,7 +409,6 @@ fn asr_options_from_pipeline(
         language,
         max_new_tokens: 0,
         decode_max_seqs: pipeline.model.max_num_seqs,
-        max_batch_audio_sec: pipeline.max_batch_audio_sec,
         chunk_max_sec: None,
         decode_tokens_per_sec: pipeline.model.decode_tokens_per_sec,
         decode_min_tokens: pipeline.model.decode_min_tokens,
@@ -467,7 +454,6 @@ mod tests {
     fn default_pipeline_args() -> TranscribePipelineArgs {
         TranscribePipelineArgs {
             model: default_model_args(),
-            max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
             num_load_workers: 1,
             num_vad_workers: 1,
             profile: false,
@@ -491,7 +477,6 @@ mod tests {
 
         let opts = asr_options_from_pipeline(&pipeline, None);
         assert_eq!(opts.max_new_tokens, 0);
-        assert_eq!(opts.max_batch_audio_sec, 60.0);
         assert!(opts.context.is_empty());
     }
 
@@ -906,13 +891,6 @@ fn log_model_load_start(args: &CommonModelArgs, device: &Device) -> Result<()> {
             target: "vasr_transcribe::serve",
             "Loading model weights for quantization."
         );
-        tracing::debug!(
-            target: "vasr_transcribe::serve",
-            "ISQ selected is {} (requested={}, backend={}).",
-            isq_display,
-            isq,
-            device_label(device)
-        );
     } else {
         tracing::info!(
             target: "vasr_transcribe::serve",
@@ -921,27 +899,6 @@ fn log_model_load_start(args: &CommonModelArgs, device: &Device) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(any(feature = "metal", feature = "cuda"))]
-fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
-    let sizing = match config.memory {
-        PagedCacheMemory::ContextSize(tokens) => format!("context_tokens={tokens}"),
-        PagedCacheMemory::Blocks(blocks) => format!("blocks={blocks}"),
-        PagedCacheMemory::GpuMemoryFraction {
-            fraction,
-            reserved_bytes: _,
-        } => format!("gpu_memory_fraction={fraction}"),
-    };
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, memory={:.2}GiB.",
-        stats.block_size,
-        stats.num_blocks,
-        stats.free_blocks,
-        stats.max_context_tokens,
-        bytes_to_gib(stats.bytes)
-    );
 }
 
 fn bytes_to_gib(bytes: usize) -> f64 {
@@ -1001,29 +958,16 @@ fn log_model_loaded(
     let isq_layers = isq_layer_counts
         .map(|(audio, text, other)| format!(" isq_layers=audio:{audio},text:{text},other:{other}"))
         .unwrap_or_default();
-    let fixed_bytes = params_bytes
-        .unwrap_or(0)
-        .saturating_add(kv_cache_bytes.unwrap_or(0))
-        .saturating_add(cuda_graph_bytes.unwrap_or(0));
-
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
     if device.is_cuda() {
         if let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device) {
-            let fixed_pct = percentage(fixed_bytes, memory.total);
             let gpu_used = memory.used();
-            let gpu_used_pct = percentage(gpu_used, memory.total);
             tracing::info!(
                 target: "vasr_transcribe::serve",
                 "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
                 bytes_to_gib(gpu_used),
                 bytes_to_gib(memory.total),
                 bytes_to_gib(memory.free),
-            );
-            tracing::debug!(
-                target: "vasr_transcribe::serve",
-                "model memory details | fixed={:.2}GiB/{fixed_pct:.1}% gpu_used={:.2}GiB/{gpu_used_pct:.1}%",
-                bytes_to_gib(fixed_bytes),
-                bytes_to_gib(gpu_used),
             );
             return;
         }
@@ -1033,19 +977,6 @@ fn log_model_loaded(
         target: "vasr_transcribe::serve",
         "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph}"
     );
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "model memory details | fixed={:.2}GiB",
-        bytes_to_gib(fixed_bytes),
-    );
-}
-
-#[cfg(all(feature = "cuda", feature = "paged-attn"))]
-fn percentage(bytes: usize, total: usize) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    bytes as f64 * 100.0 / total as f64
 }
 
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
@@ -1127,16 +1058,6 @@ fn load_asr_model_for_pipeline(
         vasr::models::qwen3asr::model::set_q8_prefill_lm_head_mmq_max_logits_bytes(
             max_logits_bytes,
         );
-        tracing::debug!(
-            target: "vasr_transcribe::serve",
-            "q8 prefill lm_head mmq config | enabled={} max_logits={}MiB",
-            if args.q8_prefill_lm_head_mmq {
-                "true"
-            } else {
-                "false"
-            },
-            args.q8_prefill_lm_head_mmq_max_logits_mib,
-        );
     }
     #[cfg(feature = "paged-attn")]
     let (paged_cache_config, kv_cache_sizing) = build_paged_cache_config(pipeline, language)?;
@@ -1149,14 +1070,6 @@ fn load_asr_model_for_pipeline(
         paged_cache: Some(paged_cache_config),
     };
 
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        cfg!(target_feature = "avx"),
-        cfg!(target_feature = "neon"),
-        cfg!(target_feature = "simd128"),
-        cfg!(target_feature = "f16c")
-    );
     tracing::info!(
         target: "vasr_transcribe::serve",
         "starting service | model={} device={} dtype={}",
@@ -1164,7 +1077,6 @@ fn load_asr_model_for_pipeline(
         device_label(&device),
         dtype_label(dtype),
     );
-    tracing::debug!(target: "vasr_transcribe::serve", "model kind=qwen3-asr adapters=none");
     #[cfg(feature = "paged-attn")]
     log_kv_cache_sizing(&kv_cache_sizing);
     log_model_load_start(args, &device)?;
@@ -1188,7 +1100,6 @@ fn load_asr_model_for_pipeline(
             None
         }
     };
-    log_model_config(&qwen3_asr);
     #[cfg(feature = "paged-attn")]
     let paged_cache_stats = qwen3_asr.paged_cache_stats();
     #[cfg(feature = "paged-attn")]
@@ -1201,10 +1112,6 @@ fn load_asr_model_for_pipeline(
     let kv_cache_bytes = None;
     #[cfg(not(feature = "paged-attn"))]
     let kv_cache_tokens = None;
-    #[cfg(any(feature = "metal", feature = "cuda"))]
-    if let Some(stats) = paged_cache_stats.as_ref() {
-        log_paged_cache_stats(stats, &paged_cache_config);
-    }
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     let mut cuda_graph_bytes = None;
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
@@ -1291,10 +1198,6 @@ fn load_asr_model_for_pipeline(
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
 fn configure_cuda_mempool_release_threshold(device: &Device) {
     if std::env::var_os("VASR_DISABLE_CUDA_MEMPOOL_RELEASE_THRESHOLD").is_some() {
-        tracing::debug!(
-            target: "vasr_transcribe::serve",
-            "CUDA mempool release threshold left unchanged"
-        );
         return;
     }
     let threshold_mib = std::env::var("VASR_CUDA_MEMPOOL_RELEASE_THRESHOLD_MIB")
@@ -1306,11 +1209,6 @@ fn configure_cuda_mempool_release_threshold(device: &Device) {
         device,
         threshold_bytes,
     );
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "CUDA mempool release threshold set | threshold={threshold_mib}MiB"
-    );
-    vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(device);
 }
 
 fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
@@ -1370,21 +1268,4 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-}
-
-fn log_model_config(model: &Qwen3ASR) {
-    let config = model.config();
-    let text = &config.thinker_config.text_config;
-    let audio = &config.thinker_config.audio_config;
-    tracing::debug!(
-        target: "vasr_transcribe::serve",
-        "Model config: model_type={:?}, thinker_type={:?}, text_layers={}, hidden_size={}, kv_heads={}, audio_layers={}, audio_dim={}",
-        config.model_type,
-        config.thinker_config.model_type,
-        text.num_hidden_layers,
-        text.hidden_size,
-        text.num_key_value_heads,
-        audio.encoder_layers,
-        audio.d_model
-    );
 }

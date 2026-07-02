@@ -31,7 +31,9 @@ pub use inference::transcribe::EncodedAsrBatchPoll;
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::transcribe::{AudioFeatureEncodeTimings, EncodedAsrBatch};
 #[cfg(feature = "paged-attn")]
-pub use inference::transcribe::{EncodedAsrBatchMetadata, decode_ids_with_metadata};
+pub use inference::transcribe::{
+    EncodedAsrBatchMetadata, StreamingMetadataDecoder, decode_ids_with_metadata,
+};
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
 #[cfg(feature = "timing")]
 pub use model::generation::GenerationTimings;
@@ -373,6 +375,80 @@ impl Qwen3ASR {
             message_rx,
             eos_token_ids.as_slice(),
             max_slots,
+            #[cfg(feature = "timing")]
+            timings,
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn decode_prefilled_dynamic_ids_streaming(
+        &self,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        opts: TranscribeOptions,
+        on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let Some(runtime) = self.paged_cache.as_ref() else {
+            anyhow::bail!(
+                "paged-attn build requires a shared paged runtime for dynamic staged ASR decode"
+            );
+        };
+        let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let max_slots = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            config.continuous_max_num_seqs(&runtime_guard).max(1)
+        };
+        let mut scheduler = AsrBatchScheduler::new(config);
+        scheduler.run_continuous_prefilled_dynamic_with_completed(
+            self.thinker.as_ref(),
+            self.device.as_ref(),
+            runtime,
+            message_rx,
+            eos_token_ids.as_slice(),
+            max_slots,
+            on_complete,
+            #[cfg(feature = "timing")]
+            timings,
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn decode_global_prefilled_dynamic_ids_streaming(
+        &self,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        opts: TranscribeOptions,
+        on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        on_tick: &mut dyn FnMut() -> Result<()>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let Some(runtime) = self.paged_cache.as_ref() else {
+            anyhow::bail!(
+                "paged-attn build requires a shared paged runtime for dynamic staged ASR decode"
+            );
+        };
+        let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let max_slots = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            config.continuous_max_num_seqs(&runtime_guard).max(1)
+        };
+        let mut scheduler = AsrBatchScheduler::new(config);
+        scheduler.run_global_continuous_prefilled_dynamic_with_completed(
+            self.thinker.as_ref(),
+            self.device.as_ref(),
+            runtime,
+            message_rx,
+            eos_token_ids.as_slice(),
+            max_slots,
+            on_complete,
+            on_tick,
             #[cfg(feature = "timing")]
             timings,
         )

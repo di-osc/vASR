@@ -41,32 +41,6 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
     }
 }
 
-#[cfg(feature = "timing")]
-fn log_prefill_speed(wave: usize, tokens: usize, elapsed_us: u64) {
-    let elapsed_s = elapsed_us as f64 / 1_000_000.0;
-    let tok_s = tokens as f64 / elapsed_s.max(f64::EPSILON);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "prefill done | seqs={wave} tokens={tokens} wall={elapsed_s:.3}s tok/s={tok_s:.1}",
-    );
-}
-
-fn log_prefill_start(
-    device: &Device,
-    seqs: usize,
-    audio_seconds: f64,
-    token_budget: usize,
-    allocated_kv_blocks: usize,
-    free_kv_blocks_before: usize,
-) {
-    let free_kv_blocks_after = free_kv_blocks_before.saturating_sub(allocated_kv_blocks);
-    tracing::debug!(
-        target: "vasr_transcribe::pipeline",
-        "prefill start | seqs={seqs} audio={audio_seconds:.1}s token_budget={token_budget} allocated_kv_blocks={allocated_kv_blocks} free_kv_blocks_before={free_kv_blocks_before} free_kv_blocks_after={free_kv_blocks_after}",
-    );
-    log_cuda_mem_debug(device, "prefill_start");
-}
-
 fn log_cuda_mem_debug(device: &Device, label: &str) {
     if std::env::var_os("VASR_DEBUG_CUDA_MEM").is_none() {
         return;
@@ -328,8 +302,26 @@ pub struct PrefillStageOutput {
     pub total_rows: usize,
     pub source_closed: bool,
     pub prefill_wave: usize,
+    pub reason: PrefillBatchReason,
     #[cfg(feature = "timing")]
     pub timings: GenerationTimings,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PrefillBatchReason {
+    MaxSlots,
+    KvBlocks,
+    WaitingEmpty,
+}
+
+impl PrefillBatchReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxSlots => "max_slots",
+            Self::KvBlocks => "kv_blocks",
+            Self::WaitingEmpty => "waiting_empty",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -518,7 +510,7 @@ impl<'a> DynamicPrefillProducer<'a> {
         let mut stage_timings = GenerationTimings::default();
         #[cfg(feature = "timing")]
         let mut stage_timings_ref = Some(&mut stage_timings);
-        let wave = self.scheduler.drive_dynamic_prefill_stage(
+        let (wave, reason) = self.scheduler.drive_dynamic_prefill_stage(
             self.thinker,
             self.device,
             self.runtime,
@@ -538,6 +530,7 @@ impl<'a> DynamicPrefillProducer<'a> {
             total_rows: self.inputs.len(),
             source_closed: self.source_closed,
             prefill_wave: wave,
+            reason,
             #[cfg(feature = "timing")]
             timings: stage_timings,
         })
@@ -648,7 +641,7 @@ fn collect_prefill_wave_by_kv<F>(
     mut free_blocks: usize,
     max_wave: usize,
     mut token_capacity: F,
-) -> Result<Vec<usize>>
+) -> Result<(Vec<usize>, PrefillBatchReason)>
 where
     F: FnMut(usize) -> Result<usize>,
 {
@@ -671,14 +664,22 @@ where
         free_blocks = free_blocks.saturating_sub(required_blocks);
         wave.push(client_index);
     }
-    Ok(wave)
+    let reason = if wave.len() >= max_wave {
+        PrefillBatchReason::MaxSlots
+    } else if waiting.is_empty() {
+        PrefillBatchReason::WaitingEmpty
+    } else {
+        PrefillBatchReason::KvBlocks
+    };
+    Ok((wave, reason))
 }
 
 fn free_finished_running(
     running: &mut [Option<RunningSlot>],
     outputs: &mut [Vec<u32>],
     runtime: &mut PagedCacheRuntime,
-) -> bool {
+    mut on_complete: Option<&mut dyn FnMut(usize, Vec<u32>) -> Result<()>>,
+) -> Result<bool> {
     let mut freed = false;
     for slot in running.iter_mut() {
         let Some(entry) = slot.as_mut() else {
@@ -687,12 +688,16 @@ fn free_finished_running(
         if !entry.slot.finished {
             continue;
         }
-        outputs[entry.client_index] = entry.slot.generated.clone();
+        let generated = entry.slot.generated.clone();
+        outputs[entry.client_index] = generated.clone();
+        if let Some(on_complete) = on_complete.as_deref_mut() {
+            on_complete(entry.client_index, generated)?;
+        }
         paged_batch_free_slots(runtime, &[entry.slot.request_id]);
         *slot = None;
         freed = true;
     }
-    freed
+    Ok(freed)
 }
 
 fn decode_running_step_groups(
@@ -1021,12 +1026,12 @@ impl AsrBatchScheduler {
         eos_token_ids: &[u32],
         pad_id: u32,
         #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, PrefillBatchReason)> {
         let manager = runtime.manager();
         let block_size = manager.block_size();
         let free_blocks = manager.free_blocks();
         let max_wave = self.config.prefill_max_wave(runtime);
-        let wave_client_indices = collect_prefill_wave_by_kv(
+        let (wave_client_indices, reason) = collect_prefill_wave_by_kv(
             waiting,
             block_size,
             free_blocks,
@@ -1043,7 +1048,7 @@ impl AsrBatchScheduler {
         )?;
 
         if wave_client_indices.is_empty() {
-            return Ok(0);
+            return Ok((0, reason));
         }
 
         let wave = wave_client_indices.len();
@@ -1064,23 +1069,6 @@ impl AsrBatchScheduler {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let allocated_kv_blocks = token_capacities
-            .iter()
-            .map(|&capacity| capacity.div_ceil(block_size))
-            .sum::<usize>();
-        let prefill_audio_seconds = wave_client_indices
-            .iter()
-            .map(|&client_index| audio_seconds[client_index])
-            .sum::<f64>();
-        let token_budget = token_capacities.iter().sum::<usize>();
-        log_prefill_start(
-            device,
-            wave,
-            prefill_audio_seconds,
-            token_budget,
-            allocated_kv_blocks,
-            free_blocks,
-        );
         let wave_audio = concat_prepared_audio(
             audio_features,
             audio_offsets,
@@ -1119,8 +1107,6 @@ impl AsrBatchScheduler {
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
         let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-        #[cfg(feature = "timing")]
-        log_prefill_speed(wave, prefill_tokens, elapsed);
         log_cuda_mem_debug(device, "prefill_done");
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
@@ -1136,7 +1122,7 @@ impl AsrBatchScheduler {
                 prefill_done_at,
             });
         }
-        Ok(wave)
+        Ok((wave, reason))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1155,7 +1141,7 @@ impl AsrBatchScheduler {
         eos_token_ids: &[u32],
         pad_id: u32,
         #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, PrefillBatchReason)> {
         let (block_size, free_blocks, max_wave) = {
             let runtime_guard = runtime
                 .lock()
@@ -1166,7 +1152,7 @@ impl AsrBatchScheduler {
                 self.config.prefill_max_wave(&runtime_guard),
             )
         };
-        let wave_client_indices = collect_prefill_wave_by_kv(
+        let (wave_client_indices, reason) = collect_prefill_wave_by_kv(
             waiting,
             block_size,
             free_blocks,
@@ -1183,7 +1169,7 @@ impl AsrBatchScheduler {
         )?;
 
         if wave_client_indices.is_empty() {
-            return Ok(0);
+            return Ok((0, reason));
         }
 
         let wave = wave_client_indices.len();
@@ -1204,23 +1190,6 @@ impl AsrBatchScheduler {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let allocated_kv_blocks = token_capacities
-            .iter()
-            .map(|&capacity| capacity.div_ceil(block_size))
-            .sum::<usize>();
-        let prefill_audio_seconds = wave_client_indices
-            .iter()
-            .map(|&client_index| audio_seconds[client_index])
-            .sum::<f64>();
-        let token_budget = token_capacities.iter().sum::<usize>();
-        log_prefill_start(
-            device,
-            wave,
-            prefill_audio_seconds,
-            token_budget,
-            allocated_kv_blocks,
-            free_blocks,
-        );
         let wave_audio = concat_prepared_audio(
             audio_features,
             audio_offsets,
@@ -1258,8 +1227,6 @@ impl AsrBatchScheduler {
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
         let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-        #[cfg(feature = "timing")]
-        log_prefill_speed(wave, prefill_tokens, elapsed);
         log_cuda_mem_debug(device, "prefill_done");
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
@@ -1275,7 +1242,7 @@ impl AsrBatchScheduler {
                 prefill_done_at,
             });
         }
-        Ok(wave)
+        Ok((wave, reason))
     }
 
     fn drive_dynamic_prefill_stage(
@@ -1292,7 +1259,7 @@ impl AsrBatchScheduler {
         pad_id: u32,
         may_block_source: bool,
         #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, PrefillBatchReason)> {
         if !*source_closed {
             loop {
                 match poll_source(may_block_source && !inputs.has_waiting())? {
@@ -1312,7 +1279,7 @@ impl AsrBatchScheduler {
         }
 
         let Some(features) = inputs.audio_features.as_ref() else {
-            return Ok(0);
+            return Ok((0, PrefillBatchReason::WaitingEmpty));
         };
         self.prefill_waiting_wave_shared(
             thinker,
@@ -1401,7 +1368,8 @@ impl AsrBatchScheduler {
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
-                );
+                    None,
+                )?;
                 attach_prefilled_to_running(
                     &mut prefilled,
                     running.as_mut_slice(),
@@ -1467,7 +1435,8 @@ impl AsrBatchScheduler {
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
-                );
+                    None,
+                )?;
                 attach_prefilled_to_running(
                     &mut prefilled,
                     running.as_mut_slice(),
@@ -1475,7 +1444,7 @@ impl AsrBatchScheduler {
                     &mut timings,
                 );
 
-                let prefill_wave = self.prefill_waiting_wave(
+                let (prefill_wave, _prefill_reason) = self.prefill_waiting_wave(
                     thinker,
                     device,
                     &mut runtime_guard,
@@ -1574,7 +1543,8 @@ impl AsrBatchScheduler {
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                    );
+                        None,
+                    )?;
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1613,7 +1583,8 @@ impl AsrBatchScheduler {
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                    );
+                        None,
+                    )?;
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1627,7 +1598,7 @@ impl AsrBatchScheduler {
                     has_running_before_poll,
                     prefill_inputs.waiting_len(),
                 );
-                let prefill_wave = self.drive_dynamic_prefill_stage(
+                let (prefill_wave, _prefill_reason) = self.drive_dynamic_prefill_stage(
                     thinker,
                     device,
                     runtime,
@@ -1806,6 +1777,85 @@ impl AsrBatchScheduler {
         max_slots: usize,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
+        self.run_continuous_prefilled_dynamic_with_completed(
+            thinker,
+            device,
+            runtime,
+            message_rx,
+            eos_token_ids,
+            max_slots,
+            &mut |_, _| Ok(()),
+            #[cfg(feature = "timing")]
+            timings.as_deref_mut(),
+        )
+    }
+
+    pub fn run_continuous_prefilled_dynamic_with_completed(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        eos_token_ids: &[u32],
+        max_slots: usize,
+        on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.run_continuous_prefilled_dynamic_with_completed_impl(
+            thinker,
+            device,
+            runtime,
+            message_rx,
+            eos_token_ids,
+            max_slots,
+            on_complete,
+            true,
+            None,
+            #[cfg(feature = "timing")]
+            timings.as_deref_mut(),
+        )
+    }
+
+    pub fn run_global_continuous_prefilled_dynamic_with_completed(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        eos_token_ids: &[u32],
+        max_slots: usize,
+        on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        on_tick: &mut dyn FnMut() -> Result<()>,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.run_continuous_prefilled_dynamic_with_completed_impl(
+            thinker,
+            device,
+            runtime,
+            message_rx,
+            eos_token_ids,
+            max_slots,
+            on_complete,
+            false,
+            Some(on_tick),
+            #[cfg(feature = "timing")]
+            timings.as_deref_mut(),
+        )
+    }
+
+    fn run_continuous_prefilled_dynamic_with_completed_impl(
+        &mut self,
+        thinker: &ThinkerForConditionalGeneration,
+        device: &Device,
+        runtime: &SharedPagedCacheRuntime,
+        message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
+        eos_token_ids: &[u32],
+        max_slots: usize,
+        on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        close_on_message_source_closed: bool,
+        mut on_tick: Option<&mut dyn FnMut() -> Result<()>>,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    ) -> Result<Vec<Vec<u32>>> {
         let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots.max(1)).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = Vec::new();
@@ -1815,9 +1865,13 @@ impl AsrBatchScheduler {
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
             loop {
+                if let Some(on_tick) = on_tick.as_deref_mut() {
+                    on_tick()?;
+                }
                 while let Ok(message) = message_rx.try_recv() {
                     let message = message?;
                     let sequence_count = message.sequences.len();
+                    let message_source_closed = message.source_closed;
                     apply_prefill_stage_message(
                         message,
                         &mut outputs,
@@ -1826,6 +1880,9 @@ impl AsrBatchScheduler {
                         #[cfg(feature = "timing")]
                         &mut timings,
                     );
+                    if !close_on_message_source_closed && message_source_closed {
+                        source_closed = false;
+                    }
                     async_debug.record_message(sequence_count, prefilled.len());
                 }
 
@@ -1838,7 +1895,8 @@ impl AsrBatchScheduler {
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                    );
+                        Some(on_complete),
+                    )?;
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1878,7 +1936,8 @@ impl AsrBatchScheduler {
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                    );
+                        Some(on_complete),
+                    )?;
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1894,6 +1953,7 @@ impl AsrBatchScheduler {
                         Ok(message) => {
                             let message = message?;
                             let sequence_count = message.sequences.len();
+                            let message_source_closed = message.source_closed;
                             apply_prefill_stage_message(
                                 message,
                                 &mut outputs,
@@ -1902,6 +1962,9 @@ impl AsrBatchScheduler {
                                 #[cfg(feature = "timing")]
                                 &mut timings,
                             );
+                            if !close_on_message_source_closed && message_source_closed {
+                                source_closed = false;
+                            }
                             async_debug.record_message(sequence_count, prefilled.len());
                             continue;
                         }
@@ -1916,6 +1979,7 @@ impl AsrBatchScheduler {
                         Ok(message) => {
                             let message = message?;
                             let sequence_count = message.sequences.len();
+                            let message_source_closed = message.source_closed;
                             apply_prefill_stage_message(
                                 message,
                                 &mut outputs,
@@ -1924,6 +1988,9 @@ impl AsrBatchScheduler {
                                 #[cfg(feature = "timing")]
                                 &mut timings,
                             );
+                            if !close_on_message_source_closed && message_source_closed {
+                                source_closed = false;
+                            }
                             async_debug.record_message(sequence_count, prefilled.len());
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2096,8 +2163,9 @@ pub fn run_paged_prepared_batch_timed(
 #[cfg(test)]
 mod tests {
     use super::{
-        AsrBatchSchedulerConfig, collect_prefill_wave_by_kv, continuous_batch_enabled,
-        dynamic_source_poll_may_block, group_running_by_decode_step, pad_prepared_wave_for_prefill,
+        AsrBatchSchedulerConfig, PrefillBatchReason, collect_prefill_wave_by_kv,
+        continuous_batch_enabled, dynamic_source_poll_may_block, group_running_by_decode_step,
+        pad_prepared_wave_for_prefill,
     };
     use std::collections::VecDeque;
 
@@ -2127,9 +2195,11 @@ mod tests {
     fn collect_prefill_wave_uses_free_kv_not_queue_head() {
         let mut waiting = VecDeque::from(vec![0usize, 1, 2]);
         let capacities = [128usize, 32, 64];
-        let wave = collect_prefill_wave_by_kv(&mut waiting, 32, 3, 3, |idx| Ok(capacities[idx]))
-            .expect("collect wave");
+        let (wave, reason) =
+            collect_prefill_wave_by_kv(&mut waiting, 32, 3, 3, |idx| Ok(capacities[idx]))
+                .expect("collect wave");
         assert_eq!(wave, vec![1, 2]);
+        assert!(matches!(reason, PrefillBatchReason::KvBlocks));
         assert_eq!(waiting.into_iter().collect::<Vec<_>>(), vec![0]);
     }
 

@@ -334,6 +334,10 @@ impl EncodedAsrBatchMetadata {
         self.audio_len
     }
 
+    pub fn chunk_len(&self) -> usize {
+        self.chunks.len()
+    }
+
     fn merge(metas: Vec<Self>) -> Self {
         let audio_len = metas.iter().map(|meta| meta.audio_len).sum();
         let chunk_count = metas.iter().map(|meta| meta.chunks.len()).sum();
@@ -478,6 +482,159 @@ pub fn decode_ids_with_metadata(
         );
     }
     Ok(grouped)
+}
+
+#[cfg(feature = "paged-attn")]
+pub struct StreamingMetadataDecoder {
+    merged: EncodedAsrBatchMetadata,
+    batch_lens: Vec<usize>,
+    out_langs: Vec<Vec<String>>,
+    out_texts: Vec<Vec<String>>,
+    chunks_done: Vec<usize>,
+    chunks_per_audio: Vec<usize>,
+    audio_done: Vec<bool>,
+}
+
+#[cfg(feature = "paged-attn")]
+impl StreamingMetadataDecoder {
+    pub fn new(metas: Vec<EncodedAsrBatchMetadata>, batch_lens: Vec<usize>) -> Self {
+        let mut decoder = Self {
+            merged: EncodedAsrBatchMetadata {
+                audio_len: 0,
+                chunks: Vec::new(),
+                chunk_audio_seconds: Vec::new(),
+                forced_langs_norm: Vec::new(),
+            },
+            batch_lens: Vec::new(),
+            out_langs: Vec::new(),
+            out_texts: Vec::new(),
+            chunks_done: Vec::new(),
+            chunks_per_audio: Vec::new(),
+            audio_done: Vec::new(),
+        };
+        for (meta, len) in metas.into_iter().zip(batch_lens) {
+            decoder.push_metadata(meta, len);
+        }
+        decoder
+    }
+
+    pub fn push_metadata(&mut self, mut meta: EncodedAsrBatchMetadata, batch_len: usize) {
+        let audio_offset = self.merged.audio_len;
+        for chunk in &mut meta.chunks {
+            chunk.orig_index = chunk.orig_index.saturating_add(audio_offset);
+        }
+        self.merged.audio_len = self.merged.audio_len.saturating_add(meta.audio_len);
+        self.out_langs.resize_with(self.merged.audio_len, Vec::new);
+        self.out_texts.resize_with(self.merged.audio_len, Vec::new);
+        self.chunks_done.resize(self.merged.audio_len, 0);
+        self.chunks_per_audio.resize(self.merged.audio_len, 0);
+        self.audio_done.resize(self.merged.audio_len, false);
+        for chunk in &meta.chunks {
+            if let Some(count) = self.chunks_per_audio.get_mut(chunk.orig_index) {
+                *count = count.saturating_add(1);
+            }
+        }
+        self.merged.chunks.extend(meta.chunks);
+        self.merged
+            .chunk_audio_seconds
+            .extend(meta.chunk_audio_seconds);
+        self.merged.forced_langs_norm.extend(meta.forced_langs_norm);
+        self.batch_lens.push(batch_len);
+    }
+
+    pub fn accept_chunk(
+        &mut self,
+        processor: &AsrProcessor,
+        chunk_index: usize,
+        ids: Vec<u32>,
+    ) -> Result<Option<(usize, usize, AsrTranscription)>> {
+        let chunk = self.merged.chunks.get(chunk_index).ok_or_else(|| {
+            anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
+        })?;
+        let raw = processor.tokenizer.decode(ids.as_slice())?;
+        let forced = self
+            .merged
+            .forced_langs_norm
+            .get(chunk.orig_index)
+            .and_then(|x| x.as_deref());
+        let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+        self.out_langs[chunk.orig_index].push(lang);
+        self.out_texts[chunk.orig_index].push(text);
+        self.chunks_done[chunk.orig_index] = self.chunks_done[chunk.orig_index].saturating_add(1);
+        if self.audio_done[chunk.orig_index]
+            || self.chunks_done[chunk.orig_index] < self.chunks_per_audio[chunk.orig_index]
+        {
+            return Ok(None);
+        }
+        self.audio_done[chunk.orig_index] = true;
+        let (batch_index, audio_index) = self.batch_audio_index(chunk.orig_index)?;
+        Ok(Some((
+            batch_index,
+            audio_index,
+            AsrTranscription {
+                language: merge_languages(self.out_langs[chunk.orig_index].clone()),
+                text: self.out_texts[chunk.orig_index].join(""),
+                timestamps: None,
+            },
+        )))
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.merged.chunks.len()
+    }
+
+    fn batch_audio_index(&self, audio_index: usize) -> Result<(usize, usize)> {
+        let mut cursor = 0usize;
+        for (batch_index, &len) in self.batch_lens.iter().enumerate() {
+            let end = cursor.saturating_add(len);
+            if audio_index < end {
+                return Ok((batch_index, audio_index - cursor));
+            }
+            cursor = end;
+        }
+        bail!("dynamic staged ASR audio index out of range: {audio_index}")
+    }
+
+    pub fn finish(self) -> Result<Vec<Vec<AsrTranscription>>> {
+        let mut outputs = Vec::with_capacity(self.merged.audio_len);
+        for audio_index in 0..self.merged.audio_len {
+            if self.chunks_done[audio_index] != self.chunks_per_audio[audio_index] {
+                bail!(
+                    "dynamic staged ASR incomplete audio output: audio={} chunks={}/{}",
+                    audio_index,
+                    self.chunks_done[audio_index],
+                    self.chunks_per_audio[audio_index]
+                );
+            }
+            outputs.push(AsrTranscription {
+                language: merge_languages(self.out_langs[audio_index].clone()),
+                text: self.out_texts[audio_index].join(""),
+                timestamps: None,
+            });
+        }
+        let mut grouped = Vec::with_capacity(self.batch_lens.len());
+        let mut cursor = 0usize;
+        for len in self.batch_lens {
+            let end = cursor.saturating_add(len);
+            if end > outputs.len() {
+                bail!(
+                    "dynamic staged ASR batch split mismatch: end={} outputs={}",
+                    end,
+                    outputs.len()
+                );
+            }
+            grouped.push(outputs[cursor..end].to_vec());
+            cursor = end;
+        }
+        if cursor != outputs.len() {
+            bail!(
+                "dynamic staged ASR unused outputs: used={} outputs={}",
+                cursor,
+                outputs.len()
+            );
+        }
+        Ok(grouped)
+    }
 }
 
 impl EncodedAsrBatch {

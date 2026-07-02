@@ -1280,6 +1280,7 @@ mod tests {
         sinusoidal_positional_embedding,
     };
     use crate::config::AudioEncoderConfig;
+    use crate::utils::progress::Progress;
     use candle_nn::Linear;
     use vasr_quant::isq_linear::IsqLinear;
 

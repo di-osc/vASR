@@ -176,10 +176,6 @@ impl ThinkerForConditionalGeneration {
             }
             Err(_) => use_flash_attn,
         };
-        tracing::debug!(
-            target: "vasr::models::qwen3asr",
-            "audio_tower_flash_attn={audio_use_flash_attn} text_flash_attn={use_flash_attn}"
-        );
         let audio_tower = AudioTower::load(
             &cfg.audio_config,
             vb.pp("audio_tower"),

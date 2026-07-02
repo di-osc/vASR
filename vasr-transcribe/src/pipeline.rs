@@ -1,7 +1,13 @@
 //! Async parallel transcribe: loader, VAD, and ASR stages overlap via channels.
 
+#[cfg(feature = "paged-attn")]
+use std::cell::RefCell;
+#[cfg(feature = "paged-attn")]
+use std::collections::BTreeMap;
+#[cfg(feature = "paged-attn")]
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -13,7 +19,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(feature = "paged-attn")]
+use anyhow::bail;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -21,18 +29,24 @@ use tokio::task::{JoinHandle, JoinSet};
 use vasr::models::qwen3asr::TranscribeTimings;
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::model::paged_cache_runtime::PagedCacheStats;
+#[cfg(feature = "paged-attn")]
+use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch};
 use vasr::models::qwen3asr::{
-    AudioFeatureEncodeTimings, AudioInput, EncodedAsrBatch, Qwen3ASR, qwen_outputs_to_timelines,
-    qwen_transcribe_options,
+    AudioInput, Qwen3ASR, qwen_outputs_to_timelines, qwen_transcribe_options,
 };
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::{
     EncodedAsrBatchMetadata, PrefillStageOutput, PreparedAudioBatch, PreparedAudioBatchPoll,
+    StreamingMetadataDecoder,
 };
 use vasr_data::AudioLoader;
-use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
+#[cfg(feature = "paged-attn")]
+use vasr_data::DurationMs;
+use vasr_data::{Annotation, AudioSource, Timeline, Waveform};
 
-use crate::runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
+use crate::runtime::pipeline::{OfflinePipeline, VadPreparation};
+#[cfg(feature = "paged-attn")]
+use crate::runtime::pipeline::{VadPrepared, offset_annotations};
 use crate::runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 use crate::table::render_titled_table;
 
@@ -41,14 +55,12 @@ const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
 const BYTES_PER_MEMORY_PERMIT: usize = 1024 * 1024;
 const MIN_LOADED_QUEUE_MEMORY_PERMITS: usize = 1;
 const ASR_MICROBATCH_COLLECT_WAIT_MS: u64 = 10;
+#[cfg(feature = "paged-attn")]
 const ASR_ENCODER_BATCH_COLLECT_WAIT_MS: u64 = 10;
+#[cfg(feature = "paged-attn")]
 const ASR_PREFILL_COALESCE_WAIT_MS: u64 = 20;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
 const COMPONENT_THROUGHPUT_LOG_INTERVAL: Duration = Duration::from_secs(5);
-
-fn dynamic_staged_asr_enabled() -> bool {
-    std::env::var_os("VASR_DISABLE_DYNAMIC_STAGED_ASR").is_none()
-}
 
 #[cfg(feature = "paged-attn")]
 fn asr_prefill_coalesce_wait() -> Duration {
@@ -484,11 +496,9 @@ impl AsyncTranscribePipeline {
 
         let offline = Arc::clone(&self.offline);
         let asr_options = self.parallel_options.asr_options.clone();
-        let max_batch_audio_sec = asr_options.max_batch_audio_sec;
         let asr_handle = spawn_asr_worker(
             offline,
             asr_options,
-            max_batch_audio_sec,
             vad_to_asr_rx,
             asr_to_result_tx,
             Arc::clone(&asr_stats),
@@ -517,6 +527,7 @@ impl AsyncTranscribePipeline {
 #[derive(Clone)]
 pub struct GlobalAsyncTranscribePipeline {
     submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
+    #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
     offline: Arc<OfflinePipeline>,
     service_id: Arc<Mutex<String>>,
 }
@@ -700,7 +711,6 @@ impl GlobalAsyncTranscribePipeline {
         spawn_asr_worker(
             Arc::clone(&offline),
             parallel_options.asr_options.clone(),
-            parallel_options.asr_options.max_batch_audio_sec,
             vad_to_asr_rx,
             asr_to_result_tx,
             asr_stats,
@@ -713,6 +723,7 @@ impl GlobalAsyncTranscribePipeline {
 
         Self {
             submit_tx,
+            #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
             offline,
             service_id,
         }
@@ -725,6 +736,7 @@ impl GlobalAsyncTranscribePipeline {
     }
 
     pub fn memory_snapshot(&self) -> PipelineMemorySnapshot {
+        #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
         let qwen = self.offline.asr.as_any().downcast_ref::<Qwen3ASR>();
         PipelineMemorySnapshot {
             #[cfg(feature = "paged-attn")]
@@ -1278,6 +1290,7 @@ fn vad_to_asr_message_memory_permits(
             .samples
             .len()
             .saturating_mul(std::mem::size_of::<f32>()),
+        #[cfg(feature = "paged-attn")]
         Ok(AsrPipelineMessage::Segment(segment)) => segment
             .waveform
             .samples
@@ -1517,6 +1530,49 @@ fn record_request_load_stage(
     }
 }
 
+#[cfg(feature = "paged-attn")]
+fn segment_batch_request_count(segments: &[AsrSegmentJob]) -> usize {
+    let mut request_ids = HashSet::new();
+    for segment in segments {
+        if let Some(request_item) = segment.request_item {
+            request_ids.insert(request_item.request_id);
+        }
+    }
+    request_ids.len()
+}
+
+#[cfg(feature = "paged-attn")]
+fn log_prefill_batch_done(
+    all_segments: &[AsrSegmentJob],
+    output: &PrefillStageOutput,
+    elapsed_seconds: f64,
+) {
+    let mut segments = Vec::new();
+    for sequence in &output.sequences {
+        if let Some(segment) = all_segments.get(sequence.client_index) {
+            segments.push(segment.clone());
+        }
+    }
+    if segments.is_empty() {
+        return;
+    }
+    let audio_seconds = segments
+        .iter()
+        .map(|segment| segment.waveform.duration_seconds())
+        .sum::<f64>();
+    let request_count = segment_batch_request_count(&segments);
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "prefill batch DONE | reqs={} seg={} audio={} elapsed={} speed={} reason={}",
+        request_count,
+        segments.len(),
+        format_seconds(audio_seconds),
+        format_seconds(elapsed_seconds),
+        format_speed(audio_seconds, elapsed_seconds),
+        output.reason.as_str(),
+    );
+}
+
 fn record_request_vad_stage(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     request_id: PipelineRequestId,
@@ -1548,6 +1604,7 @@ fn record_request_vad_stage(
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn record_request_encode_stage(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     request_id: PipelineRequestId,
@@ -1579,6 +1636,7 @@ fn record_request_encode_stage(
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn record_request_encode_stages(
     pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     segments: &[AsrSegmentJob],
@@ -1614,6 +1672,7 @@ fn record_request_encode_stages(
     }
 }
 
+#[allow(dead_code)]
 fn record_request_decode_stage(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     request_id: PipelineRequestId,
@@ -1683,6 +1742,8 @@ fn log_ready_downstream_stages(request: &mut PendingGlobalRequest) {
     }
 }
 
+#[cfg(feature = "paged-attn")]
+#[allow(dead_code)]
 fn record_request_decode_stages(
     pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     segments: &[AsrSegmentJob],
@@ -1835,6 +1896,7 @@ struct AsrJob {
 
 /// One VAD speech segment enqueued for ASR continuous micro-batching.
 #[derive(Debug, Clone)]
+#[cfg(feature = "paged-attn")]
 struct AsrSegmentJob {
     job_index: usize,
     request_item: Option<RequestItemRef>,
@@ -1852,6 +1914,7 @@ struct AsrSegmentJob {
 #[derive(Debug)]
 enum AsrPipelineMessage {
     Job(AsrJob),
+    #[cfg(feature = "paged-attn")]
     Segment(AsrSegmentJob),
 }
 
@@ -1862,6 +1925,7 @@ struct VadToAsrMessage {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 struct SegmentJobState {
     index: usize,
     request_item: Option<RequestItemRef>,
@@ -1876,10 +1940,12 @@ struct SegmentJobState {
 }
 
 #[derive(Default)]
+#[cfg(feature = "paged-attn")]
 struct SegmentAsrState {
     jobs: HashMap<usize, SegmentJobState>,
 }
 
+#[cfg(feature = "paged-attn")]
 fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
     let VadPreparation::Speech(prepared) = job.prepared else {
         bail!("speech_job_to_segments requires Speech preparation");
@@ -2215,6 +2281,7 @@ fn spawn_vad_task(
                     waveform: job.waveform,
                 };
                 match asr_job.prepared {
+                    #[cfg(feature = "paged-attn")]
                     VadPreparation::Speech(_) => {
                         let segment_jobs = match speech_job_to_segments(asr_job) {
                             Ok(segments) => segments,
@@ -2269,6 +2336,33 @@ fn spawn_vad_task(
                             })?;
                         }
                     }
+                    #[cfg(not(feature = "paged-attn"))]
+                    VadPreparation::Speech(_) => {
+                        send_vad_to_asr_timed(
+                            &vad_to_asr_tx,
+                            &vad_to_asr_queue_memory,
+                            Err(TranscribeItemOutcome {
+                                index: job_index,
+                                channel: job.channel,
+                                result: Err(anyhow::anyhow!("speech ASR requires paged-attn")),
+                                audio_seconds,
+                                timing,
+                                spans,
+                                bad_component: Some("asr"),
+                            }),
+                            &mut send_wait_seconds,
+                        )
+                        .await
+                        .map_err(|error| TranscribeItemOutcome {
+                            index: job_index,
+                            channel: job.channel,
+                            result: Err(error),
+                            audio_seconds,
+                            timing,
+                            spans,
+                            bad_component: Some("asr"),
+                        })?;
+                    }
                     _ => {
                         send_vad_to_asr_timed(
                             &vad_to_asr_tx,
@@ -2300,6 +2394,7 @@ fn spawn_vad_task(
                         segments,
                     );
                 }
+                let wall_seconds = stage_start.elapsed().as_secs_f64();
                 Ok(VadTaskStats {
                     jobs: 1,
                     no_speech: usize::from(no_speech),
@@ -2309,7 +2404,7 @@ fn spawn_vad_task(
                     compute_seconds,
                     worker_id,
                     send_wait_seconds,
-                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    wall_seconds,
                     ..Default::default()
                 })
             }
@@ -2350,6 +2445,7 @@ fn spawn_vad_task(
                         0,
                     );
                 }
+                let wall_seconds = stage_start.elapsed().as_secs_f64();
                 Ok(VadTaskStats {
                     jobs: 1,
                     failed: 1,
@@ -2357,7 +2453,7 @@ fn spawn_vad_task(
                     compute_seconds,
                     worker_id,
                     send_wait_seconds,
-                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    wall_seconds,
                     ..Default::default()
                 })
             }
@@ -2398,6 +2494,7 @@ fn spawn_vad_task(
                         0,
                     );
                 }
+                let wall_seconds = stage_start.elapsed().as_secs_f64();
                 Ok(VadTaskStats {
                     jobs: 1,
                     failed: 1,
@@ -2405,7 +2502,7 @@ fn spawn_vad_task(
                     compute_seconds,
                     worker_id,
                     send_wait_seconds,
-                    wall_seconds: stage_start.elapsed().as_secs_f64(),
+                    wall_seconds,
                     ..Default::default()
                 })
             }
@@ -2457,18 +2554,22 @@ async fn send_next_vad_task(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 struct SegmentEncodeRequest {
     segment: AsrSegmentJob,
     stage_start: Instant,
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 struct SegmentEncodeBatch {
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
+    reason: &'static str,
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 struct SegmentEncodedMessage {
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
@@ -2477,11 +2578,13 @@ struct SegmentEncodedMessage {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 enum SegmentEncodeMessage {
     Segment(SegmentEncodeRequest),
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 enum SegmentEncoderOutput {
     Encoded(SegmentEncodedMessage),
 }
@@ -2489,13 +2592,10 @@ enum SegmentEncoderOutput {
 #[cfg(feature = "paged-attn")]
 type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentPrefillMessage>;
 
-#[cfg(not(feature = "paged-attn"))]
-type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentEncoderOutput>;
-
+#[cfg(feature = "paged-attn")]
 fn spawn_segment_encoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    max_batch_audio_sec: f32,
     mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeMessage>,
     encoded_tx: mpsc::UnboundedSender<SegmentEncoderOutput>,
     stats: Arc<Mutex<AsrStageStats>>,
@@ -2513,13 +2613,8 @@ fn spawn_segment_encoder_worker(
             let request = match request {
                 SegmentEncodeMessage::Segment(request) => request,
             };
-            let request = collect_encoder_segment_batch(
-                request,
-                max_batch_audio_sec,
-                &mut request_rx,
-                &mut pending,
-            )
-            .await;
+            let request =
+                collect_encoder_segment_batch(request, &mut request_rx, &mut pending).await;
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
             let segment_audio_seconds = segments_for_result
@@ -2547,11 +2642,29 @@ fn spawn_segment_encoder_worker(
                 segment_audio_seconds,
                 encode_wall_seconds,
             );
+            let encode_failed = batch.is_err();
             let mut segments_for_result = segments_for_result;
             for segment in &mut segments_for_result {
                 segment.spans.audio_encoder = Some(encode_span);
             }
             record_request_encode_stages(&pending_requests, &segments_for_result, encode_span);
+            let request_count = segment_batch_request_count(&segments_for_result);
+            tracing::debug!(
+                target: "vasr_transcribe::pipeline",
+                "encode batch DONE | jobs={} reqs={} seg={} audio={} elapsed={} speed={} reason={} bad={}",
+                segments_for_result
+                    .iter()
+                    .map(|segment| segment.job_index)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                request_count,
+                segments_for_result.len(),
+                format_seconds(segment_audio_seconds),
+                format_seconds(encode_wall_seconds),
+                format_speed(segment_audio_seconds, encode_wall_seconds),
+                request.reason,
+                usize::from(encode_failed),
+            );
             let message = SegmentEncodedMessage {
                 segments: segments_for_result,
                 stage_start: request.stage_start,
@@ -2570,21 +2683,15 @@ fn spawn_segment_encoder_worker(
 
 #[cfg(feature = "paged-attn")]
 enum SegmentPrefillMessage {
-    Session(SegmentPrefilledSession),
+    Prefill {
+        producer_id: usize,
+        result: Result<PrefillStageOutput>,
+    },
+    Prepared {
+        producer_id: usize,
+        result: Result<SegmentPreparedEvent, SegmentEncodedFailure>,
+    },
     Failure(SegmentEncodedFailure),
-}
-
-#[cfg(feature = "paged-attn")]
-struct SegmentPrefilledSession {
-    consumed_segments: Vec<AsrSegmentJob>,
-    stage_start: Instant,
-    inference: SegmentAsrInference,
-    waveforms: Vec<Waveform>,
-    metas: Vec<EncodedAsrBatchMetadata>,
-    batch_lens: Vec<usize>,
-    encoded_failures: Vec<SegmentEncodedFailure>,
-    message_rx: std_mpsc::Receiver<Result<PrefillStageOutput>>,
-    meta_rx: std_mpsc::Receiver<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -2595,8 +2702,6 @@ enum SegmentPreparedEvent {
 #[cfg(feature = "paged-attn")]
 struct PrefillCoalescedPrepared {
     prepared: PreparedAudioBatch,
-    num_batches: usize,
-    num_segments: usize,
 }
 
 #[cfg(feature = "paged-attn")]
@@ -2616,6 +2721,7 @@ fn spawn_segment_prefill_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let encoded_rx = Arc::new(tokio::sync::Mutex::new(encoded_rx));
+        let mut next_producer_id = 0usize;
         loop {
             let first = {
                 let mut encoded_rx = encoded_rx.lock().await;
@@ -2650,13 +2756,16 @@ fn spawn_segment_prefill_worker(
                     continue;
                 }
             };
-            let session = tokio::task::spawn_blocking({
+            let result = tokio::task::spawn_blocking({
+                let producer_id = next_producer_id;
+                next_producer_id = next_producer_id.saturating_add(1);
                 let offline = Arc::clone(&offline);
                 let asr_options = asr_options.clone();
                 let encoded_rx = Arc::clone(&encoded_rx);
+                let prefilled_tx = prefilled_tx.clone();
                 let runtime_handle = tokio::runtime::Handle::current();
                 move || {
-                    prepare_segment_prefill_session(
+                    run_global_segment_prefill(
                         offline,
                         segments,
                         stage_start,
@@ -2665,38 +2774,22 @@ fn spawn_segment_prefill_worker(
                         runtime_handle,
                         &asr_options,
                         decode_idle_flush,
+                        prefilled_tx,
+                        producer_id,
                     )
                 }
             })
             .await
             .unwrap_or_else(|error| {
                 Err(anyhow::anyhow!(
-                    "ASR dynamic prefill session join error: {error}"
+                    "ASR dynamic prefill worker join error: {error}"
                 ))
             });
-            match session {
-                Ok((session, prefill_join)) => {
-                    if prefilled_tx
-                        .send(SegmentPrefillMessage::Session(session))
-                        .is_err()
-                    {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = prefill_join.join();
-                        })
-                        .await;
-                        break;
-                    }
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = prefill_join.join();
-                    })
-                    .await;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "vasr_transcribe::pipeline",
-                        "ASR dynamic prefill session failed: {error}"
-                    );
-                }
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "vasr_transcribe::pipeline",
+                    "ASR dynamic prefill failed: {error}"
+                );
             }
             if decode_idle_flush.is_none() {
                 break;
@@ -2705,14 +2798,15 @@ fn spawn_segment_prefill_worker(
     })
 }
 
+#[cfg(feature = "paged-attn")]
 async fn collect_encoder_segment_batch(
     first: SegmentEncodeRequest,
-    _max_batch_audio_sec: f32,
     request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeMessage>,
     _pending: &mut VecDeque<SegmentEncodeMessage>,
 ) -> SegmentEncodeBatch {
     let mut stage_start = first.stage_start;
     let mut segments = vec![first.segment];
+    let mut reason = "wait_timeout";
     loop {
         match request_rx.try_recv() {
             Ok(SegmentEncodeMessage::Segment(request)) => {
@@ -2735,73 +2829,57 @@ async fn collect_encoder_segment_batch(
                 stage_start = stage_start.min(request.stage_start);
                 segments.push(request.segment);
             }
-            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
+            Ok(None) => {
+                reason = "source_closed";
+                break;
+            }
+            Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
     segments.sort_by_key(|segment| (segment.job_index, segment.offset.0));
     SegmentEncodeBatch {
         segments,
         stage_start,
+        reason,
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn spawn_segment_decoder_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    #[cfg_attr(feature = "paged-attn", allow(unused_mut))] mut decoder_rx: SegmentDecoderReceiver,
+    decoder_rx: SegmentDecoderReceiver,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
-    #[allow(unused_variables)] decode_idle_flush: Option<std::time::Duration>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
-        #[cfg(feature = "paged-attn")]
-        while let Some(message) = decoder_rx.recv().await {
-            match message {
-                SegmentPrefillMessage::Session(session) => {
-                    handle_dynamic_segment_prefilled_session(
-                        session,
-                        &offline,
-                        &asr_options,
-                        &mut segment_state,
-                        &asr_to_result_tx,
-                        &stats,
-                        pending_requests.clone(),
-                    )
-                    .await;
-                }
-                SegmentPrefillMessage::Failure(failure) => {
-                    let outcomes = finish_segment_asr_batch(
-                        &mut segment_state,
-                        failure.segments.as_slice(),
-                        failure.stage_start,
-                        Err(failure.error),
-                        None,
-                        Some(&stats),
-                    );
-                    for outcome in outcomes {
-                        let _ = asr_to_result_tx.send(outcome.into()).await;
-                    }
-                }
+        let result = tokio::task::spawn_blocking({
+            let asr = Arc::clone(&offline.asr);
+            let asr_options = asr_options.clone();
+            let stats = Arc::clone(&stats);
+            let pending_requests = pending_requests.clone();
+            let asr_to_result_tx = asr_to_result_tx.clone();
+            move || {
+                run_global_segment_decode_worker(
+                    asr.as_ref(),
+                    asr_options,
+                    decoder_rx,
+                    &mut segment_state,
+                    asr_to_result_tx,
+                    stats,
+                    pending_requests,
+                )
             }
-        }
-        #[cfg(not(feature = "paged-attn"))]
-        while let Some(first) = decoder_rx.recv().await {
-            let first = match first {
-                SegmentEncoderOutput::Encoded(first) => first,
-            };
-            handle_ready_segment_encoded_messages(
-                first,
-                &mut decoder_rx,
-                &offline,
-                &asr_options,
-                &mut segment_state,
-                &asr_to_result_tx,
-                &stats,
-                pending_requests.clone(),
-            )
-            .await;
+        })
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR global decoder join error: {error}")));
+        if let Err(error) = result {
+            tracing::error!(
+                target: "vasr_transcribe::pipeline",
+                "ASR global decoder failed: {error:#}"
+            );
         }
     })
 }
@@ -2816,27 +2894,16 @@ struct SegmentEncodedFailure {
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug)]
-struct DynamicSegmentAsrDecode {
-    consumed_segments: Vec<AsrSegmentJob>,
-    inference: SegmentAsrInference,
-    timelines: Vec<Timeline>,
-    encoded_failures: Vec<SegmentEncodedFailure>,
-    #[cfg(feature = "timing")]
-    timings: TranscribeTimings,
-}
-
-#[cfg(feature = "paged-attn")]
-#[derive(Debug)]
 struct SegmentPreparedMetadata {
     segments: Vec<AsrSegmentJob>,
-    inference: SegmentAsrInference,
     waveforms: Vec<Waveform>,
     meta: EncodedAsrBatchMetadata,
+    stage_start: Instant,
 }
 
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
-fn prepare_segment_prefill_session(
+fn run_global_segment_prefill(
     offline: Arc<OfflinePipeline>,
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
@@ -2845,222 +2912,384 @@ fn prepare_segment_prefill_session(
     runtime_handle: tokio::runtime::Handle,
     asr_options: &AsrOptions,
     decode_idle_flush: Option<std::time::Duration>,
-) -> Result<(SegmentPrefilledSession, std::thread::JoinHandle<()>)> {
+    decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
+    producer_id: usize,
+) -> Result<()> {
     let qwen3 = offline
         .asr
         .as_any()
         .downcast_ref::<Qwen3ASR>()
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR prefill requires Qwen3ASR"))?;
-    let (inference, waveforms, encoded) = initial.into_parts();
+    let (_inference, waveforms, encoded) = initial.into_parts();
     let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
+    let prefill_log_segments = segments.clone();
+    decoder_tx
+        .send(SegmentPrefillMessage::Prepared {
+            producer_id,
+            result: Ok(SegmentPreparedEvent::Prepared(SegmentPreparedMetadata {
+                segments,
+                waveforms,
+                meta: initial_meta,
+                stage_start,
+            })),
+        })
+        .map_err(|_| anyhow::anyhow!("ASR global decoder closed"))?;
+
     let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
-    let (message_tx, message_rx) = std_mpsc::channel();
-    let (meta_tx, meta_rx) = std_mpsc::channel();
-    let initial_batch_len = initial_meta.audio_len();
-    let prefill_join = std::thread::spawn(move || {
-        let qwen3 = offline
-            .asr
-            .as_any()
-            .downcast_ref::<Qwen3ASR>()
-            .expect("dynamic staged ASR prefill requires Qwen3ASR");
-        run_segment_asr_prefill_dynamic_worker(
-            qwen3,
-            initial_prepared,
-            encoded_rx,
-            runtime_handle,
-            runtime_options,
-            decode_idle_flush,
-            message_tx,
-            meta_tx,
-        );
-    });
-    Ok((
-        SegmentPrefilledSession {
-            consumed_segments: segments,
-            stage_start,
-            inference,
-            waveforms,
-            metas: vec![initial_meta],
-            batch_lens: vec![initial_batch_len],
-            encoded_failures: Vec::new(),
-            message_rx,
-            meta_rx,
-        },
-        prefill_join,
-    ))
+    run_segment_asr_prefill_dynamic_worker(
+        qwen3,
+        initial_prepared,
+        encoded_rx,
+        runtime_handle,
+        runtime_options,
+        decode_idle_flush,
+        decoder_tx,
+        producer_id,
+        prefill_log_segments,
+    );
+    Ok(())
 }
 
 #[cfg(feature = "paged-attn")]
-async fn handle_dynamic_segment_prefilled_session(
-    session: SegmentPrefilledSession,
-    offline: &OfflinePipeline,
-    asr_options: &AsrOptions,
-    segment_state: &mut SegmentAsrState,
-    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
-    stats: &Arc<Mutex<AsrStageStats>>,
-    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-) {
-    let decode_start = Instant::now();
-    let fallback_segments = session.consumed_segments.clone();
-    let stage_start = session.stage_start;
-    let batch = tokio::task::spawn_blocking({
-        let asr = Arc::clone(&offline.asr);
-        let asr_options = asr_options.clone();
-        move || run_segment_asr_decode_prefilled_session(asr.as_ref(), session, &asr_options)
-    })
-    .await
-    .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR dynamic decoder join error: {error}")));
-
-    #[cfg(feature = "timing")]
-    let (consumed_segments, batch, encoded_failures, timings) = match batch {
-        Ok(decoded) => (
-            decoded.consumed_segments,
-            Ok((decoded.inference, decoded.timelines)),
-            decoded.encoded_failures,
-            Some(decoded.timings),
-        ),
-        Err(error) => (fallback_segments, Err(error), Vec::new(), None),
-    };
-    #[cfg(not(feature = "timing"))]
-    let (consumed_segments, batch, encoded_failures) = match batch {
-        Ok(decoded) => (
-            decoded.consumed_segments,
-            Ok((decoded.inference, decoded.timelines)),
-            decoded.encoded_failures,
-        ),
-        Err(error) => (fallback_segments, Err(error), Vec::new()),
-    };
-    #[cfg(feature = "timing")]
-    let asr_timing = timings.as_ref().map(transcribe_timing_seconds);
-    #[cfg(not(feature = "timing"))]
-    let asr_timing = None;
-    #[cfg(feature = "timing")]
-    if let Some(timings) = timings.as_ref() {
-        record_asr_timing_stats(stats, timings);
-    }
-    record_asr_decode_stats(
-        stats,
-        consumed_segments.len(),
-        consumed_segments
-            .iter()
-            .map(|segment| segment.waveform.duration_seconds())
-            .sum(),
-        decode_start.elapsed().as_secs_f64(),
-    );
-    let decode_span = StageSpan::new(decode_start, Instant::now());
-    let prefill_span = prefill_span_from_decode(decode_span, asr_timing);
-    record_request_decode_stages(
-        &pending_requests,
-        &consumed_segments,
-        decode_span,
-        prefill_span,
-    );
-    let outcomes = finish_segment_asr_batch(
-        segment_state,
-        &consumed_segments,
-        stage_start,
-        batch,
-        asr_timing,
-        Some(stats),
-    );
-    for outcome in outcomes {
-        let _ = asr_to_result_tx.send(outcome.into()).await;
-    }
-    for failure in encoded_failures {
-        let outcomes = finish_segment_asr_batch(
-            segment_state,
-            failure.segments.as_slice(),
-            failure.stage_start,
-            Err(failure.error),
-            None,
-            Some(stats),
-        );
-        for outcome in outcomes {
-            let _ = asr_to_result_tx.send(outcome.into()).await;
-        }
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-fn run_segment_asr_decode_prefilled_session(
+#[allow(clippy::too_many_arguments)]
+fn run_global_segment_decode_worker(
     asr: &dyn crate::runtime::model::AsrModel,
-    mut session: SegmentPrefilledSession,
-    asr_options: &AsrOptions,
-) -> Result<DynamicSegmentAsrDecode> {
+    asr_options: AsrOptions,
+    mut decoder_rx: SegmentDecoderReceiver,
+    segment_state: &mut SegmentAsrState,
+    asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: Arc<Mutex<AsrStageStats>>,
+    _pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+) -> Result<()> {
     let qwen3 = asr
         .as_any()
         .downcast_ref::<Qwen3ASR>()
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR decode requires Qwen3ASR"))?;
-    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(asr_options);
+    let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(&asr_options);
+    let (prefill_tx, prefill_rx) = std_mpsc::channel();
+    let (meta_tx, meta_rx) = std_mpsc::channel();
+    let mut stream_decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
+    let mut stream_segments = Vec::new();
+    let mut stream_waveforms = Vec::new();
+    let mut stream_batch_lens = Vec::new();
+    let mut stream_stage_starts = Vec::new();
+    let pending_chunks = RefCell::new(BTreeMap::new());
+
+    let forward_thread = std::thread::spawn(move || {
+        let mut next_global_chunk = 0usize;
+        let mut producer_chunk_ranges: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        let mut producer_chunk_counts: HashMap<usize, usize> = HashMap::new();
+        while let Some(message) = decoder_rx.blocking_recv() {
+            match message {
+                SegmentPrefillMessage::Prefill {
+                    producer_id,
+                    result,
+                } => {
+                    let result = result.map(|mut output| {
+                        if let Some(ranges) = producer_chunk_ranges.get(&producer_id) {
+                            for seq in &mut output.sequences {
+                                let local = seq.client_index;
+                                if let Some((local_start, global_start, _len)) =
+                                    ranges.iter().find(|(local_start, _, len)| {
+                                        local >= *local_start
+                                            && local < local_start.saturating_add(*len)
+                                    })
+                                {
+                                    seq.client_index =
+                                        global_start.saturating_add(local - local_start);
+                                }
+                            }
+                            output.total_rows = next_global_chunk;
+                        }
+                        output
+                    });
+                    if prefill_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+                SegmentPrefillMessage::Prepared {
+                    producer_id,
+                    result,
+                } => {
+                    if let Ok(SegmentPreparedEvent::Prepared(prepared)) = &result {
+                        let chunk_count = prepared.meta.chunk_len();
+                        let local_start = producer_chunk_counts.entry(producer_id).or_default();
+                        producer_chunk_ranges.entry(producer_id).or_default().push((
+                            *local_start,
+                            next_global_chunk,
+                            chunk_count,
+                        ));
+                        *local_start = local_start.saturating_add(chunk_count);
+                        next_global_chunk = next_global_chunk.saturating_add(chunk_count);
+                    }
+                    if meta_tx
+                        .send(SegmentPrefillMessage::Prepared {
+                            producer_id,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                SegmentPrefillMessage::Failure(failure) => {
+                    if meta_tx
+                        .send(SegmentPrefillMessage::Failure(failure))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut on_complete = |chunk_index: usize, ids: Vec<u32>| -> Result<()> {
+        pending_chunks.borrow_mut().insert(chunk_index, ids);
+        Ok(())
+    };
+    let mut on_tick = || -> Result<()> {
+        drain_global_decoder_meta(
+            &meta_rx,
+            &mut stream_decoder,
+            segment_state,
+            &mut stream_segments,
+            &mut stream_waveforms,
+            &mut stream_batch_lens,
+            &mut stream_stage_starts,
+            &asr_to_result_tx,
+            &stats,
+        )?;
+        drain_completed_chunks(
+            qwen3,
+            &mut pending_chunks.borrow_mut(),
+            &mut stream_decoder,
+            segment_state,
+            stream_segments.as_slice(),
+            stream_waveforms.as_slice(),
+            stream_batch_lens.as_slice(),
+            stream_stage_starts.as_slice(),
+            &asr_to_result_tx,
+        )
+    };
+
     #[cfg(feature = "timing")]
     let mut timings = TranscribeTimings::default();
-    let ids = qwen3.decode_prefilled_dynamic_ids(
-        session.message_rx,
+    let decode_result = qwen3.decode_global_prefilled_dynamic_ids_streaming(
+        prefill_rx,
         runtime_options,
+        &mut on_complete,
+        &mut on_tick,
         #[cfg(feature = "timing")]
         Some(&mut timings.generation),
+    );
+    drop(on_tick);
+    let _ = forward_thread.join();
+    drain_global_decoder_meta(
+        &meta_rx,
+        &mut stream_decoder,
+        segment_state,
+        &mut stream_segments,
+        &mut stream_waveforms,
+        &mut stream_batch_lens,
+        &mut stream_stage_starts,
+        &asr_to_result_tx,
+        &stats,
+    )?;
+    drain_completed_chunks(
+        qwen3,
+        &mut pending_chunks.borrow_mut(),
+        &mut stream_decoder,
+        segment_state,
+        stream_segments.as_slice(),
+        stream_waveforms.as_slice(),
+        stream_batch_lens.as_slice(),
+        stream_stage_starts.as_slice(),
+        &asr_to_result_tx,
     )?;
 
-    for meta_message in session.meta_rx.try_iter() {
-        match meta_message {
-            Ok(SegmentPreparedEvent::Prepared(prepared)) => {
-                session.consumed_segments.extend(prepared.segments);
-                session.inference.targets.extend(prepared.inference.targets);
-                session.inference.segment_audio_seconds += prepared.inference.segment_audio_seconds;
-                session.waveforms.extend(prepared.waveforms);
-                session.batch_lens.push(prepared.meta.audio_len());
-                session.metas.push(prepared.meta);
-            }
-            Err(failure) => session.encoded_failures.push(failure),
-        }
-    }
-
-    session.inference.active_job_count = session
-        .inference
-        .targets
-        .iter()
-        .map(|(job_index, _, _)| *job_index)
-        .collect::<HashSet<_>>()
-        .len();
-
-    let outputs = qwen3.decode_dynamic_ids_with_metadata(ids, session.metas, session.batch_lens)?;
-    #[cfg(feature = "timing")]
-    {
-        timings.chunks = outputs.iter().map(Vec::len).sum();
-        timings.batches = outputs.len();
-    }
-    let mut timelines = Vec::with_capacity(session.waveforms.len());
-    let mut waveform_offset = 0usize;
-    for outputs in outputs {
-        let end = waveform_offset.saturating_add(outputs.len());
-        if end > session.waveforms.len() {
-            bail!(
-                "dynamic ASR waveform split mismatch: end={} waveforms={}",
-                end,
-                session.waveforms.len()
-            );
-        }
-        timelines.extend(qwen_outputs_to_timelines(
-            outputs,
-            &session.waveforms[waveform_offset..end],
-        )?);
-        waveform_offset = end;
-    }
-    if waveform_offset != session.waveforms.len() {
+    decode_result?;
+    if !pending_chunks.borrow().is_empty() {
         bail!(
-            "dynamic ASR unused waveforms: used={} waveforms={}",
-            waveform_offset,
-            session.waveforms.len()
+            "dynamic ASR streaming metadata missing for {} completed chunks",
+            pending_chunks.borrow().len()
         );
     }
-    Ok(DynamicSegmentAsrDecode {
-        consumed_segments: session.consumed_segments,
-        inference: session.inference,
-        timelines,
-        encoded_failures: session.encoded_failures,
-        #[cfg(feature = "timing")]
-        timings,
-    })
+    Ok(())
+}
+
+#[cfg(feature = "paged-attn")]
+fn handle_global_decoder_message(
+    message: SegmentPrefillMessage,
+    decoder: &mut StreamingMetadataDecoder,
+    state: &mut SegmentAsrState,
+    segments: &mut Vec<AsrSegmentJob>,
+    waveforms: &mut Vec<Waveform>,
+    batch_lens: &mut Vec<usize>,
+    stage_starts: &mut Vec<Instant>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
+) -> Result<()> {
+    match message {
+        SegmentPrefillMessage::Prefill { .. } => Ok(()),
+        SegmentPrefillMessage::Prepared {
+            result: Ok(SegmentPreparedEvent::Prepared(prepared)),
+            ..
+        } => {
+            let segment_count = prepared.segments.len();
+            decoder.push_metadata(prepared.meta, prepared.waveforms.len());
+            prepare_segment_job_state(state, prepared.segments.as_slice());
+            batch_lens.push(prepared.waveforms.len());
+            waveforms.extend(prepared.waveforms);
+            segments.extend(prepared.segments);
+            stage_starts.extend(std::iter::repeat_n(prepared.stage_start, segment_count));
+            Ok(())
+        }
+        SegmentPrefillMessage::Prepared {
+            result: Err(failure),
+            ..
+        }
+        | SegmentPrefillMessage::Failure(failure) => {
+            let outcomes = finish_segment_asr_batch(
+                state,
+                failure.segments.as_slice(),
+                failure.stage_start,
+                Err(failure.error),
+                None,
+                Some(stats),
+            );
+            for outcome in outcomes {
+                if asr_to_result_tx.blocking_send(outcome.into()).is_err() {
+                    bail!("ASR result router closed");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+fn drain_global_decoder_meta(
+    meta_rx: &std_mpsc::Receiver<SegmentPrefillMessage>,
+    decoder: &mut StreamingMetadataDecoder,
+    state: &mut SegmentAsrState,
+    segments: &mut Vec<AsrSegmentJob>,
+    waveforms: &mut Vec<Waveform>,
+    batch_lens: &mut Vec<usize>,
+    stage_starts: &mut Vec<Instant>,
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+    stats: &Arc<Mutex<AsrStageStats>>,
+) -> Result<()> {
+    for message in meta_rx.try_iter() {
+        handle_global_decoder_message(
+            message,
+            decoder,
+            state,
+            segments,
+            waveforms,
+            batch_lens,
+            stage_starts,
+            asr_to_result_tx,
+            stats,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "paged-attn")]
+fn drain_completed_chunks(
+    qwen3: &Qwen3ASR,
+    pending_chunks: &mut BTreeMap<usize, Vec<u32>>,
+    decoder: &mut StreamingMetadataDecoder,
+    state: &mut SegmentAsrState,
+    segments: &[AsrSegmentJob],
+    waveforms: &[Waveform],
+    batch_lens: &[usize],
+    stage_starts: &[Instant],
+    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
+) -> Result<()> {
+    let ready: Vec<usize> = pending_chunks
+        .range(..decoder.chunk_count())
+        .map(|(chunk_index, _)| *chunk_index)
+        .collect();
+    for chunk_index in ready {
+        let Some(ids) = pending_chunks.remove(&chunk_index) else {
+            continue;
+        };
+        if let Some(outcomes) = accept_completed_chunk(
+            qwen3,
+            decoder,
+            state,
+            segments,
+            waveforms,
+            batch_lens,
+            stage_starts,
+            chunk_index,
+            ids,
+        )? {
+            for outcome in outcomes {
+                if asr_to_result_tx.blocking_send(outcome.into()).is_err() {
+                    bail!("ASR result router closed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "paged-attn")]
+fn accept_completed_chunk(
+    qwen3: &Qwen3ASR,
+    decoder: &mut StreamingMetadataDecoder,
+    state: &mut SegmentAsrState,
+    segments: &[AsrSegmentJob],
+    waveforms: &[Waveform],
+    batch_lens: &[usize],
+    stage_starts: &[Instant],
+    chunk_index: usize,
+    ids: Vec<u32>,
+) -> Result<Option<Vec<RoutedTranscribeItemOutcome>>> {
+    let Some((batch_index, audio_index, output)) =
+        decoder.accept_chunk(qwen3.processor(), chunk_index, ids)?
+    else {
+        return Ok(None);
+    };
+    let segment_index = batch_lens
+        .iter()
+        .take(batch_index)
+        .sum::<usize>()
+        .saturating_add(audio_index);
+    let Some(segment) = segments.get(segment_index) else {
+        bail!(
+            "dynamic ASR streaming segment index out of range: batch={} audio={} segment_index={} segments={}",
+            batch_index,
+            audio_index,
+            segment_index,
+            segments.len()
+        );
+    };
+    let stage_start = stage_starts
+        .get(segment_index)
+        .copied()
+        .unwrap_or_else(Instant::now);
+    let mut timelines =
+        qwen_outputs_to_timelines(vec![output], &waveforms[segment_index..segment_index + 1])?;
+    let timeline = timelines
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("missing streaming ASR timeline"))?;
+    let batch = SegmentAsrInference {
+        targets: vec![(segment.job_index, segment.segment_index, segment.offset)],
+        segment_audio_seconds: segment.waveform.duration_seconds(),
+        active_job_count: 1,
+    };
+    Ok(Some(finish_segment_asr_batch(
+        state,
+        std::slice::from_ref(segment),
+        stage_start,
+        Ok((batch, vec![timeline])),
+        None,
+        None,
+    )))
 }
 
 #[cfg(feature = "paged-attn")]
@@ -3072,10 +3301,12 @@ fn run_segment_asr_prefill_dynamic_worker(
     runtime_handle: tokio::runtime::Handle,
     runtime_options: vasr::models::qwen3asr::TranscribeOptions,
     decode_idle_flush: Option<std::time::Duration>,
-    message_tx: std_mpsc::Sender<Result<PrefillStageOutput>>,
-    meta_tx: std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+    decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
+    producer_id: usize,
+    prefill_log_segments: Vec<AsrSegmentJob>,
 ) {
     let run = (|| -> Result<()> {
+        let prefill_log_segments = Mutex::new(prefill_log_segments);
         let mut source_closed = false;
         let mut poll_prepared = |may_block: bool| -> Result<PreparedAudioBatchPoll> {
             if decode_idle_flush.is_some() && !may_block {
@@ -3107,17 +3338,11 @@ fn run_segment_asr_prefill_dynamic_worker(
                     message,
                     &encoded_rx,
                     &runtime_handle,
-                    &meta_tx,
+                    &decoder_tx,
+                    producer_id,
+                    &prefill_log_segments,
                 )? {
                     PrefillCoalescedPoll::Ready(coalesced) => {
-                        if coalesced.num_batches > 1 {
-                            tracing::debug!(
-                                target: "vasr_transcribe::pipeline",
-                                "prefill coalesced | batches={} segments={}",
-                                coalesced.num_batches,
-                                coalesced.num_segments,
-                            );
-                        }
                         return Ok(PreparedAudioBatchPoll::Ready(coalesced.prepared));
                     }
                     PrefillCoalescedPoll::Empty => return Ok(PreparedAudioBatchPoll::Empty),
@@ -3131,10 +3356,33 @@ fn run_segment_asr_prefill_dynamic_worker(
             runtime_options,
         )?;
         loop {
+            let stage_start = Instant::now();
             let message = producer.run_stage(true)?;
+            #[cfg(feature = "timing")]
+            let elapsed_seconds = message.timings.prefill_us as f64 / 1_000_000.0;
+            #[cfg(not(feature = "timing"))]
+            let elapsed_seconds = stage_start.elapsed().as_secs_f64();
+            #[cfg(feature = "timing")]
+            let _ = stage_start;
             let wave = message.prefill_wave;
             let done = producer.is_done();
-            if (wave > 0 || message.source_closed) && message_tx.send(Ok(message)).is_err() {
+            if wave > 0 {
+                log_prefill_batch_done(
+                    &prefill_log_segments
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?,
+                    &message,
+                    elapsed_seconds,
+                );
+            }
+            if wave > 0
+                && decoder_tx
+                    .send(SegmentPrefillMessage::Prefill {
+                        producer_id,
+                        result: Ok(message),
+                    })
+                    .is_err()
+            {
                 return Ok(());
             }
             if done {
@@ -3147,7 +3395,10 @@ fn run_segment_asr_prefill_dynamic_worker(
         Ok(())
     })();
     if let Err(error) = run {
-        let _ = message_tx.send(Err(error));
+        let _ = decoder_tx.send(SegmentPrefillMessage::Prefill {
+            producer_id,
+            result: Err(error),
+        });
     }
 }
 
@@ -3157,11 +3408,11 @@ fn prepare_coalesced_segment_prefill_batch(
     first: SegmentEncoderOutput,
     encoded_rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<SegmentEncoderOutput>>>,
     runtime_handle: &tokio::runtime::Handle,
-    meta_tx: &std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+    decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
+    producer_id: usize,
+    prefill_log_segments: &Mutex<Vec<AsrSegmentJob>>,
 ) -> Result<PrefillCoalescedPoll> {
     let mut prepared_batches = Vec::new();
-    let mut num_batches = 0usize;
-    let mut num_segments = 0usize;
 
     let mut current = Some(first);
     let deadline = std::time::Instant::now() + asr_prefill_coalesce_wait();
@@ -3172,10 +3423,10 @@ fn prepare_coalesced_segment_prefill_batch(
         if !prepare_segment_encoded_for_prefill(
             qwen3,
             message,
-            meta_tx,
+            decoder_tx,
+            producer_id,
+            prefill_log_segments,
             &mut prepared_batches,
-            &mut num_batches,
-            &mut num_segments,
         )? {
             return Ok(PrefillCoalescedPoll::Closed);
         }
@@ -3196,8 +3447,6 @@ fn prepare_coalesced_segment_prefill_batch(
 
     Ok(PrefillCoalescedPoll::Ready(PrefillCoalescedPrepared {
         prepared: merge_prepared_audio_batches(prepared_batches)?,
-        num_batches,
-        num_segments,
     }))
 }
 
@@ -3205,41 +3454,46 @@ fn prepare_coalesced_segment_prefill_batch(
 fn prepare_segment_encoded_for_prefill(
     qwen3: &Qwen3ASR,
     message: SegmentEncoderOutput,
-    meta_tx: &std_mpsc::Sender<Result<SegmentPreparedEvent, SegmentEncodedFailure>>,
+    decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
+    producer_id: usize,
+    prefill_log_segments: &Mutex<Vec<AsrSegmentJob>>,
     prepared_batches: &mut Vec<PreparedAudioBatch>,
-    num_batches: &mut usize,
-    num_segments: &mut usize,
 ) -> Result<bool> {
     let SegmentEncoderOutput::Encoded(message) = message;
     match message.batch {
         Ok(batch) => {
-            let segment_count = message.segments.len();
-            let (next_inference, next_waveforms, next_encoded) = batch.into_parts();
+            let (_next_inference, next_waveforms, next_encoded) = batch.into_parts();
             let (prepared, meta) = qwen3.prepare_encoded_audio_features(next_encoded)?;
-            if meta_tx
-                .send(Ok(SegmentPreparedEvent::Prepared(
-                    SegmentPreparedMetadata {
+            prefill_log_segments
+                .lock()
+                .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?
+                .extend(message.segments.iter().cloned());
+            if decoder_tx
+                .send(SegmentPrefillMessage::Prepared {
+                    producer_id,
+                    result: Ok(SegmentPreparedEvent::Prepared(SegmentPreparedMetadata {
                         segments: message.segments,
-                        inference: next_inference,
                         waveforms: next_waveforms,
                         meta,
-                    },
-                )))
+                        stage_start: message.stage_start,
+                    })),
+                })
                 .is_err()
             {
                 return Ok(false);
             }
-            *num_batches = num_batches.saturating_add(1);
-            *num_segments = num_segments.saturating_add(segment_count);
             prepared_batches.push(prepared);
         }
         Err(error) => {
-            if meta_tx
-                .send(Err(SegmentEncodedFailure {
-                    segments: message.segments,
-                    stage_start: message.stage_start,
-                    error,
-                }))
+            if decoder_tx
+                .send(SegmentPrefillMessage::Prepared {
+                    producer_id,
+                    result: Err(SegmentEncodedFailure {
+                        segments: message.segments,
+                        stage_start: message.stage_start,
+                        error,
+                    }),
+                })
                 .is_err()
             {
                 return Ok(false);
@@ -3353,167 +3607,7 @@ fn try_recv_segment_encoded_message(
     }
 }
 
-#[cfg(not(feature = "paged-attn"))]
-async fn handle_segment_encoded_messages(
-    offline: &OfflinePipeline,
-    asr_options: &AsrOptions,
-    segment_state: &mut SegmentAsrState,
-    encoded_messages: Vec<SegmentEncodedMessage>,
-    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
-    stats: &Arc<Mutex<AsrStageStats>>,
-    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-) {
-    let mut ok_batches = Vec::new();
-    for encoded in encoded_messages {
-        let mut encoded_segments = encoded.segments;
-        apply_batch_timing_to_segments(&mut encoded_segments, encoded.encoder_timing);
-        match encoded.batch {
-            Ok(batch) => ok_batches.push((encoded_segments, encoded.stage_start, batch)),
-            Err(error) => {
-                let outcomes = finish_segment_asr_batch(
-                    segment_state,
-                    &encoded_segments,
-                    encoded.stage_start,
-                    Err(error),
-                    None,
-                    Some(stats),
-                );
-                for outcome in outcomes {
-                    let _ = asr_to_result_tx.send(outcome.into()).await;
-                }
-            }
-        }
-    }
-    if ok_batches.is_empty() {
-        return;
-    }
-
-    let mut segments = Vec::new();
-    let mut stage_start = ok_batches[0].1;
-    let mut batches = Vec::with_capacity(ok_batches.len());
-    for (mut batch_segments, batch_start, batch) in ok_batches {
-        if batch_start < stage_start {
-            stage_start = batch_start;
-        }
-        segments.append(&mut batch_segments);
-        batches.push(batch);
-    }
-    let batch = SegmentEncodedAsrBatch::merge(batches);
-    handle_merged_segment_encoded_batch(
-        offline,
-        asr_options,
-        segment_state,
-        segments,
-        stage_start,
-        batch,
-        asr_to_result_tx,
-        stats,
-        pending_requests,
-    )
-    .await;
-}
-
-#[cfg(not(feature = "paged-attn"))]
-async fn handle_merged_segment_encoded_batch(
-    offline: &OfflinePipeline,
-    asr_options: &AsrOptions,
-    segment_state: &mut SegmentAsrState,
-    segments: Vec<AsrSegmentJob>,
-    stage_start: Instant,
-    batch: Result<SegmentEncodedAsrBatch>,
-    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
-    stats: &Arc<Mutex<AsrStageStats>>,
-    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-) {
-    let decode_start = Instant::now();
-    #[cfg(feature = "timing")]
-    let batch = match batch {
-        Ok(batch) => tokio::task::spawn_blocking({
-            let asr = Arc::clone(&offline.asr);
-            let asr_options = asr_options.clone();
-            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
-        Err(error) => Err(error),
-    };
-    #[cfg(feature = "timing")]
-    let asr_timing = batch
-        .as_ref()
-        .ok()
-        .map(|(_, _, timings)| transcribe_timing_seconds(timings));
-    #[cfg(not(feature = "timing"))]
-    let asr_timing = None;
-    #[cfg(feature = "timing")]
-    if let Ok((_, _, timings)) = &batch {
-        record_asr_timing_stats(stats, timings);
-    }
-    #[cfg(not(feature = "timing"))]
-    let batch = match batch {
-        Ok(batch) => tokio::task::spawn_blocking({
-            let asr = Arc::clone(&offline.asr);
-            let asr_options = asr_options.clone();
-            move || run_segment_asr_decode(asr.as_ref(), batch, &asr_options)
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR decoder join error: {error}"))),
-        Err(error) => Err(error),
-    };
-    record_asr_decode_stats(
-        stats,
-        segments.len(),
-        segments
-            .iter()
-            .map(|segment| segment.waveform.duration_seconds())
-            .sum(),
-        decode_start.elapsed().as_secs_f64(),
-    );
-    let decode_span = StageSpan::new(decode_start, Instant::now());
-    let prefill_span = prefill_span_from_decode(decode_span, asr_timing);
-    record_request_decode_stages(&pending_requests, &segments, decode_span, prefill_span);
-    #[cfg(feature = "timing")]
-    let batch = batch.map(|(inference, timelines, _timings)| (inference, timelines));
-    let outcomes = finish_segment_asr_batch(
-        segment_state,
-        &segments,
-        stage_start,
-        batch,
-        asr_timing,
-        Some(stats),
-    );
-    for outcome in outcomes {
-        let _ = asr_to_result_tx.send(outcome.into()).await;
-    }
-}
-
-#[cfg(not(feature = "paged-attn"))]
-async fn handle_ready_segment_encoded_messages(
-    first: SegmentEncodedMessage,
-    encoder_to_decoder_rx: &mut mpsc::UnboundedReceiver<SegmentEncoderOutput>,
-    offline: &OfflinePipeline,
-    asr_options: &AsrOptions,
-    segment_state: &mut SegmentAsrState,
-    asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
-    stats: &Arc<Mutex<AsrStageStats>>,
-    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-) {
-    let mut messages = vec![first];
-    while let Ok(message) = encoder_to_decoder_rx.try_recv() {
-        let SegmentEncoderOutput::Encoded(message) = message;
-        messages.push(message);
-    }
-    handle_segment_encoded_messages(
-        offline,
-        asr_options,
-        segment_state,
-        messages,
-        asr_to_result_tx,
-        stats,
-        pending_requests,
-    )
-    .await;
-}
-
+#[cfg(feature = "paged-attn")]
 fn send_segment_encode_request(
     asr_to_encoder_tx: &mpsc::UnboundedSender<SegmentEncodeMessage>,
     request: SegmentEncodeRequest,
@@ -3532,7 +3626,6 @@ fn send_segment_encode_request(
 fn spawn_asr_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
-    max_batch_audio_sec: f32,
     mut vad_to_asr_rx: mpsc::UnboundedReceiver<VadToAsrMessage>,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
@@ -3540,14 +3633,17 @@ fn spawn_asr_worker(
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut fallback_segment_state = SegmentAsrState::default();
+        #[cfg(not(feature = "paged-attn"))]
+        let _ = (decode_idle_flush, &pending_requests);
         let mut pending = VecDeque::new();
+        #[cfg(feature = "paged-attn")]
         let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::unbounded_channel();
+        #[cfg(feature = "paged-attn")]
         let (encoder_to_prefill_tx, encoder_to_prefill_rx) = mpsc::unbounded_channel();
+        #[cfg(feature = "paged-attn")]
         let segment_encoder_handle = spawn_segment_encoder_worker(
             Arc::clone(&offline),
             asr_options.clone(),
-            max_batch_audio_sec,
             asr_to_encoder_rx,
             encoder_to_prefill_tx,
             Arc::clone(&stats),
@@ -3569,22 +3665,10 @@ fn spawn_asr_worker(
                 prefill_to_decoder_rx,
                 asr_to_result_tx.clone(),
                 Arc::clone(&stats),
-                decode_idle_flush,
                 pending_requests.clone(),
             );
             (prefill_handle, decoder_handle)
         };
-        #[cfg(not(feature = "paged-attn"))]
-        let segment_decoder_handle = spawn_segment_decoder_worker(
-            Arc::clone(&offline),
-            asr_options.clone(),
-            encoder_to_prefill_rx,
-            asr_to_result_tx.clone(),
-            Arc::clone(&stats),
-            decode_idle_flush,
-            pending_requests.clone(),
-        );
-
         while let Some(envelope) = match pending.pop_front() {
             Some(envelope) => Some(envelope),
             None => vad_to_asr_rx.recv().await,
@@ -3595,13 +3679,8 @@ fn spawn_asr_worker(
                     let _ = asr_to_result_tx.send(outcome.into()).await;
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
-                    let messages = collect_job_microbatch(
-                        job,
-                        max_batch_audio_sec,
-                        &mut vad_to_asr_rx,
-                        &mut pending,
-                    )
-                    .await;
+                    let messages =
+                        collect_job_microbatch(job, &mut vad_to_asr_rx, &mut pending).await;
                     let mut jobs = Vec::new();
                     for message in messages {
                         match message {
@@ -3609,6 +3688,7 @@ fn spawn_asr_worker(
                                 let _ = asr_to_result_tx.send(outcome.into()).await;
                             }
                             Ok(AsrPipelineMessage::Job(job)) => jobs.push(job),
+                            #[cfg(feature = "paged-attn")]
                             Ok(AsrPipelineMessage::Segment(_)) => {
                                 tracing::warn!(
                                     "ASR worker received segment while collecting job micro-batch"
@@ -3644,62 +3724,21 @@ fn spawn_asr_worker(
                         let _ = asr_to_result_tx.send(outcome).await;
                     }
                 }
+                #[cfg(feature = "paged-attn")]
                 Ok(AsrPipelineMessage::Segment(segment)) => {
                     let stage_start = Instant::now();
-                    if offline.asr.as_any().is::<Qwen3ASR>() && dynamic_staged_asr_enabled() {
-                        let request = SegmentEncodeRequest {
-                            segment,
-                            stage_start,
-                        };
-                        send_segment_encode_request(&asr_to_encoder_tx, request);
-                    } else {
-                        let segments = collect_segment_microbatch(
-                            segment,
-                            max_batch_audio_sec,
-                            &mut vad_to_asr_rx,
-                            &mut pending,
-                        )
-                        .await;
-                        let batch = tokio::task::spawn_blocking({
-                            let offline = Arc::clone(&offline);
-                            let asr_options = asr_options.clone();
-                            let stats = Arc::clone(&stats);
-                            let segments = segments.clone();
-                            move || {
-                                let stage_start = Instant::now();
-                                let result =
-                                    run_segment_asr_inference(&offline, &segments, &asr_options);
-                                if let Ok((inference, _)) = &result {
-                                    record_asr_batch_stats(
-                                        &stats,
-                                        inference.active_job_count,
-                                        segments.len(),
-                                        inference.segment_audio_seconds,
-                                        stage_start.elapsed().as_secs_f64(),
-                                    );
-                                }
-                                result
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR join error: {error}")));
-                        let outcomes = finish_segment_asr_batch(
-                            &mut fallback_segment_state,
-                            &segments,
-                            stage_start,
-                            batch,
-                            None,
-                            None,
-                        );
-                        for outcome in outcomes {
-                            let _ = asr_to_result_tx.send(outcome.into()).await;
-                        }
-                    }
+                    let request = SegmentEncodeRequest {
+                        segment,
+                        stage_start,
+                    };
+                    send_segment_encode_request(&asr_to_encoder_tx, request);
                 }
             }
         }
 
+        #[cfg(feature = "paged-attn")]
         drop(asr_to_encoder_tx);
+        #[cfg(feature = "paged-attn")]
         let _ = segment_encoder_handle.await;
         #[cfg(feature = "paged-attn")]
         {
@@ -3708,23 +3747,21 @@ fn spawn_asr_worker(
             let _ = segment_prefill_handle.await;
             let _ = segment_decoder_handle.await;
         }
-        #[cfg(not(feature = "paged-attn"))]
-        let _ = segment_decoder_handle.await;
     })
 }
 
 async fn collect_job_microbatch(
     first: AsrJob,
-    _max_batch_audio_sec: f32,
     vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
-    pending: &mut VecDeque<VadToAsrMessage>,
+    _pending: &mut VecDeque<VadToAsrMessage>,
 ) -> Vec<Result<AsrPipelineMessage, TranscribeItemOutcome>> {
     let mut messages = vec![Ok(AsrPipelineMessage::Job(first))];
     loop {
         match vad_to_asr_rx.try_recv() {
             Ok(envelope) => match envelope.message {
+                #[cfg(feature = "paged-attn")]
                 Ok(AsrPipelineMessage::Segment(_)) => {
-                    pending.push_back(envelope);
+                    _pending.push_back(envelope);
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
                     messages.push(Ok(AsrPipelineMessage::Job(job)));
@@ -3743,8 +3780,9 @@ async fn collect_job_microbatch(
         .await
         {
             Ok(Some(envelope)) => match envelope.message {
+                #[cfg(feature = "paged-attn")]
                 Ok(AsrPipelineMessage::Segment(_)) => {
-                    pending.push_back(envelope);
+                    _pending.push_back(envelope);
                 }
                 Ok(AsrPipelineMessage::Job(job)) => {
                     messages.push(Ok(AsrPipelineMessage::Job(job)));
@@ -3757,61 +3795,7 @@ async fn collect_job_microbatch(
     messages
 }
 
-async fn collect_segment_microbatch(
-    first: AsrSegmentJob,
-    _max_batch_audio_sec: f32,
-    vad_to_asr_rx: &mut mpsc::UnboundedReceiver<VadToAsrMessage>,
-    pending: &mut VecDeque<VadToAsrMessage>,
-) -> Vec<AsrSegmentJob> {
-    let mut segments = vec![first];
-    // Phase 1: non-blocking drain of everything already in the channel.
-    loop {
-        match vad_to_asr_rx.try_recv() {
-            Ok(envelope) => match envelope.message {
-                Ok(AsrPipelineMessage::Segment(segment)) => {
-                    segments.push(segment);
-                }
-                message => {
-                    // Stash non-segment messages (e.g. Job) so we can
-                    // keep collecting segments behind them.
-                    pending.push_back(VadToAsrMessage {
-                        message,
-                        _queue_memory_permit: envelope._queue_memory_permit,
-                    });
-                }
-            },
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => return segments,
-        }
-    }
-    // Phase 2: briefly wait for more segments so the continuous scheduler sees
-    // larger admit waves without adding noticeable tail latency.
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(ASR_MICROBATCH_COLLECT_WAIT_MS),
-            vad_to_asr_rx.recv(),
-        )
-        .await
-        {
-            Ok(Some(envelope)) => match envelope.message {
-                Ok(AsrPipelineMessage::Segment(segment)) => {
-                    segments.push(segment);
-                }
-                message => {
-                    // Same as Phase 1: stash non-segment, keep looking.
-                    pending.push_back(VadToAsrMessage {
-                        message,
-                        _queue_memory_permit: envelope._queue_memory_permit,
-                    });
-                }
-            },
-            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
-        }
-    }
-    segments.sort_by_key(|segment| (segment.job_index, segment.offset.0));
-    segments
-}
-
+#[cfg(feature = "paged-attn")]
 fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegmentJob]) {
     for segment in segments {
         let entry = state
@@ -3848,6 +3832,7 @@ fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegment
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
     let mut timeline = Timeline::new("offline_audio");
     timeline.annotations.extend(job.speech_annotations);
@@ -3865,6 +3850,7 @@ fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn routed_segment_job_outcome(job: SegmentJobState) -> RoutedTranscribeItemOutcome {
     let request_item = job.request_item;
     let outcome = finish_segment_job(job);
@@ -3874,7 +3860,8 @@ fn routed_segment_job_outcome(job: SegmentJobState) -> RoutedTranscribeItemOutco
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg(feature = "paged-attn")]
 struct SegmentAsrInference {
     targets: Vec<(usize, usize, DurationMs)>,
     segment_audio_seconds: f64,
@@ -3882,6 +3869,7 @@ struct SegmentAsrInference {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "paged-attn")]
 struct SegmentEncodedAsrBatch {
     inference: SegmentAsrInference,
     waveforms: Vec<Waveform>,
@@ -3889,91 +3877,11 @@ struct SegmentEncodedAsrBatch {
     timings: AudioFeatureEncodeTimings,
 }
 
+#[cfg(feature = "paged-attn")]
 impl SegmentEncodedAsrBatch {
-    #[cfg(not(feature = "paged-attn"))]
-    fn merge(batches: Vec<Self>) -> Result<Self> {
-        let mut targets = Vec::new();
-        let mut waveforms = Vec::new();
-        let mut encoded_batches = Vec::with_capacity(batches.len());
-        let mut segment_audio_seconds = 0.0;
-        let mut active_jobs = HashSet::new();
-
-        for mut batch in batches {
-            segment_audio_seconds += batch.inference.segment_audio_seconds;
-            for (job_index, _, _) in &batch.inference.targets {
-                active_jobs.insert(*job_index);
-            }
-            targets.append(&mut batch.inference.targets);
-            waveforms.append(&mut batch.waveforms);
-            encoded_batches.push(batch.encoded);
-        }
-
-        let encoded = EncodedAsrBatch::merge(encoded_batches)?;
-        if encoded.len() != waveforms.len() {
-            bail!(
-                "merged staged ASR batch mismatch: encoded={} waveforms={}",
-                encoded.len(),
-                waveforms.len()
-            );
-        }
-
-        Ok(Self {
-            inference: SegmentAsrInference {
-                targets,
-                segment_audio_seconds,
-                active_job_count: active_jobs.len(),
-            },
-            waveforms,
-            timings: encoded.audio_feature_encode_timings(),
-            encoded,
-        })
-    }
-
-    #[cfg(feature = "paged-attn")]
     fn into_parts(self) -> (SegmentAsrInference, Vec<Waveform>, EncodedAsrBatch) {
         (self.inference, self.waveforms, self.encoded)
     }
-}
-
-fn run_segment_asr_inference(
-    offline: &OfflinePipeline,
-    segments: &[AsrSegmentJob],
-    asr_options: &AsrOptions,
-) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
-    if offline.asr.as_any().is::<Qwen3ASR>() {
-        let encoded = run_segment_asr_encode(offline, segments, asr_options)?;
-        #[cfg(feature = "timing")]
-        {
-            let (inference, timelines, _timings) =
-                run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options)?;
-            return Ok((inference, timelines));
-        }
-        #[cfg(not(feature = "timing"))]
-        return run_segment_asr_decode(offline.asr.as_ref(), encoded, asr_options);
-    }
-    let slices: Vec<Waveform> = segments
-        .iter()
-        .map(|segment| segment.waveform.clone())
-        .collect();
-    let targets: Vec<(usize, usize, DurationMs)> = segments
-        .iter()
-        .map(|segment| (segment.job_index, segment.segment_index, segment.offset))
-        .collect();
-    let active_job_count = segments
-        .iter()
-        .map(|segment| segment.job_index)
-        .collect::<HashSet<_>>()
-        .len();
-    let segment_audio_seconds: f64 = slices.iter().map(Waveform::duration_seconds).sum();
-    let timelines = offline.asr.transcribe(slices.as_slice(), asr_options)?;
-    Ok((
-        SegmentAsrInference {
-            targets,
-            segment_audio_seconds,
-            active_job_count,
-        },
-        timelines,
-    ))
 }
 
 fn run_raw_asr_inference(
@@ -4005,6 +3913,7 @@ fn run_raw_asr_inference(
         .map(|timelines| (timelines, None))
 }
 
+#[cfg(feature = "paged-attn")]
 fn run_segment_asr_encode(
     offline: &OfflinePipeline,
     segments: &[AsrSegmentJob],
@@ -4044,42 +3953,7 @@ fn run_segment_asr_encode(
     })
 }
 
-#[cfg(feature = "timing")]
-fn run_segment_asr_decode(
-    asr: &dyn crate::runtime::model::AsrModel,
-    encoded: SegmentEncodedAsrBatch,
-    asr_options: &AsrOptions,
-) -> Result<(SegmentAsrInference, Vec<Timeline>, TranscribeTimings)> {
-    let qwen3 = asr
-        .as_any()
-        .downcast_ref::<Qwen3ASR>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3ASR"))?;
-    let (timelines, timings) = qwen3.decode_cpu_audio_features_to_timelines_timed(
-        encoded.encoded,
-        encoded.waveforms.as_slice(),
-        asr_options,
-    )?;
-    Ok((encoded.inference, timelines, timings))
-}
-
-#[cfg(not(feature = "timing"))]
-fn run_segment_asr_decode(
-    asr: &dyn crate::runtime::model::AsrModel,
-    encoded: SegmentEncodedAsrBatch,
-    asr_options: &AsrOptions,
-) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
-    let qwen3 = asr
-        .as_any()
-        .downcast_ref::<Qwen3ASR>()
-        .ok_or_else(|| anyhow::anyhow!("staged ASR decode requires Qwen3ASR"))?;
-    let timelines = qwen3.decode_cpu_audio_features_to_timelines(
-        encoded.encoded,
-        encoded.waveforms.as_slice(),
-        asr_options,
-    )?;
-    Ok((encoded.inference, timelines))
-}
-
+#[cfg(feature = "paged-attn")]
 fn finish_segment_asr_batch(
     state: &mut SegmentAsrState,
     segments: &[AsrSegmentJob],
@@ -4262,24 +4136,6 @@ fn finish_segment_asr_batch(
     completed
 }
 
-fn run_segment_microbatch(
-    offline: &OfflinePipeline,
-    segments: Vec<AsrSegmentJob>,
-    asr_options: &AsrOptions,
-    state: &mut SegmentAsrState,
-) -> Vec<TranscribeItemOutcome> {
-    if segments.is_empty() {
-        return Vec::new();
-    }
-
-    let stage_start = Instant::now();
-    let batch = run_segment_asr_inference(offline, &segments, asr_options);
-    finish_segment_asr_batch(state, &segments, stage_start, batch, None, None)
-        .into_iter()
-        .map(RoutedTranscribeItemOutcome::into_public_outcome)
-        .collect()
-}
-
 fn run_asr_jobs_batch(
     offline: &OfflinePipeline,
     jobs: Vec<AsrJob>,
@@ -4288,14 +4144,26 @@ fn run_asr_jobs_batch(
 ) -> Vec<RoutedTranscribeItemOutcome> {
     let mut outcomes = Vec::with_capacity(jobs.len());
     let mut raw_jobs: Vec<(AsrJob, Vec<Annotation>)> = Vec::new();
-    let mut prepared_jobs = Vec::new();
 
     for mut job in jobs {
         let prepared = std::mem::replace(&mut job.prepared, VadPreparation::Disabled);
         match prepared {
             VadPreparation::Speech(prepared) => {
-                job.prepared = VadPreparation::Speech(prepared);
-                prepared_jobs.push(job);
+                let request_item = job.request_item;
+                outcomes.push(route_outcome(
+                    request_item,
+                    outcome_from_result(
+                        job.index,
+                        job.channel,
+                        job.waveform.duration_seconds(),
+                        job.timing,
+                        job.spans,
+                        Err(anyhow::anyhow!(
+                            "speech jobs must enter ASR as segment messages"
+                        )),
+                    ),
+                ));
+                drop(prepared);
             }
             VadPreparation::NoSpeech => {
                 let request_item = job.request_item;
@@ -4475,33 +4343,6 @@ fn run_asr_jobs_batch(
         }
     }
 
-    if !prepared_jobs.is_empty() {
-        let mut segment_state = SegmentAsrState::default();
-        let mut segment_jobs = Vec::new();
-        for job in prepared_jobs {
-            match speech_job_to_segments(job) {
-                Ok(mut segments) => segment_jobs.append(&mut segments),
-                Err(error) => outcomes.push(
-                    TranscribeItemOutcome {
-                        index: 0,
-                        channel: "mono",
-                        result: Err(error),
-                        audio_seconds: 0.0,
-                        timing: TranscribeItemTiming::default(),
-                        spans: TranscribeItemSpans::default(),
-                        bad_component: Some("vad"),
-                    }
-                    .into(),
-                ),
-            }
-        }
-        outcomes.extend(
-            run_segment_microbatch(offline, segment_jobs, asr_options, &mut segment_state)
-                .into_iter()
-                .map(Into::into),
-        );
-    }
-
     outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
     outcomes
 }
@@ -4605,6 +4446,7 @@ fn prefill_span_from_decode(
     ))
 }
 
+#[cfg(feature = "paged-attn")]
 fn apply_batch_timing_to_segments(segments: &mut [AsrSegmentJob], timing: TranscribeItemTiming) {
     if segments.is_empty() {
         return;
@@ -4634,6 +4476,7 @@ fn allocation_scale(item_audio_seconds: f64, total_audio_seconds: f64, item_coun
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn audio_encoder_timing_seconds(timings: AudioFeatureEncodeTimings) -> TranscribeItemTiming {
     TranscribeItemTiming {
         audio_encoder_seconds: timing_us_to_seconds(
@@ -4724,6 +4567,7 @@ fn record_vad_task_stats(stats: &Arc<Mutex<VadStageStats>>, task: &VadTaskStats)
     }
 }
 
+#[cfg(feature = "paged-attn")]
 fn record_asr_encode_stats(
     stats: &Arc<Mutex<AsrStageStats>>,
     segments: usize,
@@ -4739,6 +4583,7 @@ fn record_asr_encode_stats(
 }
 
 #[cfg(feature = "timing")]
+#[allow(dead_code)]
 fn record_asr_timing_stats(stats: &Arc<Mutex<AsrStageStats>>, timings: &TranscribeTimings) {
     if let Ok(mut stats) = stats.lock() {
         stats.audio_encoder_seconds += timings.audio_encoder_us as f64 / 1_000_000.0;
@@ -4754,6 +4599,7 @@ fn record_asr_timing_stats(stats: &Arc<Mutex<AsrStageStats>>, timings: &Transcri
     }
 }
 
+#[allow(dead_code)]
 fn record_asr_decode_stats(
     stats: &Arc<Mutex<AsrStageStats>>,
     segments: usize,
@@ -5167,11 +5013,10 @@ fn outcome_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{AsrModel, VadSegment};
+    use crate::runtime::AsrModel;
     use std::sync::{Arc, Mutex};
     use vasr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
-        TimeRange,
     };
 
     #[test]
@@ -5230,6 +5075,7 @@ mod tests {
         assert_eq!(loaded_job_memory_permits(&job), 5);
     }
 
+    #[cfg(feature = "paged-attn")]
     #[test]
     fn vad_to_asr_segment_memory_permits_rounds_up_to_megabytes() {
         let message = Ok(AsrPipelineMessage::Segment(AsrSegmentJob {
@@ -5304,51 +5150,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vad_segments_from_multiple_jobs_are_transcribed_as_one_batch() -> Result<()> {
-        let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        };
-        let jobs = vec![
-            AsrJob {
-                index: 0,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                prepared: VadPreparation::Speech(prepared_with_segments(&[(0, 100), (250, 400)])),
-                waveform: Waveform::new(vec![0.1; 8_000], 16_000),
-            },
-            AsrJob {
-                index: 1,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                prepared: VadPreparation::Speech(prepared_with_segments(&[(50, 200)])),
-                waveform: Waveform::new(vec![0.2; 8_000], 16_000),
-            },
-        ];
-
-        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default(), None);
-
-        assert_eq!(outcomes.len(), 2);
-        assert!(
-            outcomes
-                .iter()
-                .all(|outcome| outcome.outcome.result.is_ok())
-        );
-        assert_eq!(
-            *asr.seen_batch_sizes
-                .lock()
-                .expect("seen batch sizes poisoned"),
-            vec![3]
-        );
-        Ok(())
-    }
-
+    #[cfg(feature = "paged-attn")]
     #[test]
     fn segment_batch_error_after_partial_success_returns_job_error() -> Result<()> {
         let mut state = SegmentAsrState::default();
@@ -5428,6 +5230,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "paged-attn")]
     #[test]
     fn segment_batch_error_registers_missing_job_state() -> Result<()> {
         let mut state = SegmentAsrState::default();
@@ -5517,7 +5320,6 @@ mod tests {
         let handle = spawn_asr_worker(
             pipeline,
             AsrOptions::default(),
-            60.0,
             vad_to_asr_rx,
             asr_to_result_tx,
             stats,
@@ -5553,150 +5355,6 @@ mod tests {
                 .lock()
                 .expect("seen batch sizes poisoned"),
             vec![3]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn asr_worker_does_not_drop_job_after_segment_microbatch() -> Result<()> {
-        let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = Arc::new(OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        });
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
-        let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
-        let stats = Arc::new(Mutex::new(AsrStageStats::default()));
-        let handle = spawn_asr_worker(
-            pipeline,
-            AsrOptions::default(),
-            60.0,
-            vad_to_asr_rx,
-            asr_to_result_tx,
-            stats,
-            None,
-            None,
-        );
-
-        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
-            AsrSegmentJob {
-                job_index: 0,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                job_audio_seconds: 0.01,
-                speech_annotations: Vec::new(),
-                segment_index: 0,
-                segment_count: 1,
-                offset: DurationMs(0),
-                waveform: Waveform::new(vec![0.1; 160], 16_000),
-            },
-        ))))?;
-        tokio::task::yield_now().await;
-        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
-            AsrJob {
-                index: 1,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                prepared: VadPreparation::Disabled,
-                waveform: Waveform::new(vec![0.2; 160], 16_000),
-            },
-        ))))?;
-        drop(vad_to_asr_tx);
-
-        let mut outcomes = Vec::new();
-        while let Some(outcome) = asr_to_result_rx.recv().await {
-            outcomes.push(outcome);
-        }
-        handle.await?;
-        outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
-
-        assert_eq!(
-            outcomes
-                .iter()
-                .map(|outcome| outcome.outcome.index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(
-            outcomes
-                .iter()
-                .all(|outcome| outcome.outcome.result.is_ok())
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn asr_worker_does_not_drop_segment_after_job_microbatch() -> Result<()> {
-        let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = Arc::new(OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        });
-        let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
-        let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
-        let stats = Arc::new(Mutex::new(AsrStageStats::default()));
-        let handle = spawn_asr_worker(
-            pipeline,
-            AsrOptions::default(),
-            60.0,
-            vad_to_asr_rx,
-            asr_to_result_tx,
-            stats,
-            None,
-            None,
-        );
-
-        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Job(
-            AsrJob {
-                index: 0,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                prepared: VadPreparation::Disabled,
-                waveform: Waveform::new(vec![0.2; 160], 16_000),
-            },
-        ))))?;
-        tokio::task::yield_now().await;
-        vad_to_asr_tx.send(test_vad_to_asr_message(Ok(AsrPipelineMessage::Segment(
-            AsrSegmentJob {
-                job_index: 1,
-                request_item: None,
-                channel: "mono",
-                timing: TranscribeItemTiming::default(),
-                spans: TranscribeItemSpans::default(),
-                job_audio_seconds: 0.01,
-                speech_annotations: Vec::new(),
-                segment_index: 0,
-                segment_count: 1,
-                offset: DurationMs(0),
-                waveform: Waveform::new(vec![0.1; 160], 16_000),
-            },
-        ))))?;
-        drop(vad_to_asr_tx);
-
-        let mut outcomes = Vec::new();
-        while let Some(outcome) = asr_to_result_rx.recv().await {
-            outcomes.push(outcome);
-        }
-        handle.await?;
-        outcomes.sort_unstable_by_key(|outcome| outcome.outcome.index);
-
-        assert_eq!(
-            outcomes
-                .iter()
-                .map(|outcome| outcome.outcome.index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(
-            outcomes
-                .iter()
-                .all(|outcome| outcome.outcome.result.is_ok())
         );
         Ok(())
     }
@@ -5973,32 +5631,6 @@ mod tests {
     fn test_span() -> StageSpan {
         let start = Instant::now();
         StageSpan::new(start, start)
-    }
-
-    fn prepared_with_segments(ranges: &[(u64, u64)]) -> VadPrepared {
-        let mut speech_annotations = Vec::new();
-        let mut segments = Vec::new();
-        let mut slices = Vec::new();
-        for &(start, end) in ranges {
-            let range = TimeRange::new(DurationMs(start), DurationMs(end));
-            speech_annotations.push(Annotation::new(
-                range,
-                AnnotationPayload::Speech,
-                AnnotationSource::Model("fake_vad".to_string()),
-                AnnotationStatus::Final,
-            ));
-            segments.push(VadSegment {
-                range,
-                probability: 0.9,
-            });
-            let sample_count = ((end - start) as usize).max(1) * 16;
-            slices.push(Waveform::new(vec![0.1; sample_count], 16_000));
-        }
-        VadPrepared {
-            speech_annotations,
-            segments,
-            slices,
-        }
     }
 
     fn test_vad_to_asr_message(

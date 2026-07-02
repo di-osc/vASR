@@ -2,7 +2,7 @@
 
 ## Pipeline
 
-当前服务使用 `GlobalAsyncTranscribePipeline`。`serve` 模式下，所有 HTTP 请求共享一套 loader、VAD、ASR、encoder、prefill、decoder worker。请求进入服务后会先拆成去重后的音频/通道 job，最后再按原始输入顺序合并响应。
+当前服务使用 `GlobalAsyncTranscribePipeline`。`serve` 模式下，所有 HTTP 请求共享同一套 loader、VAD、ASR、encoder、prefill、decoder worker。请求进入服务后会先拆成去重后的音频/通道 job，结果由 `Global Result Router` 按原始输入顺序合并。
 
 ```text
                     HTTP request
@@ -10,158 +10,101 @@
                        v
 +--------------------------------------------------+
 | Submit Worker                                     |
-| 将请求拆成去重后的 TranscribeInput job             |
-| 记录 request_id / job route / duplicate mapping    |
+| 拆分输入、去重、记录 request_id/job route           |
 +--------------------------------------------------+
                        |
-                       | load_job_tx
-                       | unbounded channel
+                       | load_job_tx, unbounded
                        v
 +--------------------------------------------------+
 | Global Loader Worker                              |
-| 并发数 = --num-load-workers 或 CPU 并行度           |
-| 每个任务 spawn loader task                         |
-| 加载/解码音频，得到 waveform                        |
+| 默认并发 1；--num-load-workers=0 使用 CPU 核心数     |
+| 加载 URL/path/base64/bytes，解码为 Waveform          |
 +--------------------------------------------------+
                        |
                        | loader_to_vad
-                       | 无消息数上限
-                       | 由 waveform 内存 permit 限制
+                       | 消息不按数量限流，按 waveform 内存 permit 限流
                        v
 +--------------------------------------------------+
 | VAD Worker                                        |
-| 并发数 = --num-vad-workers 或 CPU 并行度           |
-| 从 loader_to_vad 消费 LoadedJob                    |
-| 执行 VAD                                           |
-|                                                  |
-| 如果无语音:                                       |
-|   直接返回结果，不进入 ASR                         |
-|                                                  |
-| 如果有语音:                                       |
-|   切分为语音 segment                              |
-|   每个 segment 携带 waveform 数据                  |
+| 默认并发 1；--num-vad-workers=0 使用 CPU 核心数      |
+| 无语音 item 直接返回空结果                          |
+| 有语音 item 切成 AsrSegmentJob                      |
 +--------------------------------------------------+
                        |
                        | vad_to_asr
-                       | 无消息数上限
-                       | 由 segment waveform 内存 permit 限制
+                       | 消息不按数量限流，按 segment waveform 内存 permit 限流
                        v
 +--------------------------------------------------+
 | ASR Worker                                        |
 | 单 async worker                                   |
-| 从 vad_to_asr 消费消息                             |
-|                                                  |
-| 如果消息是 Job:                                   |
-|   collect_job_microbatch()                        |
-|   走整条音频 ASR fallback 路径                      |
-|                                                  |
-| 如果消息是 Segment 且启用 Qwen3 动态分阶段路径:     |
-|   立即发送到 Segment Encoder Worker                |
-|                                                  |
-| 如果消息是 Segment 但未启用动态分阶段路径:          |
-|   collect_segment_microbatch()                    |
-|   按 max_batch_audio_sec 聚合 segment              |
-|   走 run_segment_asr_inference fallback 路径        |
+| Job fallback: collect_job_microbatch()             |
+| NoSpeech/Disabled job 走 job microbatch            |
+| Speech segment 直接送 encoder                       |
 +--------------------------------------------------+
                        |
-                       | asr_to_encoder
-                       | unbounded channel
-                       | 只用于 Qwen3 动态分阶段路径
+                       | asr_to_encoder, unbounded
                        v
 +--------------------------------------------------+
 | Segment Encoder Worker                            |
 | 单 async worker + spawn_blocking                   |
-|                                                  |
-| 输入: Vec<AsrSegmentJob>                           |
-| batch 来自 collect_encoder_segment_batch()         |
-| 收集已排队 segment，并额外等待 10ms 聚合            |
-|                                                  |
-| Qwen3 ASR 路径:                                   |
-|   run_segment_asr_encode()                        |
-|   执行 audio encoder                               |
-|   将 audio features 存到 CPU                       |
+| collect_encoder_segment_batch()                    |
+| 收集已排队 segment，并额外等待 10ms 聚合             |
+| 执行 audio encoder，输出 CPU audio features          |
 +--------------------------------------------------+
                        |
-                       | encoder_to_prefill
-                       | unbounded channel
+                       | encoder_to_prefill, unbounded
                        v
 +--------------------------------------------------+
 | Segment Prefill Worker                            |
-| 单 async worker                                   |
-|                                                  |
-| paged-attn feature 开启时:                         |
-|   执行 dynamic prefill                             |
-|   可从 encoder_to_prefill 继续合并 encoded batch    |
-|   输出 prefilling session 给 decoder               |
-|                                                  |
-| paged-attn feature 关闭时:                         |
-|   不单独启动该 worker                              |
+| paged-attn feature 开启时存在                       |
+| 单 async worker + prefill producer thread           |
+| 对 encoded batch 执行 dynamic prefill                |
+| prefill 期间可继续合并后续 encoded batch              |
+| 输出 prefill stage / metadata 给全局 decoder          |
 +--------------------------------------------------+
                        |
-                       | prefill_to_decoder
-                       | unbounded channel
+                       | prefill_to_decoder, unbounded
                        v
 +--------------------------------------------------+
 | Segment Decoder Worker                            |
 | 单 async worker                                   |
-|                                                  |
-| paged-attn feature 开启时:                         |
-|   消费 prefilled session                           |
-|   执行 continuous decode                           |
-|                                                  |
-| paged-attn feature 关闭时:                         |
-|   直接消费 encoded feature batch                   |
-|   在 decoder worker 内完成 prefill/decode           |
+| 启动后保持一个全局 continuous decode loop              |
+| 持续消费所有请求的 PrefillStageOutput                  |
+| chunk 完成时回调 token ids 并释放 paged KV slot       |
+| StreamingMetadataDecoder 聚合 chunk -> segment       |
+| segment 完成后立即发送 RoutedTranscribeItemOutcome   |
 +--------------------------------------------------+
                        |
-                       | asr_to_result
-                       | bounded channel
-                       | serve 模式 capacity = 1024
+                       | asr_to_result, bounded
+                       | serve capacity = 1024
                        v
 +--------------------------------------------------+
 | Global Result Router                              |
 | 收集 RoutedTranscribeItemOutcome                   |
-| 按 request_id 聚合请求结果                          |
-| 将重复输入展开回原始请求顺序                         |
+| 一个 request 的所有 item 完成后组装 HTTP JSON 响应     |
+| duplicate input 展开回原始输入顺序                   |
 +--------------------------------------------------+
 ```
 
 ## 队列与并发规则
 
 ```text
-Loader 并发:
-  设置了 --num-load-workers 时使用该值，否则使用 CPU available_parallelism()
+Loader:
+  默认 --num-load-workers=1
+  设置 N 时最多 N 个 load job in-flight
+  设置 0 时使用 std::thread::available_parallelism()
 
-VAD 并发:
-  设置了 --num-vad-workers 时使用该值，否则使用 CPU available_parallelism()
+VAD:
+  默认 --num-vad-workers=1
+  设置 N 时最多 N 个 VAD job in-flight
+  设置 0 时使用 std::thread::available_parallelism()
+  --vad-num-threads 控制单个 VAD 模型内部 CPU 线程数；vad-device=cuda 时不用于 CUDA kernel 并行度
 
-loader_to_vad 队列:
-  不按消息数量限制
-  按 waveform 内存 permit 限制
-
-vad_to_asr 队列:
-  不按消息数量限制
-  按 segment waveform 内存 permit 限制
-
-asr_to_encoder 队列:
-  unbounded channel
-  只传递动态 Qwen3 segment encode 请求
-
-encoder_to_prefill 队列:
-  unbounded channel
-  传递 encoded audio features
-
-prefill_to_decoder 队列:
-  unbounded channel
-  paged-attn feature 开启时存在，传递 prefilled session 或失败结果
-
-asr_to_result 队列:
-  serve 模式 bounded channel，capacity = 1024
-  local pipeline 模式 capacity = unique_inputs.len()
+ASR Worker:
+  单 worker，负责把 VAD 后的 job/segment 路由到 fallback 或动态分阶段路径
 
 Segment Encoder:
-  单 worker
-  每次处理一个 collect_encoder_segment_batch() 聚合出的 batch
+  单 worker，每次处理 collect_encoder_segment_batch() 聚合出的 batch
 
 Segment Prefill:
   paged-attn feature 开启时单 worker
@@ -169,22 +112,62 @@ Segment Prefill:
 
 Segment Decoder:
   单 worker
-  paged-attn feature 开启时消费 prefilled session
-  paged-attn feature 关闭时直接消费 encoded feature batch
+  当前是跨请求常驻的全局 decode loop
+  所有 prefill worker 产生的 PrefillStageOutput 都进入同一个 decode queue
+  有空 slot 就 attach prefilled seq，slot 满了就继续 decode running slots
+  channel 未关闭时，即使当前没有 running/prefilled seq，也会等待新消息
+  chunk/segment 完成事件即时处理，不等整个 HTTP request 的所有 item 完成
 
-整条音频 Job fallback:
-  ASR Worker 内 spawn_blocking 执行 run_asr_jobs_batch()
-
-非动态 Segment fallback:
-  ASR Worker 内 collect_segment_microbatch()
-  然后 spawn_blocking 执行 run_segment_asr_inference()
+Result Router:
+  serve 模式 bounded channel capacity = 1024
+  local pipeline 模式 capacity = unique_inputs.len()
 ```
 
-`ASR_ENCODED_FEATURE_QUEUE = 1` 仍存在于代码中，但当前全局动态分阶段路径的 `asr_to_encoder`、`encoder_to_prefill`、`prefill_to_decoder` 都使用 unbounded channel。
+`loader_to_vad`、`vad_to_asr` 不按消息数量限流，主要靠 waveform/segment 内存 permit 控制排队内存。`asr_to_encoder`、`encoder_to_prefill`、`prefill_to_decoder` 当前使用 unbounded channel。
+
+## 动态 Decode 返回规则
+
+Qwen3 动态分阶段路径中，decode 的最小完成单位是 ASR chunk。一个 VAD segment 可能被模型侧切成多个 chunk，所以“chunk 完成”不等于“segment 可返回”。
+
+```text
+PrefillStageOutput
+  -> Segment Decoder Worker
+  -> continuous decode slot
+  -> chunk tokens completed
+  -> completion callback
+  -> StreamingMetadataDecoder
+  -> segment completed
+  -> RoutedTranscribeItemOutcome
+  -> Global Result Router
+```
+
+当前行为：
+
+```text
+chunk 完成:
+  把 token ids 写入 outputs
+  调用 completion callback
+  释放该 chunk 的 paged KV slot
+
+metadata 尚未到达:
+  completed chunk 暂存在 pending map
+  后续 prefill metadata 到达后再继续聚合
+
+segment 完成:
+  当该 segment 的所有 chunk 都完成后
+  立即 decode 文本并生成 Timeline
+  立即发送 RoutedTranscribeItemOutcome 到 result router
+
+request 完成:
+  Global Result Router 等该 request 下所有 item 完成
+  再按原始输入顺序返回 HTTP JSON response
+```
+
+这意味着内部 pipeline 已经是全局流式 decode：所有请求共享同一个 decode scheduler，chunk/segment 完成即聚合、完成即路由。HTTP `/transcribe` 和 `/inference` 仍是一次请求一次 JSON 响应，不是 SSE/WebSocket 流式 API。后续如果要做对外流式服务，可以复用 `RoutedTranscribeItemOutcome` 这一层事件。
 
 ## Segment Batch 形成规则
 
-动态 Qwen3 segment 路径中，ASR Worker 不再按 `max_batch_audio_sec` 先聚合 segment，而是把 segment 发送给 Segment Encoder Worker。真正的 encoder batch 在 `collect_encoder_segment_batch()` 中形成：
+动态 Qwen3 segment 路径中，ASR Worker 不再先聚合 segment，而是把 segment 发送给 Segment Encoder Worker。真正的 encoder batch 在 `collect_encoder_segment_batch()` 中形成：
 
 ```text
 Segment Encoder Worker 收到第一个 SegmentEncodeRequest
@@ -193,35 +176,14 @@ Segment Encoder Worker 收到第一个 SegmentEncodeRequest
 collect_encoder_segment_batch()
   |
   +-- 从 asr_to_encoder 非阻塞 try_recv()
-  |
   +-- 收集所有已经排队的 SegmentEncodeRequest
-  |
   +-- 额外等待 ASR_ENCODER_BATCH_COLLECT_WAIT_MS，当前为 10ms
-  |
   +-- 按 (job_index, offset) 排序
   v
 Vec<AsrSegmentJob> -> Encoder Worker
 ```
 
-该动态 encoder batch 当前不按 `max_batch_audio_sec` 截断，也不由 decoder 空闲 slot 决定。
-
-fallback segment 路径仍使用 `collect_segment_microbatch()`：
-
-```text
-fallback 当前行为:
-  vad_to_asr 中已经可取的 segment
-  + max_batch_audio_sec
-  -> encoder batch size
-
-动态 Qwen3 当前行为:
-  asr_to_encoder 中已经可取的 segment
-  + 10ms collect wait
-  -> encoder batch size
-
-不是当前行为:
-  decoder free slots
-  -> encoder 拉取的 segment 数量
-```
+该动态 encoder batch 不按音频秒数截断，也不由 decoder 空闲 slot 决定。segment ASR 路径依赖 paged-attn；旧的同步 segment fallback 已删除。
 
 ## 简化流程
 
@@ -234,8 +196,10 @@ input
   -> ASR worker 路由 job/segment
   -> encoder 单 worker 生成 CPU audio features
   -> prefill 单 worker dynamic prefill
-  -> decoder 单 worker continuous decode
-  -> result
+  -> decoder 单 worker 常驻执行全局 continuous decode
+  -> chunk 完成即回调并释放 KV slot
+  -> segment 完成即发送结果
+  -> request 聚合完成后 HTTP 返回
 ```
 
 ## HTTP API
@@ -403,7 +367,7 @@ msgpack waveform_cache    -> AudioSource::Waveform
 
 ## 服务日志
 
-`RUST_LOG=info` 下，服务日志只保留核心信息：
+`RUST_LOG=info` 下，服务日志保留请求开始、请求结束，以及开启 `--profile` 后的周期 PERF 表：
 
 ```text
 <id> request START | items=<n> src=url:<n> base64:<n> missing:<n> mono=true:<n> false:<n>
@@ -411,19 +375,19 @@ msgpack waveform_cache    -> AudioSource::Waveform
 
 +---------------------------------------------------------------------------------------------+
 |                         Service transcribe-<uuid> Perf | window=5.0s                         |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-|  stage  | count | audio | worker | speed |                      detail                       |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-|  load   |  ...  |  ...  |  ...   |  ...  |                        ...                        |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-|   vad   |  ...  |  ...  |  ...   |  ...  |                        ...                        |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-| encode  |  ...  |  ...  |  ...   |  ...  |                        ...                        |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-| prefill |  ...  |  ...  |  ...   |  ...  |                        ...                        |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
-| decode  |  ...  |  ...  |  ...   |  ...  |                        ...                        |
-+---------+-------+-------+--------+-------+---------------------------------------------------+
++---------+-------+-------+---------+-------+--------------------------------------------------+
+|  stage  | count | audio | elapsed | speed |                      detail                      |
++---------+-------+-------+---------+-------+--------------------------------------------------+
+|  load   |  ...  |  ...  |   ...   |  ...  |                       ...                        |
++---------+-------+-------+---------+-------+--------------------------------------------------+
+|   vad   |  ...  |  ...  |   ...   |  ...  |                       ...                        |
++---------+-------+-------+---------+-------+--------------------------------------------------+
+| encode  |  ...  |  ...  |   ...   |  ...  |                       ...                        |
++---------+-------+-------+---------+-------+--------------------------------------------------+
+| prefill |  ...  |  ...  |   ...   |  ...  |                       ...                        |
++---------+-------+-------+---------+-------+--------------------------------------------------+
+| decode  |  ...  |  ...  |   ...   |  ...  |                       ...                        |
++---------+-------+-------+---------+-------+--------------------------------------------------+
 ```
 
 周期 PERF 表由 serve 参数控制：
@@ -473,7 +437,7 @@ Service <service_id> Perf | window=<seconds>s
 
 `active` 是该请求在该阶段的活跃 span 合并时长。对于多 worker 阶段，重叠的 item 工作不会被重复相加。`queue` 是该请求在该阶段的排队 span 合并时长。`elapsed = active + queue`。
 
-`wall` 是该阶段从最早 queue/run 开始到最晚 run 结束的跨度。如果 item/channel span 之间存在间隔，`wall` 可能大于 `elapsed`；它也不同于 worker 时间求和。
+`wall` 是该阶段从最早 queue/run 开始到最晚 run 结束的跨度。如果 item/channel span 之间存在间隔，`wall` 可能大于 `elapsed`。
 
 `speed = stage_audio / active`。`e2e = stage_audio / elapsed`。
 
@@ -484,51 +448,58 @@ Service <service_id> Perf | window=<seconds>s
 列说明：
 
 ```text
-stage   pipeline 阶段。
-count   当前窗口内完成的 job 或 batch 数。
-audio   当前窗口内该阶段完成的音频秒数。
-worker  当前窗口内累加的 worker/model 计算秒数。
-speed   audio / worker。
-detail  阶段特定计数器。
+stage    pipeline 阶段。
+count    当前窗口内完成的 job 或 batch 数。
+audio    当前窗口内该阶段完成的音频秒数。
+elapsed  当前窗口内该阶段用于吞吐计算的阶段耗时。
+speed    audio / elapsed。
+detail   阶段特定计数器。
+```
+
+`elapsed` 的口径按阶段不同：
+
+```text
+load/vad:
+  多 worker 阶段使用窗口内最忙 worker 的计算耗时。
+  这样 speed 表示该组件在当前 worker 配置下的有效服务吞吐，而不是把多个 worker 的耗时相加后得到单 worker 均速。
+
+encode/prefill/decode:
+  使用当前窗口内完成 batch 的模型计算耗时累加。
 ```
 
 阶段行说明：
 
 ```text
 load:
-  count  job=<加载完成的 item/channel 数>
-  audio  加载的输入音频时长
-  worker loader 解码/读取计算耗时
-  detail bad=<加载失败数>
+  count   job=<加载完成的 item/channel 数>
+  audio   加载的输入音频时长
+  elapsed 最忙 loader worker 的计算耗时
+  detail  bad=<加载失败数>
 
 vad:
-  count  job=<VAD item/channel 数>
-  audio  VAD 处理的输入音频时长
-  worker 所有 VAD worker 计算耗时求和
-  detail speech=<VAD 后语音秒数> speech_ratio=<语音/输入比例>
-         seg=<输出 segment 数> bad=<VAD 失败数>
-         no_speech=<无语音 item 数> send_wait=<等待送入 ASR 队列的时间>
+  count   job=<VAD item/channel 数>
+  audio   VAD 处理的输入音频时长
+  elapsed 最忙 VAD worker 的计算耗时
+  detail  speech=<VAD 后语音秒数> ratio=<语音/输入比例>
+          seg=<输出 segment 数> bad=<VAD 失败数> no_speech=<无语音 item 数>
 
 encode:
-  count  bat=<encoder microbatch 数>
-  audio  编码的语音音频时长
-  worker 这些 batch 的 audio encoder wall/model 时间
-  detail seg=<编码 segment 数>
+  count   bat=<encoder microbatch 数>
+  audio   编码的语音音频时长
+  elapsed audio encoder batch 耗时累加
+  detail  seg=<编码 segment 数>
 
 prefill:
-  count  bat=<decoder batch 数>
-  audio  进入 decoder batch 的语音音频时长
-  worker model prefill 计算耗时
-  speed  语音音频时长 / prefill 计算耗时
-  detail tok=<prefill tokens> tok/s=<prefill tokens per second> seg=<segments>
+  count   bat=<decoder batch 数>
+  audio   进入 decoder batch 的语音音频时长
+  elapsed model prefill 计算耗时
+  detail  tok=<prefill tokens> tok/s=<prefill tokens per second> seg=<segments>
 
 decode:
-  count  bat=<decoder batch 数>
-  audio  decode 的语音音频时长
-  worker model decode 计算耗时
-  speed  语音音频时长 / decode 计算耗时
-  detail tok=<生成 tokens> tok/s=<生成 tokens per second>
-         step=<decode scheduler steps> seg=<segments>
+  count   bat=<decoder batch 数>
+  audio   decode 的语音音频时长
+  elapsed model decode 计算耗时
+  detail  tok=<生成 tokens> tok/s=<生成 tokens per second> step=<decode scheduler steps> seg=<segments>
 ```
 
-PERF 表使用 worker/model 时间，而不是请求 wall 时间。对于 loader 和 VAD 这类多 worker 阶段，`worker` 会按 worker 求和。它回答的是“组件真正计算时有多快”，不是“某个请求端到端完成得有多快”。
+PERF 表回答的是“当前服务组件整体吞吐是多少”。单个请求的端到端耗时和排队情况看 `request DONE` 或阶段 `DEBUG` 日志。

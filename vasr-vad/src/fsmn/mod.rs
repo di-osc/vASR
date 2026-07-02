@@ -1516,11 +1516,6 @@ fn download_fsmn_vad() -> Result<PathBuf> {
     let cache = vasr_hub::cache_dir();
     let target = cache.join(FSMN_VAD_REPO);
     if fsmn_vad_cache_complete(&target)? {
-        tracing::info!(
-            target: "vasr_vad::fsmn",
-            "FSMN VAD cache is complete at {}, using local files",
-            target.display()
-        );
         return Ok(target);
     }
     if target.exists() {

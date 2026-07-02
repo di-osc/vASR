@@ -250,6 +250,10 @@ fn request_memory_debug_enabled() -> bool {
 
 fn log_request_memory_debug(
     request_id: &str,
+    #[cfg_attr(
+        not(any(feature = "paged-attn", feature = "cuda-graph")),
+        allow(unused_variables)
+    )]
     snapshot: &PipelineMemorySnapshot,
     q8_fast_path_start: vasr::models::qwen3asr::model::Q8FastPathStats,
     #[cfg(feature = "cuda-graph")] baseline_cuda_used_bytes: Option<usize>,
@@ -418,6 +422,7 @@ fn cuda_pool_fields(memory: crate::pipeline::PipelineCudaMemorySnapshot) -> Stri
     format!("{current}{default}")
 }
 
+#[cfg(feature = "cuda-graph")]
 fn bytes_to_gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
@@ -948,8 +953,6 @@ mod tests {
 pub fn build_transcribe_service(
     pipeline: Arc<GlobalAsyncTranscribePipeline>,
 ) -> Arc<TranscribeService> {
-    #[cfg(feature = "cuda-graph")]
-    let _ = pipeline.trim_cuda_mempool();
     #[cfg(feature = "cuda-graph")]
     let baseline_cuda_used_bytes = pipeline
         .memory_snapshot()

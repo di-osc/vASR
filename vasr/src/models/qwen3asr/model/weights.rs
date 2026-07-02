@@ -220,10 +220,6 @@ fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     let cache = crate::modelscope_cache_dir();
     let target = cache.join(repo_id);
     if qwen3_asr_local_cache_complete(&target)? {
-        tracing::info!(
-            "Qwen3-ASR model `{repo_id}` cache is complete at {}, using local files",
-            target.display()
-        );
         return Ok(target);
     }
 
