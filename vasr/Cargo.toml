@@ -39,7 +39,7 @@ vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
 vasr-quant = { path = "../vasr-quant", default-features = false }
 vasr-flash-attn = { path = "../vasr-flash-attn", default-features = false, optional = true }
 vasr-data = { path = "../vasr-data" }
-vasr-hub = { path = "../vasr-hub" }
+modelhub = "0.1.1"
 vasr-vad = { path = "../vasr-vad" }
 
 lindera = { version = "2.2.0", features = ["embed-ipadic"] }

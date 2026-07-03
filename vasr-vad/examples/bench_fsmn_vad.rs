@@ -236,11 +236,20 @@ fn default_model_path() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("/workspace/data/models/asr/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"),
         PathBuf::from(".cache/fsmn-vad"),
-        vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+        modelhub::modelscope_cache_dir().join(FSMN_VAD_REPO),
+        modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FSMN_VAD_REPO),
     ];
     candidates
         .into_iter()
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists())
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn validate_waveform(waveform: &Waveform, path: &Path) -> Result<()> {

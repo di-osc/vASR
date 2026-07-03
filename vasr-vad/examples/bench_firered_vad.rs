@@ -222,7 +222,11 @@ fn parse_usize(value: &str, name: &str) -> Result<usize> {
 
 fn default_model_path() -> Option<PathBuf> {
     let candidates = [
-        vasr_hub::cache_dir().join(FIRERED_VAD_REPO).join("VAD"),
+        modelhub::modelscope_cache_dir()
+            .join(FIRERED_VAD_REPO)
+            .join("VAD"),
+        modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FIRERED_VAD_REPO)
+            .join("VAD"),
         PathBuf::from("/workspace/data/models/xukaituo/FireRedVAD/VAD"),
         PathBuf::from("/workspace/data/models/asr/xukaituo/FireRedVAD/VAD"),
         PathBuf::from("/workspace/data/models/FireRedTeam/FireRedVAD/VAD"),
@@ -231,6 +235,14 @@ fn default_model_path() -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|path| path.join("model.pth.tar").exists() && path.join("cmvn.ark").exists())
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn validate_waveform(waveform: &Waveform, path: &Path) -> Result<()> {

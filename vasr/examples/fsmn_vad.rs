@@ -67,10 +67,22 @@ fn default_model_path() -> Option<PathBuf> {
         PathBuf::from("/workspace/data/models/asr/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"),
         PathBuf::from(".cache/fsmn-vad"),
         vasr::modelscope_cache_dir().join("iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"),
+        modelscope_model_snapshot_dir(
+            &vasr::modelscope_cache_dir(),
+            "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        ),
     ];
     candidates
         .into_iter()
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists())
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn load_pcm16_wav(path: &Path) -> Result<Waveform> {

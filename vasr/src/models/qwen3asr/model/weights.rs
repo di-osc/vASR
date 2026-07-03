@@ -218,7 +218,11 @@ where
 
 fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     let cache = crate::modelscope_cache_dir();
-    let target = cache.join(repo_id);
+    let legacy = cache.join(repo_id);
+    if qwen3_asr_local_cache_complete(&legacy)? {
+        return Ok(legacy);
+    }
+    let target = modelscope_model_snapshot_dir(&cache, repo_id);
     if qwen3_asr_local_cache_complete(&target)? {
         return Ok(target);
     }
@@ -235,6 +239,14 @@ fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
         .with_context(|| format!("failed to download model {repo_id:?} from ModelScope"))?;
     validate_qwen3_asr_local_model_dir(&target)?;
     Ok(target)
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn resolve_model_dir(model_id_or_path: &str) -> Result<PathBuf> {

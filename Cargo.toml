@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "vasr",
-  "vasr-hub",
   "vasr-vad",
   "vasr-aligner",
   "vasr-data",

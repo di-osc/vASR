@@ -921,25 +921,41 @@ fn validate_firered_vad_model_dir(model_dir: &Path) -> Result<()> {
 }
 
 fn default_firered_vad_model_dir() -> Result<PathBuf> {
-    let target = vasr_hub::cache_dir().join(FIRERED_VAD_REPO).join("VAD");
+    let legacy = modelhub::modelscope_cache_dir()
+        .join(FIRERED_VAD_REPO)
+        .join("VAD");
+    if validate_firered_vad_model_dir(&legacy).is_ok() {
+        return Ok(legacy);
+    }
+
+    let target = modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FIRERED_VAD_REPO)
+        .join("VAD");
     if validate_firered_vad_model_dir(&target).is_ok() {
         return Ok(target);
     }
 
-    let cache = vasr_hub::cache_dir();
+    let cache = modelhub::modelscope_cache_dir();
     tracing::warn!(
         target: "vasr_vad::firered",
         "FireRedVAD model not found locally, downloading {} from ModelScope",
         FIRERED_VAD_REPO
     );
-    block_on_async(vasr_hub::modelscope::download::download_model(
+    block_on_async(modelhub::modelscope::download_model(
         FIRERED_VAD_REPO,
         &cache,
     ))
     .with_context(|| format!("failed to download FireRedVAD model {FIRERED_VAD_REPO:?}"))?;
-    let target = cache.join(FIRERED_VAD_REPO).join("VAD");
+    let target = modelscope_model_snapshot_dir(&cache, FIRERED_VAD_REPO).join("VAD");
     validate_firered_vad_model_dir(&target)?;
     Ok(target)
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn nonempty_file(path: &Path) -> Result<bool> {

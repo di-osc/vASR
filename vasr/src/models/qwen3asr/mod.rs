@@ -6,7 +6,7 @@ pub mod processor;
 
 pub use crate::audio;
 pub use crate::error;
-pub use vasr_hub::modelscope::download;
+pub use modelhub::modelscope::download;
 
 use anyhow::Result;
 use candle_core::Device;

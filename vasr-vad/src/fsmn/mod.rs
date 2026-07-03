@@ -1791,8 +1791,12 @@ impl WavFrontend {
 }
 
 fn download_fsmn_vad() -> Result<PathBuf> {
-    let cache = vasr_hub::cache_dir();
-    let target = cache.join(FSMN_VAD_REPO);
+    let cache = modelhub::modelscope_cache_dir();
+    let legacy = cache.join(FSMN_VAD_REPO);
+    if fsmn_vad_cache_complete(&legacy)? {
+        return Ok(legacy);
+    }
+    let target = modelscope_model_snapshot_dir(&cache, FSMN_VAD_REPO);
     if fsmn_vad_cache_complete(&target)? {
         return Ok(target);
     }
@@ -1803,13 +1807,18 @@ fn download_fsmn_vad() -> Result<PathBuf> {
             target.display()
         );
     }
-    block_on_async(vasr_hub::modelscope::download::download_model(
-        FSMN_VAD_REPO,
-        &cache,
-    ))
-    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    block_on_async(modelhub::modelscope::download_model(FSMN_VAD_REPO, &cache))
+        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
     validate_fsmn_vad_model_dir(&target)?;
     Ok(target)
+}
+
+fn modelscope_model_snapshot_dir(cache: &Path, repo_id: &str) -> PathBuf {
+    cache
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join("master")
 }
 
 fn fsmn_vad_cache_complete(model_dir: &Path) -> Result<bool> {
@@ -2129,7 +2138,8 @@ mod tests {
         let model_dir = [
             PathBuf::from("/workspace/data/models/asr").join(FSMN_VAD_REPO),
             workspace.join(".cache/fsmn-vad"),
-            vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+            modelhub::modelscope_cache_dir().join(FSMN_VAD_REPO),
+            modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FSMN_VAD_REPO),
         ]
         .into_iter()
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
@@ -2178,7 +2188,8 @@ mod tests {
         let model_dir = [
             PathBuf::from("/workspace/data/models/asr").join(FSMN_VAD_REPO),
             workspace.join(".cache/fsmn-vad"),
-            vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+            modelhub::modelscope_cache_dir().join(FSMN_VAD_REPO),
+            modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FSMN_VAD_REPO),
         ]
         .into_iter()
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
@@ -2306,7 +2317,8 @@ mod tests {
             std::path::PathBuf::from(
                 "/workspace/data/models/asr/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
             ),
-            vasr_hub::cache_dir().join(FSMN_VAD_REPO),
+            modelhub::modelscope_cache_dir().join(FSMN_VAD_REPO),
+            modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FSMN_VAD_REPO),
         ]
         .into_iter()
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
