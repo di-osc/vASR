@@ -1531,6 +1531,24 @@ fn record_request_load_stage(
 }
 
 #[cfg(feature = "paged-attn")]
+#[derive(Debug, Clone, Copy)]
+struct SegmentLogItem {
+    request_item: Option<RequestItemRef>,
+    audio_seconds: f64,
+}
+
+#[cfg(feature = "paged-attn")]
+fn segment_log_items(segments: &[AsrSegmentJob]) -> Vec<SegmentLogItem> {
+    segments
+        .iter()
+        .map(|segment| SegmentLogItem {
+            request_item: segment.request_item,
+            audio_seconds: segment.waveform.duration_seconds(),
+        })
+        .collect()
+}
+
+#[cfg(feature = "paged-attn")]
 fn segment_batch_request_count(segments: &[AsrSegmentJob]) -> usize {
     let mut request_ids = HashSet::new();
     for segment in segments {
@@ -1543,14 +1561,14 @@ fn segment_batch_request_count(segments: &[AsrSegmentJob]) -> usize {
 
 #[cfg(feature = "paged-attn")]
 fn log_prefill_batch_done(
-    all_segments: &[AsrSegmentJob],
+    all_segments: &[SegmentLogItem],
     output: &PrefillStageOutput,
     elapsed_seconds: f64,
 ) {
     let mut segments = Vec::new();
     for sequence in &output.sequences {
-        if let Some(segment) = all_segments.get(sequence.client_index) {
-            segments.push(segment.clone());
+        if let Some(&segment) = all_segments.get(sequence.client_index) {
+            segments.push(segment);
         }
     }
     if segments.is_empty() {
@@ -1558,9 +1576,13 @@ fn log_prefill_batch_done(
     }
     let audio_seconds = segments
         .iter()
-        .map(|segment| segment.waveform.duration_seconds())
+        .map(|segment| segment.audio_seconds)
         .sum::<f64>();
-    let request_count = segment_batch_request_count(&segments);
+    let request_count = segments
+        .iter()
+        .filter_map(|segment| segment.request_item.map(|item| item.request_id))
+        .collect::<HashSet<_>>()
+        .len();
     tracing::debug!(
         target: "vasr_transcribe::pipeline",
         "prefill batch DONE | reqs={} seg={} audio={} elapsed={} speed={} reason={}",
@@ -2922,7 +2944,7 @@ fn run_global_segment_prefill(
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR prefill requires Qwen3ASR"))?;
     let (_inference, waveforms, encoded) = initial.into_parts();
     let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
-    let prefill_log_segments = segments.clone();
+    let prefill_log_segments = segment_log_items(&segments);
     decoder_tx
         .send(SegmentPrefillMessage::Prepared {
             producer_id,
@@ -2973,6 +2995,7 @@ fn run_global_segment_decode_worker(
     let mut stream_waveforms = Vec::new();
     let mut stream_batch_lens = Vec::new();
     let mut stream_stage_starts = Vec::new();
+    let mut stream_chunk_base = 0usize;
     let pending_chunks = RefCell::new(BTreeMap::new());
 
     let forward_thread = std::thread::spawn(move || {
@@ -3060,17 +3083,32 @@ fn run_global_segment_decode_worker(
             &asr_to_result_tx,
             &stats,
         )?;
-        drain_completed_chunks(
-            qwen3,
-            &mut pending_chunks.borrow_mut(),
+        {
+            let mut pending_chunks = pending_chunks.borrow_mut();
+            drain_completed_chunks(
+                qwen3,
+                &mut pending_chunks,
+                &mut stream_decoder,
+                segment_state,
+                stream_segments.as_mut_slice(),
+                stream_waveforms.as_mut_slice(),
+                stream_batch_lens.as_slice(),
+                stream_stage_starts.as_slice(),
+                stream_chunk_base,
+                &asr_to_result_tx,
+            )?;
+        }
+        reset_stream_decode_state_if_idle(
+            &pending_chunks.borrow(),
             &mut stream_decoder,
             segment_state,
-            stream_segments.as_slice(),
-            stream_waveforms.as_slice(),
-            stream_batch_lens.as_slice(),
-            stream_stage_starts.as_slice(),
-            &asr_to_result_tx,
-        )
+            &mut stream_segments,
+            &mut stream_waveforms,
+            &mut stream_batch_lens,
+            &mut stream_stage_starts,
+            &mut stream_chunk_base,
+        );
+        Ok(())
     };
 
     #[cfg(feature = "timing")]
@@ -3101,10 +3139,11 @@ fn run_global_segment_decode_worker(
         &mut pending_chunks.borrow_mut(),
         &mut stream_decoder,
         segment_state,
-        stream_segments.as_slice(),
-        stream_waveforms.as_slice(),
+        stream_segments.as_mut_slice(),
+        stream_waveforms.as_mut_slice(),
         stream_batch_lens.as_slice(),
         stream_stage_starts.as_slice(),
+        stream_chunk_base,
         &asr_to_result_tx,
     )?;
 
@@ -3202,20 +3241,23 @@ fn drain_completed_chunks(
     pending_chunks: &mut BTreeMap<usize, Vec<u32>>,
     decoder: &mut StreamingMetadataDecoder,
     state: &mut SegmentAsrState,
-    segments: &[AsrSegmentJob],
-    waveforms: &[Waveform],
+    segments: &mut [AsrSegmentJob],
+    waveforms: &mut [Waveform],
     batch_lens: &[usize],
     stage_starts: &[Instant],
+    chunk_base: usize,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
 ) -> Result<()> {
+    let chunk_end = chunk_base.saturating_add(decoder.chunk_count());
     let ready: Vec<usize> = pending_chunks
-        .range(..decoder.chunk_count())
+        .range(..chunk_end)
         .map(|(chunk_index, _)| *chunk_index)
         .collect();
     for chunk_index in ready {
         let Some(ids) = pending_chunks.remove(&chunk_index) else {
             continue;
         };
+        let local_chunk_index = chunk_index.saturating_sub(chunk_base);
         if let Some(outcomes) = accept_completed_chunk(
             qwen3,
             decoder,
@@ -3224,7 +3266,7 @@ fn drain_completed_chunks(
             waveforms,
             batch_lens,
             stage_starts,
-            chunk_index,
+            local_chunk_index,
             ids,
         )? {
             for outcome in outcomes {
@@ -3238,12 +3280,35 @@ fn drain_completed_chunks(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
+fn reset_stream_decode_state_if_idle(
+    pending_chunks: &BTreeMap<usize, Vec<u32>>,
+    decoder: &mut StreamingMetadataDecoder,
+    state: &SegmentAsrState,
+    segments: &mut Vec<AsrSegmentJob>,
+    waveforms: &mut Vec<Waveform>,
+    batch_lens: &mut Vec<usize>,
+    stage_starts: &mut Vec<Instant>,
+    chunk_base: &mut usize,
+) {
+    if !pending_chunks.is_empty() || !state.jobs.is_empty() || decoder.chunk_count() == 0 {
+        return;
+    }
+    *chunk_base = chunk_base.saturating_add(decoder.chunk_count());
+    *decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
+    segments.clear();
+    waveforms.clear();
+    batch_lens.clear();
+    stage_starts.clear();
+}
+
+#[cfg(feature = "paged-attn")]
 fn accept_completed_chunk(
     qwen3: &Qwen3ASR,
     decoder: &mut StreamingMetadataDecoder,
     state: &mut SegmentAsrState,
-    segments: &[AsrSegmentJob],
-    waveforms: &[Waveform],
+    segments: &mut [AsrSegmentJob],
+    waveforms: &mut [Waveform],
     batch_lens: &[usize],
     stage_starts: &[Instant],
     chunk_index: usize,
@@ -3282,14 +3347,32 @@ fn accept_completed_chunk(
         segment_audio_seconds: segment.waveform.duration_seconds(),
         active_job_count: 1,
     };
-    Ok(Some(finish_segment_asr_batch(
+    let outcomes = finish_segment_asr_batch(
         state,
         std::slice::from_ref(segment),
         stage_start,
         Ok((batch, vec![timeline])),
         None,
         None,
-    )))
+    );
+    release_stream_segment_audio(segments, waveforms, segment_index);
+    Ok(Some(outcomes))
+}
+
+#[cfg(feature = "paged-attn")]
+fn release_stream_segment_audio(
+    segments: &mut [AsrSegmentJob],
+    waveforms: &mut [Waveform],
+    segment_index: usize,
+) {
+    if let Some(segment) = segments.get_mut(segment_index) {
+        segment.waveform.samples = Vec::new();
+        segment.waveform.encoded_data = None;
+    }
+    if let Some(waveform) = waveforms.get_mut(segment_index) {
+        waveform.samples = Vec::new();
+        waveform.encoded_data = None;
+    }
 }
 
 #[cfg(feature = "paged-attn")]
@@ -3303,7 +3386,7 @@ fn run_segment_asr_prefill_dynamic_worker(
     decode_idle_flush: Option<std::time::Duration>,
     decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
-    prefill_log_segments: Vec<AsrSegmentJob>,
+    prefill_log_segments: Vec<SegmentLogItem>,
 ) {
     let run = (|| -> Result<()> {
         let prefill_log_segments = Mutex::new(prefill_log_segments);
@@ -3410,7 +3493,7 @@ fn prepare_coalesced_segment_prefill_batch(
     runtime_handle: &tokio::runtime::Handle,
     decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
-    prefill_log_segments: &Mutex<Vec<AsrSegmentJob>>,
+    prefill_log_segments: &Mutex<Vec<SegmentLogItem>>,
 ) -> Result<PrefillCoalescedPoll> {
     let mut prepared_batches = Vec::new();
 
@@ -3456,7 +3539,7 @@ fn prepare_segment_encoded_for_prefill(
     message: SegmentEncoderOutput,
     decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
-    prefill_log_segments: &Mutex<Vec<AsrSegmentJob>>,
+    prefill_log_segments: &Mutex<Vec<SegmentLogItem>>,
     prepared_batches: &mut Vec<PreparedAudioBatch>,
 ) -> Result<bool> {
     let SegmentEncoderOutput::Encoded(message) = message;
@@ -3467,7 +3550,7 @@ fn prepare_segment_encoded_for_prefill(
             prefill_log_segments
                 .lock()
                 .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?
-                .extend(message.segments.iter().cloned());
+                .extend(segment_log_items(&message.segments));
             if decoder_tx
                 .send(SegmentPrefillMessage::Prepared {
                     producer_id,

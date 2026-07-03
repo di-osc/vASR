@@ -173,7 +173,6 @@ async fn handle_transcribe(
     let wall = start.elapsed().as_secs_f64();
     let active = active_spans_seconds(active_spans).min(wall).max(0.0);
     let wait = (wall - active).max(0.0);
-    let elapsed = wall;
     let num_items = data.len();
     let bad = data.iter().filter(|item| item.is_bad).count();
     let performance = InferencePerformance {
@@ -198,7 +197,7 @@ async fn handle_transcribe(
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | elapsed={:>6.3}s active={:>6.3}s queue={:>6.3}s wall={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
+        "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | active={:>6.3}s queue={:>6.3}s wall={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         "request",
         "DONE",
@@ -208,7 +207,6 @@ async fn handle_transcribe(
         request_stats.mono,
         request_stats.stereo,
         request_stats.channels,
-        elapsed,
         active,
         wait,
         performance.batch_wall_seconds,
