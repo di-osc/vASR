@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use vasr_data::Waveform;
-use vasr_vad::{FsmnVadModel, VadOptions};
+use vasr_vad::{FsmnVadForwardTiming, FsmnVadModel, VadOptions};
 
 const FSMN_VAD_REPO: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 
@@ -51,6 +51,7 @@ fn main() -> Result<()> {
             frontend_seconds: detection.timing.frontend_seconds,
             forward_seconds: detection.timing.forward_seconds,
             segmenter_seconds: detection.timing.segmenter_seconds,
+            forward_ops: detection.timing.forward_ops,
         });
     }
 
@@ -94,6 +95,22 @@ fn main() -> Result<()> {
         avg.forward_seconds * 1000.0,
         avg.segmenter_seconds * 1000.0,
     );
+    println!(
+        "avg_forward_ops_ms in_linear1={:.3} in_linear2={:.3} out_linear1={:.3} out_linear2={:.3} softmax={:.3}",
+        avg.forward_ops.in_linear1_seconds * 1000.0,
+        avg.forward_ops.in_linear2_seconds * 1000.0,
+        avg.forward_ops.out_linear1_seconds * 1000.0,
+        avg.forward_ops.out_linear2_seconds * 1000.0,
+        avg.forward_ops.softmax_seconds * 1000.0,
+    );
+    for idx in 0..4 {
+        println!(
+            "avg_forward_block_{idx}_ms linear={:.3} memory={:.3} affine={:.3}",
+            avg.forward_ops.block_linear_seconds[idx] * 1000.0,
+            avg.forward_ops.block_memory_seconds[idx] * 1000.0,
+            avg.forward_ops.block_affine_seconds[idx] * 1000.0,
+        );
+    }
 
     Ok(())
 }
@@ -105,6 +122,7 @@ struct RunTiming {
     frontend_seconds: f64,
     forward_seconds: f64,
     segmenter_seconds: f64,
+    forward_ops: FsmnVadForwardTiming,
 }
 
 fn average_timing(runs: &[RunTiming]) -> RunTiming {
@@ -120,7 +138,26 @@ fn average_timing(runs: &[RunTiming]) -> RunTiming {
         frontend_seconds: runs.iter().map(|run| run.frontend_seconds).sum::<f64>() / count,
         forward_seconds: runs.iter().map(|run| run.forward_seconds).sum::<f64>() / count,
         segmenter_seconds: runs.iter().map(|run| run.segmenter_seconds).sum::<f64>() / count,
+        forward_ops: average_forward_ops(runs, count),
     }
+}
+
+fn average_forward_ops(runs: &[RunTiming], count: f64) -> FsmnVadForwardTiming {
+    let mut avg = FsmnVadForwardTiming::default();
+    for run in runs {
+        let ops = run.forward_ops;
+        avg.in_linear1_seconds += ops.in_linear1_seconds / count;
+        avg.in_linear2_seconds += ops.in_linear2_seconds / count;
+        avg.out_linear1_seconds += ops.out_linear1_seconds / count;
+        avg.out_linear2_seconds += ops.out_linear2_seconds / count;
+        avg.softmax_seconds += ops.softmax_seconds / count;
+        for idx in 0..4 {
+            avg.block_linear_seconds[idx] += ops.block_linear_seconds[idx] / count;
+            avg.block_memory_seconds[idx] += ops.block_memory_seconds[idx] / count;
+            avg.block_affine_seconds[idx] += ops.block_affine_seconds[idx] / count;
+        }
+    }
+    avg
 }
 
 fn parse_args() -> Result<Args> {

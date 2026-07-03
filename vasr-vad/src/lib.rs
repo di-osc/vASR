@@ -5,7 +5,7 @@ pub mod fsmn;
 pub mod traits;
 
 pub use firered::{FireRedVadDetection, FireRedVadModel, FireRedVadTiming};
-pub use fsmn::{FsmnVadDetection, FsmnVadModel, FsmnVadTiming};
+pub use fsmn::{FsmnVadDetection, FsmnVadForwardTiming, FsmnVadModel, FsmnVadTiming};
 pub use traits::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
 #[cfg(test)]
