@@ -8,6 +8,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
 
+use crate::engine::{AsrOptions, VadOptions};
 use crate::pipeline::{
     GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions, StageSpan,
     TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
@@ -16,7 +17,6 @@ use crate::protocol::{
     InferenceData, InferencePerformance, SentenceResult, TextResult, TimingBreakdown,
     TranscribeRequest, TranscribeResponse,
 };
-use crate::runtime::{AsrOptions, VadOptions};
 
 const TRANSCRIBE_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
@@ -968,7 +968,7 @@ pub fn build_transcribe_service(
 }
 
 pub fn build_transcribe_service_from_parts(
-    offline: Arc<crate::runtime::OfflinePipeline>,
+    offline: Arc<crate::engine::OfflinePipeline>,
     asr_options: AsrOptions,
     vad_options: VadOptions,
     worker_options: PipelineWorkerOptions,

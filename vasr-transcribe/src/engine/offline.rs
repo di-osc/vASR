@@ -6,7 +6,7 @@ use vasr_data::{
     normalize_audio_input,
 };
 
-use crate::runtime::model::{AsrModel, AsrOptions, VadModel, VadOptions, VadSegment};
+use crate::engine::model::{AsrModel, AsrOptions, VadModel, VadOptions, VadSegment};
 
 pub struct OfflinePipeline {
     pub vad: Option<Arc<dyn VadModel>>,
@@ -201,7 +201,7 @@ mod tests {
         fn new_stream(
             &self,
             _options: &VadOptions,
-        ) -> Result<Box<dyn crate::runtime::model::StreamingVadSession>> {
+        ) -> Result<Box<dyn crate::engine::model::StreamingVadSession>> {
             anyhow::bail!("streaming VAD is not used in this test")
         }
     }

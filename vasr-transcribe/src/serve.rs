@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::runtime::{
+use crate::engine::{
     AsrModel, AsrOptions, FireRedVadModel, FsmnVadModel, InferenceScheduler, OfflinePipeline,
     ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
