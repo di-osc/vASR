@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::Path};
 use vasr_transcribe::{
-    EvalArgs, PerfArgs, RunTranscribeArgs, ServeTranscribeArgs, init_logging, run_eval, run_local,
-    run_perf, run_transcribe,
+    EvalArgs, PerfArgs, RunTranscribeArgs, ServeTranscribeArgs, StressArgs, init_logging, run_eval,
+    run_local, run_perf, run_stress, run_transcribe,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,8 @@ enum Command {
     Eval(EvalArgs),
     /// Measure the fastest completion time for an audio source set.
     Perf(PerfArgs),
+    /// Continuously stress an HTTP service and sample peak GPU memory.
+    Stress(StressArgs),
 }
 
 fn load_dotenv() -> Result<()> {
@@ -73,5 +75,6 @@ async fn main() -> Result<()> {
         Command::Run(args) => run_local(args).await,
         Command::Eval(args) => run_eval(args).await,
         Command::Perf(args) => run_perf(args).await,
+        Command::Stress(args) => run_stress(args).await,
     }
 }

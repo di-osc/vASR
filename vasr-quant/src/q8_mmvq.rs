@@ -494,6 +494,33 @@ fn with_scratch<R>(
     })
 }
 
+fn with_temp_scratch<R>(
+    dev: &CudaDevice,
+    bytes: usize,
+    stream: &CudaStream,
+    f: impl FnOnce(*mut std::ffi::c_void) -> Result<R>,
+) -> Result<R> {
+    let mut slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
+    let (ptr, guard) = slice.device_ptr_mut(stream);
+    let result = f(ptr as *mut std::ffi::c_void);
+    drop(guard);
+    result
+}
+
+fn with_plain_scratch<R>(
+    kind: PlainKind,
+    dev: &CudaDevice,
+    bytes: usize,
+    stream: &CudaStream,
+    f: impl FnOnce(*mut std::ffi::c_void) -> Result<R>,
+) -> Result<R> {
+    if kind.caches_scratch() {
+        with_scratch(dev, bytes, stream, f)
+    } else {
+        with_temp_scratch(dev, bytes, stream, f)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DeviceInfo {
     cc: i32,
@@ -685,6 +712,13 @@ pub enum PlainKind {
     Prefill,
     Decode,
     LmHead,
+    LmHeadPrefill,
+}
+
+impl PlainKind {
+    fn caches_scratch(self) -> bool {
+        matches!(self, Self::Decode | Self::LmHead)
+    }
 }
 
 fn record_plain_fast_path(kind: PlainKind, rows: usize) {
@@ -702,7 +736,7 @@ fn record_plain_fast_path(kind: PlainKind, rows: usize) {
             PLAIN_DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
             PLAIN_DECODE_ROWS.fetch_add(rows, Ordering::Relaxed);
         }
-        PlainKind::LmHead => {
+        PlainKind::LmHead | PlainKind::LmHeadPrefill => {
             PLAIN_LM_HEAD_CALLS.fetch_add(1, Ordering::Relaxed);
             PLAIN_LM_HEAD_ROWS.fetch_add(rows, Ordering::Relaxed);
         }
@@ -712,7 +746,7 @@ fn record_plain_fast_path(kind: PlainKind, rows: usize) {
 fn record_mmq_fast_path(kind: PlainKind, rows: usize) {
     let rows = rows.min(u64::MAX as usize) as u64;
     match kind {
-        PlainKind::LmHead => {
+        PlainKind::LmHead | PlainKind::LmHeadPrefill => {
             MMQ_LM_HEAD_CALLS.fetch_add(1, Ordering::Relaxed);
             MMQ_LM_HEAD_ROWS.fetch_add(rows, Ordering::Relaxed);
         }
@@ -857,7 +891,7 @@ fn try_plain_mmq_q8_0(w: &QTensor, xs: &Tensor, kind: PlainKind) -> Result<Optio
             let mut out = unsafe { dev.alloc::<$ty>(nrows * b_size)? };
             let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
             let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            with_plain_scratch(kind, &dev, scratch_bytes, &stream, |scratch_ptr| {
                 let fixup_ptr = unsafe {
                     (scratch_ptr as *mut u8).add(activation_bytes + activation_extra_bytes)
                         as *mut std::ffi::c_void
@@ -1064,7 +1098,7 @@ fn lm_head_q8_0(
     }
     if reduce_next_ids && b_size > 8 {
         if matches!(kind, NextIdKind::Decode) {
-            if let Some(next_ids) = try_lm_head_next_ids_mmq_q8_0(w, xs, b_size)? {
+            if let Some(next_ids) = try_lm_head_next_ids_mmq_q8_0(w, xs, b_size, kind)? {
                 record_next_id_fast_path(kind, b_size);
                 return Ok(Some(next_ids));
             }
@@ -1074,7 +1108,7 @@ fn lm_head_q8_0(
         } else {
             match prefill_lm_head_mmq_decision(b_size, nrows, xs.dtype()) {
                 PrefillLmHeadMmqDecision::Allowed => {
-                    if let Some(next_ids) = try_lm_head_next_ids_mmq_q8_0(w, xs, b_size)? {
+                    if let Some(next_ids) = try_lm_head_next_ids_mmq_q8_0(w, xs, b_size, kind)? {
                         record_next_id_fast_path(kind, b_size);
                         return Ok(Some(next_ids));
                     }
@@ -1130,7 +1164,11 @@ fn lm_head_q8_0(
             } else {
                 std::ptr::null_mut()
             };
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            let plain_kind = match kind {
+                NextIdKind::Prefill => PlainKind::LmHeadPrefill,
+                NextIdKind::Decode => PlainKind::LmHead,
+            };
+            with_plain_scratch(plain_kind, &dev, scratch_bytes, &stream, |scratch_ptr| {
                 unsafe {
                     $quantize(
                         xs_ptr as *const std::ffi::c_void,
@@ -1166,7 +1204,7 @@ fn lm_head_q8_0(
             })?;
             drop(storage_guard);
             drop(xs_guard);
-            record_plain_fast_path(PlainKind::LmHead, b_size);
+            record_plain_fast_path(plain_kind, b_size);
             record_next_id_fast_path(kind, b_size);
             if reduce_next_ids {
                 let full = tensor_from_cuda_slice(storage, &dev, Shape::from((storage_len,)));
@@ -1197,8 +1235,13 @@ fn try_lm_head_next_ids_mmq_q8_0(
     w: &QTensor,
     xs: &Tensor,
     b_size: usize,
+    kind: NextIdKind,
 ) -> Result<Option<Tensor>> {
-    let Some(logits) = try_plain_mmq_q8_0(w, xs, PlainKind::LmHead)? else {
+    let plain_kind = match kind {
+        NextIdKind::Prefill => PlainKind::LmHeadPrefill,
+        NextIdKind::Decode => PlainKind::LmHead,
+    };
+    let Some(logits) = try_plain_mmq_q8_0(w, xs, plain_kind)? else {
         return Ok(None);
     };
     let logits = match logits.dims() {
@@ -1322,7 +1365,7 @@ pub fn plain(w: &QTensor, xs: &Tensor, kind: PlainKind) -> Result<Tensor> {
             let mut out = unsafe { dev.alloc::<half::bf16>(nrows * b_size)? };
             let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
             let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            with_plain_scratch(kind, &dev, scratch_bytes, &stream, |scratch_ptr| {
                 unsafe {
                     launch_mmvq_gguf_quantize_q8_1_bf16(
                         xs_ptr as *const std::ffi::c_void,
@@ -1355,7 +1398,7 @@ pub fn plain(w: &QTensor, xs: &Tensor, kind: PlainKind) -> Result<Tensor> {
             let mut out = unsafe { dev.alloc::<half::f16>(nrows * b_size)? };
             let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
             let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            with_plain_scratch(kind, &dev, scratch_bytes, &stream, |scratch_ptr| {
                 unsafe {
                     launch_mmvq_gguf_quantize_q8_1_f16(
                         xs_ptr as *const std::ffi::c_void,
@@ -1388,7 +1431,7 @@ pub fn plain(w: &QTensor, xs: &Tensor, kind: PlainKind) -> Result<Tensor> {
             let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
             let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
             let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            with_plain_scratch(kind, &dev, scratch_bytes, &stream, |scratch_ptr| {
                 unsafe {
                     launch_mmvq_gguf_quantize_q8_1_f32(
                         xs_ptr as *const std::ffi::c_void,
@@ -1850,7 +1893,7 @@ pub fn fused_gelu_erf(w: &QTensor, bias: Option<&Tensor>, xs: &Tensor) -> Result
                     (std::ptr::null(), None)
                 };
             let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
-            with_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
+            with_temp_scratch(&dev, scratch_bytes, &stream, |scratch_ptr| {
                 unsafe {
                     launch_mmvq_gguf_quantize_q8_1_bf16(
                         xs_ptr as *const std::ffi::c_void,

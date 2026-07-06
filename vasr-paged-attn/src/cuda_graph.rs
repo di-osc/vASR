@@ -126,7 +126,7 @@ pub fn cuda_trim_device_mem_pools_to(device: &Device, reserved_bytes: usize) {
     let Some(cuda) = device.as_cuda_device().ok() else {
         return;
     };
-    let _ = device.synchronize();
+    let _ = cuda.cuda_stream().context().synchronize();
     let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
         return;
     };

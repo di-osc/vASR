@@ -233,9 +233,6 @@ async fn handle_transcribe(
 #[cfg(feature = "cuda-graph")]
 fn maybe_trim_cuda_after_request(request_id: &str, service: &TranscribeService) {
     let active_after = service.active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
-    if std::env::var_os("VASR_ENABLE_CUDA_MEMPOOL_TRIM_AFTER_REQUEST").is_none() {
-        return;
-    }
     if let Some(trim) = service.pipeline.trim_cuda_mempool() {
         log_request_trim_debug(request_id, active_after, trim);
     }

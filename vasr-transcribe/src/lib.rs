@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod run;
 pub mod serve;
 pub mod server;
+pub mod stress;
 mod table;
 
 pub use eval::{EvalArgs, run_eval};
@@ -23,3 +24,4 @@ pub use server::{
     TranscribeService, build_transcribe_service, build_transcribe_service_from_parts,
     transcribe_router,
 };
+pub use stress::{StressArgs, run_stress};

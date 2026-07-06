@@ -341,7 +341,11 @@ impl QLinear {
         #[cfg(feature = "cuda")]
         if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
             let kind = if self.module_path.as_ref().ends_with("lm_head") {
-                crate::q8_mmvq::PlainKind::LmHead
+                if linear_is_prefill() {
+                    crate::q8_mmvq::PlainKind::LmHeadPrefill
+                } else {
+                    crate::q8_mmvq::PlainKind::LmHead
+                }
             } else {
                 match self.module_kind {
                     IsqModuleKind::Audio => crate::q8_mmvq::PlainKind::Audio,
@@ -356,6 +360,9 @@ impl QLinear {
                 crate::q8_mmvq::PlainKind::Prefill => crate::q8_mmvq::can_run_plain(qtensor, x),
                 crate::q8_mmvq::PlainKind::Decode => crate::q8_mmvq::can_run_decode(qtensor, x),
                 crate::q8_mmvq::PlainKind::LmHead => crate::q8_mmvq::can_run_plain(qtensor, x),
+                crate::q8_mmvq::PlainKind::LmHeadPrefill => {
+                    crate::q8_mmvq::can_run_plain(qtensor, x)
+                }
             };
             if can_run_q8_mmvq {
                 let mut ys = crate::q8_mmvq::plain(qtensor, x, kind)?;

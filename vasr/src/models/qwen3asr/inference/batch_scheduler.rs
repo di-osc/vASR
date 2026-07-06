@@ -47,12 +47,33 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
     }
     #[cfg(feature = "cuda-graph")]
     if let Some(mem) = cuda_memory_snapshot(device) {
+        let current_pool = match (mem.pool_used_current, mem.pool_reserved_current) {
+            (Some(used), Some(reserved)) => format!(
+                " pool_current={:.2}/{:.2}GiB",
+                used as f64 / (1024.0 * 1024.0 * 1024.0),
+                reserved as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+            _ => String::new(),
+        };
+        let default_pool = match (
+            mem.default_pool_used_current,
+            mem.default_pool_reserved_current,
+        ) {
+            (Some(used), Some(reserved)) => format!(
+                " pool_default={:.2}/{:.2}GiB",
+                used as f64 / (1024.0 * 1024.0 * 1024.0),
+                reserved as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+            _ => String::new(),
+        };
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "cuda_mem | {label} used={:.2}GiB free={:.2}GiB total={:.2}GiB",
+            "cuda_mem | {label} used={:.2}GiB free={:.2}GiB total={:.2}GiB{}{}",
             mem.used() as f64 / (1024.0 * 1024.0 * 1024.0),
             mem.free as f64 / (1024.0 * 1024.0 * 1024.0),
             mem.total as f64 / (1024.0 * 1024.0 * 1024.0),
+            current_pool,
+            default_pool,
         );
     }
     let _ = device;
@@ -380,6 +401,7 @@ fn add_generation_timings(dst: &mut GenerationTimings, src: &GenerationTimings) 
 
 #[derive(Debug, Default)]
 struct PrefillInputBuffer {
+    base_index: usize,
     prepared: Vec<PreparedInputs>,
     audio_features: Option<Tensor>,
     audio_seconds: Vec<f64>,
@@ -392,6 +414,7 @@ impl PrefillInputBuffer {
     fn append(&mut self, audio_token_id: u32, batch: PreparedAudioBatch) -> Result<()> {
         append_prepared_audio_batch(
             audio_token_id,
+            self.base_index,
             &mut self.prepared,
             &mut self.audio_features,
             &mut self.audio_seconds,
@@ -403,7 +426,7 @@ impl PrefillInputBuffer {
     }
 
     fn len(&self) -> usize {
-        self.prepared.len()
+        self.base_index.saturating_add(self.prepared.len())
     }
 
     fn has_waiting(&self) -> bool {
@@ -412,6 +435,57 @@ impl PrefillInputBuffer {
 
     fn waiting_len(&self) -> usize {
         self.waiting.len()
+    }
+
+    fn compact_completed_prefix(&mut self) -> Result<()> {
+        let Some(first_waiting) = self.waiting.iter().min().copied() else {
+            self.base_index = self.len();
+            self.prepared.clear();
+            self.audio_features = None;
+            self.audio_seconds.clear();
+            self.row_audio_lens.clear();
+            self.audio_offsets.clear();
+            return Ok(());
+        };
+        if first_waiting == self.base_index {
+            return Ok(());
+        }
+        let drop_rows = first_waiting.saturating_sub(self.base_index);
+        if drop_rows == 0 || drop_rows > self.prepared.len() {
+            return Ok(());
+        }
+
+        let drop_tokens = self
+            .audio_offsets
+            .get(drop_rows)
+            .copied()
+            .or_else(|| {
+                self.audio_offsets
+                    .last()
+                    .zip(self.row_audio_lens.last())
+                    .map(|(offset, len)| offset.saturating_add(*len))
+            })
+            .unwrap_or(0);
+
+        self.prepared.drain(..drop_rows);
+        self.audio_seconds.drain(..drop_rows);
+        self.row_audio_lens.drain(..drop_rows);
+        self.audio_offsets.drain(..drop_rows);
+        for offset in &mut self.audio_offsets {
+            *offset = offset.saturating_sub(drop_tokens);
+        }
+        self.base_index = first_waiting;
+
+        if let Some(features) = self.audio_features.take() {
+            let (tokens, _) = features.dims2()?;
+            let keep_tokens = tokens.saturating_sub(drop_tokens);
+            self.audio_features = if keep_tokens == 0 {
+                None
+            } else {
+                Some(features.narrow(0, drop_tokens, keep_tokens)?.copy()?)
+            };
+        }
+        Ok(())
     }
 }
 
@@ -679,6 +753,7 @@ fn free_finished_running(
     outputs: &mut [Vec<u32>],
     runtime: &mut PagedCacheRuntime,
     mut on_complete: Option<&mut dyn FnMut(usize, Vec<u32>) -> Result<()>>,
+    retain_outputs: bool,
 ) -> Result<bool> {
     let mut freed = false;
     for slot in running.iter_mut() {
@@ -689,7 +764,9 @@ fn free_finished_running(
             continue;
         }
         let generated = entry.slot.generated.clone();
-        outputs[entry.client_index] = generated.clone();
+        if retain_outputs {
+            outputs[entry.client_index] = generated.clone();
+        }
         if let Some(on_complete) = on_complete.as_deref_mut() {
             on_complete(entry.client_index, generated)?;
         }
@@ -873,6 +950,7 @@ fn concat_prepared_audio(
 
 fn append_prepared_audio_batch(
     audio_token_id: u32,
+    base_index: usize,
     prepared: &mut Vec<PreparedInputs>,
     audio_features: &mut Option<Tensor>,
     audio_seconds: &mut Vec<f64>,
@@ -891,7 +969,7 @@ fn append_prepared_audio_batch(
             batch.audio_seconds.len()
         );
     }
-    let start_idx = prepared.len();
+    let start_idx = base_index.saturating_add(prepared.len());
     let mut audio_cursor = audio_offsets
         .last()
         .zip(row_audio_lens.last())
@@ -1141,6 +1219,7 @@ impl AsrBatchScheduler {
         eos_token_ids: &[u32],
         pad_id: u32,
         #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
+        base_index: usize,
     ) -> Result<(usize, PrefillBatchReason)> {
         let (block_size, free_blocks, max_wave) = {
             let runtime_guard = runtime
@@ -1158,10 +1237,15 @@ impl AsrBatchScheduler {
             free_blocks,
             max_wave,
             |client_index| {
+                let local_index = client_index.checked_sub(base_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dynamic prefill index underflow: client={client_index} base={base_index}"
+                    )
+                })?;
                 prepared_token_capacity(
-                    &prepared[client_index],
+                    &prepared[local_index],
                     audio_seconds,
-                    client_index,
+                    local_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
                 )
@@ -1173,18 +1257,28 @@ impl AsrBatchScheduler {
         }
 
         let wave = wave_client_indices.len();
-        let request_id_base = self.allocate_request_id_base(wave);
-        let (wave_ids, wave_masks) =
-            pad_prepared_wave_for_prefill(prepared, wave_client_indices.as_slice(), pad_id)?;
-        let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
-        let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
-        let token_capacities = wave_client_indices
+        let wave_local_indices = wave_client_indices
             .iter()
             .map(|&client_index| {
+                client_index.checked_sub(base_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dynamic prefill index underflow: client={client_index} base={base_index}"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let request_id_base = self.allocate_request_id_base(wave);
+        let (wave_ids, wave_masks) =
+            pad_prepared_wave_for_prefill(prepared, wave_local_indices.as_slice(), pad_id)?;
+        let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
+        let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
+        let token_capacities = wave_local_indices
+            .iter()
+            .map(|&local_index| {
                 prepared_token_capacity(
-                    &prepared[client_index],
+                    &prepared[local_index],
                     audio_seconds,
-                    client_index,
+                    local_index,
                     self.config.generated_tokens_per_sec,
                     self.config.min_generated_tokens,
                 )
@@ -1194,7 +1288,7 @@ impl AsrBatchScheduler {
             audio_features,
             audio_offsets,
             row_audio_lens,
-            wave_client_indices.as_slice(),
+            wave_local_indices.as_slice(),
         )?
         .to_device(device)?;
         let engine_config = PagedBatchConfig {
@@ -1281,7 +1375,7 @@ impl AsrBatchScheduler {
         let Some(features) = inputs.audio_features.as_ref() else {
             return Ok((0, PrefillBatchReason::WaitingEmpty));
         };
-        self.prefill_waiting_wave_shared(
+        let result = self.prefill_waiting_wave_shared(
             thinker,
             device,
             runtime,
@@ -1296,7 +1390,12 @@ impl AsrBatchScheduler {
             pad_id,
             #[cfg(feature = "timing")]
             timings,
-        )
+            inputs.base_index,
+        );
+        if result.as_ref().is_ok_and(|(wave, _)| *wave > 0) {
+            inputs.compact_completed_prefix()?;
+        }
+        result
     }
 
     /// Continuous batching for variable-length prepared segments (VAD slices).
@@ -1369,6 +1468,7 @@ impl AsrBatchScheduler {
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                     None,
+                    true,
                 )?;
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1436,6 +1536,7 @@ impl AsrBatchScheduler {
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                     None,
+                    true,
                 )?;
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1544,6 +1645,7 @@ impl AsrBatchScheduler {
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         None,
+                        true,
                     )?;
                 }
                 attach_prefilled_to_running(
@@ -1584,6 +1686,7 @@ impl AsrBatchScheduler {
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         None,
+                        true,
                     )?;
                 }
                 attach_prefilled_to_running(
@@ -1810,6 +1913,7 @@ impl AsrBatchScheduler {
             max_slots,
             on_complete,
             true,
+            true,
             None,
             #[cfg(feature = "timing")]
             timings.as_deref_mut(),
@@ -1837,6 +1941,7 @@ impl AsrBatchScheduler {
             max_slots,
             on_complete,
             false,
+            false,
             Some(on_tick),
             #[cfg(feature = "timing")]
             timings.as_deref_mut(),
@@ -1852,6 +1957,7 @@ impl AsrBatchScheduler {
         eos_token_ids: &[u32],
         max_slots: usize,
         on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
+        retain_outputs: bool,
         close_on_message_source_closed: bool,
         mut on_tick: Option<&mut dyn FnMut() -> Result<()>>,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
@@ -1896,6 +2002,7 @@ impl AsrBatchScheduler {
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         Some(on_complete),
+                        retain_outputs,
                     )?;
                 }
                 attach_prefilled_to_running(
@@ -1937,6 +2044,7 @@ impl AsrBatchScheduler {
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         Some(on_complete),
+                        retain_outputs,
                     )?;
                 }
                 attach_prefilled_to_running(
@@ -2163,11 +2271,13 @@ pub fn run_paged_prepared_batch_timed(
 #[cfg(test)]
 mod tests {
     use super::{
-        AsrBatchSchedulerConfig, PrefillBatchReason, collect_prefill_wave_by_kv,
-        continuous_batch_enabled, dynamic_source_poll_may_block, group_running_by_decode_step,
-        pad_prepared_wave_for_prefill,
+        AsrBatchSchedulerConfig, PrefillBatchReason, PrefillInputBuffer, PreparedAudioBatch,
+        collect_prefill_wave_by_kv, continuous_batch_enabled, dynamic_source_poll_may_block,
+        group_running_by_decode_step, pad_prepared_wave_for_prefill,
     };
     use std::collections::VecDeque;
+
+    use candle_core::{Device, Tensor};
 
     use crate::processor::asr_processor::PreparedInputs;
 
@@ -2216,6 +2326,58 @@ mod tests {
         assert!(!dynamic_source_poll_may_block(false, 1));
         assert!(!dynamic_source_poll_may_block(true, 1));
         assert!(dynamic_source_poll_may_block(false, 0));
+    }
+
+    #[test]
+    fn prefill_input_buffer_compacts_completed_prefix() -> anyhow::Result<()> {
+        let prepared = (0..3)
+            .map(|_| PreparedInputs {
+                input_ids: vec![10, 99, 99],
+                attention_mask: vec![1, 1, 1],
+                input_features: vec![],
+                feature_attention_mask: vec![],
+            })
+            .collect();
+        let audio_features = Tensor::new(
+            &[
+                [1f32, 10.],
+                [2., 20.],
+                [3., 30.],
+                [4., 40.],
+                [5., 50.],
+                [6., 60.],
+            ],
+            &Device::Cpu,
+        )?;
+        let mut inputs = PrefillInputBuffer::default();
+        inputs.append(
+            99,
+            PreparedAudioBatch {
+                prepared,
+                audio_features,
+                audio_seconds: vec![1.0, 2.0, 3.0],
+            },
+        )?;
+        assert_eq!(inputs.waiting.pop_front(), Some(0));
+        inputs.compact_completed_prefix()?;
+
+        assert_eq!(inputs.base_index, 1);
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(
+            inputs.waiting.iter().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(inputs.audio_offsets, vec![0, 2]);
+        assert_eq!(inputs.row_audio_lens, vec![2, 2]);
+        assert_eq!(
+            inputs
+                .audio_features
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing compacted features"))?
+                .to_vec2::<f32>()?,
+            vec![vec![3., 30.], vec![4., 40.], vec![5., 50.], vec![6., 60.]]
+        );
+        Ok(())
     }
 
     #[test]
