@@ -9,10 +9,10 @@ use std::collections::BTreeSet;
 
 use crate::AlignerModel;
 use qwen3asr::config::AsrConfig;
-use qwen3asr::model::{AsrModel, weights::LoadOptions};
+use qwen3asr::model::weights::LoadOptions;
 use qwen3asr::processor::AsrProcessor;
 use qwen3asr::processor::asr_processor::PreparedInputs;
-use vasr::asr::qwen3asr;
+use vasr::models::qwen3asr::{self, Qwen3ASR};
 use vasr_data::Waveform;
 use vasr_data::audio::input::AudioInput;
 
@@ -35,7 +35,7 @@ pub struct Qwen3ForcedAligner {
     device: Device,
     config: AsrConfig,
     processor: AsrProcessor,
-    model: AsrModel,
+    model: Qwen3ASR,
 
     aligner_processor: ForcedAlignProcessor,
     timestamp_token_id: u32,
@@ -62,17 +62,8 @@ impl Qwen3ForcedAligner {
         opts: &LoadOptions,
         aligner_processor: ForcedAlignProcessor,
     ) -> Result<Self> {
-        let (config, model) =
-            qwen3asr::model::weights::load_model_from_pretrained(model_id_or_path, device, opts)?;
-
-        let thinker_type = config
-            .thinker_config
-            .model_type
-            .as_deref()
-            .unwrap_or_default();
-        if !thinker_type.contains("forced_aligner") {
-            bail!("model is not a forced aligner: thinker_config.model_type={thinker_type:?}");
-        }
+        let model = Qwen3ASR::from_forced_aligner_pretrained(model_id_or_path, device, opts)?;
+        let config = model.config().clone();
 
         let timestamp_token_id = config
             .timestamp_token_id
@@ -84,9 +75,7 @@ impl Qwen3ForcedAligner {
             bail!("timestamp_segment_time must be > 0, got {timestamp_segment_time}");
         }
 
-        let tokenizer =
-            qwen3asr::processor::tokenizer::Tokenizer::from_pretrained(model_id_or_path)?;
-        let processor = AsrProcessor::new(tokenizer);
+        let processor = model.processor().clone();
 
         Ok(Self {
             device: device.clone(),
@@ -185,7 +174,7 @@ impl Qwen3ForcedAligner {
         }
         let prepared = self.processor.prepare_batch(items.as_slice())?;
 
-        let audio_token_id = self.model.thinker.audio_token_id();
+        let audio_token_id = self.model.thinker().audio_token_id();
         let mut audio_placeholder_count: usize = 0;
         for (i, p) in prepared.iter().enumerate() {
             let n = p
@@ -219,10 +208,10 @@ impl Qwen3ForcedAligner {
         let (input_features, feature_lens) = stack_features(&prepared, &self.device)?;
         let audio_features = self
             .model
-            .thinker
+            .thinker()
             .get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
 
-        let logits = self.model.thinker.forward_with_audio_features(
+        let logits = self.model.thinker().forward_with_audio_features(
             &input_ids,
             &attention_mask,
             Some(&audio_features),

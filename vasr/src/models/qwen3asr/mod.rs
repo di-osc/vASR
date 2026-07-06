@@ -73,6 +73,23 @@ impl Qwen3ASR {
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
+        Self::from_pretrained_inner(model_id_or_path, device, opts, false)
+    }
+
+    pub fn from_forced_aligner_pretrained(
+        model_id_or_path: &str,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<Self> {
+        Self::from_pretrained_inner(model_id_or_path, device, opts, true)
+    }
+
+    fn from_pretrained_inner(
+        model_id_or_path: &str,
+        device: &Device,
+        opts: &LoadOptions,
+        forced_aligner: bool,
+    ) -> Result<Self> {
         let (config, model) =
             model::weights::load_model_from_pretrained(model_id_or_path, device, opts)?;
         let thinker_type = config
@@ -80,9 +97,15 @@ impl Qwen3ASR {
             .model_type
             .as_deref()
             .unwrap_or_default();
-        if thinker_type.contains("forced_aligner") {
+        let is_forced_aligner = thinker_type.contains("forced_aligner");
+        if is_forced_aligner && !forced_aligner {
             anyhow::bail!(
                 "loaded a forced aligner checkpoint (thinker_config.model_type={thinker_type:?}); use the forced aligner API instead"
+            );
+        }
+        if forced_aligner && !is_forced_aligner {
+            anyhow::bail!(
+                "model is not a forced aligner: thinker_config.model_type={thinker_type:?}"
             );
         }
         let tokenizer = processor::tokenizer::Tokenizer::from_pretrained(model_id_or_path)?;
