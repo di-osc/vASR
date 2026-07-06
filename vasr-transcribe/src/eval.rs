@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,6 +9,7 @@ use clap::{ArgAction, Args, ValueEnum};
 use serde::Serialize;
 use vasr_data::{AudioAsset, CerStats, VasrRecord, VasrRecordList, normalize_for_cer};
 
+use crate::perf::timestamp_file_name;
 use crate::table::render_table;
 
 #[derive(Debug, Args)]
@@ -119,7 +120,7 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
         bail!("--retries must be greater than 0");
     }
 
-    let timestamp = unix_timestamp_string();
+    let timestamp = timestamp_file_name();
     let mut records = VasrRecordList::read_msgpack(&args.input)
         .with_context(|| format!("failed to read dataset {}", args.input.display()))?
         .records;
@@ -788,14 +789,6 @@ fn save_report(path: &Path, report: &EvalReport<'_>) -> Result<()> {
     let json = serde_json::to_vec_pretty(report).context("failed to encode report JSON")?;
     fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
-}
-
-fn unix_timestamp_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }
 
 fn truncate_for_error(body: &str) -> String {

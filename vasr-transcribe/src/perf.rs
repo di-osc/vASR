@@ -513,7 +513,7 @@ fn save_report(path: &Path, report: &PerfReport<'_>) -> Result<()> {
     Ok(())
 }
 
-fn timestamp_file_name() -> String {
+pub(crate) fn timestamp_file_name() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
