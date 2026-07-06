@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::{AsrSegmentJob, PendingGlobalRequest, PipelineRequestId, StageSpan};
+#[cfg(feature = "paged-attn")]
+use super::AsrSegmentJob;
+use super::{PendingGlobalRequest, PipelineRequestId, StageSpan};
 
 #[derive(Debug, Default)]
 pub(super) struct RequestStageProgress {
@@ -157,6 +159,7 @@ pub(super) fn record_request_encode_stages(
     }
 }
 
+#[cfg(feature = "paged-attn")]
 #[allow(dead_code)]
 fn record_request_decode_stage(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
