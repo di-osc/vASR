@@ -109,7 +109,6 @@ impl StreamingAsrModel for Qwen3Asr {
             StreamOptions {
                 context: options.context.clone(),
                 language: options.language.clone(),
-                max_new_tokens: options.max_new_tokens,
                 ..StreamOptions::default()
             },
         )?;
@@ -173,7 +172,7 @@ pub fn qwen_transcribe_options(options: &AsrOptions) -> TranscribeOptions {
         context: Batch::one(options.context.clone()),
         language: Batch::one(options.language.clone()),
         return_timestamps: false,
-        max_new_tokens: options.max_new_tokens,
+        max_new_tokens: 0,
         decode_max_seqs: options.decode_max_seqs,
         max_batch_audio_sec: options.max_batch_audio_sec,
         chunk_max_sec: options.chunk_max_sec,

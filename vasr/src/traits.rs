@@ -7,7 +7,6 @@ use vasr_data::{Annotation, AudioChunk, Timeline, Waveform};
 pub struct AsrOptions {
     pub language: Option<String>,
     pub context: String,
-    pub max_new_tokens: usize,
     /// Maximum concurrently decoded sequences. `0` uses the recognizer default.
     pub decode_max_seqs: usize,
     /// Maximum total audio duration (seconds) per ASR pool. `0` disables duration grouping.
@@ -22,7 +21,6 @@ impl Default for AsrOptions {
         Self {
             language: None,
             context: String::new(),
-            max_new_tokens: 128,
             decode_max_seqs: 0,
             max_batch_audio_sec: 60.0,
             chunk_max_sec: None,

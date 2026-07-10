@@ -4,13 +4,13 @@ use super::{
     audio_encoder_timing_seconds, format_seconds, format_speed, record_asr_encode_stats,
     record_request_encode_stages,
 };
-use crate::engine::offline::OfflinePipeline;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use vasr::OfflineAsrModel as AsrModel;
 use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
 use vasr_data::{DurationMs, Waveform};
 
@@ -52,7 +52,7 @@ pub(super) enum SegmentEncoderOutput {
 
 #[cfg(feature = "paged-attn")]
 pub(super) fn spawn_segment_encoder_worker(
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
     mut request_rx: mpsc::UnboundedReceiver<SegmentEncodeMessage>,
     encoded_tx: mpsc::UnboundedSender<SegmentEncoderOutput>,
@@ -80,10 +80,10 @@ pub(super) fn spawn_segment_encoder_worker(
                 .map(|segment| segment.waveform.duration_seconds())
                 .sum::<f64>();
             let batch = tokio::task::spawn_blocking({
-                let offline = Arc::clone(&offline);
+                let asr = Arc::clone(&asr);
                 let asr_options = asr_options.clone();
                 let segments = request.segments;
-                move || run_segment_asr_encode(&offline, &segments, &asr_options)
+                move || run_segment_asr_encode(asr.as_ref(), &segments, &asr_options)
             })
             .await
             .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
@@ -231,12 +231,11 @@ impl SegmentEncodedAsrBatch {
 }
 #[cfg(feature = "paged-attn")]
 pub(super) fn run_segment_asr_encode(
-    offline: &OfflinePipeline,
+    asr: &dyn AsrModel,
     segments: &[AsrSegmentJob],
     asr_options: &AsrOptions,
 ) -> Result<SegmentEncodedAsrBatch> {
-    let qwen3 = offline
-        .asr
+    let qwen3 = asr
         .as_any()
         .downcast_ref::<Qwen3ASR>()
         .ok_or_else(|| anyhow::anyhow!("staged ASR requires Qwen3ASR"))?;

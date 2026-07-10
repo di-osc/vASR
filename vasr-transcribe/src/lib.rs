@@ -1,9 +1,10 @@
-mod engine;
+mod device;
 pub mod eval;
 pub mod perf;
 pub mod pipeline;
 pub mod protocol;
 pub mod run;
+mod scheduler;
 pub mod serve;
 pub mod server;
 pub mod stress;

@@ -34,7 +34,6 @@ impl StreamingAsrModel for Qwen3AsrModel {
         let stream = self.inner.new_stream(RuntimeStreamOptions {
             context: options.context.clone(),
             language: options.language.clone(),
-            max_new_tokens: options.max_new_tokens,
             ..RuntimeStreamOptions::default()
         })?;
         Ok(Box::new(Qwen3AsrStreamModel {

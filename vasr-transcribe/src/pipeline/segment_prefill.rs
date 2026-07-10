@@ -3,8 +3,6 @@ use super::{
     AsrSegmentJob, RequestItemRef, apply_batch_timing_to_segments, asr_prefill_coalesce_wait,
     format_seconds, format_speed,
 };
-use crate::engine::AsrOptions;
-use crate::engine::offline::OfflinePipeline;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -15,6 +13,7 @@ use vasr::models::qwen3asr::{
     EncodedAsrBatchMetadata, PrefillStageOutput, PreparedAudioBatch, PreparedAudioBatchPoll,
     Qwen3ASR,
 };
+use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 use vasr_data::Waveform;
 
 #[cfg(feature = "paged-attn")]
@@ -102,7 +101,7 @@ enum PrefillCoalescedPoll {
 
 #[cfg(feature = "paged-attn")]
 pub(super) fn spawn_segment_prefill_worker(
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
     encoded_rx: mpsc::UnboundedReceiver<SegmentEncoderOutput>,
     prefilled_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
@@ -148,14 +147,14 @@ pub(super) fn spawn_segment_prefill_worker(
             let result = tokio::task::spawn_blocking({
                 let producer_id = next_producer_id;
                 next_producer_id = next_producer_id.saturating_add(1);
-                let offline = Arc::clone(&offline);
+                let asr = Arc::clone(&asr);
                 let asr_options = asr_options.clone();
                 let encoded_rx = Arc::clone(&encoded_rx);
                 let prefilled_tx = prefilled_tx.clone();
                 let runtime_handle = tokio::runtime::Handle::current();
                 move || {
                     run_global_segment_prefill(
-                        offline,
+                        asr,
                         segments,
                         stage_start,
                         initial,
@@ -205,7 +204,7 @@ pub(super) struct SegmentPreparedMetadata {
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
 fn run_global_segment_prefill(
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     segments: Vec<AsrSegmentJob>,
     stage_start: Instant,
     initial: SegmentEncodedAsrBatch,
@@ -216,8 +215,7 @@ fn run_global_segment_prefill(
     decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
 ) -> Result<()> {
-    let qwen3 = offline
-        .asr
+    let qwen3 = asr
         .as_any()
         .downcast_ref::<Qwen3ASR>()
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR prefill requires Qwen3ASR"))?;

@@ -52,11 +52,12 @@ use vasr_data::AudioLoader;
 use vasr_data::DurationMs;
 use vasr_data::{Annotation, AudioSource, Timeline, Waveform};
 
+use self::vad::VadPreparation;
 #[cfg(feature = "paged-attn")]
-use crate::engine::offline::VadPrepared;
-use crate::engine::offline::{OfflinePipeline, VadPreparation};
-use crate::engine::{AsrOptions, ParallelTranscribeOptions, VadOptions};
+use self::vad::VadPrepared;
 use crate::table::render_titled_table;
+use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
+use vasr_vad::{VadModel, VadOptions};
 
 const FALLBACK_STAGE_PARALLELISM: usize = 20;
 const DEFAULT_LOADED_QUEUE_MEMORY_FRACTION: f64 = 0.20;
@@ -111,6 +112,21 @@ impl PipelineWorkerOptions {
 struct ResolvedPipelineWorkerOptions {
     load_workers: usize,
     vad_workers: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ParallelTranscribeOptions {
+    asr_options: AsrOptions,
+    vad_options: VadOptions,
+}
+
+impl From<AsrOptions> for ParallelTranscribeOptions {
+    fn from(asr_options: AsrOptions) -> Self {
+        Self {
+            asr_options,
+            vad_options: VadOptions::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -293,7 +309,8 @@ struct AsrStageStatsSnapshot {
 #[derive(Clone)]
 pub struct AsyncTranscribePipeline {
     loader: AudioLoader,
-    offline: Arc<OfflinePipeline>,
+    vad: Option<Arc<dyn VadModel>>,
+    asr: Arc<dyn AsrModel>,
     parallel_options: ParallelTranscribeOptions,
     worker_options: PipelineWorkerOptions,
 }
@@ -387,12 +404,14 @@ impl RoutedTranscribeItemOutcome {
 impl AsyncTranscribePipeline {
     pub fn new(
         loader: AudioLoader,
-        offline: Arc<OfflinePipeline>,
+        vad: Option<Arc<dyn VadModel>>,
+        asr: Arc<dyn AsrModel>,
         asr_options: AsrOptions,
     ) -> Self {
         Self {
             loader,
-            offline,
+            vad,
+            asr,
             parallel_options: ParallelTranscribeOptions::from(asr_options),
             worker_options: PipelineWorkerOptions::default(),
         }
@@ -479,10 +498,10 @@ impl AsyncTranscribePipeline {
             Arc::clone(&loader_stats),
         );
 
-        let offline = Arc::clone(&self.offline);
+        let vad = self.vad.clone();
         let vad_options = self.parallel_options.vad_options.clone();
         let vad_handle = spawn_vad_worker(
-            offline,
+            vad,
             vad_options,
             vad_parallelism,
             loader_to_vad_rx,
@@ -492,10 +511,10 @@ impl AsyncTranscribePipeline {
             Arc::clone(&vad_stats),
         );
 
-        let offline = Arc::clone(&self.offline);
+        let asr = Arc::clone(&self.asr);
         let asr_options = self.parallel_options.asr_options.clone();
         let asr_handle = spawn_asr_worker(
-            offline,
+            asr,
             asr_options,
             vad_to_asr_rx,
             asr_to_result_tx,
@@ -526,7 +545,7 @@ impl AsyncTranscribePipeline {
 pub struct GlobalAsyncTranscribePipeline {
     submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
     #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     service_id: Arc<Mutex<String>>,
 }
 
@@ -587,7 +606,8 @@ fn snapshot_qwen_cuda_memory(model: &Qwen3ASR) -> Option<PipelineCudaMemorySnaps
 impl GlobalAsyncTranscribePipeline {
     pub fn start(
         loader: AudioLoader,
-        offline: Arc<OfflinePipeline>,
+        vad: Option<Arc<dyn VadModel>>,
+        asr: Arc<dyn AsrModel>,
         asr_options: AsrOptions,
         vad_options: VadOptions,
         worker_options: PipelineWorkerOptions,
@@ -657,7 +677,7 @@ impl GlobalAsyncTranscribePipeline {
             loader_stats,
         );
         spawn_vad_worker(
-            Arc::clone(&offline),
+            vad,
             parallel_options.vad_options.clone(),
             vad_parallelism,
             loader_to_vad_rx,
@@ -667,7 +687,7 @@ impl GlobalAsyncTranscribePipeline {
             vad_stats,
         );
         spawn_asr_worker(
-            Arc::clone(&offline),
+            Arc::clone(&asr),
             parallel_options.asr_options.clone(),
             vad_to_asr_rx,
             asr_to_result_tx,
@@ -682,7 +702,7 @@ impl GlobalAsyncTranscribePipeline {
         Self {
             submit_tx,
             #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
-            offline,
+            asr,
             service_id,
         }
     }
@@ -695,7 +715,7 @@ impl GlobalAsyncTranscribePipeline {
 
     pub fn memory_snapshot(&self) -> PipelineMemorySnapshot {
         #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
-        let qwen = self.offline.asr.as_any().downcast_ref::<Qwen3ASR>();
+        let qwen = self.asr.as_any().downcast_ref::<Qwen3ASR>();
         PipelineMemorySnapshot {
             #[cfg(feature = "paged-attn")]
             paged_cache: qwen.and_then(Qwen3ASR::paged_cache_stats),
@@ -708,7 +728,7 @@ impl GlobalAsyncTranscribePipeline {
 
     #[cfg(feature = "cuda-graph")]
     pub fn trim_cuda_mempool(&self) -> Option<PipelineCudaTrimSnapshot> {
-        let qwen = self.offline.asr.as_any().downcast_ref::<Qwen3ASR>()?;
+        let qwen = self.asr.as_any().downcast_ref::<Qwen3ASR>()?;
         let before = snapshot_qwen_cuda_memory(qwen);
         vasr::vasr_quant::trim_cuda_workspaces();
         vasr::vasr_paged_attn::cuda_graph::cuda_trim_device_mem_pools(qwen.device());
@@ -874,7 +894,7 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
 }
 
 fn spawn_asr_worker(
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
     mut vad_to_asr_rx: mpsc::UnboundedReceiver<VadToAsrMessage>,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
@@ -892,7 +912,7 @@ fn spawn_asr_worker(
         let (encoder_to_prefill_tx, encoder_to_prefill_rx) = mpsc::unbounded_channel();
         #[cfg(feature = "paged-attn")]
         let segment_encoder_handle = spawn_segment_encoder_worker(
-            Arc::clone(&offline),
+            Arc::clone(&asr),
             asr_options.clone(),
             asr_to_encoder_rx,
             encoder_to_prefill_tx,
@@ -903,14 +923,14 @@ fn spawn_asr_worker(
         let segment_prefill_and_decoder_handles = {
             let (prefill_to_decoder_tx, prefill_to_decoder_rx) = mpsc::unbounded_channel();
             let prefill_handle = spawn_segment_prefill_worker(
-                Arc::clone(&offline),
+                Arc::clone(&asr),
                 asr_options.clone(),
                 encoder_to_prefill_rx,
                 prefill_to_decoder_tx,
                 decode_idle_flush,
             );
             let decoder_handle = spawn_segment_decoder_worker(
-                Arc::clone(&offline),
+                Arc::clone(&asr),
                 asr_options.clone(),
                 prefill_to_decoder_rx,
                 asr_to_result_tx.clone(),
@@ -950,10 +970,10 @@ fn spawn_asr_worker(
                         continue;
                     }
                     let outcomes = tokio::task::spawn_blocking({
-                        let offline = Arc::clone(&offline);
+                        let asr = Arc::clone(&asr);
                         let asr_options = asr_options.clone();
                         let stats = Arc::clone(&stats);
-                        move || run_asr_jobs_batch(&offline, jobs, &asr_options, Some(&stats))
+                        move || run_asr_jobs_batch(asr.as_ref(), jobs, &asr_options, Some(&stats))
                     })
                     .await
                     .unwrap_or_else(|error| {
@@ -1046,12 +1066,12 @@ async fn collect_job_microbatch(
 }
 
 fn run_raw_asr_inference(
-    offline: &OfflinePipeline,
+    asr: &dyn AsrModel,
     waveforms: &[Waveform],
     asr_options: &AsrOptions,
 ) -> Result<(Vec<Timeline>, Option<TranscribeItemTiming>)> {
     #[cfg(feature = "timing")]
-    if let Some(qwen3) = offline.asr.as_any().downcast_ref::<Qwen3ASR>() {
+    if let Some(qwen3) = asr.as_any().downcast_ref::<Qwen3ASR>() {
         let result = (|| -> Result<(Vec<Timeline>, Option<TranscribeItemTiming>)> {
             let runtime_options = qwen_transcribe_options(asr_options);
             let audio = waveforms
@@ -1068,14 +1088,12 @@ fn run_raw_asr_inference(
         return result;
     }
 
-    offline
-        .asr
-        .transcribe(waveforms, asr_options)
+    asr.transcribe(waveforms, asr_options)
         .map(|timelines| (timelines, None))
 }
 
 fn run_asr_jobs_batch(
-    offline: &OfflinePipeline,
+    asr: &dyn AsrModel,
     jobs: Vec<AsrJob>,
     asr_options: &AsrOptions,
     stats: Option<&Arc<Mutex<AsrStageStats>>>,
@@ -1140,7 +1158,7 @@ fn run_asr_jobs_batch(
         let total_audio_seconds: f64 = audio_seconds.iter().sum();
         let waveforms: Vec<Waveform> = raw_jobs.into_iter().map(|(job, _)| job.waveform).collect();
         let stage_start = Instant::now();
-        let result = run_raw_asr_inference(offline, &waveforms, asr_options);
+        let result = run_raw_asr_inference(asr, &waveforms, asr_options);
         let asr_span = StageSpan::new(stage_start, Instant::now());
         for spans in &mut spans {
             spans.asr = Some(asr_span);
@@ -1906,8 +1924,8 @@ fn outcome_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::AsrModel;
     use std::sync::{Arc, Mutex};
+    use vasr::OfflineAsrModel as AsrModel;
     use vasr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
     };
@@ -2167,10 +2185,6 @@ mod tests {
     #[test]
     fn no_speech_jobs_are_returned_without_asr() -> Result<()> {
         let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        };
         let jobs = vec![AsrJob {
             index: 0,
             request_item: None,
@@ -2181,7 +2195,7 @@ mod tests {
             waveform: Waveform::new(vec![0.1; 160], 16_000),
         }];
 
-        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default(), None);
+        let outcomes = run_asr_jobs_batch(asr.as_ref(), jobs, &AsrOptions::default(), None);
 
         assert_eq!(outcomes.len(), 1);
         assert!(
@@ -2203,15 +2217,11 @@ mod tests {
     #[tokio::test]
     async fn asr_worker_coalesces_slightly_staggered_jobs() -> Result<()> {
         let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = Arc::new(OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        });
         let (vad_to_asr_tx, vad_to_asr_rx) = mpsc::unbounded_channel();
         let (asr_to_result_tx, mut asr_to_result_rx) = mpsc::channel(4);
         let stats = Arc::new(Mutex::new(AsrStageStats::default()));
         let handle = spawn_asr_worker(
-            pipeline,
+            asr.clone(),
             AsrOptions::default(),
             vad_to_asr_rx,
             asr_to_result_tx,

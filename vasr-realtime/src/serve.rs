@@ -39,10 +39,6 @@ pub struct CommonModelArgs {
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
 
-    /// Maximum decode tokens per request.
-    #[arg(long, default_value_t = 512, env = "VASR_MAX_NEW_TOKENS")]
-    pub max_new_tokens: usize,
-
     /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
     #[arg(
         long = "gpu-memory-utilization",
@@ -127,14 +123,12 @@ pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
     let asr = load_asr_model(&args.model, cuda_graph_max_batch(&args.model))?;
 
     let realtime_asr = Arc::clone(&asr);
-    let max_new_tokens = args.model.max_new_tokens;
     let vad_model = args.vad.vad_model.clone();
     let vad_options = vad_options_from_args(&args.vad);
     let realtime_service = Arc::new(RealtimeService {
         make_session: Arc::new(move || {
             let vad = load_fsmn_vad(&vad_model)?.new_stream(&vad_options)?;
             let asr_stream = realtime_asr.new_stream(&AsrOptions {
-                max_new_tokens,
                 ..AsrOptions::default()
             })?;
             Ok(RealtimeSession::new(
@@ -157,9 +151,6 @@ pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.model.trim().is_empty() {
         bail!("--model must not be empty");
-    }
-    if args.max_new_tokens == 0 {
-        bail!("--max-new-tokens must be greater than zero");
     }
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");

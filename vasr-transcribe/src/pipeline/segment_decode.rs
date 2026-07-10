@@ -1,5 +1,6 @@
 use super::segment_encode::SegmentAsrInference;
 use super::segment_prefill::{SegmentPrefillMessage, SegmentPreparedEvent};
+use super::vad::offset_annotations;
 use super::{
     AsrOptions, AsrSegmentJob, AsrStageStats, PendingGlobalRequest, PipelineRequestId,
     RequestItemRef, RoutedTranscribeItemOutcome, StageSpan, TranscribeItemOutcome,
@@ -7,7 +8,6 @@ use super::{
     merge_optional_span, outcome_from_result, prefill_span_from_decode, record_asr_batch_stats,
     route_outcome,
 };
-use crate::engine::offline::{OfflinePipeline, offset_annotations};
 use anyhow::{Result, bail};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{Qwen3ASR, StreamingMetadataDecoder, qwen_outputs_to_timelines};
@@ -45,7 +46,7 @@ type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentPrefillMessage>;
 
 #[cfg(feature = "paged-attn")]
 pub(super) fn spawn_segment_decoder_worker(
-    offline: Arc<OfflinePipeline>,
+    asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
     decoder_rx: SegmentDecoderReceiver,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
@@ -55,7 +56,7 @@ pub(super) fn spawn_segment_decoder_worker(
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
         let result = tokio::task::spawn_blocking({
-            let asr = Arc::clone(&offline.asr);
+            let asr = Arc::clone(&asr);
             let asr_options = asr_options.clone();
             let stats = Arc::clone(&stats);
             let pending_requests = pending_requests.clone();
@@ -85,7 +86,7 @@ pub(super) fn spawn_segment_decoder_worker(
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
 fn run_global_segment_decode_worker(
-    asr: &dyn crate::engine::model::AsrModel,
+    asr: &dyn AsrModel,
     asr_options: AsrOptions,
     mut decoder_rx: SegmentDecoderReceiver,
     segment_state: &mut SegmentAsrState,

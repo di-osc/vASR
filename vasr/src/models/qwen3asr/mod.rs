@@ -1,3 +1,4 @@
+pub mod builder;
 pub mod capabilities;
 pub mod config;
 pub mod inference;
@@ -18,6 +19,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
+pub use builder::{Qwen3AsrBuilder, resolve_qwen3_asr_model_id};
 pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{

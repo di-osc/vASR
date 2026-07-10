@@ -1387,8 +1387,8 @@ mod tests {
         let xs: Vec<f32> = (0..seq_len * embed_dim).map(|i| i as f32).collect();
         let hidden_states = candle_core::Tensor::from_vec(xs, (seq_len, embed_dim), &device)?;
 
-        let out_blocked = attn.forward(&hidden_states, &[0usize, 2, 5], 0)?;
-        let out_full = attn.forward(&hidden_states, &[0usize, 5], 0)?;
+        let out_blocked = attn.forward(hidden_states.clone(), &[0usize, 2, 5])?;
+        let out_full = attn.forward(hidden_states, &[0usize, 5])?;
 
         let got = out_blocked.to_vec2::<f32>()?;
         let exp = out_full.to_vec2::<f32>()?;

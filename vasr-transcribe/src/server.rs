@@ -6,9 +6,10 @@ use std::time::Instant;
 
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
+use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 use vasr_data::AudioSource;
+use vasr_vad::{VadModel, VadOptions};
 
-use crate::engine::{AsrOptions, VadOptions};
 use crate::pipeline::{
     GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions, StageSpan,
     TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
@@ -965,14 +966,16 @@ pub fn build_transcribe_service(
 }
 
 pub fn build_transcribe_service_from_parts(
-    offline: Arc<crate::engine::OfflinePipeline>,
+    vad: Option<Arc<dyn VadModel>>,
+    asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
     vad_options: VadOptions,
     worker_options: PipelineWorkerOptions,
 ) -> Arc<TranscribeService> {
     build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start(
         vasr_data::AudioLoader,
-        offline,
+        vad,
+        asr,
         asr_options,
         vad_options,
         worker_options,

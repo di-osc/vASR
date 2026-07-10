@@ -5,9 +5,10 @@ use std::time::Instant;
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-
-use crate::engine::VadOptions;
-use crate::engine::offline::{OfflinePipeline, VadPreparation};
+use vasr_data::{
+    Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, TimeRange, Waveform, normalize_audio_input,
+};
+use vasr_vad::{VadModel, VadOptions, VadSegment};
 
 use super::{
     AsrJob, AsrPipelineMessage, LoadedJob, LoadedQueueMemoryBudget, PendingGlobalRequest,
@@ -19,8 +20,103 @@ use super::{
 #[cfg(feature = "paged-attn")]
 use super::speech_job_to_segments;
 
+/// Output of the VAD stage, ready for batched ASR.
+#[derive(Debug, Clone)]
+pub(super) struct VadPrepared {
+    pub(super) speech_annotations: Vec<Annotation>,
+    pub(super) segments: Vec<VadSegment>,
+    pub(super) slices: Vec<Waveform>,
+}
+
+/// Result of the VAD stage. `Disabled` is the only case that should fall back
+/// to raw ASR; `NoSpeech` means VAD ran and found nothing to recognize.
+#[derive(Debug, Clone)]
+pub(super) enum VadPreparation {
+    Disabled,
+    NoSpeech,
+    Speech(VadPrepared),
+}
+
+pub(super) fn prepare_vad_stage(
+    vad: Option<&dyn VadModel>,
+    waveform: &Waveform,
+    vad_options: &VadOptions,
+) -> Result<VadPreparation> {
+    let Some(vad) = vad else {
+        return Ok(VadPreparation::Disabled);
+    };
+    let vad_waveform = prepare_waveform_for_vad(waveform)?;
+    let segments = pad_vad_segments(
+        vad.detect(&vad_waveform, vad_options)?,
+        vad_options.pad_ms,
+        waveform.duration_ms().round() as u64,
+    );
+    if segments.is_empty() {
+        return Ok(VadPreparation::NoSpeech);
+    }
+    let speech_annotations = segments
+        .iter()
+        .map(|segment| {
+            vasr_data::Annotation::new(
+                segment.range,
+                vasr_data::AnnotationPayload::Speech,
+                vasr_data::AnnotationSource::Model("vad".to_string()),
+                vasr_data::AnnotationStatus::Final,
+            )
+        })
+        .collect();
+    let slices = segments
+        .iter()
+        .map(|segment| waveform.slice_ms(segment.range.start.0, segment.range.end.0))
+        .collect();
+    Ok(VadPreparation::Speech(VadPrepared {
+        speech_annotations,
+        segments,
+        slices,
+    }))
+}
+
+fn pad_vad_segments(mut segments: Vec<VadSegment>, pad_ms: u64, audio_ms: u64) -> Vec<VadSegment> {
+    if pad_ms == 0 {
+        return segments;
+    }
+    for segment in &mut segments {
+        segment.range = TimeRange::new(
+            DurationMs(segment.range.start.0.saturating_sub(pad_ms)),
+            DurationMs(segment.range.end.0.saturating_add(pad_ms).min(audio_ms)),
+        );
+    }
+    segments
+}
+
+pub(super) fn offset_annotations(
+    annotations: Vec<Annotation>,
+    offset: DurationMs,
+) -> Vec<Annotation> {
+    annotations
+        .into_iter()
+        .map(|mut annotation| {
+            annotation.range.start.0 = annotation.range.start.0.saturating_add(offset.0);
+            annotation.range.end.0 = annotation.range.end.0.saturating_add(offset.0);
+            annotation
+        })
+        .collect()
+}
+
+fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
+    let mono = waveform.to_mono()?;
+    if mono.sample_rate == SAMPLE_RATE_HZ && mono.is_normalized {
+        return Ok(mono);
+    }
+    let samples = normalize_audio_input(&AudioInput::Waveform {
+        samples: &mono.samples,
+        sample_rate: mono.sample_rate,
+    })?;
+    Ok(Waveform::new(samples, SAMPLE_RATE_HZ))
+}
+
 pub(super) fn spawn_vad_worker(
-    offline: Arc<OfflinePipeline>,
+    vad: Option<Arc<dyn VadModel>>,
     vad_options: VadOptions,
     max_in_flight: usize,
     mut loader_to_vad_rx: mpsc::UnboundedReceiver<Result<LoadedJob, TranscribeItemOutcome>>,
@@ -45,7 +141,7 @@ pub(super) fn spawn_vad_worker(
                     let worker_id = free_workers.pop().unwrap_or(tasks.len());
                     spawn_vad_task(
                         &mut tasks,
-                        Arc::clone(&offline),
+                        vad.clone(),
                         vad_options.clone(),
                         vad_to_asr_tx.clone(),
                         vad_to_asr_queue_memory.clone(),
@@ -80,7 +176,7 @@ pub(super) fn spawn_vad_worker(
 
 fn spawn_vad_task(
     tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
-    offline: Arc<OfflinePipeline>,
+    vad: Option<Arc<dyn VadModel>>,
     vad_options: VadOptions,
     vad_to_asr_tx: mpsc::UnboundedSender<VadToAsrMessage>,
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
@@ -101,10 +197,10 @@ fn spawn_vad_task(
             .loader
             .and_then(|loader| StageSpan::try_new(loader.end, stage_start));
         let prepared = tokio::task::spawn_blocking({
-            let offline = Arc::clone(&offline);
+            let vad = vad.clone();
             let waveform = job.waveform.clone();
             let vad_options = vad_options.clone();
-            move || offline.prepare_vad_stage(&waveform, &vad_options)
+            move || prepare_vad_stage(vad.as_deref(), &waveform, &vad_options)
         })
         .await;
         let compute_seconds = stage_start.elapsed().as_secs_f64();
@@ -396,5 +492,76 @@ async fn send_next_vad_task(
             bad_component: Some("vad"),
         }),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingVad {
+        seen: Mutex<Vec<(u32, u16)>>,
+    }
+
+    impl VadModel for RecordingVad {
+        fn detect(&self, waveform: &Waveform, _options: &VadOptions) -> Result<Vec<VadSegment>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((waveform.sample_rate, waveform.channels));
+            Ok(vec![VadSegment {
+                range: TimeRange::new(DurationMs(0), DurationMs(500)),
+                probability: 0.9,
+            }])
+        }
+
+        fn new_stream(
+            &self,
+            _options: &VadOptions,
+        ) -> Result<Box<dyn vasr_vad::StreamingVadSession>> {
+            anyhow::bail!("streaming VAD is not used in this test")
+        }
+    }
+
+    #[test]
+    fn vad_stage_resamples_for_vad_but_slices_original_waveform() -> Result<()> {
+        let vad = Arc::new(RecordingVad::default());
+        let waveform = Waveform::new_with_channels(vec![0.0; 48_000 * 2], 48_000, 2);
+
+        let prepared = prepare_vad_stage(Some(vad.as_ref()), &waveform, &VadOptions::default())?;
+
+        assert_eq!(vad.seen.lock().unwrap().as_slice(), &[(SAMPLE_RATE_HZ, 1)]);
+        let VadPreparation::Speech(prepared) = prepared else {
+            panic!("expected speech");
+        };
+        assert_eq!(prepared.slices.len(), 1);
+        assert_eq!(prepared.slices[0].sample_rate, 48_000);
+        assert_eq!(prepared.slices[0].channels, 2);
+        assert_eq!(prepared.slices[0].duration_ms(), 500.0);
+        Ok(())
+    }
+
+    #[test]
+    fn vad_stage_applies_padding_before_slicing() -> Result<()> {
+        let vad = Arc::new(RecordingVad::default());
+        let waveform = Waveform::new(vec![0.0; 16_000], 16_000);
+        let prepared = prepare_vad_stage(
+            Some(vad.as_ref()),
+            &waveform,
+            &VadOptions {
+                pad_ms: 100,
+                ..VadOptions::default()
+            },
+        )?;
+
+        let VadPreparation::Speech(prepared) = prepared else {
+            panic!("expected speech");
+        };
+        assert_eq!(prepared.segments[0].range.start.0, 0);
+        assert_eq!(prepared.segments[0].range.end.0, 600);
+        assert_eq!(prepared.slices[0].duration_ms(), 600.0);
+        Ok(())
     }
 }

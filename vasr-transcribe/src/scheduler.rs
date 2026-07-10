@@ -9,7 +9,7 @@ use std::thread;
 use anyhow::{Result, anyhow};
 use vasr_data::{Timeline, Waveform};
 
-use crate::engine::model::{AsrModel, AsrOptions};
+use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferencePriority {
@@ -176,8 +176,8 @@ mod tests {
     };
     use vasr_data::{Timeline, Waveform};
 
-    use super::{InferencePriority, InferenceScheduler, ScheduledAsrModel};
-    use crate::engine::model::{AsrModel, AsrOptions};
+    use super::{InferenceScheduler, ScheduledAsrModel};
+    use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 
     #[test]
     fn scheduled_asr_model_preserves_batch_calls() {
