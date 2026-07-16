@@ -3,7 +3,6 @@ members = [
   "vasr",
   "vasr-vad",
   "vasr-aligner",
-  "vasr-data",
   "vasr-transcribe",
   "vasr-realtime",
   "vasr-paged-attn",
@@ -11,6 +10,9 @@ members = [
   "vasr-flash-attn",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+asr-data = { git = "https://github.com/di-osc/asr-data", rev = "8082c6fe74bc020ef45106da36560dcf35ee53a9" }
 
 [patch."https://github.com/huggingface/candle.git"]
 candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }

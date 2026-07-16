@@ -1,24 +1,24 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::device::{auto_dtype, device_label, resolve_device};
 use crate::scheduler::{InferenceScheduler, ScheduledAsrModel};
 use anyhow::{Result, bail};
+use asr_data::AudioLoader;
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::{ArgAction, Args};
 use indicatif::{ProgressBar, ProgressStyle};
 use vasr::utils::progress::{Progress, ProgressEvent, ProgressHandle, ProgressSink, ProgressTask};
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
-use vasr_data::AudioLoader;
 use vasr_vad::{FireRedVadModel, FsmnVadModel, VadModel, VadOptions};
 
 use crate::pipeline::{
     AsyncTranscribePipeline, GlobalAsyncTranscribePipeline, PipelineWorkerOptions,
 };
-use crate::server::build_transcribe_service_from_parts;
+use crate::server::build_transcribe_service;
 
 const DEFAULT_MAX_NUM_SEQS: usize = 256;
 const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
@@ -279,7 +279,8 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
     configure_model_cache_dir(&args.pipeline);
-    let transcribe_service = build_transcribe_service_from_parts(
+    let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start(
+        AudioLoader,
         build_vad_model(&args.pipeline.vad)?,
         load_asr_model_for_pipeline(
             &args.pipeline,
@@ -290,13 +291,15 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
         asr_options_from_pipeline(&args.pipeline, args.language.clone()),
         vad_options_from_pipeline(&args.pipeline),
         worker_options_from_pipeline(&args.pipeline),
-    );
+    ));
+    let fatal_errors = pipeline.subscribe_fatal_errors();
+    let transcribe_service = build_transcribe_service(pipeline);
 
     let app = Router::new()
         .route("/health", get(health))
         .merge(crate::server::transcribe_router(transcribe_service));
     let addr = bind_addr(&args.host, args.port)?;
-    serve_app(app, addr).await
+    serve_app(app, addr, fatal_errors).await
 }
 
 pub fn build_async_transcribe_pipeline(
@@ -334,7 +337,7 @@ pub fn build_global_transcribe_pipeline(
         false,
     )?;
     Ok(Arc::new(GlobalAsyncTranscribePipeline::start(
-        vasr_data::AudioLoader,
+        asr_data::AudioLoader,
         build_vad_model(&pipeline.vad)?,
         asr,
         asr_options_from_pipeline(pipeline, language),
@@ -477,6 +480,34 @@ mod tests {
 
         let error = validate_model_args(&args).expect_err("kv_peak_ratio=1.5 should fail");
         assert!(error.to_string().contains("--kv-peak-ratio"));
+    }
+
+    #[tokio::test]
+    async fn fatal_error_subscription_delivers_the_failure_reason() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some("CUDA out of memory".to_string()));
+
+        let error = wait_for_fatal_error(&mut rx)
+            .await
+            .expect("fatal error should be delivered");
+
+        assert_eq!(error, "CUDA out of memory");
+    }
+
+    #[tokio::test]
+    async fn fatal_pipeline_error_stops_http_server_with_error() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some("CUDA out of memory".to_string()));
+
+        let error = serve_app(
+            Router::new(),
+            "127.0.0.1:0".parse().expect("valid test address"),
+            rx,
+        )
+        .await
+        .expect_err("fatal pipeline error must stop the HTTP server");
+
+        assert!(error.to_string().contains("CUDA out of memory"));
     }
 
     #[cfg(feature = "cuda")]
@@ -751,16 +782,69 @@ fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(format!("{host}:{port}").parse()?)
 }
 
-async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
+async fn serve_app(
+    app: Router,
+    addr: SocketAddr,
+    mut fatal_errors: tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         target: "vasr_transcribe::serve",
         "server ready | http://{addr} endpoints=health,transcribe,inference"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    };
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = server.as_mut() => {
+            result?;
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            let _ = shutdown_tx.send(());
+            server.as_mut().await?;
+            Ok(())
+        }
+        fatal = wait_for_fatal_error(&mut fatal_errors) => {
+            let fatal = fatal?;
+            tracing::error!(
+                target: "vasr_transcribe::serve",
+                "fatal pipeline failure; terminating service process: {fatal}"
+            );
+            let _ = shutdown_tx.send(());
+            if tokio::time::timeout(Duration::from_secs(1), server.as_mut())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "vasr_transcribe::serve",
+                    "graceful shutdown timed out after fatal pipeline failure"
+                );
+            }
+            bail!("fatal pipeline failure: {fatal}")
+        }
+    }
+}
+
+async fn wait_for_fatal_error(
+    fatal_errors: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<String> {
+    loop {
+        if let Some(error) = fatal_errors.borrow().clone() {
+            return Ok(error);
+        }
+        fatal_errors
+            .changed()
+            .await
+            .map_err(|_| anyhow::anyhow!("fatal pipeline error channel closed"))?;
+    }
 }
 
 fn resolve_vad_device(value: &str) -> Result<Device> {
@@ -800,8 +884,4 @@ fn load_firered_vad(device: &Device) -> Result<FireRedVadModel> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

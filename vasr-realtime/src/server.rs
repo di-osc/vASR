@@ -1,8 +1,8 @@
 use crate::protocol::{ClientRealtimeEvent, ServerRealtimeEvent};
 use crate::runtime::RealtimePipeline;
+use asr_data::{AnnotationPayload, AnnotationStatus, AudioBytesStream};
 use base64::Engine;
 use futures_util::StreamExt;
-use vasr_data::{AnnotationPayload, AnnotationStatus, AudioBytesStream};
 
 use std::sync::Arc;
 
@@ -160,7 +160,7 @@ impl RealtimeSession {
     }
 }
 
-fn events_from_annotations(annotations: Vec<vasr_data::Annotation>) -> Vec<ServerRealtimeEvent> {
+fn events_from_annotations(annotations: Vec<asr_data::Annotation>) -> Vec<ServerRealtimeEvent> {
     annotations
         .into_iter()
         .filter_map(|annotation| match annotation.payload {

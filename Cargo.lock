@@ -109,6 +109,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "asr-data"
+version = "0.1.0"
+source = "git+https://github.com/di-osc/asr-data?rev=8082c6fe74bc020ef45106da36560dcf35ee53a9#8082c6fe74bc020ef45106da36560dcf35ee53a9"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "reqwest 0.13.4",
+ "rmp-serde",
+ "rubato",
+ "rusqlite",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "symphonia",
+ "thiserror 2.0.18",
+ "tokio",
+ "unicode-general-category",
+ "uuid",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,6 +1074,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1570,6 +1604,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hashlink"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2039,6 +2082,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libsqlite3-sys"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -3253,6 +3307,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rubato"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3266,6 +3330,21 @@ dependencies = [
  "realfft",
  "visibility",
  "windowfunctions",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3"
+dependencies = [
+ "bitflags 2.11.1",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libsqlite3-sys",
+ "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -3672,6 +3751,18 @@ dependencies = [
  "nom",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4624,6 +4715,7 @@ version = "0.1.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
+ "asr-data",
  "bindgen_cuda",
  "bytemuck",
  "candle-core",
@@ -4651,7 +4743,6 @@ dependencies = [
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
- "vasr-data",
  "vasr-flash-attn",
  "vasr-paged-attn",
  "vasr-quant",
@@ -4663,6 +4754,7 @@ name = "vasr-aligner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asr-data",
  "candle-core",
  "lindera",
  "lindera-ipadic",
@@ -4671,26 +4763,6 @@ dependencies = [
  "unicode-general-category",
  "unicode-normalization",
  "vasr",
- "vasr-data",
-]
-
-[[package]]
-name = "vasr-data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "reqwest 0.13.4",
- "rmp-serde",
- "rubato",
- "serde",
- "serde_bytes",
- "serde_json",
- "symphonia",
- "thiserror 2.0.18",
- "unicode-general-category",
- "uuid",
 ]
 
 [[package]]
@@ -4738,6 +4810,7 @@ name = "vasr-realtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asr-data",
  "axum",
  "base64 0.22.1",
  "candle-core",
@@ -4750,7 +4823,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vasr",
- "vasr-data",
  "vasr-vad",
 ]
 
@@ -4759,6 +4831,7 @@ name = "vasr-transcribe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asr-data",
  "axum",
  "base64 0.22.1",
  "candle-core",
@@ -4773,7 +4846,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vasr",
- "vasr-data",
  "vasr-vad",
 ]
 
@@ -4782,6 +4854,7 @@ name = "vasr-vad"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asr-data",
  "candle-core",
  "candle-nn",
  "gemm 0.19.0",
@@ -4793,8 +4866,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "vasr-data",
 ]
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

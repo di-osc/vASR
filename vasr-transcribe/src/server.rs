@@ -4,10 +4,10 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use asr_data::AudioSource;
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
-use vasr_data::AudioSource;
 use vasr_vad::{VadModel, VadOptions};
 
 use crate::pipeline::{
@@ -973,7 +973,7 @@ pub fn build_transcribe_service_from_parts(
     worker_options: PipelineWorkerOptions,
 ) -> Arc<TranscribeService> {
     build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start(
-        vasr_data::AudioLoader,
+        asr_data::AudioLoader,
         vad,
         asr,
         asr_options,

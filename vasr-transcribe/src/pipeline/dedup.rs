@@ -4,7 +4,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use vasr_data::AudioSource;
+use asr_data::AudioSource;
 
 use super::{TranscribeInput, TranscribeItemOutcome};
 
@@ -73,7 +73,16 @@ fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey> {
         }
         AudioSource::Base64(encoded) => Some(AudioSourceDedupKey::Base64(encoded.clone())),
         AudioSource::EncodedBytes(bytes) => Some(AudioSourceDedupKey::EncodedBytes(bytes.clone())),
-        AudioSource::Waveform(_) => None,
+        AudioSource::PcmS16Le {
+            bytes,
+            sample_rate,
+            channels,
+        } => {
+            let mut key = sample_rate.to_le_bytes().to_vec();
+            key.extend_from_slice(&channels.to_le_bytes());
+            key.extend_from_slice(bytes);
+            Some(AudioSourceDedupKey::EncodedBytes(key))
+        }
     }
 }
 

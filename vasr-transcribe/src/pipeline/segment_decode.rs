@@ -5,21 +5,22 @@ use super::{
     AsrOptions, AsrSegmentJob, AsrStageStats, PendingGlobalRequest, PipelineRequestId,
     RequestItemRef, RoutedTranscribeItemOutcome, StageSpan, TranscribeItemOutcome,
     TranscribeItemSpans, TranscribeItemTiming, allocated_batch_seconds, allocation_scale,
-    merge_optional_span, outcome_from_result, prefill_span_from_decode, record_asr_batch_stats,
-    route_outcome,
+    global_pipeline_failure_outcomes, merge_optional_span, outcome_from_result,
+    prefill_span_from_decode, record_asr_batch_stats, route_outcome,
 };
 use anyhow::{Result, bail};
+use asr_data::{Annotation, Timeline, Waveform};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{Qwen3ASR, StreamingMetadataDecoder, qwen_outputs_to_timelines};
-use vasr_data::{Annotation, Timeline, Waveform};
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]
@@ -52,6 +53,8 @@ pub(super) fn spawn_segment_decoder_worker(
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    failed: Option<Arc<AtomicBool>>,
+    fatal_error_tx: Option<watch::Sender<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
@@ -59,7 +62,6 @@ pub(super) fn spawn_segment_decoder_worker(
             let asr = Arc::clone(&asr);
             let asr_options = asr_options.clone();
             let stats = Arc::clone(&stats);
-            let pending_requests = pending_requests.clone();
             let asr_to_result_tx = asr_to_result_tx.clone();
             move || {
                 run_global_segment_decode_worker(
@@ -69,19 +71,52 @@ pub(super) fn spawn_segment_decoder_worker(
                     &mut segment_state,
                     asr_to_result_tx,
                     stats,
-                    pending_requests,
                 )
             }
         })
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR global decoder join error: {error}")));
         if let Err(error) = result {
+            let error = format!("ASR global decoder failed: {error:#}");
             tracing::error!(
                 target: "vasr_transcribe::pipeline",
-                "ASR global decoder failed: {error:#}"
+                "{error}"
             );
+            if let Some(failed) = failed {
+                failed.store(true, Ordering::Release);
+            }
+            fail_pending_requests(&pending_requests, &error);
+            if let Some(fatal_error_tx) = fatal_error_tx {
+                fatal_error_tx.send_replace(Some(error));
+            }
         }
     })
+}
+
+#[cfg(feature = "paged-attn")]
+fn fail_pending_requests(
+    pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    error: &str,
+) {
+    let Some(pending_requests) = pending_requests else {
+        return;
+    };
+    let requests = match pending_requests.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending)
+            .into_values()
+            .collect::<Vec<_>>(),
+        Err(_) => {
+            tracing::error!(
+                target: "vasr_transcribe::pipeline",
+                "failed to notify pending requests after decoder failure: pending request lock poisoned"
+            );
+            return;
+        }
+    };
+    for request in requests {
+        let outcomes = global_pipeline_failure_outcomes(request.failure_indices, error);
+        let _ = request.response_tx.send(outcomes);
+    }
 }
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
@@ -92,7 +127,6 @@ fn run_global_segment_decode_worker(
     segment_state: &mut SegmentAsrState,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
-    _pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> Result<()> {
     let qwen3 = asr
         .as_any()
@@ -478,11 +512,9 @@ fn release_stream_segment_audio(
 ) {
     if let Some(segment) = segments.get_mut(segment_index) {
         segment.waveform.samples = Vec::new();
-        segment.waveform.encoded_data = None;
     }
     if let Some(waveform) = waveforms.get_mut(segment_index) {
         waveform.samples = Vec::new();
-        waveform.encoded_data = None;
     }
 }
 #[cfg(feature = "paged-attn")]

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use vasr_data::{Annotation, AudioChunk, TimeRange, Waveform};
+use asr_data::{Annotation, AudioChunk, TimeRange, Waveform};
 
 #[derive(Debug, Clone)]
 pub struct VadOptions {

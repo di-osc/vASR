@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use vasr_data::Waveform;
+use asr_data::Waveform;
 use vasr_vad as model_vad;
 
 use crate::runtime::model::{StreamingVadSession, VadModel, VadOptions, VadSegment};
@@ -39,11 +39,11 @@ struct FsmnVadStream {
 }
 
 impl StreamingVadSession for FsmnVadStream {
-    fn push_chunk(&mut self, chunk: &vasr_data::AudioChunk) -> Result<Vec<vasr_data::Annotation>> {
+    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<asr_data::Annotation>> {
         self.inner.push_chunk(chunk)
     }
 
-    fn finish(&mut self) -> Result<Vec<vasr_data::Annotation>> {
+    fn finish(&mut self) -> Result<Vec<asr_data::Annotation>> {
         self.inner.finish()
     }
 }

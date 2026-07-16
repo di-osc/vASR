@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use asr_data::AudioSource;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use vasr_data::AudioSource;
 
 use super::{
     DeduplicatedTranscribeInputs, PendingGlobalRequest, PipelineRequestId, RequestItemRef,
     RequestStageProgress, TranscribeInput, TranscribeItemOutcome, deduplicate_transcribe_inputs,
+    global_pipeline_failure_outcomes,
 };
 
 pub(super) struct GlobalTranscribeRequest {
@@ -34,6 +35,7 @@ pub(super) fn spawn_global_submit_worker(
     job_routes: Arc<Mutex<HashMap<usize, RequestItemRef>>>,
     next_request_id: Arc<AtomicU64>,
     next_job_id: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(request) = submit_rx.recv().await {
@@ -42,6 +44,14 @@ pub(super) fn spawn_global_submit_worker(
                 inputs,
                 response_tx,
             } = request;
+            let failure_indices = inputs.iter().map(|input| input.index).collect::<Vec<_>>();
+            if failed.load(Ordering::Acquire) {
+                let _ = response_tx.send(global_pipeline_failure_outcomes(
+                    failure_indices,
+                    "global transcribe pipeline stopped after ASR decoder failure",
+                ));
+                continue;
+            }
             let request_id = PipelineRequestId(next_request_id.fetch_add(1, Ordering::Relaxed));
             let DeduplicatedTranscribeInputs {
                 unique_inputs,
@@ -68,16 +78,20 @@ pub(super) fn spawn_global_submit_worker(
                     mono: input.mono,
                 });
             }
-            if let Ok(mut routes) = job_routes.lock() {
-                for job in &load_jobs {
-                    routes.insert(job.internal_index, job.request_item);
-                }
-            }
             if let Ok(mut pending) = pending_requests.lock() {
+                if failed.load(Ordering::Acquire) {
+                    drop(pending);
+                    let _ = response_tx.send(global_pipeline_failure_outcomes(
+                        failure_indices,
+                        "global transcribe pipeline stopped after ASR decoder failure",
+                    ));
+                    continue;
+                }
                 pending.insert(
                     request_id,
                     PendingGlobalRequest {
                         log_id,
+                        failure_indices,
                         remaining: unique_count,
                         duplicate_indices,
                         internal_indices,
@@ -90,6 +104,17 @@ pub(super) fn spawn_global_submit_worker(
                         response_tx,
                     },
                 );
+            } else {
+                let _ = response_tx.send(global_pipeline_failure_outcomes(
+                    failure_indices,
+                    "global transcribe pipeline pending request lock poisoned",
+                ));
+                continue;
+            }
+            if let Ok(mut routes) = job_routes.lock() {
+                for job in &load_jobs {
+                    routes.insert(job.internal_index, job.request_item);
+                }
             }
             for job in load_jobs {
                 if load_job_tx.send(job).is_err() {

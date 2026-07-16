@@ -7,7 +7,7 @@ pub mod models;
 pub mod traits;
 pub mod utils;
 
-pub use vasr_data::audio;
+pub use asr_data::audio;
 
 pub use model_builder::{
     AsrQuantizationConfig, OfflineAsrBuildOutput, OfflineAsrBuildRequest, OfflineAsrBuildStats,

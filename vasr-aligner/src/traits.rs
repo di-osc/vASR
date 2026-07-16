@@ -1,5 +1,5 @@
 use anyhow::Result;
-use vasr_data::Waveform;
+use asr_data::Waveform;
 
 use crate::ForcedAlignResult;
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use asr_data::{DurationMs, TimeRange, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::sigmoid};
 use gemm::Parallelism;
@@ -11,7 +12,6 @@ use kaldi_fbank_rust_kautism::{
 };
 use ndarray::Array2;
 use rayon::prelude::*;
-use vasr_data::{DurationMs, TimeRange, Waveform};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadModel, VadOptions, VadSegment};

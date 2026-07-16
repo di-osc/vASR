@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
+pub use asr_data::audio::input::AudioInput;
 pub use builder::{Qwen3AsrBuilder, resolve_qwen3_asr_model_id};
 pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]
@@ -44,7 +45,6 @@ pub use model::paged_batch_engine::{PagedBatchConfig, PagedBatchState, PagedDeco
 pub use model::weights::LoadOptions;
 pub use model::weights::WeightsMemoryStats;
 pub use processor::AsrProcessor;
-pub use vasr_data::audio::input::AudioInput;
 #[cfg(feature = "paged-attn")]
 pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheMemory, PagedCacheStats};
 

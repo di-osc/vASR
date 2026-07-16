@@ -6,9 +6,9 @@ use std::sync::{
 use std::time::Instant;
 
 use anyhow::Result;
+use asr_data::AudioLoader;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use vasr_data::AudioLoader;
 
 use super::{
     GlobalLoadJob, LoadedJob, LoadedQueueMemoryBudget, LoaderStageStats, LoaderTaskStats,

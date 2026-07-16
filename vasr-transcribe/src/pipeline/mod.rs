@@ -29,14 +29,21 @@ use self::submit::*;
 use self::vad::*;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, atomic::AtomicU64};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 #[cfg(feature = "paged-attn")]
 use anyhow::bail;
+use asr_data::AudioLoader;
+#[cfg(feature = "paged-attn")]
+use asr_data::DurationMs;
+use asr_data::{Annotation, AudioSource, Timeline, Waveform};
 use tokio::sync::OwnedSemaphorePermit;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::AudioFeatureEncodeTimings;
@@ -47,10 +54,6 @@ use vasr::models::qwen3asr::model::paged_cache_runtime::PagedCacheStats;
 use vasr::models::qwen3asr::{
     AudioInput, Qwen3ASR, qwen_outputs_to_timelines, qwen_transcribe_options,
 };
-use vasr_data::AudioLoader;
-#[cfg(feature = "paged-attn")]
-use vasr_data::DurationMs;
-use vasr_data::{Annotation, AudioSource, Timeline, Waveform};
 
 use self::vad::VadPreparation;
 #[cfg(feature = "paged-attn")]
@@ -521,6 +524,8 @@ impl AsyncTranscribePipeline {
             Arc::clone(&asr_stats),
             None,
             None,
+            None,
+            None,
         );
 
         let mut outcomes = Vec::with_capacity(job_count);
@@ -544,6 +549,8 @@ impl AsyncTranscribePipeline {
 #[derive(Clone)]
 pub struct GlobalAsyncTranscribePipeline {
     submit_tx: mpsc::UnboundedSender<GlobalTranscribeRequest>,
+    failed: Arc<AtomicBool>,
+    fatal_error_tx: watch::Sender<Option<String>>,
     #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
     asr: Arc<dyn AsrModel>,
     service_id: Arc<Mutex<String>>,
@@ -580,12 +587,31 @@ pub struct PipelineCudaTrimSnapshot {
 
 struct PendingGlobalRequest {
     log_id: String,
+    failure_indices: Vec<usize>,
     remaining: usize,
     duplicate_indices: Vec<(usize, usize)>,
     internal_indices: Vec<usize>,
     outcomes: Vec<TranscribeItemOutcome>,
     stages: RequestStageProgress,
     response_tx: oneshot::Sender<Vec<TranscribeItemOutcome>>,
+}
+
+fn global_pipeline_failure_outcomes(
+    indices: impl IntoIterator<Item = usize>,
+    error: &str,
+) -> Vec<TranscribeItemOutcome> {
+    indices
+        .into_iter()
+        .map(|index| TranscribeItemOutcome {
+            index,
+            channel: "mono",
+            result: Err(anyhow::anyhow!(error.to_owned())),
+            audio_seconds: 0.0,
+            timing: TranscribeItemTiming::default(),
+            spans: TranscribeItemSpans::default(),
+            bad_component: Some("recognizer"),
+        })
+        .collect()
 }
 
 #[cfg(feature = "cuda-graph")]
@@ -642,6 +668,8 @@ impl GlobalAsyncTranscribePipeline {
         let job_routes = Arc::new(Mutex::new(HashMap::new()));
         let next_request_id = Arc::new(AtomicU64::new(1));
         let next_job_id = Arc::new(AtomicU64::new(1));
+        let failed = Arc::new(AtomicBool::new(false));
+        let (fatal_error_tx, _fatal_error_rx) = watch::channel(None);
         let service_id = Arc::new(Mutex::new(String::from("service")));
         let loader_stats = Arc::new(Mutex::new(LoaderStageStats::default()));
         let vad_stats = Arc::new(Mutex::new(VadStageStats::default()));
@@ -664,6 +692,7 @@ impl GlobalAsyncTranscribePipeline {
             Arc::clone(&job_routes),
             Arc::clone(&next_request_id),
             Arc::clone(&next_job_id),
+            Arc::clone(&failed),
         );
         spawn_global_loader_worker(
             loader,
@@ -696,11 +725,15 @@ impl GlobalAsyncTranscribePipeline {
                 GLOBAL_DECODE_IDLE_FLUSH_MS,
             )),
             Some(Arc::clone(&pending_requests)),
+            Some(Arc::clone(&failed)),
+            Some(fatal_error_tx.clone()),
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
         Self {
             submit_tx,
+            failed,
+            fatal_error_tx,
             #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
             asr,
             service_id,
@@ -711,6 +744,15 @@ impl GlobalAsyncTranscribePipeline {
         if let Ok(mut current) = self.service_id.lock() {
             *current = service_id;
         }
+    }
+
+    /// Subscribe to unrecoverable background pipeline failures.
+    ///
+    /// The global decoder cannot be restarted in place. HTTP servers should
+    /// terminate with a non-zero status when this channel publishes an error,
+    /// allowing their process supervisor to start a clean instance.
+    pub fn subscribe_fatal_errors(&self) -> watch::Receiver<Option<String>> {
+        self.fatal_error_tx.subscribe()
     }
 
     pub fn memory_snapshot(&self) -> PipelineMemorySnapshot {
@@ -747,6 +789,12 @@ impl GlobalAsyncTranscribePipeline {
     ) -> Vec<TranscribeItemOutcome> {
         if inputs.is_empty() {
             return Vec::new();
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return global_pipeline_failure_outcomes(
+                inputs.into_iter().map(|input| input.index),
+                "global transcribe pipeline stopped after ASR decoder failure",
+            );
         }
         let (response_tx, response_rx) = oneshot::channel();
         if self
@@ -901,10 +949,17 @@ fn spawn_asr_worker(
     stats: Arc<Mutex<AsrStageStats>>,
     decode_idle_flush: Option<std::time::Duration>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    failed: Option<Arc<AtomicBool>>,
+    fatal_error_tx: Option<watch::Sender<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         #[cfg(not(feature = "paged-attn"))]
-        let _ = (decode_idle_flush, &pending_requests);
+        let _ = (
+            decode_idle_flush,
+            &pending_requests,
+            &failed,
+            &fatal_error_tx,
+        );
         let mut pending = VecDeque::new();
         #[cfg(feature = "paged-attn")]
         let (asr_to_encoder_tx, asr_to_encoder_rx) = mpsc::unbounded_channel();
@@ -936,6 +991,8 @@ fn spawn_asr_worker(
                 asr_to_result_tx.clone(),
                 Arc::clone(&stats),
                 pending_requests.clone(),
+                failed,
+                fatal_error_tx,
             );
             (prefill_handle, decoder_handle)
         };
@@ -1924,11 +1981,11 @@ fn outcome_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use vasr::OfflineAsrModel as AsrModel;
-    use vasr_data::{
+    use asr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
     };
+    use std::sync::{Arc, Mutex};
+    use vasr::OfflineAsrModel as AsrModel;
 
     #[test]
     fn default_stage_parallelism_is_nonzero() {
@@ -2228,6 +2285,8 @@ mod tests {
             stats,
             None,
             None,
+            None,
+            None,
         );
 
         for index in 0..3usize {
@@ -2327,20 +2386,28 @@ mod tests {
     fn load_transcribe_waveform_downmixes_stereo_when_mono_is_requested() -> anyhow::Result<()> {
         let waveform = Waveform::new_with_channels(
             vec![
-                1.0, 3.0, // frame 0
-                2.0, 4.0, // frame 1
+                0.25, 0.75, // frame 0
+                0.5, -0.5, // frame 1
             ],
             16_000,
             2,
         );
 
-        let loaded =
-            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), true)?;
+        let source = AudioSource::from_pcm_s16le(
+            waveform
+                .to_i16_pcm()
+                .into_iter()
+                .flat_map(i16::to_le_bytes)
+                .collect::<Vec<_>>(),
+            waveform.sample_rate,
+            waveform.channels,
+        );
+        let loaded = load_transcribe_waveforms(&AudioLoader, &source, true)?;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "mono");
         assert_eq!(loaded[0].1.channels, 1);
-        assert_eq!(loaded[0].1.samples, vec![2.0, 3.0]);
+        assert_eq!(loaded[0].1.samples, vec![0.5, 0.0]);
         Ok(())
     }
 
@@ -2348,15 +2415,23 @@ mod tests {
     fn load_transcribe_waveforms_preserves_source_sample_rate() -> anyhow::Result<()> {
         let waveform = Waveform::new_with_channels(
             vec![
-                1.0, 3.0, // frame 0
-                2.0, 4.0, // frame 1
+                0.25, 0.75, // frame 0
+                0.5, -0.5, // frame 1
             ],
             48_000,
             2,
         );
 
-        let loaded =
-            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), true)?;
+        let source = AudioSource::from_pcm_s16le(
+            waveform
+                .to_i16_pcm()
+                .into_iter()
+                .flat_map(i16::to_le_bytes)
+                .collect::<Vec<_>>(),
+            waveform.sample_rate,
+            waveform.channels,
+        );
+        let loaded = load_transcribe_waveforms(&AudioLoader, &source, true)?;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1.sample_rate, 48_000);
@@ -2368,23 +2443,31 @@ mod tests {
     fn load_transcribe_waveforms_splits_stereo_when_mono_is_false() -> anyhow::Result<()> {
         let waveform = Waveform::new_with_channels(
             vec![
-                1.0, 3.0, // frame 0
-                2.0, 4.0, // frame 1
+                0.25, 0.75, // frame 0
+                0.5, -0.5, // frame 1
             ],
             16_000,
             2,
         );
 
-        let loaded =
-            load_transcribe_waveforms(&AudioLoader, &AudioSource::Waveform(waveform), false)?;
+        let source = AudioSource::from_pcm_s16le(
+            waveform
+                .to_i16_pcm()
+                .into_iter()
+                .flat_map(i16::to_le_bytes)
+                .collect::<Vec<_>>(),
+            waveform.sample_rate,
+            waveform.channels,
+        );
+        let loaded = load_transcribe_waveforms(&AudioLoader, &source, false)?;
 
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].0, "left");
         assert_eq!(loaded[0].1.channels, 1);
-        assert_eq!(loaded[0].1.samples, vec![1.0, 2.0]);
+        assert_eq!(loaded[0].1.samples, vec![0.25, 0.5]);
         assert_eq!(loaded[1].0, "right");
         assert_eq!(loaded[1].1.channels, 1);
-        assert_eq!(loaded[1].1.samples, vec![3.0, 4.0]);
+        assert_eq!(loaded[1].1.samples, vec![0.75, -0.5]);
         Ok(())
     }
 
@@ -2498,6 +2581,7 @@ mod tests {
         let (response_tx, _rx) = oneshot::channel();
         let mut request = PendingGlobalRequest {
             log_id: "test".to_string(),
+            failure_indices: vec![0],
             remaining: 1,
             duplicate_indices: Vec::new(),
             internal_indices: Vec::new(),

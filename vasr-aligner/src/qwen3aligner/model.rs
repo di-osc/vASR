@@ -8,13 +8,13 @@ use candle_core::{Device, Tensor};
 use std::collections::BTreeSet;
 
 use crate::AlignerModel;
+use asr_data::Waveform;
+use asr_data::audio::input::AudioInput;
 use qwen3asr::config::AsrConfig;
 use qwen3asr::model::weights::LoadOptions;
 use qwen3asr::processor::AsrProcessor;
 use qwen3asr::processor::asr_processor::PreparedInputs;
 use vasr::models::qwen3asr::{self, Qwen3ASR};
-use vasr_data::Waveform;
-use vasr_data::audio::input::AudioInput;
 
 use super::processor::ForcedAlignProcessor;
 

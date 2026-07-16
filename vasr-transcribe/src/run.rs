@@ -6,8 +6,8 @@ use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
+use asr_data::{Audio, AudioDb, AudioDbMode, AudioQuery, AudioSource, MAX_QUERY_LIMIT};
 use clap::Args;
-use vasr_data::{AudioAsset, AudioSource, VasrRecord, VasrRecordList};
 
 #[derive(Debug, Clone, Args)]
 pub struct RunTranscribeArgs {
@@ -237,17 +237,17 @@ fn collect_run_inputs(input: &Path, recursive: bool) -> Result<Vec<RunInputItem>
 }
 
 fn collect_vasr_inputs(input: &Path) -> Result<Vec<RunInputItem>> {
-    let records = read_vasr_records(input)?;
-    if records.is_empty() {
+    let audios = read_vasr_audios(input)?;
+    if audios.is_empty() {
         bail!("vASR record list is empty: {}", input.display());
     }
     let base_dir = input.parent().unwrap_or_else(|| Path::new("."));
-    records
+    audios
         .into_iter()
-        .map(|record| {
-            let record_id = record.record_id();
-            let source = audio_source_from_record(&record)?;
-            let record_path = base_dir.join(record_id);
+        .map(|audio| {
+            let audio_id = audio.audio_id();
+            let source = audio.source.clone();
+            let record_path = base_dir.join(audio_id);
             Ok(RunInputItem {
                 source,
                 output_path: record_path.clone(),
@@ -257,36 +257,15 @@ fn collect_vasr_inputs(input: &Path) -> Result<Vec<RunInputItem>> {
         .collect()
 }
 
-fn read_vasr_records(input: &Path) -> Result<Vec<VasrRecord>> {
-    match VasrRecordList::read_msgpack(input) {
-        Ok(list) => Ok(list.records),
-        Err(list_error) => match VasrRecord::read_msgpack(input) {
-            Ok(record) => Ok(vec![record]),
-            Err(record_error) => Err(anyhow::anyhow!(
-                "failed to read vASR MessagePack from {} as record list ({list_error}) or single record ({record_error})",
-                input.display()
-            )),
-        },
-    }
-}
-
-fn audio_source_from_record(record: &VasrRecord) -> Result<AudioSource> {
-    if let Some(cache) = &record.waveform_cache {
-        return Ok(AudioSource::Waveform(cache.waveform.clone()));
-    }
-
-    match &record.media {
-        AudioAsset::Uri { uri, .. } => {
-            if uri.starts_with("http://") || uri.starts_with("https://") {
-                Ok(AudioSource::Url(uri.clone()))
-            } else if let Some(path) = local_path_from_uri(uri) {
-                Ok(AudioSource::Path(path))
-            } else {
-                Ok(AudioSource::Url(uri.clone()))
-            }
-        }
-        AudioAsset::Embedded { bytes, .. } => Ok(AudioSource::EncodedBytes(bytes.clone())),
-    }
+fn read_vasr_audios(input: &Path) -> Result<Vec<Audio>> {
+    AudioDb::open(input, AudioDbMode::ReadOnly)
+        .and_then(|db| {
+            db.query(&AudioQuery {
+                limit: MAX_QUERY_LIMIT,
+                ..AudioQuery::default()
+            })
+        })
+        .with_context(|| format!("failed to read vASR AudioDb from {}", input.display()))
 }
 
 fn collect_audio_in_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -332,44 +311,6 @@ fn is_vasr_data_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn local_path_from_uri(uri: &str) -> Option<PathBuf> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        return Some(PathBuf::from(percent_decode_path(rest)));
-    }
-    if uri.starts_with("http://") || uri.starts_with("https://") {
-        return None;
-    }
-    Some(PathBuf::from(uri))
-}
-
-fn percent_decode_path(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
-        {
-            out.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn validate_output_target(output: Option<&Path>, multiple_inputs: bool) -> Result<()> {
     if multiple_inputs {
         if let Some(output) = output
@@ -413,11 +354,8 @@ pub fn resolve_output_json_path(
 #[cfg(test)]
 mod tests {
     use super::{collect_audio_inputs, collect_run_inputs, resolve_output_json_path};
+    use asr_data::{Audio, AudioDb, AudioDbMode, AudioSource};
     use std::path::Path;
-    use vasr_data::{
-        AudioAsset, AudioEncoding, AudioSource, PersistedAudioFormat, Timeline, VasrRecord,
-        VasrRecordList,
-    };
 
     #[test]
     fn resolve_output_json_path_uses_stem_for_directory_output() {
@@ -469,27 +407,22 @@ mod tests {
         let audio = dir.join("audio one.wav");
         let input = dir.join("records.vasr.msgpack");
 
-        let records = VasrRecordList::new(vec![VasrRecord::new(
-            AudioAsset::Uri {
-                uri: format!("file://{}", audio.display()).replace(' ', "%20"),
-                format: PersistedAudioFormat {
-                    sample_rate: Some(16_000),
-                    channels: Some(1),
-                    encoding: AudioEncoding::Wav,
-                },
-                duration: None,
-                sha256: None,
-            },
-            Timeline::new("call-1"),
-        )]);
-        records.write_msgpack(&input).expect("write records");
+        let records = vec![Audio::with_id(
+            "call-1",
+            format!("file://{}", audio.display()).replace(' ', "%20"),
+        )];
+        let db = AudioDb::open(&input, AudioDbMode::ReadWrite).expect("create db");
+        db.insert(&records[0]).expect("insert audio");
 
         let items = collect_run_inputs(&input, false).expect("collect vasr records");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].service_path, dir.join("call-1"));
         assert_eq!(items[0].output_path, dir.join("call-1"));
-        assert_eq!(items[0].source, AudioSource::Path(audio));
+        assert_eq!(
+            items[0].source,
+            AudioSource::Url(format!("file://{}", audio.display()).replace(' ', "%20"))
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -504,20 +437,12 @@ mod tests {
         let input = dir.join("records.vasr.msgpack");
 
         let bytes = b"encoded-audio".to_vec();
-        let records = VasrRecordList::new(vec![VasrRecord::new(
-            AudioAsset::Embedded {
-                bytes: bytes.clone(),
-                format: PersistedAudioFormat {
-                    sample_rate: Some(16_000),
-                    channels: Some(1),
-                    encoding: AudioEncoding::Mp3,
-                },
-                duration: None,
-                sha256: None,
-            },
-            Timeline::new("embedded-call"),
-        )]);
-        records.write_msgpack(&input).expect("write records");
+        let records = vec![Audio::with_id(
+            "embedded-call",
+            AudioSource::from_encoded_bytes(bytes.clone()),
+        )];
+        let db = AudioDb::open(&input, AudioDbMode::ReadWrite).expect("create db");
+        db.insert(&records[0]).expect("insert audio");
 
         let items = collect_run_inputs(&input, false).expect("collect vasr records");
 

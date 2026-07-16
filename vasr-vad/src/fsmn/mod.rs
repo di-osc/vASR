@@ -5,6 +5,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use asr_data::{
+    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
+    TimeRange, Timeline, Waveform,
+};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
 use gemm::Parallelism;
@@ -13,10 +17,6 @@ use kaldi_fbank_rust_kautism::{
 };
 use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
-use vasr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
-    TimeRange, Timeline, Waveform,
-};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadModel, VadOptions, VadSegment};

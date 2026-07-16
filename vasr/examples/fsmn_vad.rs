@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use asr_data::Waveform;
 use vasr::vad::{FsmnVadModel, VadOptions};
-use vasr_data::Waveform;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

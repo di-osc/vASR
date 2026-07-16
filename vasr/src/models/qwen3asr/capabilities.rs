@@ -1,5 +1,5 @@
 use anyhow::Result;
-use vasr_data::{
+use asr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, TextSpan,
     TimeRange, Timeline, Waveform,
 };
@@ -203,8 +203,8 @@ pub fn qwen_outputs_to_timelines(
 fn qwen_output_to_timeline(output: AsrTranscription, waveform: &Waveform) -> Timeline {
     let mut timeline = Timeline::new("qwen3_asr_audio");
     let range = TimeRange::new(
-        vasr_data::DurationMs(0),
-        vasr_data::DurationMs(waveform.duration_ms().round() as u64),
+        asr_data::DurationMs(0),
+        asr_data::DurationMs(waveform.duration_ms().round() as u64),
     );
     if !output.language.is_empty() {
         timeline.push(Annotation::new(

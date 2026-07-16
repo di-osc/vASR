@@ -1,20 +1,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
+use asr_data::{
+    Audio, AudioChannel, AudioDb, AudioDbMode, AudioQuery, AudioSource, CerStats, normalize_for_cer,
+};
 use base64::Engine;
-use clap::{ArgAction, Args, ValueEnum};
+use clap::{Args, ValueEnum};
 use serde::Serialize;
-use vasr_data::{AudioAsset, CerStats, VasrRecord, VasrRecordList, normalize_for_cer};
 
 use crate::perf::timestamp_file_name;
 use crate::table::render_table;
 
 #[derive(Debug, Args)]
 pub struct EvalArgs {
-    /// vASR `VasrRecordList` MessagePack dataset.
+    /// vASR SQLite AudioDb.
     #[arg(short, long, alias = "dataset", value_name = "PATH")]
     input: PathBuf,
 
@@ -34,9 +36,9 @@ pub struct EvalArgs {
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Override mono mode for every request item. Omit to let the server decide.
-    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    mono: Option<bool>,
+    /// Audio timeline/channel to evaluate.
+    #[arg(long, value_enum, default_value_t = EvalTimeline::Mono)]
+    timeline: EvalTimeline,
 
     /// HTTP request retries.
     #[arg(long, default_value_t = 5)]
@@ -57,6 +59,36 @@ enum EvalNormalizer {
     Bench,
     /// Existing simple vASR CER normalizer: punctuation and space removal only.
     Simple,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum EvalTimeline {
+    Mono,
+    Left,
+    Right,
+}
+
+impl EvalTimeline {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn channel(self) -> AudioChannel {
+        match self {
+            Self::Mono => AudioChannel::Mono,
+            Self::Left => AudioChannel::Left,
+            Self::Right => AudioChannel::Right,
+        }
+    }
+
+    fn request_mono(self) -> bool {
+        matches!(self, Self::Mono)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +139,7 @@ struct EvalReport<'a> {
     timestamp: String,
     dataset: &'a str,
     service_url: &'a str,
+    timeline: EvalTimeline,
     summary: Summary,
     items: Vec<ItemResult>,
     response: TranscribeResponse,
@@ -121,9 +154,14 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
     }
 
     let timestamp = timestamp_file_name();
-    let mut records = VasrRecordList::read_msgpack(&args.input)
-        .with_context(|| format!("failed to read dataset {}", args.input.display()))?
-        .records;
+    let db = AudioDb::open(&args.input, AudioDbMode::ReadOnly)
+        .with_context(|| format!("failed to open AudioDb {}", args.input.display()))?;
+    let mut records = db
+        .query(&AudioQuery {
+            limit: args.limit.unwrap_or(asr_data::MAX_QUERY_LIMIT),
+            ..AudioQuery::default()
+        })
+        .with_context(|| format!("failed to read AudioDb {}", args.input.display()))?;
     if let Some(limit) = args.limit {
         records.truncate(limit);
     }
@@ -132,24 +170,25 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
     }
 
     println!(
-        "eval START | input={} items={} server={} normalizer={:?} mono={}",
+        "eval START | input={} items={} server={} normalizer={:?} timeline={}",
         args.input.display(),
         records.len(),
         args.server,
         args.normalizer,
-        format_mono(args.mono)
+        args.timeline.name()
     );
 
-    let request = build_request(&records, args.mono)?;
+    validate_timeline(&records, args.timeline)?;
+    let request = build_request(&records, args.timeline.request_mono())?;
     println!(
         "eval request START | items={} retries={} timeout={}s",
         request.inputs.len(),
         args.retries,
         args.timeout_sec
     );
-    let (response, wall_seconds) = request_batch(&args, request).await?;
-    let items = extract_items(&records, &response, args.normalizer);
-    let summary = summarize(&items, wall_seconds, &response)?;
+    let response = request_batch(&args, request).await?;
+    let items = extract_items(&records, &response, args.normalizer, args.timeline)?;
+    let summary = summarize(&items, &response)?;
     let bad_count = items.iter().filter(|item| item.is_bad).count();
     println!(
         "eval request DONE  | items={} bad={} elapsed={:.3}s audio={:.1}s speed={:.1}x cer={:.4}",
@@ -194,6 +233,7 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
             timestamp,
             dataset: &args.input.to_string_lossy(),
             service_url: &args.server,
+            timeline: args.timeline,
             summary,
             items,
             response,
@@ -246,43 +286,74 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
     println!("\n{table}\n");
 }
 
-fn format_mono(mono: Option<bool>) -> &'static str {
-    match mono {
-        Some(true) => "true",
-        Some(false) => "false",
-        None => "auto",
+fn validate_timeline(records: &[Audio], timeline: EvalTimeline) -> Result<()> {
+    let mut missing = Vec::new();
+    for record in records {
+        if record
+            .timeline(timeline.channel())
+            .map_err(|error| anyhow!(error))?
+            .is_none()
+        {
+            missing.push(record.audio_id());
+        }
     }
+    if !missing.is_empty() {
+        let examples = missing
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "timeline '{}' is missing from {} audio(s); examples: {}",
+            timeline.name(),
+            missing.len(),
+            examples
+        );
+    }
+    Ok(())
 }
 
-fn build_request(records: &[VasrRecord], mono: Option<bool>) -> Result<TranscribeRequest> {
+fn build_request(records: &[Audio], mono: bool) -> Result<TranscribeRequest> {
     let mut inputs = Vec::with_capacity(records.len());
     for record in records {
-        let input = match &record.media {
-            AudioAsset::Uri { uri, .. } => AudioInputDto {
-                url: Some(uri.clone()),
+        let input = match &record.source {
+            AudioSource::Path(path) => AudioInputDto {
+                url: Some(path.display().to_string()),
                 b64_str: None,
-                mono,
+                mono: Some(mono),
                 hotword: hotword_from_record(record),
             },
-            AudioAsset::Embedded { bytes, .. } => AudioInputDto {
+            AudioSource::Url(url) => AudioInputDto {
+                url: Some(url.clone()),
+                b64_str: None,
+                mono: Some(mono),
+                hotword: hotword_from_record(record),
+            },
+            AudioSource::Base64(data) => AudioInputDto {
                 url: None,
-                b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-                mono,
+                b64_str: Some(data.clone()),
+                mono: Some(mono),
                 hotword: hotword_from_record(record),
             },
+            AudioSource::EncodedBytes(bytes) | AudioSource::PcmS16Le { bytes, .. } => {
+                AudioInputDto {
+                    url: None,
+                    b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                    mono: Some(mono),
+                    hotword: hotword_from_record(record),
+                }
+            }
         };
         if input.url.is_none() && input.b64_str.is_none() {
-            bail!("record {} has no usable audio source", record.record_id());
+            bail!("audio {} has no usable source", record.audio_id());
         }
         inputs.push(input);
     }
     Ok(TranscribeRequest { inputs })
 }
 
-async fn request_batch(
-    args: &EvalArgs,
-    request: TranscribeRequest,
-) -> Result<(TranscribeResponse, f64)> {
+async fn request_batch(args: &EvalArgs, request: TranscribeRequest) -> Result<TranscribeResponse> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(args.timeout_sec))
@@ -291,9 +362,7 @@ async fn request_batch(
 
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..args.retries {
-        let start = Instant::now();
         let response = client.post(&args.server).json(&request).send().await;
-        let elapsed = start.elapsed().as_secs_f64();
         match response {
             Ok(response) => {
                 let status = response.status();
@@ -314,7 +383,7 @@ async fn request_batch(
                         .json::<TranscribeResponse>()
                         .await
                         .context("failed to decode transcribe response JSON")?;
-                    return Ok((parsed, elapsed));
+                    return Ok(parsed);
                 }
             }
             Err(error) => {
@@ -331,17 +400,20 @@ async fn request_batch(
 }
 
 fn extract_items(
-    records: &[VasrRecord],
+    records: &[Audio],
     response: &TranscribeResponse,
     normalizer: EvalNormalizer,
-) -> Vec<ItemResult> {
+    timeline: EvalTimeline,
+) -> Result<Vec<ItemResult>> {
     records
         .iter()
         .enumerate()
         .map(|(index, record)| {
             let response_item = response.data.get(index);
-            let reference = reference_text(record);
-            let hypothesis = response_item.map(hypothesis_text).unwrap_or_default();
+            let reference = reference_text(record, timeline)?;
+            let hypothesis = response_item
+                .map(|item| hypothesis_text(item, timeline))
+                .unwrap_or_default();
             let reference_normalized = normalize_text(&reference, normalizer);
             let hypothesis_normalized = normalize_text(&hypothesis, normalizer);
             let counts = align_counts(&reference_normalized, &hypothesis_normalized);
@@ -353,9 +425,9 @@ fn extract_items(
                 counts.correct() as f64 / reference_length as f64
             };
 
-            ItemResult {
+            Ok(ItemResult {
                 index,
-                audio_id: record.record_id(),
+                audio_id: record.audio_id(),
                 url: url_from_record(record),
                 reference,
                 hypothesis,
@@ -369,23 +441,18 @@ fn extract_items(
                 reference_length,
                 accuracy: round6(accuracy),
                 error_rate: round6(cer),
-                duration_s: record
-                    .media
-                    .duration()
-                    .map(|duration| duration.0 as f64 / 1000.0),
+                duration_s: response_item
+                    .map(|item| item.timings.audio)
+                    .filter(|duration| *duration > 0.0),
                 is_bad: response_item.map(|item| item.is_bad).unwrap_or(true),
                 bad_reason: response_item.and_then(|item| item.bad_reason.clone()),
                 bad_component: response_item.and_then(|item| item.bad_component.clone()),
-            }
+            })
         })
         .collect()
 }
 
-fn summarize(
-    items: &[ItemResult],
-    wall_seconds: f64,
-    response: &TranscribeResponse,
-) -> Result<Summary> {
+fn summarize(items: &[ItemResult], response: &TranscribeResponse) -> Result<Summary> {
     let valid: Vec<_> = items
         .iter()
         .filter(|item| !item.reference_normalized.is_empty())
@@ -419,25 +486,15 @@ fn summarize(
     } else {
         (insertions + deletions + substitutions) as f64 / reference_length as f64
     };
-    let audio_seconds: f64 = items.iter().filter_map(|item| item.duration_s).sum();
-    let speedup = if wall_seconds > 0.0 {
-        audio_seconds / wall_seconds
-    } else {
-        0.0
-    };
-    let rtf = if audio_seconds > 0.0 {
-        wall_seconds / audio_seconds
-    } else {
-        0.0
-    };
+    let performance = &response.inference_performance;
     let service_performance =
         serde_json::to_value(&response.inference_performance).context("encode service perf")?;
 
     Ok(Summary {
-        wall_seconds: round4(wall_seconds),
-        audio_seconds: round4(audio_seconds),
-        speedup_audio_seconds_per_second: round4(speedup),
-        rtf: round6(rtf),
+        wall_seconds: round4(performance.batch_wall_seconds),
+        audio_seconds: round4(performance.total_audio_duration_seconds),
+        speedup_audio_seconds_per_second: round4(performance.speedup),
+        rtf: round6(performance.rtf),
         cer_weighted: round6(cer_weighted),
         cer_average: round6(cer_average),
         correct,
@@ -569,18 +626,26 @@ impl Op {
     }
 }
 
-fn reference_text(record: &VasrRecord) -> String {
-    record.timeline.transcript().text
+fn reference_text(record: &Audio, timeline: EvalTimeline) -> Result<String> {
+    record
+        .timeline(timeline.channel())
+        .map_err(|error| anyhow!(error))?
+        .map(|timeline| timeline.transcript().text)
+        .ok_or_else(|| {
+            anyhow!(
+                "audio {} has no '{}' timeline",
+                record.audio_id(),
+                timeline.name()
+            )
+        })
 }
 
-fn hypothesis_text(item: &crate::InferenceData) -> String {
-    if !item.text.mono.is_empty() {
-        return item.text.mono.clone();
+fn hypothesis_text(item: &crate::InferenceData, timeline: EvalTimeline) -> String {
+    match timeline {
+        EvalTimeline::Mono => item.text.mono.clone(),
+        EvalTimeline::Left => item.text.left.clone(),
+        EvalTimeline::Right => item.text.right.clone(),
     }
-    if !item.text.left.is_empty() {
-        return item.text.left.clone();
-    }
-    item.text.right.clone()
 }
 
 fn normalize_text(text: &str, normalizer: EvalNormalizer) -> String {
@@ -745,14 +810,17 @@ fn chinese_number_value(chars: &[char]) -> Option<u64> {
     Some(total + section + number)
 }
 
-fn url_from_record(record: &VasrRecord) -> String {
-    match &record.media {
-        AudioAsset::Uri { uri, .. } => uri.clone(),
-        AudioAsset::Embedded { .. } => String::new(),
+fn url_from_record(record: &Audio) -> String {
+    match &record.source {
+        AudioSource::Path(path) => path.display().to_string(),
+        AudioSource::Url(url) => url.clone(),
+        AudioSource::Base64(_) | AudioSource::EncodedBytes(_) | AudioSource::PcmS16Le { .. } => {
+            String::new()
+        }
     }
 }
 
-fn hotword_from_record(record: &VasrRecord) -> Option<String> {
+fn hotword_from_record(record: &Audio) -> Option<String> {
     for key in ["hotword", "hotwords", "fasr_hotword", "fasr_hotwords"] {
         let Some(value) = record.metadata.get(key) else {
             continue;
@@ -814,7 +882,61 @@ fn round6(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalNormalizer, normalize_text};
+    use super::{EvalNormalizer, EvalTimeline, hypothesis_text, normalize_text, reference_text};
+    use crate::InferenceData;
+    use asr_data::{
+        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, Audio, AudioChannel,
+        DurationMs, TextSpan, TimeRange,
+    };
+
+    fn add_reference(audio: &mut Audio, channel: AudioChannel, text: &str) {
+        audio
+            .ensure_timeline(channel)
+            .expect("timeline")
+            .push(Annotation::new(
+                TimeRange::new(DurationMs(0), DurationMs(0)),
+                AnnotationPayload::Transcription(TextSpan {
+                    text: text.to_string(),
+                    tokens: Vec::new(),
+                    language: Some("en".to_string()),
+                }),
+                AnnotationSource::User,
+                AnnotationStatus::Final,
+            ));
+    }
+
+    #[test]
+    fn timeline_selects_matching_reference_and_hypothesis() {
+        let mut audio = Audio::with_id("call-1", "https://example.com/call.wav");
+        add_reference(&mut audio, AudioChannel::Left, "left reference");
+        add_reference(&mut audio, AudioChannel::Right, "right reference");
+
+        let mut inference = InferenceData::from_timeline("service", audio.mono_timeline());
+        inference.text.mono = "mono hypothesis".to_string();
+        inference.text.left = "left hypothesis".to_string();
+        inference.text.right = "right hypothesis".to_string();
+
+        assert_eq!(
+            reference_text(&audio, EvalTimeline::Left).expect("left reference"),
+            "left reference"
+        );
+        assert_eq!(
+            reference_text(&audio, EvalTimeline::Right).expect("right reference"),
+            "right reference"
+        );
+        assert_eq!(
+            hypothesis_text(&inference, EvalTimeline::Mono),
+            "mono hypothesis"
+        );
+        assert_eq!(
+            hypothesis_text(&inference, EvalTimeline::Left),
+            "left hypothesis"
+        );
+        assert_eq!(
+            hypothesis_text(&inference, EvalTimeline::Right),
+            "right hypothesis"
+        );
+    }
 
     #[test]
     fn bench_normalizer_folds_width_case_punctuation_and_spaces() {

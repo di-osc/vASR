@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, JoinSet};
-use vasr_data::{
+use asr_data::{
     Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, TimeRange, Waveform, normalize_audio_input,
 };
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 use vasr_vad::{VadModel, VadOptions, VadSegment};
 
 use super::{
@@ -57,11 +57,11 @@ pub(super) fn prepare_vad_stage(
     let speech_annotations = segments
         .iter()
         .map(|segment| {
-            vasr_data::Annotation::new(
+            asr_data::Annotation::new(
                 segment.range,
-                vasr_data::AnnotationPayload::Speech,
-                vasr_data::AnnotationSource::Model("vad".to_string()),
-                vasr_data::AnnotationStatus::Final,
+                asr_data::AnnotationPayload::Speech,
+                asr_data::AnnotationSource::Model("vad".to_string()),
+                asr_data::AnnotationStatus::Final,
             )
         })
         .collect();

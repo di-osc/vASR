@@ -38,7 +38,7 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
 vasr-quant = { path = "../vasr-quant", default-features = false }
 vasr-flash-attn = { path = "../vasr-flash-attn", default-features = false, optional = true }
-vasr-data = { path = "../vasr-data" }
+asr-data = { workspace = true }
 modelhub = "0.1.1"
 vasr-vad = { path = "../vasr-vad" }
 
@@ -90,7 +90,7 @@ cuda-paged-attn = [
 ]
 cudarc = ["dep:cudarc"]
 
-audio-loading = ["vasr-data/audio-loading"]
+audio-loading = ["asr-data/audio-loading"]
 
 integration-tests = []
 timing = ["vasr-quant/timing"]

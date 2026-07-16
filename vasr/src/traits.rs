@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use anyhow::Result;
-use vasr_data::{Annotation, AudioChunk, Timeline, Waveform};
+use asr_data::{Annotation, AudioChunk, Timeline, Waveform};
 
 #[derive(Debug, Clone)]
 pub struct AsrOptions {

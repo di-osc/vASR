@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
-vasr-data = { path = "../vasr-data", features = ["audio-loading"] }
+asr-data = { workspace = true, features = ["audio-loading"] }
 vasr = { path = "../vasr" }
 vasr-vad = { path = "../vasr-vad" }
 
