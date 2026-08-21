@@ -9,6 +9,8 @@ mod cuda_build {
 
     const CUTLASS_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
     const CUTLASS_COMMIT_ENV: &str = "VASR_CUTLASS_COMMIT";
+    const CUTLASS_REPO: &str = "https://gitee.com/good-as-water/cutlass.git";
+    const CUTLASS_REPO_ENV: &str = "VASR_CUTLASS_REPO";
 
     const KERNEL_FILES: &[&str] = &[
         "kernels/flash_api.cu",
@@ -58,6 +60,7 @@ mod cuda_build {
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-env-changed=VASR_FLASH_ATTN_BUILD_DIR");
         println!("cargo:rerun-if-env-changed={CUTLASS_COMMIT_ENV}");
+        println!("cargo:rerun-if-env-changed={CUTLASS_REPO_ENV}");
 
         for kernel_file in KERNEL_FILES {
             println!("cargo:rerun-if-changed={kernel_file}");
@@ -81,10 +84,19 @@ mod cuda_build {
         );
         let cutlass_commit =
             std::env::var(CUTLASS_COMMIT_ENV).unwrap_or_else(|_| CUTLASS_COMMIT.to_string());
+        let cutlass_repo =
+            std::env::var(CUTLASS_REPO_ENV).unwrap_or_else(|_| CUTLASS_REPO.to_string());
         let builder = KernelBuilder::new()
             .source_files(KERNEL_FILES)
             .out_dir(&build_dir)
-            .with_cutlass(Some(&cutlass_commit))
+            .with_git_dependency(
+                "cutlass",
+                &cutlass_repo,
+                &cutlass_commit,
+                vec!["include", "tools/util/include"],
+                Vec::new(),
+                true,
+            )
             .arg("-std=c++17")
             .arg("-O3")
             .arg("-U__CUDA_NO_HALF_OPERATORS__")

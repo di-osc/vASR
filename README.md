@@ -112,6 +112,29 @@ cargo build --release -p vasr-cli --features metal
 ./target/release/vasr-realtime --model /path/to/Qwen3-ASR-0.6B --host 127.0.0.1 --port 8001 --device metal --isq q8_0
 ```
 
+SenseVoice Online realtime (Candle CUDA):
+
+```bash
+cargo run -p vasr-realtime --features cuda -- \
+  --model-kind sensevoice-online \
+  --model /path/to/SenseVoiceSmall \
+  --device cuda \
+  --host 127.0.0.1 --port 8001
+```
+
+The SenseVoice checkpoint directory must contain `model.pt`, `am.mvn`, and
+`tokens.json`. The online path follows FASR's SenseVoice Online frontend
+(16 kHz PCM16, 80-bin Fbank, 7x6 LFR, CMVN) and emits cumulative CTC partial
+transcripts. Use `--sensevoice-chunk-size` to control the number of new 60 ms
+LFR frames required before decoding, and `--sensevoice-max-history` to bound
+the retained feature history. CUDA builds use the `cuda` feature; the
+existing `cuda` feature remains the Qwen3-ASR optimized build.
+
+CUDA FlashAttention builds fetch CUTLASS from
+`https://gitee.com/good-as-water/cutlass.git` by default. Override the mirror
+with `VASR_CUTLASS_REPO` and, when necessary, the revision with
+`VASR_CUTLASS_COMMIT`.
+
 FunASR FSMN VAD is enabled by default for offline `/transcribe` segmentation and realtime
 speech events. Pass `--vad-model /path/to/funasr-fsmn-vad` to use a local directory containing
 `model.pt` and `am.mvn`, or `--no-vad` on `vasr-transcribe` to disable offline VAD

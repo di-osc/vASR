@@ -17,6 +17,7 @@ use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 use vasr::models::qwen3asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
+use vasr::models::sensevoice::{SenseVoiceLoadOptions, SenseVoiceOnline};
 
 use crate::server::{RealtimeService, RealtimeSession};
 
@@ -27,6 +28,10 @@ const DEFAULT_CUDA_GRAPH_MAX_SEQS: usize = 512;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
+    /// Model type: auto, qwen3-asr, or sensevoice-online.
+    #[arg(long, default_value = "auto", env = "VASR_MODEL_KIND")]
+    pub model_kind: String,
+
     /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B` or `Qwen/Qwen3-ASR-1.7B`, or a local directory.
     #[arg(long, default_value = "Qwen/Qwen3-ASR-0.6B", env = "VASR_MODEL")]
     pub model: String,
@@ -38,6 +43,22 @@ pub struct CommonModelArgs {
     /// Enable in-situ quantization, for example q8_0.
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
+
+    /// Recognition language. Qwen auto-detects when omitted; SenseVoice defaults to zh.
+    #[arg(long, env = "VASR_LANGUAGE")]
+    pub language: Option<String>,
+
+    /// Newly available 60ms LFR frames required for a SenseVoice decode.
+    #[arg(long, default_value_t = 4, env = "VASR_SENSEVOICE_CHUNK_SIZE")]
+    pub sensevoice_chunk_size: usize,
+
+    /// Maximum retained SenseVoice LFR frames. Zero keeps the full history.
+    #[arg(long, default_value_t = 0, env = "VASR_SENSEVOICE_MAX_HISTORY")]
+    pub sensevoice_max_history: usize,
+
+    /// Enable the SenseVoice inverse-text-normalization query.
+    #[arg(long, env = "VASR_SENSEVOICE_TEXTNORM")]
+    pub sensevoice_textnorm: bool,
 
     /// Target GPU memory fraction for model parameters and PagedAttention KV cache.
     #[arg(
@@ -123,12 +144,14 @@ pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
     let asr = load_asr_model(&args.model, cuda_graph_max_batch(&args.model))?;
 
     let realtime_asr = Arc::clone(&asr);
+    let asr_language = args.model.language.clone();
     let vad_model = args.vad.vad_model.clone();
     let vad_options = vad_options_from_args(&args.vad);
     let realtime_service = Arc::new(RealtimeService {
         make_session: Arc::new(move || {
             let vad = load_fsmn_vad(&vad_model)?.new_stream(&vad_options)?;
             let asr_stream = realtime_asr.new_stream(&AsrOptions {
+                language: asr_language.clone(),
                 ..AsrOptions::default()
             })?;
             Ok(RealtimeSession::new(
@@ -161,7 +184,39 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
             DEFAULT_CUDA_GRAPH_MAX_SEQS
         );
     }
+    resolve_model_kind(args)?;
+    if args.sensevoice_chunk_size == 0 {
+        bail!("--sensevoice-chunk-size must be greater than zero");
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeModelKind {
+    Qwen3Asr,
+    SenseVoiceOnline,
+}
+
+fn resolve_model_kind(args: &CommonModelArgs) -> Result<RealtimeModelKind> {
+    match args.model_kind.trim().to_ascii_lowercase().as_str() {
+        "qwen3-asr" | "qwen3_asr" | "qwen" => Ok(RealtimeModelKind::Qwen3Asr),
+        "sensevoice-online" | "sensevoice_online" | "sensevoice" => {
+            Ok(RealtimeModelKind::SenseVoiceOnline)
+        }
+        "auto" => {
+            let path = std::path::Path::new(&args.model);
+            if args.model.to_ascii_lowercase().contains("sensevoice")
+                || (path.is_dir() && path.join("tokens.json").is_file())
+            {
+                Ok(RealtimeModelKind::SenseVoiceOnline)
+            } else {
+                Ok(RealtimeModelKind::Qwen3Asr)
+            }
+        }
+        value => bail!(
+            "unsupported --model-kind {value:?}; expected auto, qwen3-asr, or sensevoice-online"
+        ),
+    }
 }
 
 #[cfg(feature = "cuda-graph")]
@@ -260,6 +315,40 @@ fn load_asr_model(
 ) -> Result<Arc<dyn AsrModel>> {
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
+    if resolve_model_kind(args)? == RealtimeModelKind::SenseVoiceOnline {
+        if args.isq.is_some() {
+            bail!("--isq is not supported by sensevoice-online");
+        }
+        let model_id = if args.model == "Qwen/Qwen3-ASR-0.6B" {
+            "iic/SenseVoiceSmall"
+        } else {
+            args.model.as_str()
+        };
+        let options = SenseVoiceLoadOptions {
+            dtype,
+            chunk_size: args.sensevoice_chunk_size,
+            max_history: args.sensevoice_max_history,
+            language: args.language.clone().unwrap_or_else(|| "zh".to_string()),
+            textnorm: args.sensevoice_textnorm,
+        };
+        tracing::info!(
+            target: "vasr_realtime::serve",
+            "Loading SenseVoice online model {model_id} on {} (dtype={dtype:?}, chunk_size={}, max_history={}, language={}, textnorm={}).",
+            device_label(&device),
+            options.chunk_size,
+            options.max_history,
+            options.language,
+            options.textnorm
+        );
+        let model_load_start = Instant::now();
+        let model = SenseVoiceOnline::from_pretrained(model_id, &device, &options)?;
+        tracing::info!(
+            target: "vasr_realtime::serve",
+            "SenseVoice online model loaded in {:.3}s.",
+            model_load_start.elapsed().as_secs_f64()
+        );
+        return Ok(Arc::new(model));
+    }
     #[cfg(any(feature = "metal", feature = "cuda"))]
     let paged_cache_config = build_paged_cache_config(&device, args.gpu_memory_utilization)?;
     let load_options = LoadOptions {

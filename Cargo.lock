@@ -111,7 +111,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "asr-data"
 version = "0.1.0"
-source = "git+https://github.com/di-osc/asr-data?rev=8082c6fe74bc020ef45106da36560dcf35ee53a9#8082c6fe74bc020ef45106da36560dcf35ee53a9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a26bad550db68f4af0b44252f223e2de44083964d212655cb303b2fe384d1bc7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
