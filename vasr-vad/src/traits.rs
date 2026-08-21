@@ -1,5 +1,17 @@
 use anyhow::Result;
-use asr_data::{Annotation, AudioChunk, TimeRange, Waveform};
+use asr_data::{AudioChunk, TimeRange, Waveform};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VadEventStatus {
+    Partial,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VadEvent {
+    pub range: TimeRange,
+    pub status: VadEventStatus,
+}
 
 #[derive(Debug, Clone)]
 pub struct VadOptions {
@@ -43,9 +55,9 @@ pub trait VadModel: Send + Sync {
 }
 
 pub trait StreamingVadSession: Send {
-    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<Annotation>>;
+    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<VadEvent>>;
 
-    fn finish(&mut self) -> Result<Vec<Annotation>>;
+    fn finish(&mut self) -> Result<Vec<VadEvent>>;
 }
 
 pub(crate) fn run_with_vad_threads<T>(num_threads: usize, f: impl FnOnce() -> T + Send) -> Result<T>
