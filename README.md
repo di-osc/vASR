@@ -57,6 +57,15 @@ cargo run -p vasr-cli --bin vasr-transcribe --features metal -- serve \
   --isq q8_0
 ```
 
+Start the standalone realtime WebSocket service with a custom model cache directory:
+
+```bash
+cargo run -p vasr-realtime -- serve \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --cache-dir /path/to/vasr-cache \
+  --device cpu
+```
+
 Transcribe local audio files to JSON (`{stem}.transcribe.json`):
 
 ```bash

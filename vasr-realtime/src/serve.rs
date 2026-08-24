@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +38,10 @@ pub struct CommonModelArgs {
     /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B` or `Qwen/Qwen3-ASR-1.7B`, or a local directory.
     #[arg(long, default_value = "Qwen/Qwen3-ASR-0.6B", env = "VASR_MODEL")]
     pub model: String,
+
+    /// vASR model cache directory.
+    #[arg(long = "cache-dir", default_value_os_t = vasr::modelscope_cache_dir())]
+    pub cache_dir: PathBuf,
 
     /// Device: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto", env = "VASR_DEVICE")]
@@ -122,6 +127,7 @@ fn realtime_vad_options() -> VadOptions {
 
 pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
     validate_model_args(&args.model)?;
+    vasr::set_cache_dir(args.model.cache_dir.clone());
     let asr = load_asr_model(&args.model, cuda_graph_max_batch(&args.model))?;
     let vad: Arc<dyn VadModel> = Arc::new(load_firered_vad()?);
 
@@ -214,6 +220,7 @@ fn model_args_from_config(config: &AsrModelConfig) -> CommonModelArgs {
     CommonModelArgs {
         model_kind: config.kind.clone(),
         model: config.checkpoint.clone(),
+        cache_dir: vasr::modelscope_cache_dir(),
         device: config.device.clone(),
         isq: config.isq.clone(),
         language: config.language.clone(),
@@ -258,6 +265,9 @@ fn vad_options_from_config(config: &VadModelConfig) -> VadOptions {
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.model.trim().is_empty() {
         bail!("--model must not be empty");
+    }
+    if args.cache_dir.as_os_str().is_empty() {
+        bail!("--cache-dir must not be empty");
     }
     if !(args.gpu_memory_utilization > 0.0 && args.gpu_memory_utilization <= 1.0) {
         bail!("--gpu-memory-utilization must be in (0.0, 1.0]");

@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
+    use std::path::PathBuf;
 
     use super::{Cli, Command};
 
@@ -47,6 +48,19 @@ mod tests {
     fn serve_subcommand_uses_realtime_defaults() {
         let cli = Cli::try_parse_from(["vasr-realtime", "serve"]).unwrap();
         assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn serve_accepts_custom_cache_dir() {
+        let cli = Cli::try_parse_from([
+            "vasr-realtime",
+            "serve",
+            "--cache-dir",
+            "/tmp/vasr-model-cache",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command;
+        assert_eq!(args.model.cache_dir, PathBuf::from("/tmp/vasr-model-cache"));
     }
 
     #[test]
