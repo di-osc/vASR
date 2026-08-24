@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use asr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange, Token,
+    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange,
+    Timeline, Token, Waveform,
 };
 use candle_core::Device;
 use vasr::models::qwen3asr::{
@@ -8,6 +9,16 @@ use vasr::models::qwen3asr::{
 };
 
 use crate::runtime::model::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
+
+impl vasr::OfflineAsrModel for Qwen3AsrModel {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn transcribe(&self, waveforms: &[Waveform], options: &AsrOptions) -> Result<Vec<Timeline>> {
+        vasr::OfflineAsrModel::transcribe(&self.inner, waveforms, options)
+    }
+}
 
 pub struct Qwen3AsrModel {
     inner: Qwen3Asr,
@@ -59,7 +70,7 @@ impl StreamingAsrSession for Qwen3AsrStreamModel {
         Ok(output
             .map(|output| {
                 vec![Annotation::new(
-                    chunk.range,
+                    TimeRange::default(),
                     AnnotationPayload::Transcription(TextSpan {
                         text: output.text,
                         tokens: Vec::<Token>::new(),

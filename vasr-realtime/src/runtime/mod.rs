@@ -10,5 +10,5 @@ pub use model::{
     AsrModel, AsrOptions, StreamingAsrModel, StreamingAsrSession, StreamingVadSession, VadModel,
     VadOptions, VadSegment,
 };
-pub use models::{qwen3_asr::Qwen3AsrModel, vad::FsmnVadModel};
+pub use models::{qwen3_asr::Qwen3AsrModel, vad::FireRedVadModel};
 pub use pipeline::RealtimePipeline;

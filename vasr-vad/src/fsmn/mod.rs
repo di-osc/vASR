@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use asr_data::{
-    Annotation, AudioActivity, AudioChunk, DurationMs, TimeRange, TimeSpan, Timeline, Waveform,
+    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
+    TimeRange, Timeline, Waveform,
 };
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
@@ -18,9 +19,7 @@ use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 
 use crate::traits::run_with_vad_threads;
-use crate::{
-    StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment,
-};
+use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};
 
 mod e2e;
 use e2e::{E2EVadConfig, E2EVadModel};
@@ -272,13 +271,11 @@ impl FsmnVadModel {
     }
 
     pub fn annotate(&self, waveform: &Waveform, options: &VadOptions) -> Timeline {
-        let mut timeline = Timeline::new(
-            "vad_audio",
-            DurationMs(waveform.duration_ms().round() as u64),
-        );
+        let mut timeline = Timeline::new("vad_audio");
+        timeline.duration = Some(DurationMs(waveform.duration_ms().round() as u64));
         if let Ok(segments) = self.detect(waveform, options) {
             for segment in segments {
-                timeline.prediction.push(speech_span(
+                timeline.push(speech_annotation(
                     ms_to_samples(segment.range.start.0),
                     ms_to_samples(segment.range.end.0),
                 ));
@@ -1468,13 +1465,13 @@ fn extract_cmvn_vector(text: &str, section: &str) -> Result<Vec<f32>> {
 
 impl StreamingVadSession for FsmnVadSession {
     fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<VadEvent>> {
-        if chunk.sample_rate != FSMN_VAD_SAMPLE_RATE {
+        if chunk.waveform.sample_rate != FSMN_VAD_SAMPLE_RATE {
             bail!(
                 "FSMN VAD expects 16kHz mono audio, got sample_rate={}",
-                chunk.sample_rate
+                chunk.waveform.sample_rate
             );
         }
-        let segments = self.push_samples_f32(&chunk.samples)?;
+        let segments = self.push_samples_f32(&chunk.waveform.samples)?;
         Ok(segments
             .into_iter()
             .map(|segment| VadEvent {
@@ -1878,11 +1875,12 @@ fn ms_to_samples(ms: u64) -> usize {
     (ms as usize).saturating_mul(FSMN_VAD_SAMPLE_RATE as usize) / 1000
 }
 
-fn speech_span(start: usize, end: usize) -> TimeSpan {
-    TimeSpan::new(
+fn speech_annotation(start: usize, end: usize) -> Annotation {
+    Annotation::new(
         sample_range(start, end),
-        Annotation::Activity(AudioActivity::new().with_event("speech")),
-        Some(FSMN_VAD_SOURCE.to_string()),
+        AnnotationPayload::Speech,
+        AnnotationSource::Model(FSMN_VAD_SOURCE.to_string()),
+        AnnotationStatus::Final,
     )
 }
 

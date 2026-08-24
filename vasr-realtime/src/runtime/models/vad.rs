@@ -1,25 +1,35 @@
 use std::path::Path;
 
 use anyhow::Result;
-use asr_data::Waveform;
+use asr_data::{Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, Waveform};
+use candle_core::Device;
 use vasr_vad as model_vad;
 
 use crate::runtime::model::{StreamingVadSession, VadModel, VadOptions, VadSegment};
 
 #[derive(Debug, Clone)]
-pub struct FsmnVadModel {
-    inner: model_vad::FsmnVadModel,
+pub struct FireRedVadModel {
+    inner: model_vad::FireRedVadModel,
 }
 
-impl FsmnVadModel {
+impl FireRedVadModel {
     pub fn from_pretrained(path: Option<impl AsRef<Path>>) -> Result<Self> {
         Ok(Self {
-            inner: model_vad::FsmnVadModel::from_pretrained(path)?,
+            inner: model_vad::FireRedVadModel::from_pretrained_streaming(path)?,
+        })
+    }
+
+    pub fn from_pretrained_on_device(
+        path: Option<impl AsRef<Path>>,
+        device: &Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: model_vad::FireRedVadModel::from_pretrained_streaming_on_device(path, device)?,
         })
     }
 }
 
-impl VadModel for FsmnVadModel {
+impl VadModel for FireRedVadModel {
     fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
         Ok(self
             .inner
@@ -28,24 +38,47 @@ impl VadModel for FsmnVadModel {
     }
 
     fn new_stream(&self, options: &VadOptions) -> Result<Box<dyn StreamingVadSession>> {
-        Ok(Box::new(FsmnVadStream {
+        Ok(Box::new(FireRedVadStream {
             inner: model_vad::VadModel::new_stream(&self.inner, &model_options(options))?,
         }))
     }
 }
 
-struct FsmnVadStream {
+struct FireRedVadStream {
     inner: Box<dyn model_vad::StreamingVadSession>,
 }
 
-impl StreamingVadSession for FsmnVadStream {
+impl StreamingVadSession for FireRedVadStream {
     fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<asr_data::Annotation>> {
-        self.inner.push_chunk(chunk)
+        Ok(self
+            .inner
+            .push_chunk(chunk)?
+            .into_iter()
+            .map(vad_event_annotation)
+            .collect())
     }
 
     fn finish(&mut self) -> Result<Vec<asr_data::Annotation>> {
-        self.inner.finish()
+        Ok(self
+            .inner
+            .finish()?
+            .into_iter()
+            .map(vad_event_annotation)
+            .collect())
     }
+}
+
+fn vad_event_annotation(event: model_vad::VadEvent) -> Annotation {
+    let status = match event.status {
+        model_vad::VadEventStatus::Partial => AnnotationStatus::Partial,
+        model_vad::VadEventStatus::Final => AnnotationStatus::Final,
+    };
+    Annotation::new(
+        event.range,
+        AnnotationPayload::Speech,
+        AnnotationSource::Model("firered_vad".to_string()),
+        status,
+    )
 }
 
 fn model_options(options: &VadOptions) -> model_vad::VadOptions {

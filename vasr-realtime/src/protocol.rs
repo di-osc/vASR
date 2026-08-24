@@ -1,18 +1,22 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionUpdatePayload {
     #[serde(default)]
-    pub input_audio_format: Option<String>,
+    pub audio: Option<Value>,
     #[serde(default)]
-    pub sample_rate: Option<u32>,
+    pub asr: Option<Value>,
     #[serde(default)]
-    pub input_audio_transcription: Option<Value>,
+    pub correct: Option<Value>,
     #[serde(default)]
-    pub turn_detection: Option<Value>,
+    pub vad: Option<Value>,
     #[serde(default)]
     pub enhance: Option<Value>,
+    #[serde(default)]
+    pub turn_analyzer: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,19 +25,27 @@ pub enum ClientRealtimeEvent {
     #[serde(rename = "session.update")]
     SessionUpdate {
         #[serde(default)]
-        session: Option<SessionUpdatePayload>,
-        // Kept for wire compatibility with the original vASR protocol.
+        event_id: Option<String>,
         #[serde(default)]
-        sample_rate: Option<u32>,
-        #[serde(default)]
-        input_audio_format: Option<String>,
+        session: Option<Value>,
     },
     #[serde(rename = "input_audio_buffer.append")]
-    AudioAppend { audio: String },
+    AudioAppend {
+        #[serde(default)]
+        event_id: Option<String>,
+        #[serde(default)]
+        audio: Option<String>,
+    },
     #[serde(rename = "input_audio_buffer.commit")]
-    AudioCommit,
+    AudioCommit {
+        #[serde(default)]
+        event_id: Option<String>,
+    },
     #[serde(rename = "session.finish")]
-    SessionFinish,
+    SessionFinish {
+        #[serde(default)]
+        event_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +77,8 @@ pub enum ServerRealtimeEvent {
     SessionUpdated {
         event_id: String,
         session: SessionInfo,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<SessionUpdateWarning>,
     },
     #[serde(rename = "input_audio_buffer.speech_started")]
     SpeechStarted {
@@ -130,6 +144,17 @@ pub struct RealtimeError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdateWarning {
+    #[serde(rename = "type")]
+    pub warning_type: String,
+    pub code: String,
+    pub param: String,
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -137,18 +162,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_fasr_nested_session_update() {
+    fn parses_fasr_structured_session_update() {
         let event: ClientRealtimeEvent = serde_json::from_value(serde_json::json!({
             "type": "session.update",
             "session": {
-                "input_audio_format": "pcm",
-                "sample_rate": 16000,
-                "input_audio_transcription": {
+                "audio": {
+                    "format": "pcm",
+                    "sample_rate": 16000
+                },
+                "asr": {
                     "language": "Chinese",
                     "hotwords": ["SenseVoice"]
                 },
-                "turn_detection": {
-                    "type": "server_vad",
+                "vad": {
                     "silence_duration_ms": 500
                 }
             }
@@ -157,13 +183,11 @@ mod tests {
 
         match event {
             ClientRealtimeEvent::SessionUpdate { session, .. } => {
-                let session = session.unwrap();
-                assert_eq!(session.sample_rate, Some(16_000));
-                assert_eq!(session.input_audio_format.as_deref(), Some("pcm"));
-                assert_eq!(
-                    session.input_audio_transcription.unwrap()["language"],
-                    "Chinese"
-                );
+                let session: SessionUpdatePayload =
+                    serde_json::from_value(session.unwrap()).unwrap();
+                assert_eq!(session.audio.unwrap()["sample_rate"], 16_000);
+                assert_eq!(session.asr.unwrap()["language"], "Chinese");
+                assert_eq!(session.vad.unwrap()["silence_duration_ms"], 500);
             }
             _ => panic!("expected session.update"),
         }

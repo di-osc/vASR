@@ -5,6 +5,7 @@ members = [
   "vasr-aligner",
   "vasr-transcribe",
   "vasr-realtime",
+  "vasr-cli",
   "vasr-paged-attn",
   "vasr-quant",
   "vasr-flash-attn",

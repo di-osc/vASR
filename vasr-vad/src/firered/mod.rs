@@ -1,20 +1,21 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{DurationMs, TimeRange, Waveform};
+use asr_data::{AudioChunk, DurationMs, TimeRange, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::sigmoid};
 use gemm::Parallelism;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
-use ndarray::Array2;
+use ndarray::{Array2, s};
 use rayon::prelude::*;
 
 use crate::traits::run_with_vad_threads;
-use crate::{StreamingVadSession, VadModel, VadOptions, VadSegment};
+use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};
 
 const FIRERED_SAMPLE_RATE: u32 = 16_000;
 const FIRERED_FRAME_SHIFT_MS: u64 = 10;
@@ -27,6 +28,8 @@ const FIRERED_FSMN_ORDER: usize = 20;
 const FIRERED_DEFAULT_THRESHOLD: f32 = 0.4;
 const FIRERED_DEFAULT_MAX_SPEECH_FRAME: usize = 2000;
 const FIRERED_VAD_REPO: &str = "xukaituo/FireRedVAD";
+const FIRERED_OFFLINE_MODEL_DIR: &str = "VAD";
+const FIRERED_STREAM_MODEL_DIR: &str = "Stream-VAD";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FireRedVadTiming {
@@ -46,6 +49,7 @@ pub struct FireRedVadDetection {
 pub struct FireRedVadModel {
     weights: Arc<FireRedVadWeights>,
     model_dir: PathBuf,
+    streaming: bool,
 }
 
 impl FireRedVadModel {
@@ -53,20 +57,42 @@ impl FireRedVadModel {
         Self::from_pretrained_on_device(path, &firered_vad_device()?)
     }
 
+    pub fn from_pretrained_streaming(path: Option<impl AsRef<Path>>) -> Result<Self> {
+        Self::from_pretrained_streaming_on_device(path, &firered_vad_device()?)
+    }
+
     pub fn from_pretrained_on_device(
         path: Option<impl AsRef<Path>>,
         device: &Device,
     ) -> Result<Self> {
-        let model_dir = match path {
-            Some(path) => {
-                let model_dir = path.as_ref().to_path_buf();
-                validate_firered_vad_model_dir(&model_dir)?;
-                model_dir
-            }
-            None => default_firered_vad_model_dir()?,
+        Self::load(path, device, false)
+    }
+
+    pub fn from_pretrained_streaming_on_device(
+        path: Option<impl AsRef<Path>>,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load(path, device, true)
+    }
+
+    fn load(path: Option<impl AsRef<Path>>, device: &Device, streaming: bool) -> Result<Self> {
+        let model_subdir = if streaming {
+            FIRERED_STREAM_MODEL_DIR
+        } else {
+            FIRERED_OFFLINE_MODEL_DIR
         };
-        let weights = Arc::new(FireRedVadWeights::load_on_device(&model_dir, device)?);
-        Ok(Self { weights, model_dir })
+        let model_dir = match path {
+            Some(path) => resolve_firered_vad_model_dir(path.as_ref(), model_subdir)?,
+            None => default_firered_vad_model_dir(model_subdir)?,
+        };
+        let weights = Arc::new(FireRedVadWeights::load_on_device(
+            &model_dir, device, streaming,
+        )?);
+        Ok(Self {
+            weights,
+            model_dir,
+            streaming,
+        })
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -124,8 +150,298 @@ impl VadModel for FireRedVadModel {
         FireRedVadModel::detect(self, waveform, options)
     }
 
-    fn new_stream(&self, _options: &VadOptions) -> Result<Box<dyn StreamingVadSession>> {
-        bail!("FireRedVAD native implementation currently supports offline VAD only")
+    fn new_stream(&self, options: &VadOptions) -> Result<Box<dyn StreamingVadSession>> {
+        if !self.streaming {
+            bail!(
+                "FireRedVAD offline weights do not support streaming; load the Stream-VAD checkpoint"
+            );
+        }
+        Ok(Box::new(FireRedStreamingVadSession::new(
+            Arc::clone(&self.weights),
+            options,
+        )))
+    }
+}
+
+struct FireRedStreamingVadSession {
+    weights: Arc<FireRedVadWeights>,
+    options: VadOptions,
+    samples: Vec<f32>,
+    processed_frames: usize,
+    forward_state: FireRedStreamForwardState,
+    postprocessor: FireRedStreamPostprocessor,
+}
+
+impl FireRedStreamingVadSession {
+    fn new(weights: Arc<FireRedVadWeights>, options: &VadOptions) -> Self {
+        Self {
+            weights,
+            options: options.clone(),
+            samples: Vec::new(),
+            processed_frames: 0,
+            forward_state: FireRedStreamForwardState::default(),
+            postprocessor: FireRedStreamPostprocessor::from_options(options),
+        }
+    }
+
+    fn process_available_frames(&mut self) -> Result<Vec<VadEvent>> {
+        let feats = self.weights.frontend.extract(&self.samples)?;
+        let frame_count = feats.shape()[0];
+        if frame_count <= self.processed_frames {
+            return Ok(Vec::new());
+        }
+        let probs = if self.weights.cpu.is_some() {
+            let new_feats = feats.slice(s![self.processed_frames.., ..]).to_owned();
+            self.weights.forward_probs_streaming(
+                &new_feats,
+                self.options.num_threads,
+                &mut self.forward_state,
+            )?
+        } else {
+            self.weights
+                .forward_probs(&feats, self.options.num_threads)?
+                .into_iter()
+                .skip(self.processed_frames)
+                .collect()
+        };
+        let mut events = Vec::new();
+        for probability in probs {
+            for boundary in self.postprocessor.process(probability) {
+                events.push(boundary.into_event());
+            }
+        }
+        self.processed_frames = frame_count;
+        Ok(events)
+    }
+}
+
+#[derive(Default)]
+struct FireRedStreamForwardState {
+    fsmn_caches: Vec<Vec<f32>>,
+}
+
+impl StreamingVadSession for FireRedStreamingVadSession {
+    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<VadEvent>> {
+        if chunk.waveform.sample_rate != FIRERED_SAMPLE_RATE {
+            bail!(
+                "FireRed Stream-VAD expects 16kHz mono audio, got sample_rate={}",
+                chunk.waveform.sample_rate
+            );
+        }
+        if chunk.waveform.channels != 1 {
+            bail!(
+                "FireRed Stream-VAD expects mono audio, got channels={}",
+                chunk.waveform.channels
+            );
+        }
+        self.samples.extend_from_slice(&chunk.waveform.samples);
+        self.process_available_frames()
+    }
+
+    fn finish(&mut self) -> Result<Vec<VadEvent>> {
+        let mut events = self.process_available_frames()?;
+        if let Some(start_frame) = self.postprocessor.finish() {
+            let end_ms = samples_to_ms(self.samples.len());
+            let start_ms = frame_to_ms(start_frame).min(end_ms);
+            events.push(VadEvent {
+                range: TimeRange::new(DurationMs(start_ms), DurationMs(end_ms)),
+                status: VadEventStatus::Final,
+            });
+        }
+        Ok(events)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireRedStreamState {
+    Silence,
+    PossibleSpeech,
+    Speech,
+    PossibleSilence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireRedStreamBoundary {
+    Start {
+        start_frame: usize,
+        frame: usize,
+    },
+    End {
+        start_frame: usize,
+        end_frame: usize,
+    },
+}
+
+impl FireRedStreamBoundary {
+    fn into_event(self) -> VadEvent {
+        match self {
+            Self::Start { start_frame, frame } => VadEvent {
+                range: TimeRange::new(
+                    DurationMs(frame_to_ms(start_frame)),
+                    DurationMs(frame_to_ms(frame)),
+                ),
+                status: VadEventStatus::Partial,
+            },
+            Self::End {
+                start_frame,
+                end_frame,
+            } => VadEvent {
+                range: TimeRange::new(
+                    DurationMs(frame_to_ms(start_frame)),
+                    DurationMs(frame_to_ms(end_frame)),
+                ),
+                status: VadEventStatus::Final,
+            },
+        }
+    }
+}
+
+struct FireRedStreamPostprocessor {
+    smooth_window_size: usize,
+    speech_threshold: f32,
+    pad_start_frame: usize,
+    min_speech_frame: usize,
+    max_speech_frame: usize,
+    min_silence_frame: usize,
+    smooth_window: VecDeque<f32>,
+    smooth_window_sum: f32,
+    state: FireRedStreamState,
+    frame_count: usize,
+    speech_count: usize,
+    silence_count: usize,
+    hit_max_speech: bool,
+    last_speech_start_frame: Option<usize>,
+    last_speech_end_frame: Option<usize>,
+}
+
+impl FireRedStreamPostprocessor {
+    fn from_options(options: &VadOptions) -> Self {
+        let smooth_window_size = 5;
+        Self {
+            smooth_window_size,
+            speech_threshold: options.threshold,
+            pad_start_frame: smooth_window_size.max(ms_to_frame_count_allow_zero(options.pad_ms)),
+            min_speech_frame: ms_to_frame_count(options.min_speech_ms),
+            max_speech_frame: ms_to_frame_count(options.max_segment_ms),
+            min_silence_frame: ms_to_frame_count(options.min_silence_ms),
+            smooth_window: VecDeque::with_capacity(smooth_window_size),
+            smooth_window_sum: 0.0,
+            state: FireRedStreamState::Silence,
+            frame_count: 0,
+            speech_count: 0,
+            silence_count: 0,
+            hit_max_speech: false,
+            last_speech_start_frame: None,
+            last_speech_end_frame: None,
+        }
+    }
+
+    fn process(&mut self, probability: f32) -> Vec<FireRedStreamBoundary> {
+        self.frame_count += 1;
+        self.smooth_window.push_back(probability);
+        self.smooth_window_sum += probability;
+        if self.smooth_window.len() > self.smooth_window_size
+            && let Some(first) = self.smooth_window.pop_front()
+        {
+            self.smooth_window_sum -= first;
+        }
+        let smoothed = self.smooth_window_sum / self.smooth_window.len() as f32;
+        let is_speech = smoothed >= self.speech_threshold;
+        let mut boundaries = Vec::new();
+
+        if self.hit_max_speech {
+            self.last_speech_start_frame = Some(self.frame_count);
+            boundaries.push(FireRedStreamBoundary::Start {
+                start_frame: self.frame_count,
+                frame: self.frame_count,
+            });
+            self.hit_max_speech = false;
+        }
+
+        match self.state {
+            FireRedStreamState::Silence => {
+                if is_speech {
+                    self.state = FireRedStreamState::PossibleSpeech;
+                    self.speech_count += 1;
+                } else {
+                    self.silence_count += 1;
+                    self.speech_count = 0;
+                }
+            }
+            FireRedStreamState::PossibleSpeech => {
+                if is_speech {
+                    self.speech_count += 1;
+                    if self.speech_count >= self.min_speech_frame {
+                        self.state = FireRedStreamState::Speech;
+                        let start_frame = self
+                            .frame_count
+                            .saturating_sub(self.speech_count - 1)
+                            .saturating_sub(self.pad_start_frame)
+                            .max(1)
+                            .max(self.last_speech_end_frame.map_or(1, |frame| frame + 1));
+                        self.last_speech_start_frame = Some(start_frame);
+                        self.silence_count = 0;
+                        boundaries.push(FireRedStreamBoundary::Start {
+                            start_frame,
+                            frame: self.frame_count,
+                        });
+                    }
+                } else {
+                    self.state = FireRedStreamState::Silence;
+                    self.silence_count = 1;
+                    self.speech_count = 0;
+                }
+            }
+            FireRedStreamState::Speech => {
+                self.speech_count += 1;
+                if is_speech {
+                    self.silence_count = 0;
+                    self.maybe_end_max_speech(&mut boundaries);
+                } else {
+                    self.state = FireRedStreamState::PossibleSilence;
+                    self.silence_count += 1;
+                }
+            }
+            FireRedStreamState::PossibleSilence => {
+                self.speech_count += 1;
+                if is_speech {
+                    self.state = FireRedStreamState::Speech;
+                    self.silence_count = 0;
+                    self.maybe_end_max_speech(&mut boundaries);
+                } else {
+                    self.silence_count += 1;
+                    if self.silence_count >= self.min_silence_frame {
+                        self.state = FireRedStreamState::Silence;
+                        self.end_speech(self.frame_count, &mut boundaries);
+                        self.speech_count = 0;
+                    }
+                }
+            }
+        }
+        boundaries
+    }
+
+    fn maybe_end_max_speech(&mut self, boundaries: &mut Vec<FireRedStreamBoundary>) {
+        if self.speech_count >= self.max_speech_frame {
+            self.hit_max_speech = true;
+            self.speech_count = 0;
+            self.end_speech(self.frame_count, boundaries);
+        }
+    }
+
+    fn end_speech(&mut self, end_frame: usize, boundaries: &mut Vec<FireRedStreamBoundary>) {
+        if let Some(start_frame) = self.last_speech_start_frame.take() {
+            boundaries.push(FireRedStreamBoundary::End {
+                start_frame,
+                end_frame,
+            });
+            self.last_speech_end_frame = Some(end_frame);
+        }
+    }
+
+    fn finish(&mut self) -> Option<usize> {
+        self.hit_max_speech = false;
+        self.last_speech_start_frame.take()
     }
 }
 
@@ -162,7 +478,7 @@ struct FireRedCpuBlock {
 #[derive(Debug, Clone)]
 struct FireRedCpuFsmn {
     lookback: Vec<f32>,
-    lookahead: Vec<f32>,
+    lookahead: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -174,7 +490,7 @@ struct CpuLinear {
 }
 
 impl FireRedVadWeights {
-    fn load_on_device(model_dir: &Path, device: &Device) -> Result<Self> {
+    fn load_on_device(model_dir: &Path, device: &Device, causal: bool) -> Result<Self> {
         let cmvn_path = model_dir.join("cmvn.ark");
         let frontend = FireRedFrontend::new(&cmvn_path)?;
         let pth_path = model_dir.join("model.pth.tar");
@@ -203,10 +519,10 @@ impl FireRedVadWeights {
             FIRERED_PROJ_DIM,
             dfsmn.pp("fc2").pp("0"),
         )?;
-        let fsmn1 = FireRedFsmn::new(dfsmn.pp("fsmn1"))?;
+        let fsmn1 = FireRedFsmn::new(dfsmn.pp("fsmn1"), causal)?;
         let mut blocks = Vec::with_capacity(FIRERED_BLOCKS - 1);
         for i in 0..FIRERED_BLOCKS - 1 {
-            blocks.push(FireRedDfsmnBlock::new(dfsmn.pp("fsmns").pp(i))?);
+            blocks.push(FireRedDfsmnBlock::new(dfsmn.pp("fsmns").pp(i), causal)?);
         }
         let dnn = linear(
             FIRERED_PROJ_DIM,
@@ -266,6 +582,21 @@ impl FireRedVadWeights {
         x = sigmoid(&self.out.forward(&x)?)?;
         Ok(x.squeeze(0)?.squeeze(1)?.to_vec1::<f32>()?)
     }
+
+    fn forward_probs_streaming(
+        &self,
+        feats: &Array2<f32>,
+        num_threads: usize,
+        state: &mut FireRedStreamForwardState,
+    ) -> Result<Vec<f32>> {
+        let cpu = self
+            .cpu
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("streaming CPU fast path is unavailable"))?;
+        run_with_vad_threads(num_threads, || {
+            cpu.forward_probs_streaming(feats, &mut state.fsmn_caches)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -276,11 +607,11 @@ struct FireRedDfsmnBlock {
 }
 
 impl FireRedDfsmnBlock {
-    fn new(vb: VarBuilder) -> Result<Self> {
+    fn new(vb: VarBuilder, causal: bool) -> Result<Self> {
         Ok(Self {
             fc1: linear(FIRERED_PROJ_DIM, FIRERED_HIDDEN_DIM, vb.pp("fc1").pp("0"))?,
             fc2: linear_no_bias(FIRERED_HIDDEN_DIM, FIRERED_PROJ_DIM, vb.pp("fc2"))?,
-            fsmn: FireRedFsmn::new(vb.pp("fsmn"))?,
+            fsmn: FireRedFsmn::new(vb.pp("fsmn"), causal)?,
         })
     }
 
@@ -316,6 +647,38 @@ impl FireRedCpuWeights {
             .map(|value| 1.0 / (1.0 + (-value).exp()))
             .collect())
     }
+
+    fn forward_probs_streaming(&self, feats: &Array2<f32>, caches: &mut Vec<Vec<f32>>) -> Vec<f32> {
+        let frames = feats.shape()[0];
+        if frames == 0 {
+            return Vec::new();
+        }
+        if caches.len() != FIRERED_BLOCKS {
+            *caches = vec![Vec::new(); FIRERED_BLOCKS];
+        }
+        let mut x = feats.iter().copied().collect::<Vec<_>>();
+        x = self.fc1.forward(&x, frames, true);
+        x = self.fc2.forward(&x, frames, true);
+        self.fsmn1.apply_streaming(&mut x, frames, &mut caches[0]);
+        for (index, block) in self.blocks.iter().enumerate() {
+            let residual = x;
+            let mut y = block.fc1.forward(&residual, frames, true);
+            y = block.fc2.forward(&y, frames, false);
+            block
+                .fsmn
+                .apply_streaming(&mut y, frames, &mut caches[index + 1]);
+            y.par_iter_mut()
+                .zip(residual.par_iter())
+                .for_each(|(value, residual)| *value += *residual);
+            x = y;
+        }
+        x = self.dnn.forward(&x, frames, true);
+        self.out
+            .forward(&x, frames, false)
+            .into_iter()
+            .map(|value| 1.0 / (1.0 + (-value).exp()))
+            .collect()
+    }
 }
 
 impl FireRedCpuBlock {
@@ -335,10 +698,7 @@ impl FireRedCpuFsmn {
                 .lookback_cpu
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("FireRedVAD CPU FSMN missing lookback weights"))?,
-            lookahead: fsmn
-                .lookahead_cpu
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("FireRedVAD CPU FSMN missing lookahead weights"))?,
+            lookahead: fsmn.lookahead_cpu.clone(),
         })
     }
 
@@ -358,13 +718,46 @@ impl FireRedCpuFsmn {
                             sum += src[source_t * FIRERED_PROJ_DIM + c] * self.lookback[kernel + k];
                         }
                         let ahead_t = t + k + 1;
-                        if frames > 1 && ahead_t < frames {
-                            sum += src[ahead_t * FIRERED_PROJ_DIM + c] * self.lookahead[kernel + k];
+                        if let Some(lookahead) = &self.lookahead
+                            && frames > 1
+                            && ahead_t < frames
+                        {
+                            sum += src[ahead_t * FIRERED_PROJ_DIM + c] * lookahead[kernel + k];
                         }
                     }
                     *value = sum;
                 }
             });
+    }
+
+    fn apply_streaming(&self, input: &mut Vec<f32>, frames: usize, cache: &mut Vec<f32>) {
+        debug_assert!(self.lookahead.is_none());
+        let cache_frames = cache.len() / FIRERED_PROJ_DIM;
+        let mut combined = Vec::with_capacity(cache.len() + input.len());
+        combined.extend_from_slice(cache);
+        combined.extend_from_slice(input);
+        let mut out = input.clone();
+        out.par_chunks_mut(FIRERED_PROJ_DIM)
+            .enumerate()
+            .for_each(|(t, dst)| {
+                let combined_t = cache_frames + t;
+                for (channel, value) in dst.iter_mut().enumerate() {
+                    let kernel = channel * FIRERED_FSMN_ORDER;
+                    let mut sum = combined[combined_t * FIRERED_PROJ_DIM + channel];
+                    for k in 0..FIRERED_FSMN_ORDER {
+                        if let Some(source_t) = (combined_t + k).checked_sub(FIRERED_FSMN_ORDER - 1)
+                        {
+                            sum += combined[source_t * FIRERED_PROJ_DIM + channel]
+                                * self.lookback[kernel + k];
+                        }
+                    }
+                    *value = sum;
+                }
+            });
+        let retained_frames = (cache_frames + frames).min(FIRERED_FSMN_ORDER - 1);
+        let retained_values = retained_frames * FIRERED_PROJ_DIM;
+        *cache = combined[combined.len() - retained_values..].to_vec();
+        *input = out;
     }
 }
 
@@ -445,21 +838,30 @@ impl CpuLinear {
 #[derive(Debug)]
 struct FireRedFsmn {
     lookback_weight: Tensor,
-    lookahead_weight: Tensor,
+    lookahead_weight: Option<Tensor>,
     lookback_cpu: Option<Vec<f32>>,
     lookahead_cpu: Option<Vec<f32>>,
 }
 
 impl FireRedFsmn {
-    fn new(vb: VarBuilder) -> Result<Self> {
+    fn new(vb: VarBuilder, causal: bool) -> Result<Self> {
         let lookback_weight = vb
             .pp("lookback_filter")
             .get((FIRERED_PROJ_DIM, 1, FIRERED_FSMN_ORDER), "weight")?;
-        let lookahead_weight = vb
-            .pp("lookahead_filter")
-            .get((FIRERED_PROJ_DIM, 1, FIRERED_FSMN_ORDER), "weight")?;
+        let lookahead_weight = if causal {
+            None
+        } else {
+            Some(
+                vb.pp("lookahead_filter")
+                    .get((FIRERED_PROJ_DIM, 1, FIRERED_FSMN_ORDER), "weight")?,
+            )
+        };
         let lookback_cpu = tensor_cpu_vec(&lookback_weight)?;
-        let lookahead_cpu = tensor_cpu_vec(&lookahead_weight)?;
+        let lookahead_cpu = lookahead_weight
+            .as_ref()
+            .map(tensor_cpu_vec)
+            .transpose()?
+            .flatten();
         Ok(Self {
             lookback_weight,
             lookahead_weight,
@@ -470,16 +872,18 @@ impl FireRedFsmn {
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if input.device().is_cpu()
-            && let (Some(lookback), Some(lookahead)) = (&self.lookback_cpu, &self.lookahead_cpu)
+            && let Some(lookback) = &self.lookback_cpu
         {
-            return firered_fsmn_cpu(input, lookback, lookahead);
+            return firered_fsmn_cpu(input, lookback, self.lookahead_cpu.as_deref());
         }
 
         let x = input.permute((0, 2, 1))?;
         let lookback = depthwise_conv1d_left(&x, &self.lookback_weight)?;
         let mut memory = x.broadcast_add(&lookback)?;
-        if x.dim(2)? > 1 {
-            let lookahead = depthwise_conv1d_ahead(&x, &self.lookahead_weight)?;
+        if x.dim(2)? > 1
+            && let Some(lookahead_weight) = &self.lookahead_weight
+        {
+            let lookahead = depthwise_conv1d_ahead(&x, lookahead_weight)?;
             memory = memory.broadcast_add(&lookahead)?;
         }
         Ok(memory.permute((0, 2, 1))?)
@@ -509,7 +913,7 @@ fn depthwise_conv1d_ahead(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     Ok(windows.broadcast_mul(&kernel)?.sum_keepdim(3)?.squeeze(3)?)
 }
 
-fn firered_fsmn_cpu(input: &Tensor, lookback: &[f32], lookahead: &[f32]) -> Result<Tensor> {
+fn firered_fsmn_cpu(input: &Tensor, lookback: &[f32], lookahead: Option<&[f32]>) -> Result<Tensor> {
     let (batch, frames, channels) = input.dims3()?;
     if batch != 1 || channels != FIRERED_PROJ_DIM {
         bail!("unexpected FireRed FSMN input shape: {:?}", input.dims());
@@ -527,7 +931,10 @@ fn firered_fsmn_cpu(input: &Tensor, lookback: &[f32], lookahead: &[f32]) -> Resu
                     out[dst] += src[source_t * channels + c] * lookback[kernel + k];
                 }
                 let ahead_t = t + k + 1;
-                if frames > 1 && ahead_t < frames {
+                if let Some(lookahead) = lookahead
+                    && frames > 1
+                    && ahead_t < frames
+                {
                     out[dst] += src[ahead_t * channels + c] * lookahead[kernel + k];
                 }
             }
@@ -854,6 +1261,20 @@ fn ms_to_frame_count(ms: u64) -> usize {
     ms.div_ceil(FIRERED_FRAME_SHIFT_MS).max(1) as usize
 }
 
+fn ms_to_frame_count_allow_zero(ms: u64) -> usize {
+    ms.div_ceil(FIRERED_FRAME_SHIFT_MS) as usize
+}
+
+fn frame_to_ms(frame: usize) -> u64 {
+    frame
+        .saturating_sub(1)
+        .saturating_mul(FIRERED_FRAME_SHIFT_MS as usize) as u64
+}
+
+fn samples_to_ms(samples: usize) -> u64 {
+    (samples as u64).saturating_mul(1000) / u64::from(FIRERED_SAMPLE_RATE)
+}
+
 fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read FireRed CMVN {}", path.display()))?;
@@ -920,16 +1341,25 @@ fn validate_firered_vad_model_dir(model_dir: &Path) -> Result<()> {
     )
 }
 
-fn default_firered_vad_model_dir() -> Result<PathBuf> {
+fn resolve_firered_vad_model_dir(path: &Path, preferred_subdir: &str) -> Result<PathBuf> {
+    let nested = path.join(preferred_subdir);
+    if validate_firered_vad_model_dir(&nested).is_ok() {
+        return Ok(nested);
+    }
+    validate_firered_vad_model_dir(path)?;
+    Ok(path.to_path_buf())
+}
+
+fn default_firered_vad_model_dir(preferred_subdir: &str) -> Result<PathBuf> {
     let legacy = modelhub::modelscope_cache_dir()
         .join(FIRERED_VAD_REPO)
-        .join("VAD");
+        .join(preferred_subdir);
     if validate_firered_vad_model_dir(&legacy).is_ok() {
         return Ok(legacy);
     }
 
     let target = modelscope_model_snapshot_dir(&modelhub::modelscope_cache_dir(), FIRERED_VAD_REPO)
-        .join("VAD");
+        .join(preferred_subdir);
     if validate_firered_vad_model_dir(&target).is_ok() {
         return Ok(target);
     }
@@ -945,7 +1375,7 @@ fn default_firered_vad_model_dir() -> Result<PathBuf> {
         &cache,
     ))
     .with_context(|| format!("failed to download FireRedVAD model {FIRERED_VAD_REPO:?}"))?;
-    let target = modelscope_model_snapshot_dir(&cache, FIRERED_VAD_REPO).join("VAD");
+    let target = modelscope_model_snapshot_dir(&cache, FIRERED_VAD_REPO).join(preferred_subdir);
     validate_firered_vad_model_dir(&target)?;
     Ok(target)
 }
@@ -988,4 +1418,102 @@ where
             .join()
             .expect("tokio download thread panicked")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asr_data::AudioChunk;
+
+    fn realtime_options() -> VadOptions {
+        VadOptions {
+            threshold: 0.5,
+            min_speech_ms: 80,
+            min_silence_ms: 500,
+            max_segment_ms: 20_000,
+            pad_ms: 50,
+            num_threads: 0,
+        }
+    }
+
+    #[test]
+    fn stream_postprocessor_emits_start_and_end_boundaries() {
+        let mut postprocessor = FireRedStreamPostprocessor::from_options(&realtime_options());
+        let starts = (0..8)
+            .flat_map(|_| postprocessor.process(1.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![FireRedStreamBoundary::Start {
+                start_frame: 1,
+                frame: 8,
+            }]
+        );
+
+        let ends = (0..52)
+            .flat_map(|_| postprocessor.process(0.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ends,
+            vec![FireRedStreamBoundary::End {
+                start_frame: 1,
+                end_frame: 60,
+            }]
+        );
+    }
+
+    #[test]
+    fn stream_postprocessor_finishes_an_open_segment() {
+        let mut postprocessor = FireRedStreamPostprocessor::from_options(&realtime_options());
+        for _ in 0..8 {
+            postprocessor.process(1.0);
+        }
+        assert_eq!(postprocessor.finish(), Some(1));
+        assert_eq!(postprocessor.finish(), None);
+    }
+
+    #[test]
+    #[ignore = "requires a local FireRedVAD checkpoint; set VASR_FIRERED_VAD_ROOT"]
+    fn stream_checkpoint_loads_and_accepts_audio() -> Result<()> {
+        let root = std::env::var("VASR_FIRERED_VAD_ROOT")?;
+        let model = FireRedVadModel::from_pretrained_streaming(Some(root))?;
+        assert!(model.model_dir().ends_with(FIRERED_STREAM_MODEL_DIR));
+
+        let samples = (0..4000)
+            .map(|index| ((index as f32 * 0.017).sin() * 0.1).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let feats = model.weights.frontend.extract(&samples)?;
+        let expected = model.weights.forward_probs(&feats, 0)?;
+        let split = 7.min(feats.shape()[0]);
+        let mut state = FireRedStreamForwardState::default();
+        let mut actual = model.weights.forward_probs_streaming(
+            &feats.slice(s![..split, ..]).to_owned(),
+            0,
+            &mut state,
+        )?;
+        actual.extend(model.weights.forward_probs_streaming(
+            &feats.slice(s![split.., ..]).to_owned(),
+            0,
+            &mut state,
+        )?);
+        assert_eq!(actual.len(), expected.len());
+        let max_error = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_error < 1e-5, "streaming max error: {max_error}");
+
+        let mut stream = VadModel::new_stream(&model, &realtime_options())?;
+        let chunk = AudioChunk {
+            stream_id: "firered-smoke".to_string(),
+            waveform: Waveform::new(vec![0.0; 1600], FIRERED_SAMPLE_RATE),
+            is_start: true,
+            is_last: true,
+            range: TimeRange::new(DurationMs(0), DurationMs(100)),
+        };
+        stream.push_chunk(&chunk)?;
+        stream.finish()?;
+        Ok(())
+    }
 }

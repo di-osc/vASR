@@ -16,8 +16,16 @@ impl RealtimePipeline {
     }
 
     pub fn finish(&mut self) -> Result<Vec<Annotation>> {
-        let mut annotations = self.vad.finish()?;
-        annotations.extend(self.asr.finish()?);
+        let mut annotations = self.finish_vad()?;
+        annotations.extend(self.finish_asr()?);
         Ok(annotations)
+    }
+
+    pub fn finish_vad(&mut self) -> Result<Vec<Annotation>> {
+        self.vad.finish()
+    }
+
+    pub fn finish_asr(&mut self) -> Result<Vec<Annotation>> {
+        self.asr.finish()
     }
 }

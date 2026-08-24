@@ -10,7 +10,7 @@ protocol DTOs, and HTTP/WebSocket service entry points.
 
 - [`asr-data`](https://github.com/di-osc/asr-data): `Audio`, `Timeline`, `Annotation`, `Waveform`, and SQLite dataset storage.
 - `vasr-audio`: audio source loading into normalized 16 kHz mono waveforms.
-- `vasr-runtime`: model capability traits, Qwen3-ASR ASR model wrapper, FunASR FSMN VAD, offline/realtime pipelines.
+- `vasr-runtime`: model capability traits, Qwen3-ASR ASR model wrapper, FSMN/FireRed VAD, offline/realtime pipelines.
 - `vasr-protocol`: fasr-compatible transcribe and realtime DTOs.
 - `vasr-server`: axum routes for split transcribe and realtime services.
 - `vasr`: Candle Qwen3-ASR model implementation.
@@ -92,60 +92,68 @@ cargo run -p vasr-cli --bin vasr-transcribe -- convert-fasr \
   --output ./lbg_400call-200.vasr.msgpack
 ```
 
-Start the realtime service as a separate process:
+Initialize the realtime 2-pass TOML configuration:
 
 ```bash
-cargo run -p vasr-cli --bin vasr-realtime --features metal -- \
-  --model /path/to/Qwen3-ASR-0.6B \
-  --host 127.0.0.1 \
-  --port 8001 \
-  --device metal \
-  --isq q8_0
+cargo run -p vasr-cli -- init --cfg vasr.cfg
 ```
 
-Build release binaries:
+Edit `vasr.cfg` to select all three realtime models:
+
+```toml
+[models.vad]
+kind = "firered"
+device = "cpu"
+
+[models.online]
+kind = "sensevoice-online"
+checkpoint = "iic/SenseVoiceSmall"
+device = "cuda"
+
+[models.offline]
+kind = "qwen3-asr"
+checkpoint = "Qwen/Qwen3-ASR-0.6B"
+device = "cuda"
+```
+
+Start the service:
 
 ```bash
-cargo build --release -p vasr-cli --features metal
-./target/release/vasr-transcribe serve --model /path/to/Qwen3-ASR-0.6B --device metal --isq q8_0
-./target/release/vasr-transcribe run --model /path/to/Qwen3-ASR-0.6B --device metal --input ./raw_audios/ --output ./outputs/
-./target/release/vasr-realtime --model /path/to/Qwen3-ASR-0.6B --host 127.0.0.1 --port 8001 --device metal --isq q8_0
+cargo run -p vasr-cli --features cuda -- serve --cfg vasr.cfg
 ```
 
-SenseVoice Online realtime (Candle CUDA):
+The online model emits low-latency partial transcripts. FireRed Stream-VAD detects the utterance
+boundary, then the complete buffered utterance is sent to the offline model for the final
+transcript. Model selection, checkpoints, devices, quantization, and model-specific parameters
+are configured only in the TOML file.
+
+Build the unified release binary:
 
 ```bash
-cargo run -p vasr-realtime --features cuda -- \
-  --model-kind sensevoice-online \
-  --model /path/to/SenseVoiceSmall \
-  --device cuda \
-  --host 127.0.0.1 --port 8001
+cargo build --release -p vasr-cli --features cuda
+./target/release/vasr serve --cfg vasr.cfg
 ```
-
-The SenseVoice checkpoint directory must contain `model.pt`, `am.mvn`, and
-`tokens.json`. The online path follows FASR's SenseVoice Online frontend
-(16 kHz PCM16, 80-bin Fbank, 7x6 LFR, CMVN) and emits cumulative CTC partial
-transcripts. Use `--sensevoice-chunk-size` to control the number of new 60 ms
-LFR frames required before decoding, and `--sensevoice-max-history` to bound
-the retained feature history. CUDA builds use the `cuda` feature; the
-existing `cuda` feature remains the Qwen3-ASR optimized build.
 
 CUDA FlashAttention builds fetch CUTLASS from
 `https://gitee.com/good-as-water/cutlass.git` by default. Override the mirror
 with `VASR_CUTLASS_REPO` and, when necessary, the revision with
 `VASR_CUTLASS_COMMIT`.
 
-FunASR FSMN VAD is enabled by default for offline `/transcribe` segmentation and realtime
-speech events. Pass `--vad-model /path/to/funasr-fsmn-vad` to use a local directory containing
-`model.pt` and `am.mvn`, or `--no-vad` on `vasr-transcribe` to disable offline VAD
-segmentation. The default FSMN VAD `speech_noise_thres` is `0.5`; use `--vad-threshold <0..1>`
-or `VASR_VAD_THRESHOLD` to tune segmentation. Additional VAD tuning flags:
+FunASR FSMN VAD is enabled by default for offline `/transcribe` segmentation. Pass
+`--vad-model /path/to/funasr-fsmn-vad` to use a local directory containing `model.pt` and
+`am.mvn`, or `--no-vad` on `vasr-transcribe` to disable offline VAD segmentation. The default
+FSMN VAD `speech_noise_thres` is `0.5`; use `--vad-threshold <0..1>` or `VASR_VAD_THRESHOLD`
+to tune segmentation. Additional offline VAD tuning flags:
 
 - `--vad-min-speech-ms` (default `250`)
 - `--vad-min-silence-ms` (default `500`)
 - `--vad-max-segment-sec` (default `30`)
 
 When `--vad-model` is omitted, vASR downloads/uses `funasr/fsmn-vad` from the Hugging Face cache.
+
+The realtime service uses FireRed `Stream-VAD`. Its startup settings live under `[models.vad]`
+instead of command-line flags. Per-session VAD fields can still be adjusted through
+`session.update`.
 
 Weight dtype is selected automatically from the device (`f32` on CPU, `bf16` on Metal/CUDA).
 
