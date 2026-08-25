@@ -164,9 +164,18 @@ pub async fn run_realtime_config(config: VasrConfig) -> Result<()> {
             config.version
         );
     }
+    let cache_dir = config
+        .models
+        .cache_dir
+        .clone()
+        .unwrap_or_else(vasr::modelscope_cache_dir);
+    if cache_dir.as_os_str().is_empty() {
+        bail!("models.cache_dir must not be empty");
+    }
+    vasr::set_cache_dir(cache_dir.clone());
     validate_vad_config(&config.models.vad)?;
-    let online_args = model_args_from_config(&config.models.online);
-    let offline_args = model_args_from_config(&config.models.offline);
+    let online_args = model_args_from_config(&config.models.online, cache_dir.clone());
+    let offline_args = model_args_from_config(&config.models.offline, cache_dir);
     validate_model_args(&online_args)?;
     validate_model_args(&offline_args)?;
     if resolve_model_kind(&offline_args)? != RealtimeModelKind::Qwen3Asr {
@@ -216,11 +225,11 @@ pub async fn run_realtime_config(config: VasrConfig) -> Result<()> {
     serve_app(app, addr).await
 }
 
-fn model_args_from_config(config: &AsrModelConfig) -> CommonModelArgs {
+fn model_args_from_config(config: &AsrModelConfig, cache_dir: PathBuf) -> CommonModelArgs {
     CommonModelArgs {
         model_kind: config.kind.clone(),
         model: config.checkpoint.clone(),
-        cache_dir: vasr::modelscope_cache_dir(),
+        cache_dir,
         device: config.device.clone(),
         isq: config.isq.clone(),
         language: config.language.clone(),

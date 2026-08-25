@@ -1,0 +1,43 @@
+# vASR realtime 2-pass configuration
+version = 1
+
+[service]
+host = "0.0.0.0"
+port = 8000
+
+# Shared cache directory for downloaded ASR/VAD models. Leave unset to use
+# vASR's default ModelScope cache directory.
+[models]
+cache_dir = "/workspace/data/models/asr"
+
+# Realtime speech boundary detector. FireRed Stream-VAD is currently the
+# supported online VAD backend.
+[models.vad]
+kind = "firered"
+# checkpoint = "/path/to/FireRedVAD"
+device = "cuda"
+threshold = 0.5
+min_speech_ms = 80
+min_silence_ms = 500
+max_segment_ms = 20000
+prefix_padding_ms = 50
+
+# First pass: low-latency partial transcripts.
+[models.online]
+kind = "sensevoice-online"
+checkpoint = "iic/SenseVoiceSmall"
+device = "cuda"
+language = "zh"
+chunk_size = 4
+max_history = 0
+textnorm = false
+
+# Second pass: whole-utterance final transcript after VAD speech end.
+[models.offline]
+kind = "qwen3-asr"
+checkpoint = "Qwen/Qwen3-ASR-0.6B"
+device = "cuda"
+# isq = "q8_0"
+# language = "Chinese"
+gpu_memory_utilization = 0.65
+cuda_graph_max_seqs = 512

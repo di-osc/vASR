@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "serviceId": "/workspace/code/vASR/3d3773a01787121575688480420.wav",
+      "spentSeconds": 0.0,
+      "spentDetails": {
+        "loader": 0.0,
+        "detector": 0.0,
+        "recognizer": 0.0,
+        "sentencizer": 0.0
+      },
+      "timings": {
+        "total": 0.0,
+        "loader": 0.0,
+        "pipeline": 0.0,
+        "audio": 0.0
+      },
+      "text": {
+        "mono": "我要修改商品帖子的价格。",
+        "left": "",
+        "right": ""
+      },
+      "sentences": [
+        {
+          "text": "我要修改商品帖子的价格。",
+          "startTime": 1010,
+          "endTime": 4200,
+          "duration": 3190,
+          "channel": "mono",
+          "sentenceIndex": 0
+        }
+      ],
+      "is_bad": false,
+      "bad_reason": null,
+      "bad_component": null
+    }
+  ],
+  "inference_performance": {
+    "batch_wall_seconds": 2.433285111,
+    "num_items": 1,
+    "throughput_items_per_second": 0.4109670484068482,
+    "total_audio_duration_seconds": 4.216,
+    "speedup": 1.732637076083272,
+    "rtf": 0.5771549124762808
+  }
+}

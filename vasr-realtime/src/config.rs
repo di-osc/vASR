@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,11 @@ version = 1
 [service]
 host = "0.0.0.0"
 port = 8000
+
+# Shared cache directory for downloaded ASR/VAD models. Leave unset to use
+# vASR's default ModelScope cache directory.
+[models]
+# cache_dir = "/path/to/vasr-cache"
 
 # Realtime speech boundary detector. FireRed Stream-VAD is currently the
 # supported online VAD backend.
@@ -92,6 +97,7 @@ impl Default for ServiceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ModelsConfig {
+    pub cache_dir: Option<PathBuf>,
     pub vad: VadModelConfig,
     pub online: AsrModelConfig,
     pub offline: AsrModelConfig,
@@ -100,6 +106,7 @@ pub struct ModelsConfig {
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
+            cache_dir: None,
             vad: VadModelConfig::default(),
             online: AsrModelConfig::sensevoice_online_default(),
             offline: AsrModelConfig::qwen3_offline_default(),
@@ -198,8 +205,25 @@ mod tests {
     fn default_template_parses() {
         let config = VasrConfig::from_toml_str(DEFAULT_CONFIG_TOML).unwrap();
         assert_eq!(config.models.vad.kind, "firered");
+        assert_eq!(config.models.cache_dir, None);
         assert_eq!(config.models.online.kind, "sensevoice-online");
         assert_eq!(config.models.offline.kind, "qwen3-asr");
         assert_eq!(config.models.online.chunk_size, 4);
+    }
+
+    #[test]
+    fn parses_custom_cache_dir() {
+        let config = VasrConfig::from_toml_str(
+            r#"
+                version = 1
+                [models]
+                cache_dir = "/tmp/vasr-cache"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.models.cache_dir,
+            Some(PathBuf::from("/tmp/vasr-cache"))
+        );
     }
 }

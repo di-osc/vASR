@@ -289,11 +289,8 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
 fn validate_timeline(records: &[Audio], timeline: EvalTimeline) -> Result<()> {
     let mut missing = Vec::new();
     for record in records {
-        if record
-            .timeline(timeline.channel())
-            .map_err(|error| anyhow!(error))?
-            .is_none()
-        {
+        // asr-data 0.1.0 stores one canonical timeline directly on Audio.
+        if record.timeline.transcript().text.is_empty() {
             missing.push(record.audio_id());
         }
     }
@@ -627,17 +624,8 @@ impl Op {
 }
 
 fn reference_text(record: &Audio, timeline: EvalTimeline) -> Result<String> {
-    record
-        .timeline(timeline.channel())
-        .map_err(|error| anyhow!(error))?
-        .map(|timeline| timeline.transcript().text)
-        .ok_or_else(|| {
-            anyhow!(
-                "audio {} has no '{}' timeline",
-                record.audio_id(),
-                timeline.name()
-            )
-        })
+    let _ = timeline;
+    Ok(record.timeline.transcript().text)
 }
 
 fn hypothesis_text(item: &crate::InferenceData, timeline: EvalTimeline) -> String {

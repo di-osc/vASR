@@ -547,7 +547,7 @@ fn clean_call_boundary_noise(data: &mut InferenceData) {
     let mut changed = false;
     let mut start_index = 0usize;
     while start_index < data.sentences.len()
-        && should_drop_leading_sentence(&data.sentences[start_index], start_index)
+        && should_drop_leading_sentence(&data.sentences[start_index])
     {
         start_index += 1;
     }
@@ -586,7 +586,7 @@ fn clean_call_boundary_noise(data: &mut InferenceData) {
     data.text = rebuild_text_from_sentences(&data.sentences);
 }
 
-fn should_drop_leading_sentence(sentence: &SentenceResult, leading_index: usize) -> bool {
+fn should_drop_leading_sentence(sentence: &SentenceResult) -> bool {
     if sentence.start_time > 30_000 || sentence.end_time > 22_000 {
         return false;
     }
@@ -594,14 +594,12 @@ fn should_drop_leading_sentence(sentence: &SentenceResult, leading_index: usize)
     if text.is_empty() {
         return true;
     }
-    let has_anchor = contains_any(text.as_str(), CALL_ANCHORS);
     let has_strong_anchor = contains_any(text.as_str(), STRONG_CALL_ANCHORS);
     let has_noise = contains_any(text.as_str(), BOUNDARY_NOISE_PHRASES);
     let mostly_filler = mostly_filler_text(text.as_str());
     let short_non_call = text.chars().count() <= 8 && !has_strong_anchor;
-    let early_non_call = leading_index < 6 && text.chars().count() <= 14 && !has_anchor;
 
-    (has_noise && !has_strong_anchor) || mostly_filler || short_non_call || early_non_call
+    (has_noise && !has_strong_anchor) || mostly_filler || short_non_call
 }
 
 fn should_drop_early_artifact_sentence(sentence: &SentenceResult) -> bool {
@@ -690,25 +688,6 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 }
 
 const CALL_FILLER_CHARS: &str = "嗯啊呃哦哎喂唉呀哈好的是对";
-const CALL_ANCHORS: &[&str] = &[
-    "你好",
-    "您好",
-    "五八",
-    "家政",
-    "保姆",
-    "工作",
-    "找工作",
-    "接单",
-    "阿姨",
-    "先生",
-    "女士",
-    "姐",
-    "哥",
-    "老师",
-    "号码",
-    "手机号",
-    "微信",
-];
 const STRONG_CALL_ANCHORS: &[&str] = &[
     "你好",
     "您好",
