@@ -38,7 +38,7 @@ cargo test --workspace --features vasr-runtime/cuda
 Start the CPU transcribe HTTP service:
 
 ```bash
-cargo run -p vasr-cli --bin vasr-transcribe -- serve \
+cargo run -p vasr-transcribe -- serve \
   --model /path/to/Qwen3-ASR-0.6B \
   --vad-model /path/to/funasr-fsmn-vad \
   --host 127.0.0.1 \
@@ -49,7 +49,7 @@ cargo run -p vasr-cli --bin vasr-transcribe -- serve \
 Start the Metal transcribe service:
 
 ```bash
-cargo run -p vasr-cli --bin vasr-transcribe --features metal -- serve \
+cargo run -p vasr-transcribe --features metal -- serve \
   --model /path/to/Qwen3-ASR-0.6B \
   --host 127.0.0.1 \
   --port 8000 \
@@ -57,24 +57,28 @@ cargo run -p vasr-cli --bin vasr-transcribe --features metal -- serve \
   --isq q8_0
 ```
 
-Initialize the standalone realtime WebSocket service configuration:
+The realtime WebSocket service accepts the same common model and service options as
+`vasr-transcribe serve`:
 
 ```bash
-cargo run -p vasr-realtime -- init realtime.cfg
-# Edit realtime.cfg to set checkpoints, devices, and models.cache_dir.
-cargo run -p vasr-realtime -- serve realtime.cfg
+cargo run -p vasr-realtime --features metal -- serve \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --device metal \
+  --isq q8_0 \
+  --host 127.0.0.1 \
+  --port 8000
 ```
 
 Transcribe local audio files to JSON (`{stem}.transcribe.json`):
 
 ```bash
-cargo run -p vasr-cli --bin vasr-transcribe --features metal -- run \
+cargo run -p vasr-transcribe --features metal -- run \
   --model /path/to/Qwen3-ASR-0.6B \
   --device metal \
   --input ./raw_audios/audio.wav \
   --output ./outputs/
 
-cargo run -p vasr-cli --bin vasr-transcribe --features metal -- run \
+cargo run -p vasr-transcribe --features metal -- run \
   --model /path/to/Qwen3-ASR-0.6B \
   --device metal \
   --input ./raw_audios/ \
@@ -82,64 +86,22 @@ cargo run -p vasr-cli --bin vasr-transcribe --features metal -- run \
   --recursive
 ```
 
-Benchmark ASR character error rate (CER) against a `VasrRecordList` MessagePack file:
+Evaluate ASR character error rate (CER) against a vASR SQLite AudioDb:
 
 ```bash
-cargo run -p vasr-cli --bin vasr-transcribe --features metal -- benchmark \
-  --model /path/to/Qwen3-ASR-0.6B \
-  --device metal \
-  --input ./datasets/eval.records.msgpack \
+cargo run -p vasr-transcribe --features metal -- eval \
+  --input ./datasets/eval.vasr \
+  --server http://127.0.0.1:8867/inference \
   --output ./outputs/benchmark.json
 ```
-
-Convert a FASR `FASRAL01` AudioList binary file to `VasrRecordList` MessagePack:
-
-```bash
-cargo run -p vasr-cli --bin vasr-transcribe -- convert-fasr \
-  --input ./lbg_400call-200.bin \
-  --output ./lbg_400call-200.vasr.msgpack
-```
-
-Initialize the realtime 2-pass TOML configuration:
-
-```bash
-cargo run -p vasr-cli -- init --cfg vasr.cfg
-```
-
-Edit `vasr.cfg` to select all three realtime models:
-
-```toml
-[models.vad]
-kind = "firered"
-device = "cpu"
-
-[models.online]
-kind = "sensevoice-online"
-checkpoint = "iic/SenseVoiceSmall"
-device = "cuda"
-
-[models.offline]
-kind = "qwen3-asr"
-checkpoint = "Qwen/Qwen3-ASR-0.6B"
-device = "cuda"
-```
-
-Start the service:
-
-```bash
-cargo run -p vasr-cli --features cuda -- serve --cfg vasr.cfg
-```
-
-The online model emits low-latency partial transcripts. FireRed Stream-VAD detects the utterance
-boundary, then the complete buffered utterance is sent to the offline model for the final
-transcript. Model selection, checkpoints, devices, quantization, and model-specific parameters
-are configured only in the TOML file.
 
 Build the unified release binary:
 
 ```bash
-cargo build --release -p vasr-cli --features cuda
-./target/release/vasr serve --cfg vasr.cfg
+cargo build --release -p vasr-realtime --features cuda
+./target/release/vasr-realtime serve \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --device cuda
 ```
 
 CUDA FlashAttention builds fetch CUTLASS from
@@ -159,14 +121,13 @@ to tune segmentation. Additional offline VAD tuning flags:
 
 When `--vad-model` is omitted, vASR downloads/uses `funasr/fsmn-vad` from the Hugging Face cache.
 
-The realtime service uses FireRed `Stream-VAD`. Its startup settings live under `[models.vad]`
-instead of command-line flags. Per-session VAD fields can still be adjusted through
-`session.update`.
+The realtime service uses FireRed `Stream-VAD` with built-in startup defaults. Per-session VAD
+fields can still be adjusted through `session.update`.
 
 Weight dtype is selected automatically from the device (`f32` on CPU, `bf16` on Metal/CUDA).
 
 By default, component runtime logs (loader/VAD/ASR timings) are hidden. Pass `--verbose`
-or set `VASR_LOG=warn,vasr_cli=info,vasr_runtime=info,vasr_server=info` to enable them.
+or set `VASR_LOG=warn,vasr_realtime=info` to enable them.
 
 Health check:
 
