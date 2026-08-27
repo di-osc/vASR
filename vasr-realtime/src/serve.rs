@@ -560,7 +560,7 @@ async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         target: "vasr_realtime::serve",
-        "WebSocket endpoints: /v1/realtime, /api-ws/v1/realtime"
+        "WebSocket endpoint: /v1/realtime"
     );
     tracing::info!(
         target: "vasr_realtime::serve",

@@ -31,7 +31,6 @@ pub struct RealtimeService {
 pub fn realtime_router(service: Arc<RealtimeService>) -> Router {
     Router::new()
         .route("/v1/realtime", get(handle_realtime))
-        .route("/api-ws/v1/realtime", get(handle_realtime))
         .with_state(service)
 }
 

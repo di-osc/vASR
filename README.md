@@ -57,12 +57,14 @@ cargo run -p vasr-cli --bin vasr-transcribe --features metal -- serve \
   --isq q8_0
 ```
 
-Initialize the standalone realtime WebSocket service configuration:
+Start the standalone realtime WebSocket service:
 
 ```bash
-cargo run -p vasr-realtime -- init realtime.cfg
-# Edit realtime.cfg to set checkpoints, devices, and models.cache_dir.
-cargo run -p vasr-realtime -- serve realtime.cfg
+cargo run -p vasr-realtime -- serve \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --device cpu
 ```
 
 Transcribe local audio files to JSON (`{stem}.transcribe.json`):
@@ -194,7 +196,6 @@ Realtime WebSocket endpoints:
 
 ```text
 ws://127.0.0.1:8001/v1/realtime
-ws://127.0.0.1:8001/api-ws/v1/realtime
 ```
 
 The realtime API accepts fasr-style JSON events such as `session.update`,
