@@ -19,16 +19,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the realtime WebSocket service.
+    /// Start the realtime WebSocket service with command-line model options.
     Serve(RealtimeArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
     match cli.command {
-        Command::Serve(args) => run_realtime(args).await,
+        Command::Serve(args) => {
+            init_logging(cli.verbose);
+            run_realtime(args).await
+        }
     }
 }
 
@@ -49,27 +51,26 @@ mod tests {
             "vasr-realtime",
             "serve",
             "--model",
-            "model-dir",
+            "Qwen/Qwen3-ASR-1.7B",
             "--device",
             "cpu",
             "--host",
-            "0.0.0.0",
+            "127.0.0.1",
             "--port",
-            "8867",
+            "9000",
         ])
         .unwrap();
         let Command::Serve(args) = cli.command;
-        assert_eq!(args.model.model, "model-dir");
+        assert_eq!(args.model.model, "Qwen/Qwen3-ASR-1.7B");
         assert_eq!(args.model.device, "cpu");
-        assert_eq!(args.host, "0.0.0.0");
-        assert_eq!(args.port, 8867);
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.port, 9000);
     }
 
     #[test]
-    fn cfg_is_not_a_named_option() {
-        let error =
-            Cli::try_parse_from(["vasr-realtime", "serve", "--cfg", "custom.cfg"]).unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    fn init_is_not_a_command() {
+        let error = Cli::try_parse_from(["vasr-realtime", "init"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

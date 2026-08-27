@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{AsrModelConfig, VadModelConfig, VasrConfig};
 use crate::runtime::{
     AsrModel, AsrOptions, FireRedVadModel, Qwen3AsrModel, VadModel, VadOptions, auto_dtype,
     device_label, resolve_device,
@@ -13,7 +12,6 @@ use axum::{Json, Router, routing::get};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use candle_core::Device;
 use clap::Args;
-use vasr::OfflineAsrModel;
 use vasr::models::qwen3asr::LoadOptions;
 use vasr::models::qwen3asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal", feature = "cuda"))]
@@ -155,120 +153,6 @@ pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
         .merge(crate::server::realtime_router(realtime_service));
     let addr = bind_addr(&args.host, args.port)?;
     serve_app(app, addr).await
-}
-
-pub async fn run_realtime_config(config: VasrConfig) -> Result<()> {
-    if config.version != 1 {
-        bail!(
-            "unsupported config version {}; expected version = 1",
-            config.version
-        );
-    }
-    let cache_dir = config
-        .models
-        .cache_dir
-        .clone()
-        .unwrap_or_else(vasr::modelscope_cache_dir);
-    if cache_dir.as_os_str().is_empty() {
-        bail!("models.cache_dir must not be empty");
-    }
-    vasr::set_cache_dir(cache_dir.clone());
-    validate_vad_config(&config.models.vad)?;
-    let online_args = model_args_from_config(&config.models.online, cache_dir.clone());
-    let offline_args = model_args_from_config(&config.models.offline, cache_dir);
-    validate_model_args(&online_args)?;
-    validate_model_args(&offline_args)?;
-    if resolve_model_kind(&offline_args)? != RealtimeModelKind::Qwen3Asr {
-        bail!(
-            "models.offline.kind {:?} does not support offline transcription; expected qwen3-asr",
-            offline_args.model_kind
-        );
-    }
-
-    let vad: Arc<dyn VadModel> = Arc::new(load_firered_vad_config(&config.models.vad)?);
-    let online_asr = load_asr_model(&online_args, cuda_graph_max_batch(&online_args))?;
-    let offline_asr = load_offline_asr_model(&offline_args, cuda_graph_max_batch(&offline_args))?;
-    let vad_options = vad_options_from_config(&config.models.vad);
-    let online_options = AsrOptions {
-        language: config.models.online.language.clone(),
-        ..AsrOptions::default()
-    };
-    let offline_options = AsrOptions {
-        language: config.models.offline.language.clone(),
-        ..AsrOptions::default()
-    };
-
-    tracing::info!(
-        target: "vasr_realtime::serve",
-        "Starting realtime 2-pass service: vad={}, online={}, offline={}.",
-        config.models.vad.kind,
-        config.models.online.kind,
-        config.models.offline.kind,
-    );
-    let service = Arc::new(RealtimeService {
-        make_session: Arc::new(move || {
-            RealtimeSession::from_two_pass_models(
-                16_000,
-                Arc::clone(&vad),
-                Arc::clone(&online_asr),
-                Some(Arc::clone(&offline_asr)),
-                vad_options.clone(),
-                online_options.clone(),
-                offline_options.clone(),
-            )
-        }),
-    });
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(crate::server::realtime_router(service));
-    let addr = bind_addr(&config.service.host, config.service.port)?;
-    serve_app(app, addr).await
-}
-
-fn model_args_from_config(config: &AsrModelConfig, cache_dir: PathBuf) -> CommonModelArgs {
-    CommonModelArgs {
-        model_kind: config.kind.clone(),
-        model: config.checkpoint.clone(),
-        cache_dir,
-        device: config.device.clone(),
-        isq: config.isq.clone(),
-        language: config.language.clone(),
-        sensevoice_chunk_size: config.chunk_size,
-        sensevoice_max_history: config.max_history,
-        sensevoice_textnorm: config.textnorm,
-        gpu_memory_utilization: config.gpu_memory_utilization,
-        cuda_graph_max_seqs: config.cuda_graph_max_seqs,
-    }
-}
-
-fn validate_vad_config(config: &VadModelConfig) -> Result<()> {
-    if !matches!(
-        config.kind.trim().to_ascii_lowercase().as_str(),
-        "firered" | "firered-online" | "firered_online"
-    ) {
-        bail!(
-            "unsupported models.vad.kind {:?}; expected firered",
-            config.kind
-        );
-    }
-    if !(0.0..=1.0).contains(&config.threshold) {
-        bail!("models.vad.threshold must be in [0.0, 1.0]");
-    }
-    if config.min_speech_ms == 0 || config.min_silence_ms == 0 || config.max_segment_ms == 0 {
-        bail!("models.vad durations must be greater than zero");
-    }
-    Ok(())
-}
-
-fn vad_options_from_config(config: &VadModelConfig) -> VadOptions {
-    VadOptions {
-        threshold: config.threshold,
-        min_speech_ms: config.min_speech_ms,
-        min_silence_ms: config.min_silence_ms,
-        max_segment_ms: config.max_segment_ms,
-        pad_ms: config.prefix_padding_ms,
-        num_threads: config.num_threads,
-    }
 }
 
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
@@ -442,19 +326,6 @@ fn load_asr_model(
     Ok(Arc::new(load_qwen3_asr_model(args, cuda_graph_max_batch)?))
 }
 
-fn load_offline_asr_model(
-    args: &CommonModelArgs,
-    cuda_graph_max_batch: Option<usize>,
-) -> Result<Arc<dyn OfflineAsrModel>> {
-    if resolve_model_kind(args)? != RealtimeModelKind::Qwen3Asr {
-        bail!(
-            "models.offline.kind {:?} does not support offline transcription; expected qwen3-asr",
-            args.model_kind
-        );
-    }
-    Ok(Arc::new(load_qwen3_asr_model(args, cuda_graph_max_batch)?))
-}
-
 fn load_qwen3_asr_model(
     args: &CommonModelArgs,
     #[cfg_attr(not(feature = "cuda-graph"), allow(unused_variables))] cuda_graph_max_batch: Option<
@@ -576,11 +447,6 @@ fn load_firered_vad() -> Result<FireRedVadModel> {
     FireRedVadModel::from_pretrained(None::<&std::path::Path>)
 }
 
-fn load_firered_vad_config(config: &VadModelConfig) -> Result<FireRedVadModel> {
-    let device = resolve_device(&config.device)?;
-    FireRedVadModel::from_pretrained_on_device(config.checkpoint.as_deref(), &device)
-}
-
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
@@ -604,35 +470,4 @@ fn log_model_config(model: &Qwen3AsrModel) {
         audio.encoder_layers,
         audio.d_model
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn config_rejects_online_only_model_in_offline_slot_before_loading() {
-        let mut config = VasrConfig::default();
-        config.models.offline = AsrModelConfig::sensevoice_online_default();
-        let error = run_realtime_config(config).await.unwrap_err();
-        assert!(error.to_string().contains("models.offline.kind"));
-    }
-
-    #[tokio::test]
-    async fn config_rejects_unknown_version_before_loading() {
-        let mut config = VasrConfig::default();
-        config.version = 99;
-        let error = run_realtime_config(config).await.unwrap_err();
-        assert!(error.to_string().contains("unsupported config version"));
-    }
-
-    #[test]
-    fn config_maps_vad_defaults_to_runtime_options() {
-        let options = vad_options_from_config(&VadModelConfig::default());
-        assert_eq!(options.threshold, 0.5);
-        assert_eq!(options.min_speech_ms, 80);
-        assert_eq!(options.min_silence_ms, 500);
-        assert_eq!(options.max_segment_ms, 20_000);
-        assert_eq!(options.pad_ms, 50);
-    }
 }
