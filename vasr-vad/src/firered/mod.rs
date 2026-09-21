@@ -11,7 +11,6 @@ use gemm::Parallelism;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
-use ndarray::{Array2, s};
 use rayon::prelude::*;
 
 use crate::traits::run_with_vad_threads;
@@ -121,7 +120,7 @@ impl FireRedVadModel {
         let frontend_start = Instant::now();
         let feats = self.weights.frontend.extract(&waveform.samples)?;
         timing.frontend_seconds = frontend_start.elapsed().as_secs_f64();
-        timing.frames = feats.shape()[0];
+        timing.frames = feats.dim(0)?;
         if timing.frames == 0 {
             return Ok(FireRedVadDetection {
                 segments: Vec::new(),
@@ -186,12 +185,19 @@ impl FireRedStreamingVadSession {
 
     fn process_available_frames(&mut self) -> Result<Vec<VadEvent>> {
         let feats = self.weights.frontend.extract(&self.samples)?;
-        let frame_count = feats.shape()[0];
+        let frame_count = feats.dim(0)?;
         if frame_count <= self.processed_frames {
             return Ok(Vec::new());
         }
         let probs = if self.weights.cpu.is_some() {
-            let new_feats = feats.slice(s![self.processed_frames.., ..]).to_owned();
+            // 流式 CPU 路径只消费尚未处理过的帧，切出连续块即可。
+            let new_feats = feats
+                .narrow(
+                    0,
+                    self.processed_frames,
+                    frame_count - self.processed_frames,
+                )?
+                .contiguous()?;
             self.weights.forward_probs_streaming(
                 &new_feats,
                 self.options.num_threads,
@@ -552,20 +558,16 @@ impl FireRedVadWeights {
         })
     }
 
-    fn forward_probs(&self, feats: &Array2<f32>, num_threads: usize) -> Result<Vec<f32>> {
-        let frames = feats.shape()[0];
-        let dim = feats.shape()[1];
+    fn forward_probs(&self, feats: &Tensor, num_threads: usize) -> Result<Vec<f32>> {
+        let dim = feats.dim(1)?;
         if dim != FIRERED_INPUT_DIM {
             bail!("FireRedVAD expects feature dim {FIRERED_INPUT_DIM}, got {dim}");
         }
         if let Some(cpu) = &self.cpu {
             return run_with_vad_threads(num_threads, || cpu.forward_probs(feats))?;
         }
-        let x = Tensor::from_vec(
-            feats.iter().copied().collect::<Vec<_>>(),
-            (1usize, frames, FIRERED_INPUT_DIM),
-            &self.device,
-        )?;
+        // 前端特征固定在 CPU，这里先补上 batch 维再搬到模型所在设备。
+        let x = feats.unsqueeze(0)?.contiguous()?.to_device(&self.device)?;
         let mut x = self.fc1.forward(&x)?.relu()?;
         x = self.fc2.forward(&x)?.relu()?;
         x = self.fsmn1.forward(&x)?;
@@ -579,7 +581,7 @@ impl FireRedVadWeights {
 
     fn forward_probs_streaming(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         num_threads: usize,
         state: &mut FireRedStreamForwardState,
     ) -> Result<Vec<f32>> {
@@ -589,7 +591,7 @@ impl FireRedVadWeights {
             .ok_or_else(|| anyhow::anyhow!("streaming CPU fast path is unavailable"))?;
         run_with_vad_threads(num_threads, || {
             cpu.forward_probs_streaming(feats, &mut state.fsmn_caches)
-        })
+        })?
     }
 }
 
@@ -618,9 +620,9 @@ impl FireRedDfsmnBlock {
 }
 
 impl FireRedCpuWeights {
-    fn forward_probs(&self, feats: &Array2<f32>) -> Result<Vec<f32>> {
-        let frames = feats.shape()[0];
-        let mut x = feats.iter().copied().collect::<Vec<_>>();
+    fn forward_probs(&self, feats: &Tensor) -> Result<Vec<f32>> {
+        let frames = feats.dim(0)?;
+        let mut x = feats.flatten_all()?.to_vec1::<f32>()?;
         x = self.fc1.forward(&x, frames, true);
         x = self.fc2.forward(&x, frames, true);
         self.fsmn1.apply(&mut x, frames);
@@ -642,15 +644,24 @@ impl FireRedCpuWeights {
             .collect())
     }
 
-    fn forward_probs_streaming(&self, feats: &Array2<f32>, caches: &mut Vec<Vec<f32>>) -> Vec<f32> {
-        let frames = feats.shape()[0];
+    /// 流式 CPU 前向：只对新增帧计算，FSMN 卷积状态通过 `caches` 跨调用累积。
+    ///
+    /// # Errors
+    ///
+    /// 输入不是二维张量或无法物化成连续 `f32` 数据时返回错误。
+    fn forward_probs_streaming(
+        &self,
+        feats: &Tensor,
+        caches: &mut Vec<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        let frames = feats.dim(0)?;
         if frames == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if caches.len() != FIRERED_BLOCKS {
             *caches = vec![Vec::new(); FIRERED_BLOCKS];
         }
-        let mut x = feats.iter().copied().collect::<Vec<_>>();
+        let mut x = feats.flatten_all()?.to_vec1::<f32>()?;
         x = self.fc1.forward(&x, frames, true);
         x = self.fc2.forward(&x, frames, true);
         self.fsmn1.apply_streaming(&mut x, frames, &mut caches[0]);
@@ -667,11 +678,12 @@ impl FireRedCpuWeights {
             x = y;
         }
         x = self.dnn.forward(&x, frames, true);
-        self.out
+        Ok(self
+            .out
             .forward(&x, frames, false)
             .into_iter()
             .map(|value| 1.0 / (1.0 + (-value).exp()))
-            .collect()
+            .collect())
     }
 }
 
@@ -963,7 +975,11 @@ impl FireRedFrontend {
         Ok(Self { means, inverse_std })
     }
 
-    fn extract(&self, samples: &[f32]) -> Result<Array2<f32>> {
+    /// 从归一化到 `[-1, 1]` 的采样提取 fbank + CMVN 特征。
+    ///
+    /// 返回 CPU 上的 `(frames, FIRERED_INPUT_DIM)` F32 张量；是否搬运到计算设备
+    /// 由 `forward_probs*` 根据模型所在设备决定。
+    fn extract(&self, samples: &[f32]) -> Result<Tensor> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -996,7 +1012,11 @@ impl FireRedFrontend {
                 out.push((*value - self.means[d]) * self.inverse_std[d]);
             }
         }
-        Ok(Array2::from_shape_vec((frames, FIRERED_INPUT_DIM), out)?)
+        Ok(Tensor::from_vec(
+            out,
+            (frames, FIRERED_INPUT_DIM),
+            &Device::Cpu,
+        )?)
     }
 }
 
@@ -1490,15 +1510,16 @@ mod tests {
             .collect::<Vec<_>>();
         let feats = model.weights.frontend.extract(&samples)?;
         let expected = model.weights.forward_probs(&feats, 0)?;
-        let split = 7.min(feats.shape()[0]);
+        let frame_count = feats.dim(0)?;
+        let split = 7.min(frame_count);
         let mut state = FireRedStreamForwardState::default();
         let mut actual = model.weights.forward_probs_streaming(
-            &feats.slice(s![..split, ..]).to_owned(),
+            &feats.narrow(0, 0, split)?.contiguous()?,
             0,
             &mut state,
         )?;
         actual.extend(model.weights.forward_probs_streaming(
-            &feats.slice(s![split.., ..]).to_owned(),
+            &feats.narrow(0, split, frame_count - split)?.contiguous()?,
             0,
             &mut state,
         )?);

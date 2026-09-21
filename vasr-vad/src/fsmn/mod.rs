@@ -11,7 +11,6 @@ use gemm::Parallelism;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
-use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 
 use crate::traits::run_with_vad_threads;
@@ -91,7 +90,11 @@ impl FsmnVadFrontend {
         })
     }
 
-    pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<Array2<f32>> {
+    /// 从归一化到 `[-1, 1]` 的 16 kHz 单声道采样提取 LFR + CMVN 特征。
+    ///
+    /// 返回 CPU 上的 `(frames, feature_dim)` F32 张量；是否搬运到计算设备
+    /// 由 `forward_frame_scores*` 根据模型所在设备决定。
+    pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<Tensor> {
         self.inner.extract_features_from_normalized_f32(samples)
     }
 }
@@ -316,9 +319,10 @@ impl FsmnVadModel {
         Ok(FsmnVadDetection { segments, timing })
     }
 
+    /// 直接在已提取的 `(frames, feature_dim)` 特征上跑前向并返回逐帧分数。
     pub fn forward_frame_scores_from_features(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         num_threads: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let mut caches = self.weights.zero_caches()?;
@@ -340,7 +344,7 @@ impl FsmnVadModel {
             .extract_features_from_normalized_f32(&waveform.samples)?;
         timing.frontend_seconds += frontend_start.elapsed().as_secs_f64();
 
-        let total_frames = feats.shape()[0];
+        let total_frames = feats.dim(0)?;
         if total_frames == 0 {
             return Ok(FsmnVadDetection {
                 segments: Vec::new(),
@@ -358,9 +362,8 @@ impl FsmnVadModel {
         while frame_offset < total_frames {
             let step = FSMN_VAD_FEAT_CHUNK_SIZE.min(total_frames - frame_offset);
             let is_final = frame_offset + step >= total_frames;
-            let feat_chunk = feats
-                .slice(s![frame_offset..frame_offset + step, ..])
-                .to_owned();
+            // 前向只读取 `feats`，这里切出连续视图即可，无需拷贝整块特征。
+            let feat_chunk = feats.narrow(0, frame_offset, step)?.contiguous()?;
             let frame_scores = self.weights.forward_frame_scores_with_timing(
                 &feat_chunk,
                 &mut caches,
@@ -733,7 +736,7 @@ impl FsmnVadWeights {
 
     fn forward_frame_scores(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         caches: &mut [Tensor],
         num_threads: usize,
     ) -> Result<Vec<Vec<f32>>> {
@@ -743,13 +746,12 @@ impl FsmnVadWeights {
 
     fn forward_frame_scores_with_timing(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         caches: &mut [Tensor],
         num_threads: usize,
         timing: &mut FsmnVadForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
-        let t = feats.shape()[0];
-        let d = feats.shape()[1];
+        let (t, d) = feats.dims2()?;
         if d != 400 {
             bail!("FSMN VAD expects feature dim 400, got {d}");
         }
@@ -762,11 +764,8 @@ impl FsmnVadWeights {
             return cpu.forward_frame_scores(feats, caches, num_threads, timing);
         }
 
-        let speech = Tensor::from_vec(
-            feats.iter().copied().collect::<Vec<f32>>(),
-            (1usize, t, d),
-            &self.device,
-        )?;
+        // 前端特征固定在 CPU，这里先补上 batch 维再搬到模型所在设备。
+        let speech = feats.unsqueeze(0)?.contiguous()?.to_device(&self.device)?;
 
         let mut x = self.in_linear1.forward(&speech)?;
         x = self.in_linear2.forward(&x)?.relu()?;
@@ -839,12 +838,12 @@ impl FsmnCpuWeights {
 
     fn forward_frame_scores(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         caches: &mut [Tensor],
         num_threads: usize,
         timing: &mut FsmnVadForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
-        let frames = feats.shape()[0];
+        let frames = feats.dim(0)?;
         let mut cpu_caches = tensor_caches_to_cpu(caches)?;
         let scores = run_with_vad_threads(num_threads, || {
             self.forward_frame_scores_cpu(feats, &mut cpu_caches, timing)
@@ -867,16 +866,15 @@ impl FsmnCpuWeights {
 
     fn forward_frame_scores_cpu(
         &self,
-        feats: &Array2<f32>,
+        feats: &Tensor,
         caches: &mut [Vec<f32>],
         timing: &mut FsmnVadForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
-        let frames = feats.shape()[0];
-        let feats = feats
-            .as_slice()
-            .ok_or_else(|| anyhow::anyhow!("FSMN features must be contiguous"))?;
+        let frames = feats.dim(0)?;
+        // CPU 快速路径（gemm）要求行主序连续数据，`flatten_all` 会按需物化拷贝。
+        let feats = feats.flatten_all()?.to_vec1::<f32>()?;
         let start = Instant::now();
-        let mut x = self.in_linear1.forward(feats, frames, false);
+        let mut x = self.in_linear1.forward(&feats, frames, false);
         timing.in_linear1_seconds += start.elapsed().as_secs_f64();
 
         let start = Instant::now();
@@ -1646,8 +1644,8 @@ impl Default for WavFrontendConfig {
 #[derive(Debug, Clone)]
 struct WavFrontend {
     config: WavFrontendConfig,
-    cmvn_means: Option<Array1<f32>>,
-    cmvn_vars: Option<Array1<f32>>,
+    cmvn_means: Option<Vec<f32>>,
+    cmvn_vars: Option<Vec<f32>>,
 }
 
 impl WavFrontend {
@@ -1665,7 +1663,8 @@ impl WavFrontend {
         })
     }
 
-    fn load_cmvn(path: &Path) -> Result<(Array1<f32>, Array1<f32>)> {
+    /// 解析 Kaldi `am.mvn`，返回 `(AddShift, Rescale)` 两个等长向量。
+    fn load_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read CMVN file {}", path.display()))?;
         let means = extract_cmvn_vector(&text, "<AddShift>")
@@ -1680,34 +1679,37 @@ impl WavFrontend {
                 vars.len()
             );
         }
-        Ok((Array1::from_vec(means), Array1::from_vec(vars)))
+        Ok((means, vars))
     }
 
-    fn extract_features(&self, waveform: &[i16]) -> Result<Array2<f32>> {
+    fn extract_features(&self, waveform: &[i16]) -> Result<Tensor> {
         self.extract_features_from_pcm(waveform)
     }
 
-    fn extract_features_from_pcm(&self, samples: &[i16]) -> Result<Array2<f32>> {
+    fn extract_features_from_pcm(&self, samples: &[i16]) -> Result<Tensor> {
         let waveform = samples
             .iter()
             .map(|&sample| f32::from(sample))
             .collect::<Vec<_>>();
         let fbank = self.compute_fbank_features(&waveform)?;
         let lfr = self.apply_lfr(&fbank)?;
-        Ok(self.apply_cmvn(&lfr))
+        self.apply_cmvn(&lfr)
     }
 
-    fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<Array2<f32>> {
+    fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<Tensor> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
             .collect::<Vec<_>>();
         let fbank = self.compute_fbank_features(&waveform)?;
         let lfr = self.apply_lfr(&fbank)?;
-        Ok(self.apply_cmvn(&lfr))
+        self.apply_cmvn(&lfr)
     }
 
-    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<Array2<f32>> {
+    /// 用 Kaldi fbank（C 实现）计算对数梅尔谱。
+    ///
+    /// 结果固定在 CPU 上，形状为 `(frames, n_mels)`。
+    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<Tensor> {
         let opt = FbankOptions {
             frame_opts: FrameExtractionOptions {
                 samp_freq: self.config.sample_rate as f32,
@@ -1736,74 +1738,76 @@ impl WavFrontend {
                 .ok_or_else(|| anyhow::anyhow!("missing fbank frame {i}"))?;
             out.extend_from_slice(frame);
         }
-        Ok(Array2::from_shape_vec(
-            (frames as usize, self.config.n_mels),
+        Ok(Tensor::from_vec(
             out,
+            (frames as usize, self.config.n_mels),
+            &Device::Cpu,
         )?)
     }
 
     /// 按 LFR-m/LFR-n 把 fbank 特征拼接成 LFR 特征。
     ///
+    /// 与 Kaldi `apply-lfr` 行为一致：先在左侧复制 `(lfr_m - 1) / 2` 行第 0 帧填充，
+    /// 再按步长 `lfr_n` 连续取 `lfr_m` 行展平拼接；末尾不足 `lfr_m` 行时重复
+    /// 最后一帧补齐，因此输出宽度恒为 `n_mels * lfr_m`。
+    ///
+    /// 输入为 `(frames, n_mels)`，输出为 `(frames_lfr, n_mels * lfr_m)`，均在 CPU 上。
+    /// 输入先用 `flatten_all` 取成连续切片，填充与窗口展开一次写入 `Vec` 后构造张量，
+    /// 避免逐窗张量算子带来的开销。
+    ///
     /// # Errors
     ///
-    /// 帧切片无法展平成一维视图时返回错误。
-    fn apply_lfr(&self, fbank: &Array2<f32>) -> Result<Array2<f32>> {
-        let t = fbank.shape()[0];
+    /// 输入不是二维张量或张量运算失败时返回错误。
+    fn apply_lfr(&self, fbank: &Tensor) -> Result<Tensor> {
+        let (t, n_mels) = fbank.dims2()?;
+        let lfr_m = self.config.lfr_m;
+        let feat_dim = n_mels * lfr_m;
         if t == 0 {
-            return Ok(Array2::zeros((0, self.config.n_mels * self.config.lfr_m)));
+            return Ok(Tensor::zeros((0, feat_dim), DType::F32, &Device::Cpu)?);
         }
-        let t_lfr = (t as f32 / self.config.lfr_n as f32).ceil() as usize;
-        let left_padding_rows = (self.config.lfr_m - 1) / 2;
-        let mut padded = Array2::zeros((t + left_padding_rows, fbank.shape()[1]));
-        for i in 0..left_padding_rows {
-            padded.slice_mut(s![i, ..]).assign(&fbank.slice(s![0, ..]));
+        let t_lfr = t.div_ceil(self.config.lfr_n);
+        let left_padding_rows = (lfr_m - 1) / 2;
+
+        // 左侧填充第 0 帧；尾部额外重复最后一帧 `lfr_m - 1` 次，
+        // 这样每个窗口都能取满 `lfr_m` 行，末尾补帧分支即可省去。
+        let features = fbank.flatten_all()?.to_vec1::<f32>()?;
+        let mut padded = Vec::with_capacity((t + left_padding_rows + lfr_m - 1) * n_mels);
+        for _ in 0..left_padding_rows {
+            padded.extend_from_slice(&features[..n_mels]);
         }
-        for i in 0..t {
-            padded
-                .slice_mut(s![i + left_padding_rows, ..])
-                .assign(&fbank.slice(s![i, ..]));
+        padded.extend_from_slice(&features);
+        let last_row = &features[(t - 1) * n_mels..];
+        for _ in 1..lfr_m {
+            padded.extend_from_slice(last_row);
         }
 
-        let feat_dim = self.config.n_mels * self.config.lfr_m;
-        let mut lfr = Array2::zeros((t_lfr, feat_dim));
+        let mut out = Vec::with_capacity(t_lfr * feat_dim);
         for i in 0..t_lfr {
-            let start = i * self.config.lfr_n;
-            let end = (start + self.config.lfr_m).min(t + left_padding_rows);
-            let frame = padded.slice(s![start..end, ..]);
-            let flat = frame
-                .into_shape_with_order(frame.len())
-                .map_err(|error| anyhow::anyhow!("failed to flatten LFR frame: {error}"))?;
-            lfr.slice_mut(s![i, ..flat.len()]).assign(&flat);
-            if end < start + self.config.lfr_m {
-                let last_row = padded.slice(s![padded.shape()[0] - 1, ..]);
-                for j in end - start..self.config.lfr_m {
-                    lfr.slice_mut(s![i, j * self.config.n_mels..(j + 1) * self.config.n_mels])
-                        .assign(&last_row);
-                }
-            }
+            let start = i * self.config.lfr_n * n_mels;
+            out.extend_from_slice(&padded[start..start + feat_dim]);
         }
-        Ok(lfr)
+        Ok(Tensor::from_vec(out, (t_lfr, feat_dim), &Device::Cpu)?)
     }
 
-    /// 应用 CMVN 归一化。
+    /// 应用 CMVN 归一化：`(feats + means) * vars`，沿帧维广播。
     ///
-    /// `cmvn_means` / `cmvn_vars` 缺失或维度不匹配时原样返回，因此下面的
-    /// broadcast 分支实际不可达，用 `let ... else` 兜底即可。
-    fn apply_cmvn(&self, feats: &Array2<f32>) -> Array2<f32> {
+    /// `cmvn_means` / `cmvn_vars` 缺失或维度不匹配时原样返回输入，与旧实现保持一致。
+    ///
+    /// # Errors
+    ///
+    /// 输入不是二维张量或广播失败时返回错误。
+    fn apply_cmvn(&self, feats: &Tensor) -> Result<Tensor> {
         let (Some(means), Some(vars)) = (&self.cmvn_means, &self.cmvn_vars) else {
-            return feats.to_owned();
+            return Ok(feats.clone());
         };
-        let (frames, dim) = feats.dim();
+        let dim = feats.dim(1)?;
         if means.len() != dim || vars.len() != dim {
-            return feats.to_owned();
+            return Ok(feats.clone());
         }
-        let Some(means) = means.broadcast((frames, dim)) else {
-            return feats.to_owned();
-        };
-        let Some(vars) = vars.broadcast((frames, dim)) else {
-            return feats.to_owned();
-        };
-        (feats + &means) * vars
+        let device = feats.device();
+        let means = Tensor::from_vec(means.clone(), (1, dim), device)?;
+        let vars = Tensor::from_vec(vars.clone(), (1, dim), device)?;
+        Ok(feats.broadcast_add(&means)?.broadcast_mul(&vars)?)
     }
 }
 
@@ -2469,6 +2473,124 @@ mod tests {
         assert_eq!(means.to_vec(), vec![-1.5, -2.5]);
         assert_eq!(vars.to_vec(), vec![0.25, 0.5]);
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// LFR 的朴素参考实现（纯索引，不依赖 Tensor），用于校验 `WavFrontend::apply_lfr`。
+    ///
+    /// 语义与 Kaldi `apply-lfr` 一致：左侧复制第 0 帧填充 `(lfr_m - 1) / 2` 行，
+    /// 按步长 `lfr_n` 取 `lfr_m` 行展平拼接，末尾不足时重复最后一帧补齐。
+    fn reference_lfr(
+        fbank: &[f32],
+        frames: usize,
+        n_mels: usize,
+        lfr_m: usize,
+        lfr_n: usize,
+    ) -> Vec<f32> {
+        if frames == 0 {
+            return Vec::new();
+        }
+        let left = (lfr_m - 1) / 2;
+        let padded_frames = frames + left;
+        let mut padded = Vec::with_capacity(padded_frames * n_mels);
+        for _ in 0..left {
+            padded.extend_from_slice(&fbank[..n_mels]);
+        }
+        padded.extend_from_slice(fbank);
+
+        let mut out = Vec::with_capacity(frames.div_ceil(lfr_n) * n_mels * lfr_m);
+        for i in 0..frames.div_ceil(lfr_n) {
+            let start = i * lfr_n;
+            let end = (start + lfr_m).min(padded_frames);
+            out.extend_from_slice(&padded[start * n_mels..end * n_mels]);
+            for _ in end..start + lfr_m {
+                out.extend_from_slice(&padded[(padded_frames - 1) * n_mels..]);
+            }
+        }
+        out
+    }
+
+    /// 覆盖 LFR 的三种分支：`lfr_n > 1` 的正常窗口、尾部补帧、以及空输入。
+    #[test]
+    fn lfr_matches_naive_reference() -> Result<()> {
+        let n_mels = 4usize;
+        for (frames, lfr_m, lfr_n) in [(11usize, 5usize, 1usize), (4, 5, 2), (1, 5, 2), (0, 5, 2)] {
+            let fbank: Vec<f32> = (0..frames * n_mels).map(|i| i as f32 * 0.25).collect();
+            let frontend = WavFrontend::new(WavFrontendConfig {
+                n_mels,
+                lfr_m,
+                lfr_n,
+                cmvn_file: None,
+                ..Default::default()
+            })?;
+
+            let input = Tensor::from_vec(fbank.clone(), (frames, n_mels), &Device::Cpu)?;
+            let lfr = frontend.apply_lfr(&input)?;
+
+            let expected = reference_lfr(&fbank, frames, n_mels, lfr_m, lfr_n);
+            assert_eq!(lfr.dims(), [frames.div_ceil(lfr_n), n_mels * lfr_m]);
+            assert_eq!(
+                lfr.flatten_all()?.to_vec1::<f32>()?,
+                expected,
+                "LFR mismatch for frames={frames} lfr_m={lfr_m} lfr_n={lfr_n}"
+            );
+        }
+        Ok(())
+    }
+
+    /// 校验 CMVN 的广播加乘，并确认维度不匹配时原样返回输入。
+    #[test]
+    fn cmvn_matches_naive_reference() -> Result<()> {
+        let n_mels = 3usize;
+        let lfr_m = 3usize;
+        let frames = 5usize;
+        let dim = n_mels * lfr_m;
+        let means: Vec<f32> = (0..dim).map(|i| i as f32 - 2.0).collect();
+        let vars: Vec<f32> = (0..dim).map(|i| 0.5 + i as f32 * 0.125).collect();
+
+        let mut frontend = WavFrontend::new(WavFrontendConfig {
+            n_mels,
+            lfr_m,
+            lfr_n: 1,
+            cmvn_file: None,
+            ..Default::default()
+        })?;
+        let feats: Vec<f32> = (0..frames * dim).map(|i| i as f32 * 0.5).collect();
+        let input = Tensor::from_vec(feats.clone(), (frames, dim), &Device::Cpu)?;
+
+        // 未配置 CMVN 时应原样通过。
+        assert_eq!(
+            frontend
+                .apply_cmvn(&input)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            feats
+        );
+
+        frontend.cmvn_means = Some(means.clone());
+        frontend.cmvn_vars = Some(vars.clone());
+        let expected: Vec<f32> = feats
+            .iter()
+            .enumerate()
+            .map(|(i, value)| (value + means[i % dim]) * vars[i % dim])
+            .collect();
+        assert_eq!(
+            frontend
+                .apply_cmvn(&input)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            expected
+        );
+
+        // 维度不匹配时同样原样返回，与旧实现保持一致。
+        frontend.cmvn_means = Some(vec![0.0; dim + 1]);
+        assert_eq!(
+            frontend
+                .apply_cmvn(&input)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            feats
+        );
         Ok(())
     }
 
