@@ -27,7 +27,6 @@ bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"
 rayon = "1"
 kaldi-fbank-rust-kautism = "0.1.0"
-ndarray = "0.17"
 
 accelerate-src = { version = "0.3.2", optional = true }
 bindgen_cuda = { version = "0.1.5", optional = true }

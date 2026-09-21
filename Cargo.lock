@@ -4788,7 +4788,6 @@ dependencies = [
  "lindera",
  "lindera-ipadic",
  "modelhub",
- "ndarray",
  "rayon",
  "reqwest 0.13.4",
  "rustfft",
