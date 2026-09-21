@@ -332,9 +332,11 @@ fn load_pcm16_wav(path: &Path) -> Result<Waveform> {
     }
 
     let samples = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
-            let pcm = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let pcm = i16::from_le_bytes(*chunk);
             f32::from(pcm) / f32::from(i16::MAX)
         })
         .collect();

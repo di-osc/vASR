@@ -31,7 +31,7 @@ struct DecodeStepDistribution {
 fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistribution {
     let mut steps = Vec::new();
     for (&step, &count) in counts {
-        steps.extend(std::iter::repeat(step).take(count));
+        steps.extend(std::iter::repeat_n(step, count));
     }
     if steps.is_empty() {
         return DecodeStepDistribution::default();
@@ -152,7 +152,8 @@ pub struct GenerationTimings {
 #[derive(Debug, Clone, Default)]
 pub struct GenerationTimings;
 
-#[cfg(feature = "timing")]
+/// 是否在 argmax 前同步设备（仅 paged 解码路径使用，由环境变量控制）。
+#[cfg(all(feature = "timing", feature = "paged-attn"))]
 fn timing_sync_before_argmax_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -498,8 +499,7 @@ pub fn greedy_generate_cached(
         };
         next_id = {
             let step_logits = logits_new.i((0usize, 0usize))?;
-            let next = argmax_token_id(&step_logits)?;
-            next
+            argmax_token_id(&step_logits)?
         };
     }
 
@@ -535,6 +535,7 @@ pub fn greedy_generate_cached_batch(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 pub fn greedy_generate_cached_batch_with_paged_runtime(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -586,6 +587,7 @@ pub fn greedy_generate_cached_batch_timed(
 }
 
 #[cfg(all(feature = "timing", feature = "paged-attn"))]
+#[allow(clippy::too_many_arguments)]
 pub fn greedy_generate_cached_batch_timed_with_paged_runtime(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -1083,6 +1085,7 @@ fn greedy_generate_cached_batch_impl(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 fn greedy_generate_paged(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -1329,11 +1332,15 @@ pub(crate) fn count_audio_placeholders_batch(
     Ok(total)
 }
 
+/// 归一化后的 paged prefill 批数据：填充后的输入 id、填充后的 mask、以及各行的真实长度。
+#[cfg(feature = "paged-attn")]
+type NormalizedPagedPrefill = (Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<usize>);
+
 #[cfg(feature = "paged-attn")]
 pub(crate) fn normalize_batch_for_paged_prefill(
     input_ids: &[&[u32]],
     attention_mask: &[&[u32]],
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<usize>)> {
+) -> Result<NormalizedPagedPrefill> {
     let batch = input_ids.len();
     if batch != attention_mask.len() {
         bail!(

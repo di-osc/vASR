@@ -161,6 +161,7 @@ pub(super) fn record_request_encode_stages(
 
 #[cfg(feature = "paged-attn")]
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn record_request_decode_stage(
     pending_requests: &Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     request_id: PipelineRequestId,

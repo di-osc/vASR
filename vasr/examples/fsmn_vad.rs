@@ -53,9 +53,9 @@ fn main() -> Result<()> {
     for (idx, segment) in detection.segments.iter().enumerate() {
         println!(
             "{idx:03} start_ms={} end_ms={} duration_ms={}",
-            segment.range.start.0,
-            segment.range.end.0,
-            segment.range.duration().0,
+            segment.range.start_ms,
+            segment.range.end_ms,
+            segment.range.duration(),
         );
     }
 
@@ -149,9 +149,11 @@ fn load_pcm16_wav(path: &Path) -> Result<Waveform> {
     }
 
     let samples = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
-            let pcm = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let pcm = i16::from_le_bytes(*chunk);
             f32::from(pcm) / f32::from(i16::MAX)
         })
         .collect();

@@ -127,10 +127,10 @@ impl CpuF64DenseExtractor {
         let mut max_log = f32::NEG_INFINITY;
         for frame_idx in 0..frames {
             let start = frame_idx * self.cfg.hop_length;
-            for i in 0..self.cfg.n_fft {
+            for (i, slot) in buf.iter_mut().enumerate() {
                 let idx = start as isize + i as isize - (self.cfg.n_fft / 2) as isize;
                 let src = reflect_index(idx, source_len);
-                buf[i] = Complex::new(sample_at(src) * self.window[i], 0.0);
+                *slot = Complex::new(sample_at(src) * self.window[i], 0.0);
             }
             self.fft.process(&mut buf);
             for k in 0..n_freq {
@@ -225,10 +225,10 @@ impl CpuF32Extractor {
         let mut max_log = f32::NEG_INFINITY;
         for frame_idx in 0..frames {
             let start = frame_idx * self.cfg.hop_length;
-            for i in 0..self.cfg.n_fft {
+            for (i, slot) in buf.iter_mut().enumerate() {
                 let idx = start as isize + i as isize - (self.cfg.n_fft / 2) as isize;
                 let src = reflect_index(idx, source_len);
-                buf[i] = Complex::new(sample_at(src) * self.window[i], 0.0);
+                *slot = Complex::new(sample_at(src) * self.window[i], 0.0);
             }
             self.fft.process(&mut buf);
             for k in 0..n_freq {
@@ -324,10 +324,10 @@ impl CpuF32SparseExtractor {
         let mut max_log = f32::NEG_INFINITY;
         for frame_idx in 0..frames {
             let start = frame_idx * self.cfg.hop_length;
-            for i in 0..self.cfg.n_fft {
+            for (i, slot) in buf.iter_mut().enumerate() {
                 let idx = start as isize + i as isize - (self.cfg.n_fft / 2) as isize;
                 let src = reflect_index(idx, source_len);
-                buf[i] = Complex::new(sample_at(src) * self.window[i], 0.0);
+                *slot = Complex::new(sample_at(src) * self.window[i], 0.0);
             }
             self.fft.process(&mut buf);
             for k in 0..n_freq {

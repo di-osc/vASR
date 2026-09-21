@@ -517,6 +517,48 @@ fn gather_hidden_states_at_flat_indices(
     Ok(flat_hidden.index_select(&idx, 0)?)
 }
 
+#[cfg(feature = "paged-attn")]
+impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration {
+    fn forward_input_ids_with_paged_cache(
+        &self,
+        input_ids: &Tensor,
+        position_ids: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+    ) -> Result<Tensor> {
+        ThinkerForConditionalGeneration::forward_input_ids_with_paged_cache(
+            self,
+            input_ids,
+            position_ids,
+            paged_cache,
+            input_metadata,
+        )
+    }
+
+    fn forward_chunked_next_ids_with_paged_cache(
+        &self,
+        input_ids: &Tensor,
+        position_ids: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+        chunk_size: usize,
+    ) -> Result<Option<Tensor>> {
+        if !self.lm_head.supports_chunked_argmax_next_ids() {
+            return Ok(None);
+        }
+        let inputs_embeds = self.embed_tokens(input_ids)?;
+        let hidden_states = self.text_model.forward_with_paged_cache(
+            position_ids,
+            &inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        Ok(self
+            .lm_head
+            .forward_chunked_argmax_next_ids(&hidden_states, chunk_size)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{get_rope_index, merge_audio_features};
@@ -772,47 +814,5 @@ mod tests {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "paged-attn")]
-impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration {
-    fn forward_input_ids_with_paged_cache(
-        &self,
-        input_ids: &Tensor,
-        position_ids: &Tensor,
-        paged_cache: &PagedKvCache,
-        input_metadata: &PagedInputMetadata,
-    ) -> Result<Tensor> {
-        ThinkerForConditionalGeneration::forward_input_ids_with_paged_cache(
-            self,
-            input_ids,
-            position_ids,
-            paged_cache,
-            input_metadata,
-        )
-    }
-
-    fn forward_chunked_next_ids_with_paged_cache(
-        &self,
-        input_ids: &Tensor,
-        position_ids: &Tensor,
-        paged_cache: &PagedKvCache,
-        input_metadata: &PagedInputMetadata,
-        chunk_size: usize,
-    ) -> Result<Option<Tensor>> {
-        if !self.lm_head.supports_chunked_argmax_next_ids() {
-            return Ok(None);
-        }
-        let inputs_embeds = self.embed_tokens(input_ids)?;
-        let hidden_states = self.text_model.forward_with_paged_cache(
-            position_ids,
-            &inputs_embeds,
-            paged_cache,
-            input_metadata,
-        )?;
-        Ok(self
-            .lm_head
-            .forward_chunked_argmax_next_ids(&hidden_states, chunk_size)?)
     }
 }

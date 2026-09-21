@@ -118,9 +118,7 @@ pub(super) fn spawn_segment_prefill_worker(
             let Some(first) = first else {
                 break;
             };
-            let first = match first {
-                SegmentEncoderOutput::Encoded(message) => message,
-            };
+            let SegmentEncoderOutput::Encoded(first) = first;
             let SegmentEncodedMessage {
                 mut segments,
                 stage_start,
@@ -268,27 +266,24 @@ fn run_segment_asr_prefill_dynamic_worker(
             if decode_idle_flush.is_some() && !may_block {
                 return Ok(PreparedAudioBatchPoll::Empty);
             }
-            loop {
-                if source_closed {
-                    return Ok(PreparedAudioBatchPoll::Closed);
-                }
-                let message = if may_block {
-                    recv_segment_encoded_message_blocking(
-                        &encoded_rx,
-                        &runtime_handle,
-                        decode_idle_flush,
-                        &mut source_closed,
-                    )
-                } else {
-                    try_recv_segment_encoded_message(
-                        &encoded_rx,
-                        &runtime_handle,
-                        &mut source_closed,
-                    )
-                };
-                let Some(message) = message else {
-                    return Ok(PreparedAudioBatchPoll::Empty);
-                };
+            // 单次轮询即可得出结果，因此无需循环重试。
+            if source_closed {
+                return Ok(PreparedAudioBatchPoll::Closed);
+            }
+            let message = if may_block {
+                recv_segment_encoded_message_blocking(
+                    &encoded_rx,
+                    &runtime_handle,
+                    decode_idle_flush,
+                    &mut source_closed,
+                )
+            } else {
+                try_recv_segment_encoded_message(&encoded_rx, &runtime_handle, &mut source_closed)
+            };
+            let Some(message) = message else {
+                return Ok(PreparedAudioBatchPoll::Empty);
+            };
+            Ok(
                 match prepare_coalesced_segment_prefill_batch(
                     qwen3,
                     message,
@@ -299,12 +294,12 @@ fn run_segment_asr_prefill_dynamic_worker(
                     &prefill_log_segments,
                 )? {
                     PrefillCoalescedPoll::Ready(coalesced) => {
-                        return Ok(PreparedAudioBatchPoll::Ready(coalesced.prepared));
+                        PreparedAudioBatchPoll::Ready(coalesced.prepared)
                     }
-                    PrefillCoalescedPoll::Empty => return Ok(PreparedAudioBatchPoll::Empty),
-                    PrefillCoalescedPoll::Closed => return Ok(PreparedAudioBatchPoll::Closed),
-                }
-            }
+                    PrefillCoalescedPoll::Empty => PreparedAudioBatchPoll::Empty,
+                    PrefillCoalescedPoll::Closed => PreparedAudioBatchPoll::Closed,
+                },
+            )
         };
         let mut producer = qwen3.dynamic_prefill_producer(
             initial_prepared,

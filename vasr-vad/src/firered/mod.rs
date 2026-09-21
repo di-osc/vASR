@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{AudioChunk, DurationMs, TimeRange, Waveform};
+use asr_data::{AudioChunk, TimeRange, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::sigmoid};
 use gemm::Parallelism;
@@ -222,19 +222,19 @@ struct FireRedStreamForwardState {
 
 impl StreamingVadSession for FireRedStreamingVadSession {
     fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<VadEvent>> {
-        if chunk.waveform.sample_rate != FIRERED_SAMPLE_RATE {
+        if chunk.sample_rate != FIRERED_SAMPLE_RATE {
             bail!(
                 "FireRed Stream-VAD expects 16kHz mono audio, got sample_rate={}",
-                chunk.waveform.sample_rate
+                chunk.sample_rate
             );
         }
-        if chunk.waveform.channels != 1 {
+        if chunk.channels != 1 {
             bail!(
                 "FireRed Stream-VAD expects mono audio, got channels={}",
-                chunk.waveform.channels
+                chunk.channels
             );
         }
-        self.samples.extend_from_slice(&chunk.waveform.samples);
+        self.samples.extend_from_slice(&chunk.samples);
         self.process_available_frames()
     }
 
@@ -244,7 +244,7 @@ impl StreamingVadSession for FireRedStreamingVadSession {
             let end_ms = samples_to_ms(self.samples.len());
             let start_ms = frame_to_ms(start_frame).min(end_ms);
             events.push(VadEvent {
-                range: TimeRange::new(DurationMs(start_ms), DurationMs(end_ms)),
+                range: TimeRange::new(start_ms, end_ms),
                 status: VadEventStatus::Final,
             });
         }
@@ -276,20 +276,14 @@ impl FireRedStreamBoundary {
     fn into_event(self) -> VadEvent {
         match self {
             Self::Start { start_frame, frame } => VadEvent {
-                range: TimeRange::new(
-                    DurationMs(frame_to_ms(start_frame)),
-                    DurationMs(frame_to_ms(frame)),
-                ),
+                range: TimeRange::new(frame_to_ms(start_frame), frame_to_ms(frame)),
                 status: VadEventStatus::Partial,
             },
             Self::End {
                 start_frame,
                 end_frame,
             } => VadEvent {
-                range: TimeRange::new(
-                    DurationMs(frame_to_ms(start_frame)),
-                    DurationMs(frame_to_ms(end_frame)),
-                ),
+                range: TimeRange::new(frame_to_ms(start_frame), frame_to_ms(end_frame)),
                 status: VadEventStatus::Final,
             },
         }
@@ -702,8 +696,11 @@ impl FireRedCpuFsmn {
         })
     }
 
-    fn apply(&self, input: &mut Vec<f32>, frames: usize) {
-        let src = input.clone();
+    /// 对 `input` 就地做 FSMN lookback / lookahead 卷积。
+    ///
+    /// 参数取切片而非 `&mut Vec`，避免调用方为借用检查额外构造容器。
+    fn apply(&self, input: &mut [f32], frames: usize) {
+        let src = input.to_vec();
         input
             .par_chunks_mut(FIRERED_PROJ_DIM)
             .enumerate()
@@ -1141,13 +1138,12 @@ impl FireRedVadPostprocessor {
         for t in 1..decisions.len() {
             if decisions[t - 1] == 1 && decisions[t] == 0 && silence_start.is_none() {
                 silence_start = Some(t);
-            } else if decisions[t - 1] == 0 && decisions[t] == 1 {
-                if let Some(start) = silence_start.take() {
-                    let silence_frames = t - start;
-                    if silence_frames < self.merge_silence_frame {
-                        out[start..t].fill(1);
-                    }
-                }
+            } else if decisions[t - 1] == 0
+                && decisions[t] == 1
+                && let Some(start) = silence_start.take()
+                && t - start < self.merge_silence_frame
+            {
+                out[start..t].fill(1);
             }
         }
         out
@@ -1194,11 +1190,9 @@ impl FireRedVadPostprocessor {
         end: usize,
     ) {
         let end = end.min(probs.len()).min(decisions.len());
-        if start < end {
-            if end.saturating_sub(start) > self.max_speech_frame {
-                for split in self.find_split_points(&probs[start..end]) {
-                    decisions[start + split] = 0;
-                }
+        if start < end && end.saturating_sub(start) > self.max_speech_frame {
+            for split in self.find_split_points(&probs[start..end]) {
+                decisions[start + split] = 0;
             }
         }
     }
@@ -1226,12 +1220,12 @@ impl FireRedVadPostprocessor {
             .into_iter()
             .map(|(start, end)| VadSegment {
                 range: TimeRange::new(
-                    DurationMs((start * 1000.0).round() as u64),
-                    DurationMs((end * 1000.0).round() as u64),
+                    (start * 1000.0).round() as usize,
+                    (end * 1000.0).round() as usize,
                 ),
                 probability: self.prob_threshold,
             })
-            .filter(|segment| segment.range.duration().0 >= self.min_speech_ms)
+            .filter(|segment| segment.range.duration() >= self.min_speech_ms as usize)
             .collect()
     }
 
@@ -1241,8 +1235,9 @@ impl FireRedVadPostprocessor {
         for (t, decision) in decisions.iter().copied().enumerate() {
             if decision == 1 && speech_start.is_none() {
                 speech_start = Some(t);
-            } else if decision == 0 && speech_start.is_some() {
-                let start = speech_start.take().unwrap();
+            } else if decision == 0
+                && let Some(start) = speech_start.take()
+            {
                 segments.push((start as f64 * 0.010, t as f64 * 0.010));
             }
         }
@@ -1265,14 +1260,14 @@ fn ms_to_frame_count_allow_zero(ms: u64) -> usize {
     ms.div_ceil(FIRERED_FRAME_SHIFT_MS) as usize
 }
 
-fn frame_to_ms(frame: usize) -> u64 {
+fn frame_to_ms(frame: usize) -> usize {
     frame
         .saturating_sub(1)
-        .saturating_mul(FIRERED_FRAME_SHIFT_MS as usize) as u64
+        .saturating_mul(FIRERED_FRAME_SHIFT_MS as usize)
 }
 
-fn samples_to_ms(samples: usize) -> u64 {
-    (samples as u64).saturating_mul(1000) / u64::from(FIRERED_SAMPLE_RATE)
+fn samples_to_ms(samples: usize) -> usize {
+    samples.saturating_mul(1000) / FIRERED_SAMPLE_RATE as usize
 }
 
 fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -1294,9 +1289,10 @@ fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     if bytes.len() < offset + need {
         bail!("truncated FireRed CMVN matrix: {}", path.display());
     }
+    let (chunks, _remainder) = bytes[offset..offset + need].as_chunks::<8>();
     let mut values = Vec::with_capacity(rows * cols);
-    for chunk in bytes[offset..offset + need].chunks_exact(8) {
-        values.push(f64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+    for chunk in chunks {
+        values.push(f64::from_le_bytes(*chunk));
     }
     let count = values[FIRERED_INPUT_DIM].max(1.0);
     let mut means = Vec::with_capacity(FIRERED_INPUT_DIM);
@@ -1315,7 +1311,11 @@ fn read_kaldi_i32(bytes: &[u8], offset: &mut usize) -> Result<i32> {
         bail!("invalid Kaldi binary int marker");
     }
     *offset += 1;
-    let value = i32::from_le_bytes(bytes[*offset..*offset + 4].try_into().expect("4 bytes"));
+    let value = i32::from_le_bytes(
+        bytes[*offset..*offset + 4]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("truncated Kaldi binary int value"))?,
+    );
     *offset += 4;
     Ok(value)
 }
@@ -1370,11 +1370,12 @@ fn default_firered_vad_model_dir(preferred_subdir: &str) -> Result<PathBuf> {
         "FireRedVAD model not found locally, downloading {} from ModelScope",
         FIRERED_VAD_REPO
     );
-    block_on_async(modelhub::modelscope::download_model(
+    let downloaded = block_on_async(modelhub::modelscope::download_model(
         FIRERED_VAD_REPO,
         &cache,
-    ))
-    .with_context(|| format!("failed to download FireRedVAD model {FIRERED_VAD_REPO:?}"))?;
+    ))?;
+    downloaded
+        .with_context(|| format!("failed to download FireRedVAD model {FIRERED_VAD_REPO:?}"))?;
     let target = modelscope_model_snapshot_dir(&cache, FIRERED_VAD_REPO).join(preferred_subdir);
     validate_firered_vad_model_dir(&target)?;
     Ok(target)
@@ -1405,18 +1406,23 @@ fn firered_vad_device() -> Result<Device> {
     }
 }
 
-fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
+/// 在独立线程上用一次性 tokio runtime 阻塞执行 `future`。
+///
+/// 返回值包一层 [`Result`]，让运行时创建失败与线程 panic 都能向上传播，
+/// 避免在库代码里使用 `unwrap` / `expect`。
+fn block_on_async<F: std::future::Future + Send>(future: F) -> Result<F::Output>
 where
     F::Output: Send,
 {
     std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                rt.block_on(future)
-            })
+        let handle = scope.spawn(|| -> Result<F::Output> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+            Ok(runtime.block_on(future))
+        });
+        handle
             .join()
-            .expect("tokio download thread panicked")
+            .map_err(|_| anyhow::anyhow!("tokio download thread panicked"))?
     })
 }
 
@@ -1506,11 +1512,13 @@ mod tests {
 
         let mut stream = VadModel::new_stream(&model, &realtime_options())?;
         let chunk = AudioChunk {
-            stream_id: "firered-smoke".to_string(),
-            waveform: Waveform::new(vec![0.0; 1600], FIRERED_SAMPLE_RATE),
-            is_start: true,
-            is_last: true,
-            range: TimeRange::new(DurationMs(0), DurationMs(100)),
+            samples: vec![0.0; 1600],
+            sample_rate: FIRERED_SAMPLE_RATE,
+            channels: 1,
+            source_format: None,
+            index: 0,
+            offset_ms: 0,
+            is_final: true,
         };
         stream.push_chunk(&chunk)?;
         stream.finish()?;

@@ -6,9 +6,9 @@ use std::sync::{
 use std::time::Instant;
 
 use anyhow::Result;
-use asr_data::AudioLoader;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
+use vasr::AudioLoader;
 
 use super::{
     GlobalLoadJob, LoadedJob, LoadedQueueMemoryBudget, LoaderStageStats, LoaderTaskStats,
@@ -18,6 +18,7 @@ use super::{
     record_request_load_stage,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_global_loader_worker(
     loader: AudioLoader,
     max_in_flight: usize,
@@ -39,7 +40,7 @@ pub(super) fn spawn_global_loader_worker(
                     match job {
                         Some(job) => {
                             let worker_id = free_workers.pop().unwrap_or(0);
-                            spawn_global_loader_task(&mut tasks, loader.clone(), Arc::clone(&next_job_id), job, worker_id);
+                            spawn_global_loader_task(&mut tasks, loader, Arc::clone(&next_job_id), job, worker_id);
                         }
                         None => break,
                     }
@@ -82,16 +83,15 @@ pub(super) fn spawn_loader_worker(
         let mut tasks = JoinSet::new();
         let mut free_workers = (0..max_in_flight).rev().collect::<Vec<_>>();
         for input in inputs {
-            if tasks.len() >= max_in_flight {
-                if let Some(worker_id) =
+            if tasks.len() >= max_in_flight
+                && let Some(worker_id) =
                     send_next_loaded(&mut tasks, &loaded_queue_memory, &loader_to_vad_tx, &stats)
                         .await?
-                {
-                    free_workers.push(worker_id);
-                }
+            {
+                free_workers.push(worker_id);
             }
             let worker_id = free_workers.pop().unwrap_or(tasks.len());
-            spawn_loader_task(&mut tasks, loader.clone(), input, worker_id);
+            spawn_loader_task(&mut tasks, loader, input, worker_id);
         }
         while !tasks.is_empty() {
             if let Some(worker_id) =
@@ -405,13 +405,13 @@ async fn send_global_loaded_result(
         if jobs.len() > 1 {
             let request_item = jobs[0].request_item;
             if let Some(request_item) = request_item {
-                if let Ok(mut pending) = pending_requests.lock() {
-                    if let Some(request) = pending.get_mut(&request_item.request_id) {
-                        request.remaining += jobs.len() - 1;
-                        request
-                            .internal_indices
-                            .extend(jobs.iter().skip(1).map(|job| job.index));
-                    }
+                if let Ok(mut pending) = pending_requests.lock()
+                    && let Some(request) = pending.get_mut(&request_item.request_id)
+                {
+                    request.remaining += jobs.len() - 1;
+                    request
+                        .internal_indices
+                        .extend(jobs.iter().skip(1).map(|job| job.index));
                 }
                 if let Ok(mut routes) = job_routes.lock() {
                     for job in jobs.iter().skip(1) {

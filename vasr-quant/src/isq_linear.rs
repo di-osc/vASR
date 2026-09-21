@@ -309,10 +309,10 @@ impl LinearX {
             return Ok(None);
         }
         #[cfg(feature = "cuda")]
-        if let Self::QLinear(qlinear) = self {
-            if let Some(next_ids) = qlinear.forward_q8_lm_head_next_ids(x, chunk_size)? {
-                return Ok(Some(next_ids));
-            }
+        if let Self::QLinear(qlinear) = self
+            && let Some(next_ids) = qlinear.forward_q8_lm_head_next_ids(x, chunk_size)?
+        {
+            return Ok(Some(next_ids));
         }
         Ok(None)
     }

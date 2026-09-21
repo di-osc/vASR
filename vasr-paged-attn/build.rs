@@ -103,9 +103,7 @@ fn compile_cuda() -> Result<(), String> {
     } else {
         build_dir.join("libvasrpagedattention.a")
     };
-    builder
-        .build_lib(out_file)
-        .expect("Build paged attention lib failed!");
+    builder.build_lib(out_file).map_err(|e| e.to_string())?;
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=vasrpagedattention");

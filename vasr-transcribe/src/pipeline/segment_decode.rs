@@ -9,7 +9,7 @@ use super::{
     prefill_span_from_decode, record_asr_batch_stats, route_outcome,
 };
 use anyhow::{Result, bail};
-use asr_data::{Annotation, Timeline, Waveform};
+use asr_data::{TimeSpan, Timeline, Waveform};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,8 +31,8 @@ pub(super) struct SegmentJobState {
     timing: TranscribeItemTiming,
     spans: TranscribeItemSpans,
     audio_seconds: f64,
-    speech_annotations: Vec<Annotation>,
-    segment_annotations: Vec<Option<Vec<Annotation>>>,
+    speech_annotations: Vec<TimeSpan>,
+    segment_annotations: Vec<Option<Vec<TimeSpan>>>,
     segment_count: usize,
     segments_done: usize,
 }
@@ -46,6 +46,7 @@ pub(super) struct SegmentAsrState {
 type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentPrefillMessage>;
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_segment_decoder_worker(
     asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
@@ -266,7 +267,8 @@ fn run_global_segment_decode_worker(
         #[cfg(feature = "timing")]
         Some(&mut timings.generation),
     );
-    drop(on_tick);
+    // 显式结束 `on_tick` 的可变借用以释放对回调上下文的借用；闭包不实现 `Drop`，用 `let _` 移动即可。
+    let _ = on_tick;
     let _ = forward_thread.join();
     drain_global_decoder_meta(
         &meta_rx,
@@ -303,6 +305,7 @@ fn run_global_segment_decode_worker(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 fn handle_global_decoder_message(
     message: SegmentPrefillMessage,
     decoder: &mut StreamingMetadataDecoder,
@@ -343,7 +346,7 @@ fn handle_global_decoder_message(
                 Some(stats),
             );
             for outcome in outcomes {
-                if asr_to_result_tx.blocking_send(outcome.into()).is_err() {
+                if asr_to_result_tx.blocking_send(outcome).is_err() {
                     bail!("ASR result router closed");
                 }
             }
@@ -353,6 +356,7 @@ fn handle_global_decoder_message(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 fn drain_global_decoder_meta(
     meta_rx: &std_mpsc::Receiver<SegmentPrefillMessage>,
     decoder: &mut StreamingMetadataDecoder,
@@ -381,6 +385,7 @@ fn drain_global_decoder_meta(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 fn drain_completed_chunks(
     qwen3: &Qwen3ASR,
     pending_chunks: &mut BTreeMap<usize, Vec<u32>>,
@@ -415,7 +420,7 @@ fn drain_completed_chunks(
             ids,
         )? {
             for outcome in outcomes {
-                if asr_to_result_tx.blocking_send(outcome.into()).is_err() {
+                if asr_to_result_tx.blocking_send(outcome).is_err() {
                     bail!("ASR result router closed");
                 }
             }
@@ -448,6 +453,7 @@ fn reset_stream_decode_state_if_idle(
 }
 
 #[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
 fn accept_completed_chunk(
     qwen3: &Qwen3ASR,
     decoder: &mut StreamingMetadataDecoder,
@@ -556,10 +562,31 @@ pub(super) fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &
 
 #[cfg(feature = "paged-attn")]
 fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
-    let mut timeline = Timeline::new("offline_audio");
-    timeline.annotations.extend(job.speech_annotations);
+    let duration = (job.audio_seconds * 1000.0).round() as usize;
+    let mut timeline = Timeline::new("offline_audio", duration);
+    if let Err(err) = vasr::extend_predictions(&mut timeline, job.speech_annotations) {
+        return TranscribeItemOutcome {
+            index: job.index,
+            channel: job.channel,
+            result: Err(err),
+            audio_seconds: job.audio_seconds,
+            timing: job.timing,
+            spans: job.spans,
+            bad_component: Some("recognizer"),
+        };
+    }
     for annotations in job.segment_annotations.into_iter().flatten() {
-        timeline.annotations.extend(annotations);
+        if let Err(err) = vasr::extend_predictions(&mut timeline, annotations) {
+            return TranscribeItemOutcome {
+                index: job.index,
+                channel: job.channel,
+                result: Err(err),
+                audio_seconds: job.audio_seconds,
+                timing: job.timing,
+                spans: job.spans,
+                bad_component: Some("recognizer"),
+            };
+        }
     }
     TranscribeItemOutcome {
         index: job.index,
@@ -657,11 +684,11 @@ pub(super) fn finish_segment_asr_batch(
                         job.spans.decode =
                             Some(merge_optional_span(job.spans.decode, Some(asr_span)));
                         job.segment_annotations[segment_index] =
-                            Some(offset_annotations(asr_timeline.annotations, offset));
-                        if job.segments_done >= job.segment_count {
-                            if let Some(job) = state.jobs.remove(&job_index) {
-                                completed.push(routed_segment_job_outcome(job));
-                            }
+                            Some(offset_annotations(asr_timeline.prediction.clone(), offset));
+                        if job.segments_done >= job.segment_count
+                            && let Some(job) = state.jobs.remove(&job_index)
+                        {
+                            completed.push(routed_segment_job_outcome(job));
                         }
                     }
                 }

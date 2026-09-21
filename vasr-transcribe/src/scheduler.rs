@@ -43,8 +43,25 @@ struct QueuedTask {
     run: Box<dyn FnOnce() + Send + 'static>,
 }
 
+/// 获取任务队列锁。
+///
+/// 持锁线程 panic 导致锁中毒时，直接取出内部数据继续工作：
+/// 队列里的任务是自包含的，不会因为中毒而产生脏数据。
+fn lock_queue(
+    queue: &Mutex<BinaryHeap<QueuedTask>>,
+) -> std::sync::MutexGuard<'_, BinaryHeap<QueuedTask>> {
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl InferenceScheduler {
-    pub fn start(label: impl Into<String>) -> Self {
+    /// 启动推理调度器及其后台工作线程。
+    ///
+    /// # Errors
+    ///
+    /// 工作线程创建失败时返回错误。
+    pub fn start(label: impl Into<String>) -> Result<Self> {
         let scheduler = Self {
             inner: Arc::new(SchedulerInner {
                 label: label.into(),
@@ -53,8 +70,8 @@ impl InferenceScheduler {
                 sequence: AtomicU64::new(0),
             }),
         };
-        scheduler.spawn_worker();
-        scheduler
+        scheduler.spawn_worker()?;
+        Ok(scheduler)
     }
 
     pub fn submit_blocking<T, F>(
@@ -79,7 +96,7 @@ impl InferenceScheduler {
         };
 
         {
-            let mut queue = self.inner.queue.lock().expect("inference queue poisoned");
+            let mut queue = lock_queue(&self.inner.queue);
             queue.push(queued);
         }
         self.inner.available.notify_one();
@@ -88,19 +105,25 @@ impl InferenceScheduler {
             .map_err(|_| anyhow!("inference scheduler worker stopped"))?
     }
 
-    fn spawn_worker(&self) {
+    /// 启动后台工作线程消费任务队列。
+    ///
+    /// # Errors
+    ///
+    /// 线程创建失败时返回错误，避免调用方在无人消费的队列上永久阻塞。
+    fn spawn_worker(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         thread::Builder::new()
             .name(format!("{}-inference-worker", inner.label))
             .spawn(move || worker_loop(inner))
-            .expect("failed to spawn inference scheduler worker");
+            .map(|_| ())
+            .map_err(|error| anyhow!("failed to spawn inference scheduler worker: {error}"))
     }
 }
 
 fn worker_loop(inner: Arc<SchedulerInner>) {
     loop {
         let task = {
-            let mut queue = inner.queue.lock().expect("inference queue poisoned");
+            let mut queue = lock_queue(&inner.queue);
             loop {
                 if let Some(task) = queue.pop() {
                     break task;
@@ -108,7 +131,7 @@ fn worker_loop(inner: Arc<SchedulerInner>) {
                 queue = inner
                     .available
                     .wait(queue)
-                    .expect("inference queue poisoned");
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
         let _label = task.label;
@@ -196,7 +219,10 @@ mod tests {
                 _options: &AsrOptions,
             ) -> Result<Vec<Timeline>> {
                 self.batch_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(waveforms.iter().map(|_| Timeline::new("batch")).collect())
+                Ok(waveforms
+                    .iter()
+                    .map(|_| Timeline::new("batch", 0))
+                    .collect())
             }
         }
 
@@ -205,7 +231,7 @@ mod tests {
             Arc::new(BatchOnlyAsr {
                 batch_calls: Arc::clone(&batch_calls),
             }),
-            InferenceScheduler::start("batch-test"),
+            InferenceScheduler::start("batch-test").expect("scheduler"),
         );
         let waveforms = vec![
             Waveform::new(vec![0.0; 16_000], 16_000),

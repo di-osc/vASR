@@ -3,11 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use asr_data::{
-    Annotation, AudioInput, DurationMs, SAMPLE_RATE_HZ, TimeRange, Waveform, normalize_audio_input,
-};
+use asr_data::{TimeRange, Waveform};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
+use vasr::{AudioInput, SAMPLE_RATE_HZ, normalize_audio_input};
 use vasr_vad::{VadModel, VadOptions, VadSegment};
 
 use super::{
@@ -23,8 +22,12 @@ use super::speech_job_to_segments;
 /// Output of the VAD stage, ready for batched ASR.
 #[derive(Debug, Clone)]
 pub(super) struct VadPrepared {
-    pub(super) speech_annotations: Vec<Annotation>,
+    /// 语音活动标注，仅在 `paged-attn` 分段解码路径中消费。
+    #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
+    pub(super) speech_annotations: Vec<asr_data::TimeSpan>,
     pub(super) segments: Vec<VadSegment>,
+    /// 分段音频切片，仅在 `paged-attn` 分段解码路径中消费。
+    #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
     pub(super) slices: Vec<Waveform>,
 }
 
@@ -48,26 +51,21 @@ pub(super) fn prepare_vad_stage(
     let vad_waveform = prepare_waveform_for_vad(waveform)?;
     let segments = pad_vad_segments(
         vad.detect(&vad_waveform, vad_options)?,
-        vad_options.pad_ms,
-        waveform.duration_ms().round() as u64,
+        vad_options.pad_ms as usize,
+        waveform.duration_ms().round() as usize,
     );
     if segments.is_empty() {
         return Ok(VadPreparation::NoSpeech);
     }
     let speech_annotations = segments
         .iter()
-        .map(|segment| {
-            asr_data::Annotation::new(
-                segment.range,
-                asr_data::AnnotationPayload::Speech,
-                asr_data::AnnotationSource::Model("vad".to_string()),
-                asr_data::AnnotationStatus::Final,
-            )
-        })
+        .map(|segment| vasr::activity_span(segment.range, "speech", vasr::VAD_SOURCE))
         .collect();
     let slices = segments
         .iter()
-        .map(|segment| waveform.slice_ms(segment.range.start.0, segment.range.end.0))
+        .map(|segment| {
+            waveform.slice_ms(segment.range.start_ms as u64, segment.range.end_ms as u64)
+        })
         .collect();
     Ok(VadPreparation::Speech(VadPrepared {
         speech_annotations,
@@ -76,36 +74,34 @@ pub(super) fn prepare_vad_stage(
     }))
 }
 
-fn pad_vad_segments(mut segments: Vec<VadSegment>, pad_ms: u64, audio_ms: u64) -> Vec<VadSegment> {
+fn pad_vad_segments(
+    mut segments: Vec<VadSegment>,
+    pad_ms: usize,
+    audio_ms: usize,
+) -> Vec<VadSegment> {
     if pad_ms == 0 {
         return segments;
     }
     for segment in &mut segments {
         segment.range = TimeRange::new(
-            DurationMs(segment.range.start.0.saturating_sub(pad_ms)),
-            DurationMs(segment.range.end.0.saturating_add(pad_ms).min(audio_ms)),
+            segment.range.start_ms.saturating_sub(pad_ms),
+            segment.range.end_ms.saturating_add(pad_ms).min(audio_ms),
         );
     }
     segments
 }
 
+#[cfg(feature = "paged-attn")]
 pub(super) fn offset_annotations(
-    annotations: Vec<Annotation>,
-    offset: DurationMs,
-) -> Vec<Annotation> {
-    annotations
-        .into_iter()
-        .map(|mut annotation| {
-            annotation.range.start.0 = annotation.range.start.0.saturating_add(offset.0);
-            annotation.range.end.0 = annotation.range.end.0.saturating_add(offset.0);
-            annotation
-        })
-        .collect()
+    annotations: Vec<asr_data::TimeSpan>,
+    offset: usize,
+) -> Vec<asr_data::TimeSpan> {
+    vasr::offset_spans(annotations, offset)
 }
 
 fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
     let mono = waveform.to_mono()?;
-    if mono.sample_rate == SAMPLE_RATE_HZ && mono.is_normalized {
+    if mono.sample_rate == SAMPLE_RATE_HZ {
         return Ok(mono);
     }
     let samples = normalize_audio_input(&AudioInput::Waveform {
@@ -115,6 +111,7 @@ fn prepare_waveform_for_vad(waveform: &Waveform) -> Result<Waveform> {
     Ok(Waveform::new(samples, SAMPLE_RATE_HZ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_vad_worker(
     vad: Option<Arc<dyn VadModel>>,
     vad_options: VadOptions,
@@ -133,10 +130,10 @@ pub(super) fn spawn_vad_worker(
         while let Some(message) = loader_to_vad_rx.recv().await {
             match message {
                 Ok(job) => {
-                    if tasks.len() >= max_in_flight {
-                        if let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await {
-                            free_workers.push(worker_id);
-                        }
+                    if tasks.len() >= max_in_flight
+                        && let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await
+                    {
+                        free_workers.push(worker_id);
                     }
                     let worker_id = free_workers.pop().unwrap_or(tasks.len());
                     spawn_vad_task(
@@ -174,6 +171,7 @@ pub(super) fn spawn_vad_worker(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_vad_task(
     tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
     vad: Option<Arc<dyn VadModel>>,
@@ -470,6 +468,11 @@ async fn send_vad_to_asr_timed(
     result
 }
 
+/// 从任务集合取下一个 VAD 任务结果。
+///
+/// `TranscribeItemOutcome` 体积较大，但它是流水线统一的结果载体，
+/// 逐个 Box 会牵动上下游类型，因此这里保留原样并显式放开该 lint。
+#[allow(clippy::result_large_err)]
 async fn send_next_vad_task(
     tasks: &mut JoinSet<Result<VadTaskStats, TranscribeItemOutcome>>,
     stats: &Arc<Mutex<VadStageStats>>,
@@ -512,7 +515,7 @@ mod tests {
                 .unwrap()
                 .push((waveform.sample_rate, waveform.channels));
             Ok(vec![VadSegment {
-                range: TimeRange::new(DurationMs(0), DurationMs(500)),
+                range: TimeRange::new(0, 500),
                 probability: 0.9,
             }])
         }
@@ -559,8 +562,8 @@ mod tests {
         let VadPreparation::Speech(prepared) = prepared else {
             panic!("expected speech");
         };
-        assert_eq!(prepared.segments[0].range.start.0, 0);
-        assert_eq!(prepared.segments[0].range.end.0, 600);
+        assert_eq!(prepared.segments[0].range.start_ms, 0);
+        assert_eq!(prepared.segments[0].range.end_ms, 600);
         assert_eq!(prepared.slices[0].duration_ms(), 600.0);
         Ok(())
     }

@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use crate::device::{auto_dtype, device_label, resolve_device};
 use crate::scheduler::{InferenceScheduler, ScheduledAsrModel};
 use anyhow::{Result, bail};
-use asr_data::AudioLoader;
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::{ArgAction, Args};
 use indicatif::{ProgressBar, ProgressStyle};
+use vasr::AudioLoader;
 use vasr::utils::progress::{Progress, ProgressEvent, ProgressHandle, ProgressSink, ProgressTask};
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 use vasr_vad::{FireRedVadModel, FsmnVadModel, VadModel, VadOptions};
@@ -337,7 +337,7 @@ pub fn build_global_transcribe_pipeline(
         false,
     )?;
     Ok(Arc::new(GlobalAsyncTranscribePipeline::start(
-        asr_data::AudioLoader,
+        AudioLoader,
         build_vad_model(&pipeline.vad)?,
         asr,
         asr_options_from_pipeline(pipeline, language),
@@ -403,122 +403,6 @@ fn worker_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> PipelineWo
         num_vad_workers: pipeline.num_vad_workers,
         profile: pipeline.profile,
         profile_window: std::time::Duration::from_secs_f64(pipeline.profile_window),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn default_model_args() -> CommonModelArgs {
-        CommonModelArgs {
-            model: DEFAULT_ASR_MODEL.to_string(),
-            cache_dir: vasr::modelscope_cache_dir(),
-            device: "auto".to_string(),
-            isq: None,
-            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
-            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
-            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
-            kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
-            #[cfg(feature = "cuda-graph")]
-            cuda_graph_chunked_argmax: false,
-            #[cfg(feature = "cuda-graph")]
-            cuda_graph_chunked_argmax_size: 4096,
-            #[cfg(feature = "cuda")]
-            q8_prefill_lm_head_mmq: true,
-            #[cfg(feature = "cuda")]
-            q8_prefill_lm_head_mmq_max_logits_mib: DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB,
-        }
-    }
-
-    fn default_pipeline_args() -> TranscribePipelineArgs {
-        TranscribePipelineArgs {
-            model: default_model_args(),
-            num_load_workers: 1,
-            num_vad_workers: 1,
-            profile: false,
-            profile_window: DEFAULT_PROFILE_WINDOW_SECS,
-            vad: VadCliArgs {
-                vad_model: "fsmn".to_string(),
-                vad_device: "cpu".to_string(),
-                vad_threshold: 0.6,
-                vad_min_speech_ms: 250,
-                vad_min_silence_ms: 800,
-                vad_pad_ms: 0,
-                vad_num_threads: 0,
-                vad_max_segment_sec: 30.0,
-            },
-        }
-    }
-
-    #[test]
-    fn pipeline_defaults_match_validated_vad_batch_bounds() {
-        let pipeline = default_pipeline_args();
-
-        let opts = asr_options_from_pipeline(&pipeline, None);
-        assert!(opts.context.is_empty());
-    }
-
-    #[test]
-    fn max_num_seqs_must_be_positive_for_kv_sizing() {
-        let args = CommonModelArgs {
-            max_num_seqs: 0,
-            ..default_model_args()
-        };
-
-        let error = validate_model_args(&args).expect_err("max_num_seqs=0 should fail");
-        assert!(error.to_string().contains("--max-num-seqs"));
-    }
-
-    #[test]
-    fn kv_peak_ratio_must_be_valid() {
-        let args = CommonModelArgs {
-            kv_peak_ratio: 1.5,
-            ..default_model_args()
-        };
-
-        let error = validate_model_args(&args).expect_err("kv_peak_ratio=1.5 should fail");
-        assert!(error.to_string().contains("--kv-peak-ratio"));
-    }
-
-    #[tokio::test]
-    async fn fatal_error_subscription_delivers_the_failure_reason() {
-        let (tx, mut rx) = tokio::sync::watch::channel(None);
-        tx.send_replace(Some("CUDA out of memory".to_string()));
-
-        let error = wait_for_fatal_error(&mut rx)
-            .await
-            .expect("fatal error should be delivered");
-
-        assert_eq!(error, "CUDA out of memory");
-    }
-
-    #[tokio::test]
-    async fn fatal_pipeline_error_stops_http_server_with_error() {
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        tx.send_replace(Some("CUDA out of memory".to_string()));
-
-        let error = serve_app(
-            Router::new(),
-            "127.0.0.1:0".parse().expect("valid test address"),
-            rx,
-        )
-        .await
-        .expect_err("fatal pipeline error must stop the HTTP server");
-
-        assert!(error.to_string().contains("CUDA out of memory"));
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn q8_prefill_lm_head_mmq_defaults_enabled() {
-        let args = default_model_args();
-        assert!(args.q8_prefill_lm_head_mmq);
-        assert_eq!(
-            args.q8_prefill_lm_head_mmq_max_logits_mib,
-            DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB
-        );
     }
 }
 
@@ -618,19 +502,19 @@ fn log_model_loaded(
         .map(|(audio, text, other)| format!(" isq_layers=audio:{audio},text:{text},other:{other}"))
         .unwrap_or_default();
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
-    if device.is_cuda() {
-        if let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device) {
-            let gpu_used = memory.used();
-            tracing::info!(
-                target: "vasr_transcribe::serve",
-                "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
-                bytes_to_gib(gpu_used),
-                bytes_to_gib(memory.total),
-                bytes_to_gib(memory.free),
-                elapsed_seconds = stats.build_seconds,
-            );
-            return;
-        }
+    if device.is_cuda()
+        && let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device)
+    {
+        let gpu_used = memory.used();
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
+            bytes_to_gib(gpu_used),
+            bytes_to_gib(memory.total),
+            bytes_to_gib(memory.free),
+            elapsed_seconds = stats.build_seconds,
+        );
+        return;
     }
 
     tracing::info!(
@@ -752,7 +636,7 @@ fn load_asr_model_for_pipeline(
     log_model_loaded(&output.stats, &device);
     let base_asr = output.model;
     if scheduled {
-        let asr_scheduler = InferenceScheduler::start("asr");
+        let asr_scheduler = InferenceScheduler::start("asr")?;
         Ok(Arc::new(ScheduledAsrModel::new(
             Arc::clone(&base_asr),
             asr_scheduler.clone(),
@@ -884,4 +768,120 @@ fn load_firered_vad(device: &Device) -> Result<FireRedVadModel> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_model_args() -> CommonModelArgs {
+        CommonModelArgs {
+            model: DEFAULT_ASR_MODEL.to_string(),
+            cache_dir: vasr::modelscope_cache_dir(),
+            device: "auto".to_string(),
+            isq: None,
+            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
+            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
+            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
+            kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax: false,
+            #[cfg(feature = "cuda-graph")]
+            cuda_graph_chunked_argmax_size: 4096,
+            #[cfg(feature = "cuda")]
+            q8_prefill_lm_head_mmq: true,
+            #[cfg(feature = "cuda")]
+            q8_prefill_lm_head_mmq_max_logits_mib: DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB,
+        }
+    }
+
+    fn default_pipeline_args() -> TranscribePipelineArgs {
+        TranscribePipelineArgs {
+            model: default_model_args(),
+            num_load_workers: 1,
+            num_vad_workers: 1,
+            profile: false,
+            profile_window: DEFAULT_PROFILE_WINDOW_SECS,
+            vad: VadCliArgs {
+                vad_model: "fsmn".to_string(),
+                vad_device: "cpu".to_string(),
+                vad_threshold: 0.6,
+                vad_min_speech_ms: 250,
+                vad_min_silence_ms: 800,
+                vad_pad_ms: 0,
+                vad_num_threads: 0,
+                vad_max_segment_sec: 30.0,
+            },
+        }
+    }
+
+    #[test]
+    fn pipeline_defaults_match_validated_vad_batch_bounds() {
+        let pipeline = default_pipeline_args();
+
+        let opts = asr_options_from_pipeline(&pipeline, None);
+        assert!(opts.context.is_empty());
+    }
+
+    #[test]
+    fn max_num_seqs_must_be_positive_for_kv_sizing() {
+        let args = CommonModelArgs {
+            max_num_seqs: 0,
+            ..default_model_args()
+        };
+
+        let error = validate_model_args(&args).expect_err("max_num_seqs=0 should fail");
+        assert!(error.to_string().contains("--max-num-seqs"));
+    }
+
+    #[test]
+    fn kv_peak_ratio_must_be_valid() {
+        let args = CommonModelArgs {
+            kv_peak_ratio: 1.5,
+            ..default_model_args()
+        };
+
+        let error = validate_model_args(&args).expect_err("kv_peak_ratio=1.5 should fail");
+        assert!(error.to_string().contains("--kv-peak-ratio"));
+    }
+
+    #[tokio::test]
+    async fn fatal_error_subscription_delivers_the_failure_reason() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some("CUDA out of memory".to_string()));
+
+        let error = wait_for_fatal_error(&mut rx)
+            .await
+            .expect("fatal error should be delivered");
+
+        assert_eq!(error, "CUDA out of memory");
+    }
+
+    #[tokio::test]
+    async fn fatal_pipeline_error_stops_http_server_with_error() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some("CUDA out of memory".to_string()));
+
+        let error = serve_app(
+            Router::new(),
+            "127.0.0.1:0".parse().expect("valid test address"),
+            rx,
+        )
+        .await
+        .expect_err("fatal pipeline error must stop the HTTP server");
+
+        assert!(error.to_string().contains("CUDA out of memory"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn q8_prefill_lm_head_mmq_defaults_enabled() {
+        let args = default_model_args();
+        assert!(args.q8_prefill_lm_head_mmq);
+        assert_eq!(
+            args.q8_prefill_lm_head_mmq_max_logits_mib,
+            DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB
+        );
+    }
 }

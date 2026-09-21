@@ -12,12 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange, Token,
-};
+use asr_data::TimeRange;
 use candle_core::{DType, Device, Tensor};
 
-use crate::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
+use crate::{AsrOptions, StreamEvent, StreamingAsrModel, StreamingAsrSession};
 
 use frontend::SenseVoiceFrontend;
 use model::SenseVoiceModel;
@@ -172,46 +170,42 @@ impl SenseVoiceSession {
         }
     }
 
-    fn annotation(&self, text: String, status: AnnotationStatus) -> Annotation {
-        Annotation::new(
+    fn event(&self, text: String, is_final: bool) -> StreamEvent {
+        StreamEvent::transcription(
             TimeRange::default(),
-            AnnotationPayload::Transcription(TextSpan {
-                text,
-                tokens: Vec::<Token>::new(),
-                language: Some(self.language.clone()),
-            }),
-            AnnotationSource::Model("sensevoice_online".to_string()),
-            status,
+            text,
+            Some(self.language.clone()),
+            "sensevoice_online",
+            is_final,
         )
     }
 }
 
 impl StreamingAsrSession for SenseVoiceSession {
-    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<Annotation>> {
+    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         if self.finished {
             bail!("SenseVoice stream is already finished");
         }
-        let waveform = &chunk.waveform;
-        if waveform.sample_rate != SENSEVOICE_SAMPLE_RATE {
+        if chunk.sample_rate != SENSEVOICE_SAMPLE_RATE {
             bail!(
                 "SenseVoice streaming expects {SENSEVOICE_SAMPLE_RATE} Hz audio, got {} Hz",
-                waveform.sample_rate
+                chunk.sample_rate
             );
         }
-        self.samples.extend_from_slice(&waveform.samples);
+        self.samples.extend_from_slice(&chunk.samples);
         Ok(self
             .decode(false)?
-            .map(|text| vec![self.annotation(text, AnnotationStatus::Partial)])
+            .map(|text| vec![self.event(text, false)])
             .unwrap_or_default())
     }
 
-    fn finish(&mut self) -> Result<Vec<Annotation>> {
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
         if self.finished {
             bail!("SenseVoice stream is already finished");
         }
         self.finished = true;
         let text = self.decode(true)?.unwrap_or_default();
-        Ok(vec![self.annotation(text, AnnotationStatus::Final)])
+        Ok(vec![self.event(text, true)])
     }
 }
 

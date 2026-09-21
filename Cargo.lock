@@ -110,17 +110,17 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "asr-data"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a26bad550db68f4af0b44252f223e2de44083964d212655cb303b2fe384d1bc7"
+checksum = "75f8922018f09d5e8b70cb25b567980c8220bc46b7d393fffe660377a1b62686"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "clap",
  "reqwest 0.13.4",
  "rmp-serde",
  "rubato",
  "rusqlite",
+ "rustfst",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -128,6 +128,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "unicode-general-category",
+ "unicode-width",
+ "urlencoding",
  "uuid",
 ]
 
@@ -276,6 +278,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bimap"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
 name = "bindgen_cuda"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -310,7 +318,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
- "generic-array",
+ "generic-array 0.14.7",
 ]
 
 [[package]]
@@ -703,7 +711,7 @@ version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
- "generic-array",
+ "generic-array 0.14.7",
  "typenum",
 ]
 
@@ -1501,6 +1509,16 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "generic-array"
+version = "1.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "337d46834ee672ab3e48caca2cb0c78cc174fb12b3a68d0d88f99a0519a5e36e"
+dependencies = [
+ "rustversion",
+ "typenum",
 ]
 
 [[package]]
@@ -2405,16 +2423,19 @@ dependencies = [
 
 [[package]]
 name = "modelhub"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26597ab075544b6fff0ae9d1f5b4d6e0a6a2db5e0c651eca7f10a82aa09340e0"
+checksum = "777ae4a06f2b79cce569e62e994c5d8d7912eb2ac1b177b50b3b38d46f726f8e"
 dependencies = [
  "anyhow",
+ "clap",
  "futures-util",
  "indicatif",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "tokio",
  "tracing",
  "urlencoding",
@@ -2730,6 +2751,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "ordered-float"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "papergrid"
@@ -3378,6 +3408,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfst"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3096239ad3664245480c50bf34a6ed45af5f40c0f6258d4b28a4c8082813a519"
+dependencies = [
+ "anyhow",
+ "bimap",
+ "bitflags 2.11.1",
+ "generic-array 1.4.5",
+ "itertools",
+ "nom",
+ "num-traits",
+ "ordered-float",
+ "rand 0.9.4",
+ "rand_chacha",
+ "serde",
+ "superslice",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3835,6 +3885,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "superslice"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab16ced94dbd8a46c82fd81e3ed9a8727dac2977ea869d217bcc4ea1f122e81f"
 
 [[package]]
 name = "symphonia"
@@ -4751,22 +4807,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasr-aligner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "asr-data",
- "candle-core",
- "lindera",
- "lindera-ipadic",
- "serde",
- "serde_json",
- "unicode-general-category",
- "unicode-normalization",
- "vasr",
-]
-
-[[package]]
 name = "vasr-flash-attn"
 version = "0.1.0"
 dependencies = [
@@ -4839,6 +4879,8 @@ dependencies = [
  "clap",
  "indicatif",
  "reqwest 0.13.4",
+ "rmp-serde",
+ "rusqlite",
  "serde",
  "serde_json",
  "tabled",

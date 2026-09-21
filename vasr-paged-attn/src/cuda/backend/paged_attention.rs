@@ -35,7 +35,9 @@ fn workspace_ensure(
     let map = PAGED_ATTN_V2_WORKSPACE.get_or_init(|| Mutex::new(HashMap::new()));
     let device_key = dev.id();
     let device_mtx: &'static Mutex<WorkspaceSlot> = {
-        let mut guard = map.lock().unwrap();
+        let mut guard = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match guard.get(&device_key).copied() {
             Some(mtx) => mtx,
             None => {
@@ -50,7 +52,9 @@ fn workspace_ensure(
         }
     };
 
-    let mut slot = device_mtx.lock().unwrap();
+    let mut slot = device_mtx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.cap < bytes {
         slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
         slot.cap = bytes;

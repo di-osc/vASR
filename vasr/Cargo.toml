@@ -39,7 +39,7 @@ vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
 vasr-quant = { path = "../vasr-quant", default-features = false }
 vasr-flash-attn = { path = "../vasr-flash-attn", default-features = false, optional = true }
 asr-data = { workspace = true }
-modelhub = "0.1.1"
+modelhub = "0.1.3"
 vasr-vad = { path = "../vasr-vad" }
 
 lindera = { version = "2.2.0", features = ["embed-ipadic"] }
@@ -90,7 +90,7 @@ cuda-paged-attn = [
 ]
 cudarc = ["dep:cudarc"]
 
-audio-loading = ["asr-data/audio-loading"]
+audio-loading = []
 
 integration-tests = []
 timing = ["vasr-quant/timing"]

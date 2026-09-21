@@ -34,15 +34,15 @@ pub fn resolve_device(value: &str) -> Result<Device> {
 
 /// Auto-select the best available device.
 pub fn auto_device() -> Result<Device> {
+    // 三个分支互斥（cfg 保证只编译一个），因此可以直接作为函数尾表达式返回。
     #[cfg(feature = "cuda")]
     {
-        return Device::new_cuda(0)
-            .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"));
+        Device::new_cuda(0).map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"))
     }
     #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     {
-        return Device::new_metal(0)
-            .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"));
+        Device::new_metal(0)
+            .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
     }
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     {

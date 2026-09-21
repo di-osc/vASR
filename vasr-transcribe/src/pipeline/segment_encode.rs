@@ -5,7 +5,7 @@ use super::{
     record_request_encode_stages,
 };
 use anyhow::Result;
-use asr_data::{DurationMs, Waveform};
+use asr_data::Waveform;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -61,16 +61,11 @@ pub(super) fn spawn_segment_encoder_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut pending = VecDeque::new();
-        loop {
-            let Some(request) = (match pending.pop_front() {
-                Some(request) => Some(request),
-                None => request_rx.recv().await,
-            }) else {
-                break;
-            };
-            let request = match request {
-                SegmentEncodeMessage::Segment(request) => request,
-            };
+        while let Some(request) = match pending.pop_front() {
+            Some(request) => Some(request),
+            None => request_rx.recv().await,
+        } {
+            let SegmentEncodeMessage::Segment(request) = request;
             let request =
                 collect_encoder_segment_batch(request, &mut request_rx, &mut pending).await;
             let encode_start = Instant::now();
@@ -155,16 +150,9 @@ async fn collect_encoder_segment_batch(
     let mut stage_start = first.stage_start;
     let mut segments = vec![first.segment];
     let mut reason = "wait_timeout";
-    loop {
-        match request_rx.try_recv() {
-            Ok(SegmentEncodeMessage::Segment(request)) => {
-                stage_start = stage_start.min(request.stage_start);
-                segments.push(request.segment);
-            }
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                break;
-            }
-        }
+    while let Ok(SegmentEncodeMessage::Segment(request)) = request_rx.try_recv() {
+        stage_start = stage_start.min(request.stage_start);
+        segments.push(request.segment);
     }
     loop {
         match tokio::time::timeout(
@@ -184,7 +172,7 @@ async fn collect_encoder_segment_batch(
             Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
-    segments.sort_by_key(|segment| (segment.job_index, segment.offset.0));
+    segments.sort_by_key(|segment| (segment.job_index, segment.offset));
     SegmentEncodeBatch {
         segments,
         stage_start,
@@ -209,7 +197,7 @@ pub(super) fn send_segment_encode_request(
 #[derive(Debug, Clone)]
 #[cfg(feature = "paged-attn")]
 pub(super) struct SegmentAsrInference {
-    pub(super) targets: Vec<(usize, usize, DurationMs)>,
+    pub(super) targets: Vec<(usize, usize, usize)>,
     pub(super) segment_audio_seconds: f64,
     pub(super) active_job_count: usize,
 }
@@ -243,7 +231,7 @@ pub(super) fn run_segment_asr_encode(
         .iter()
         .map(|segment| segment.waveform.clone())
         .collect();
-    let targets: Vec<(usize, usize, DurationMs)> = segments
+    let targets: Vec<(usize, usize, usize)> = segments
         .iter()
         .map(|segment| (segment.job_index, segment.segment_index, segment.offset))
         .collect();

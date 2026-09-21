@@ -8,13 +8,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use crate::dataset::read_audio_input_dtos;
 use crate::{
     AudioInputDto, InferenceData, TranscribeRequest, TranscribeResponse, table::render_table,
 };
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
-    /// Text file containing one audio file path or URL per line.
+    /// Text file with one audio path/URL per line, or a vASR AudioDb (`.vasr`).
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
@@ -108,7 +109,7 @@ struct PerfRunReport {
 
 pub async fn run_perf(args: PerfArgs) -> Result<()> {
     validate_args(&args)?;
-    let mut sources = read_audio_sources(&args.input)?;
+    let mut sources = read_audio_input_dtos(&args.input, args.mono)?;
     if sources.is_empty() {
         bail!("input contains no audio sources: {}", args.input.display());
     }
@@ -139,7 +140,6 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
         &sources,
         concurrency,
         batch_size,
-        args.mono,
         args.retries,
     )
     .await
@@ -189,17 +189,6 @@ fn validate_args(args: &PerfArgs) -> Result<()> {
     Ok(())
 }
 
-fn read_audio_sources(path: &Path) -> Result<Vec<String>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
 fn resolve_concurrency(value: usize) -> usize {
     if value > 0 {
         return value;
@@ -220,13 +209,12 @@ fn format_mono(mono: Option<bool>) -> &'static str {
 async fn run_one_perf_trial(
     client: &reqwest::Client,
     server: &str,
-    sources: &[String],
+    sources: &[AudioInputDto],
     concurrency: usize,
     batch_size: usize,
-    mono: Option<bool>,
     retries: usize,
 ) -> Result<PerfRunReport> {
-    let batches = build_batches(sources, batch_size, mono);
+    let batches = build_batches(sources, batch_size);
     let total_requests = batches.len();
     let progress = progress_bar(total_requests);
     let start = Instant::now();
@@ -274,24 +262,11 @@ async fn run_one_perf_trial(
     })
 }
 
-fn build_batches(
-    sources: &[String],
-    batch_size: usize,
-    mono: Option<bool>,
-) -> Vec<TranscribeRequest> {
+fn build_batches(sources: &[AudioInputDto], batch_size: usize) -> Vec<TranscribeRequest> {
     sources
         .chunks(batch_size)
-        .map(|chunk| {
-            let inputs = chunk
-                .iter()
-                .map(|source| AudioInputDto {
-                    url: Some(source.clone()),
-                    b64_str: None,
-                    mono,
-                    hotword: None,
-                })
-                .collect();
-            TranscribeRequest { inputs }
+        .map(|chunk| TranscribeRequest {
+            inputs: chunk.to_vec(),
         })
         .collect()
 }

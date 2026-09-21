@@ -131,7 +131,7 @@ fn should_use_paged_attention_v2(
 ) -> bool {
     let partition_size = 512usize;
     !(max_num_partitions == 1 || num_seqs.saturating_mul(num_heads) > 512)
-        || partition_size % block_size != 0
+        || !partition_size.is_multiple_of(block_size)
 }
 
 #[cfg(feature = "cuda-graph")]
@@ -727,10 +727,9 @@ impl PagedCacheRuntime {
     fn insert_cuda_decode_graph(&mut self, key: CudaDecodeGraphKey, graph: DecodeCudaGraph) {
         if self.cuda_decode_graphs.len() >= CUDA_DECODE_GRAPH_MAX_GRAPHS
             && !self.cuda_decode_graphs.contains_key(&key)
+            && let Some(oldest) = self.cuda_decode_graphs.keys().next().copied()
         {
-            if let Some(oldest) = self.cuda_decode_graphs.keys().next().copied() {
-                self.cuda_decode_graphs.remove(&oldest);
-            }
+            self.cuda_decode_graphs.remove(&oldest);
         }
         self.cuda_decode_graphs.insert(key, graph);
     }
@@ -786,9 +785,7 @@ impl PagedCacheRuntime {
                 | DecodeGraphOutputKind::NextIds
                 | DecodeGraphOutputKind::ChunkedNextIds => 0,
             };
-            let tensor = logits
-                .narrow(batch_dim, 0, actual_batch)
-                .map_err(|err| candle_core::Error::from(err))?;
+            let tensor = logits.narrow(batch_dim, 0, actual_batch)?;
             Ok(CudaDecodeGraphOutput {
                 tensor,
                 kind: graph.output_kind(),
@@ -854,9 +851,7 @@ impl PagedCacheRuntime {
             | DecodeGraphOutputKind::NextIds
             | DecodeGraphOutputKind::ChunkedNextIds => 0,
         };
-        let tensor = warmup_logits
-            .narrow(batch_dim, 0, actual_batch)
-            .map_err(|err| candle_core::Error::from(err))?;
+        let tensor = warmup_logits.narrow(batch_dim, 0, actual_batch)?;
         Ok(CudaDecodeGraphOutput {
             tensor,
             kind: output_kind,
@@ -1001,14 +996,15 @@ pub type SharedPagedCacheRuntime = Arc<Mutex<PagedCacheRuntime>>;
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::DType;
+    #[cfg(feature = "cuda-graph")]
+    use candle_core::{Device, Tensor};
 
     #[cfg(feature = "cuda")]
     use super::blocks_for_byte_budget;
-    use super::{
-        PagedBlockManager, PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime,
-        bytes_per_paged_block,
-    };
+    use super::{PagedBlockManager, bytes_per_paged_block};
+    #[cfg(feature = "cuda-graph")]
+    use super::{PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime};
 
     #[test]
     fn bytes_per_paged_block_matches_qwen3_asr_defaults() -> anyhow::Result<()> {

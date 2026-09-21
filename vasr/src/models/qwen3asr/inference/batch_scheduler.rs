@@ -276,7 +276,7 @@ struct DecodeStepDistribution {
 fn decode_step_distribution(counts: &BTreeMap<usize, usize>) -> DecodeStepDistribution {
     let mut steps = Vec::new();
     for (&step, &count) in counts {
-        steps.extend(std::iter::repeat(step).take(count));
+        steps.extend(std::iter::repeat_n(step, count));
     }
     if steps.is_empty() {
         return DecodeStepDistribution::default();
@@ -777,6 +777,7 @@ fn free_finished_running(
     Ok(freed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_running_step_groups(
     running: &mut [Option<RunningSlot>],
     active_steps: &[(usize, usize)],
@@ -878,12 +879,15 @@ fn decode_running_step_groups(
     Ok(())
 }
 
+/// 右对齐填充后的一批 token 行，分别对应输入 id 与标签 id。
+type PaddedWaveTokens = (Vec<Vec<u32>>, Vec<Vec<u32>>);
+
 /// Right-pad selected rows to the max effective prompt length within the admit wave.
 fn pad_prepared_wave_for_prefill(
     prepared: &[PreparedInputs],
     wave_indices: &[usize],
     pad_id: u32,
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+) -> Result<PaddedWaveTokens> {
     if wave_indices.is_empty() {
         bail!("pad_prepared_wave_for_prefill requires at least one row");
     }
@@ -948,6 +952,7 @@ fn concat_prepared_audio(
     Ok(Tensor::cat(parts.as_slice(), 0)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_prepared_audio_batch(
     audio_token_id: u32,
     base_index: usize,
@@ -1048,6 +1053,7 @@ impl AsrBatchScheduler {
     }
 
     /// Run one homogeneous micro-batch (same padded `seq_len` across rows).
+    #[allow(clippy::too_many_arguments)]
     pub fn run_micro_batch(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1089,6 +1095,7 @@ impl AsrBatchScheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prefill_waiting_wave(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1339,6 +1346,7 @@ impl AsrBatchScheduler {
         Ok((wave, reason))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drive_dynamic_prefill_stage(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1402,6 +1410,7 @@ impl AsrBatchScheduler {
     ///
     /// `waiting` starts as all segment indices; each admit wave is right-padded locally and
     /// prefilled with per-row `query_lens` for flash varlen metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_continuous_prepared(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1479,10 +1488,10 @@ impl AsrBatchScheduler {
 
                 let mut active_steps: Vec<(usize, usize)> = Vec::new();
                 for (slot_idx, entry) in running.iter().enumerate() {
-                    if let Some(entry) = entry {
-                        if !entry.slot.finished {
-                            active_steps.push((slot_idx, entry.slot.decode_step));
-                        }
+                    if let Some(entry) = entry
+                        && !entry.slot.finished
+                    {
+                        active_steps.push((slot_idx, entry.slot.decode_step));
                     }
                 }
 
@@ -1604,6 +1613,7 @@ impl AsrBatchScheduler {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_continuous_prepared_dynamic(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1657,10 +1667,10 @@ impl AsrBatchScheduler {
 
                 let mut active_steps: Vec<(usize, usize)> = Vec::new();
                 for (slot_idx, entry) in running.iter().enumerate() {
-                    if let Some(entry) = entry {
-                        if !entry.slot.finished {
-                            active_steps.push((slot_idx, entry.slot.decode_step));
-                        }
+                    if let Some(entry) = entry
+                        && !entry.slot.finished
+                    {
+                        active_steps.push((slot_idx, entry.slot.decode_step));
                     }
                 }
 
@@ -1782,6 +1792,7 @@ impl AsrBatchScheduler {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_continuous_prepared_dynamic_async(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1791,7 +1802,7 @@ impl AsrBatchScheduler {
         poll_source: &mut (dyn FnMut(bool) -> Result<PreparedAudioBatchPoll> + Send),
         eos_token_ids: &[u32],
         pad_id: u32,
-        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
         let max_num_seqs = {
             let runtime_guard = runtime
@@ -1835,10 +1846,8 @@ impl AsrBatchScheduler {
                         let message = producer.run_stage(true)?;
                         let wave = message.prefill_wave;
                         let done = producer.is_done();
-                        if wave > 0 || message.source_closed {
-                            if !send_message(message) {
-                                return Ok(());
-                            }
+                        if (wave > 0 || message.source_closed) && !send_message(message) {
+                            return Ok(());
                         }
                         if done {
                             break;
@@ -1862,7 +1871,7 @@ impl AsrBatchScheduler {
                 eos_token_ids,
                 max_slots,
                 #[cfg(feature = "timing")]
-                timings.as_deref_mut(),
+                timings,
             )?;
 
             self.next_request_id = shared_request_ids.load(Ordering::Relaxed);
@@ -1870,6 +1879,7 @@ impl AsrBatchScheduler {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_continuous_prefilled_dynamic(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1878,7 +1888,7 @@ impl AsrBatchScheduler {
         message_rx: mpsc::Receiver<Result<PrefillStageOutput>>,
         eos_token_ids: &[u32],
         max_slots: usize,
-        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
         self.run_continuous_prefilled_dynamic_with_completed(
             thinker,
@@ -1889,10 +1899,11 @@ impl AsrBatchScheduler {
             max_slots,
             &mut |_, _| Ok(()),
             #[cfg(feature = "timing")]
-            timings.as_deref_mut(),
+            timings,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_continuous_prefilled_dynamic_with_completed(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1902,7 +1913,7 @@ impl AsrBatchScheduler {
         eos_token_ids: &[u32],
         max_slots: usize,
         on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
-        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
         self.run_continuous_prefilled_dynamic_with_completed_impl(
             thinker,
@@ -1916,10 +1927,11 @@ impl AsrBatchScheduler {
             true,
             None,
             #[cfg(feature = "timing")]
-            timings.as_deref_mut(),
+            timings,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_global_continuous_prefilled_dynamic_with_completed(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -1930,7 +1942,7 @@ impl AsrBatchScheduler {
         max_slots: usize,
         on_complete: &mut dyn FnMut(usize, Vec<u32>) -> Result<()>,
         on_tick: &mut dyn FnMut() -> Result<()>,
-        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+        #[cfg(feature = "timing")] timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
         self.run_continuous_prefilled_dynamic_with_completed_impl(
             thinker,
@@ -1944,10 +1956,11 @@ impl AsrBatchScheduler {
             false,
             Some(on_tick),
             #[cfg(feature = "timing")]
-            timings.as_deref_mut(),
+            timings,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_continuous_prefilled_dynamic_with_completed_impl(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -2015,10 +2028,10 @@ impl AsrBatchScheduler {
 
                 let mut active_steps: Vec<(usize, usize)> = Vec::new();
                 for (slot_idx, entry) in running.iter().enumerate() {
-                    if let Some(entry) = entry {
-                        if !entry.slot.finished {
-                            active_steps.push((slot_idx, entry.slot.decode_step));
-                        }
+                    if let Some(entry) = entry
+                        && !entry.slot.finished
+                    {
+                        active_steps.push((slot_idx, entry.slot.decode_step));
                     }
                 }
 
@@ -2155,6 +2168,7 @@ pub(crate) fn group_running_by_decode_step(active: &[(usize, usize)]) -> Vec<(us
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_paged_prepared_batch(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -2211,6 +2225,7 @@ pub fn run_paged_prepared_batch(
 }
 
 #[cfg(feature = "timing")]
+#[allow(clippy::too_many_arguments)]
 pub fn run_paged_prepared_batch_timed(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,

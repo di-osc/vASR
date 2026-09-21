@@ -140,10 +140,10 @@ fn unpack_gathered_kv_for_attention(
         let total = batch
             .checked_mul(max_kv)
             .ok_or_else(|| candle_core::Error::Msg("gathered kv token count overflow".into()))?;
-        return Ok(packed
+        return packed
             .narrow(0, 0, total)?
             .reshape((batch, max_kv, num_kv_heads, head_size))?
-            .transpose(1, 2)?);
+            .transpose(1, 2);
     }
 
     let mut start = 0usize;
@@ -467,12 +467,11 @@ impl ThinkerTextMlp {
 impl Module for ThinkerTextMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
-        if matches!(self.hidden_act.as_str(), "silu" | "swish") {
-            if let Some(hidden) =
+        if matches!(self.hidden_act.as_str(), "silu" | "swish")
+            && let Some(hidden) =
                 isq_linear::try_fused_q8_silu_gate_up(&self.gate_proj, &self.up_proj, xs)?
-            {
-                return self.down_proj.forward(&hidden);
-            }
+        {
+            return self.down_proj.forward(&hidden);
         }
         let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
@@ -1159,7 +1158,7 @@ impl ThinkerTextAttention {
                                 value_cache,
                                 input_metadata,
                                 kv_lens.as_slice(),
-                                &paged_attn,
+                                paged_attn,
                                 batch,
                                 seq_len,
                                 hidden_states,
@@ -1176,7 +1175,7 @@ impl ThinkerTextAttention {
                             value_cache,
                             input_metadata,
                             kv_lens.as_slice(),
-                            &paged_attn,
+                            paged_attn,
                             batch,
                             seq_len,
                             hidden_states,
@@ -1195,7 +1194,7 @@ impl ThinkerTextAttention {
                         value_cache,
                         input_metadata,
                         kv_lens.as_slice(),
-                        &paged_attn,
+                        paged_attn,
                         batch,
                         seq_len,
                         hidden_states,

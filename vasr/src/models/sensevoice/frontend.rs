@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -48,7 +47,7 @@ impl SenseVoiceFrontend {
         let options = FbankOptions {
             frame_opts: FrameExtractionOptions {
                 samp_freq: SAMPLE_RATE,
-                window_type: CStr::from_bytes_with_nul(b"hamming\0")?.as_ptr(),
+                window_type: c"hamming".as_ptr(),
                 dither: 0.0,
                 frame_shift_ms: 10.0,
                 frame_length_ms: 25.0,

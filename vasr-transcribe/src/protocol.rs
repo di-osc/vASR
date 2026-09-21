@@ -1,4 +1,4 @@
-use asr_data::{AnnotationPayload, AnnotationStatus, Timeline};
+use asr_data::{Annotation, Timeline};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,34 +103,29 @@ impl InferenceData {
         timeline: &Timeline,
         channel: &str,
     ) -> Self {
-        let transcript = timeline.transcript();
+        let transcript = vasr::prediction_text(timeline);
         let mut sentences = Vec::new();
-        for annotation in timeline
-            .annotations
-            .iter()
-            .filter(|annotation| annotation.status == AnnotationStatus::Final)
-        {
-            match &annotation.payload {
-                AnnotationPayload::Transcription(segment)
-                | AnnotationPayload::Sentence(segment) => {
-                    let duration = annotation.range.duration().0;
-                    sentences.push(SentenceResult {
-                        text: segment.text.clone(),
-                        start_time: annotation.range.start.0,
-                        end_time: annotation.range.end.0,
-                        duration,
-                        channel: channel.to_string(),
-                        sentence_index: sentences.len(),
-                    });
-                }
-                _ => {}
-            }
+        for span in &timeline.prediction {
+            let (text, range) = match &span.annotation {
+                Annotation::Transcription(segment) => (segment.text.clone(), span.range),
+                Annotation::Sentence(segment) => (segment.text.clone(), span.range),
+                _ => continue,
+            };
+            let duration = range.duration();
+            sentences.push(SentenceResult {
+                text,
+                start_time: range.start_ms as u64,
+                end_time: range.end_ms as u64,
+                duration: duration as u64,
+                channel: channel.to_string(),
+                sentence_index: sentences.len(),
+            });
         }
         let mut text = TextResult::default();
         match channel {
-            "left" => text.left = transcript.text,
-            "right" => text.right = transcript.text,
-            _ => text.mono = transcript.text,
+            "left" => text.left = transcript,
+            "right" => text.right = transcript,
+            _ => text.mono = transcript,
         }
         Self {
             service_id: service_id.into(),

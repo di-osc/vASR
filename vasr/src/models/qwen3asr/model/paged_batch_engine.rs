@@ -199,6 +199,7 @@ fn cuda_packed_prefill_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CUDA_PACKED_PREFILL").is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn paged_batch_prefill_row(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -313,9 +314,9 @@ pub fn paged_batch_decode_slots_at_step(
     }
 
     if active_indices.is_empty() {
-        for i in 0..slots.len() {
-            if !slots[i].finished && slots[i].decode_step == step {
-                slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+        for slot in slots.iter_mut() {
+            if !slot.finished && slot.decode_step == step {
+                slot.decode_step = slot.decode_step.saturating_add(1);
             }
         }
         return Ok(());
@@ -467,9 +468,9 @@ pub fn paged_batch_decode_slots_at_step_shared(
         }
 
         if active_indices.is_empty() {
-            for i in 0..slots.len() {
-                if !slots[i].finished && slots[i].decode_step == step {
-                    slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+            for slot in slots.iter_mut() {
+                if !slot.finished && slot.decode_step == step {
+                    slot.decode_step = slot.decode_step.saturating_add(1);
                 }
             }
             return Ok(());
@@ -872,10 +873,10 @@ pub fn paged_batch_prefill(
                 .iter()
                 .filter(|&&id| id == thinker.audio_token_id())
                 .count();
-            if let Some(af) = audio_features {
-                if row_audio_tokens > 0 {
-                    packed_audio_features.push(af.narrow(0, audio_offset, row_audio_tokens)?);
-                }
+            if let Some(af) = audio_features
+                && row_audio_tokens > 0
+            {
+                packed_audio_features.push(af.narrow(0, audio_offset, row_audio_tokens)?);
             }
             audio_offset = audio_offset.saturating_add(row_audio_tokens);
         }
@@ -1245,10 +1246,10 @@ fn paged_batch_prefill_with_allocated(
                 .iter()
                 .filter(|&&id| id == thinker.audio_token_id())
                 .count();
-            if let Some(af) = audio_features {
-                if row_audio_tokens > 0 {
-                    packed_audio_features.push(af.narrow(0, audio_offset, row_audio_tokens)?);
-                }
+            if let Some(af) = audio_features
+                && row_audio_tokens > 0
+            {
+                packed_audio_features.push(af.narrow(0, audio_offset, row_audio_tokens)?);
             }
             audio_offset = audio_offset.saturating_add(row_audio_tokens);
         }

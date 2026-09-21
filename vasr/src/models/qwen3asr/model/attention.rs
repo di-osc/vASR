@@ -376,6 +376,7 @@ fn metal_dense_varlen_prefill_attention(
 /// Right-padded query batches use valid tokens at the start of each row. On Metal this
 /// avoids `unpack_gathered_kv_for_attention` pad/cat by slicing packed K/V per sequence
 /// and running native GQA SDPA.
+#[allow(clippy::too_many_arguments)]
 fn packed_varlen_attention(
     q: &Tensor,
     k: &Tensor,
@@ -577,86 +578,85 @@ fn flash_attn_dispatch(
         || batch > 1
         || q_len != k_len;
 
-    if use_varlen {
-        if let Some(params) = flash_params {
-            if let (Some(cu_q), Some(cu_k)) = (
-                params.cumulative_seqlens_q.as_ref(),
-                params.logical_k.cumulative_seqlens.as_ref(),
-            ) {
-                let query_lens = sequence_lengths_from_cu(cu_q)?;
-                let total_q = query_lens.iter().try_fold(0usize, |acc, &len| {
-                    if len == 0 {
-                        return Err(candle_core::Error::Msg(
-                            "flash varlen query length must be non-zero".to_string(),
-                        ));
-                    }
-                    acc.checked_add(len).ok_or_else(|| {
-                        candle_core::Error::Msg("flash varlen query length overflow".to_string())
-                    })
-                })?;
-                let q_packed = if batch == 1 && q_len == total_q {
-                    q.reshape((total_q, heads, head_dim))?
-                } else {
-                    let mut q_chunks = Vec::with_capacity(query_lens.len());
-                    for (row, &len) in query_lens.iter().enumerate() {
-                        if row >= batch {
-                            candle_core::bail!(
-                                "flash varlen query row exceeds q batch: row={row} batch={batch}"
-                            );
-                        }
-                        if len > q_len {
-                            candle_core::bail!(
-                                "flash varlen query length exceeds padded q_len: row={row} len={len} q_len={q_len}"
-                            );
-                        }
-                        q_chunks.push(
-                            q.narrow(0, row, 1)?
-                                .narrow(1, 0, len)?
-                                .reshape((len, heads, head_dim))?,
-                        );
-                    }
-                    Tensor::cat(q_chunks.as_slice(), 0)?
-                };
-                let k = k.flatten_to(1)?;
-                let v = v.flatten_to(1)?;
-                let out = flash_attn_varlen(
-                    &q_packed,
-                    &k,
-                    &v,
-                    cu_q,
-                    cu_k,
-                    params.max_q as usize,
-                    params.logical_k.max as usize,
-                    softmax_scale,
-                    params.causal,
-                )?;
-
-                if batch == 1 && q_len == total_q {
-                    return Ok(Some(out.reshape((1usize, total_q, heads, head_dim))?));
-                }
-
-                let mut rows = Vec::with_capacity(query_lens.len());
-                let mut offset = 0usize;
-                for &len in &query_lens {
-                    let slice = out
-                        .narrow(0, offset, len)?
-                        .reshape((1usize, len, heads, head_dim))?;
-                    let row = if len < q_len {
-                        let pad = Tensor::zeros(
-                            (1usize, q_len - len, heads, head_dim),
-                            out.dtype(),
-                            out.device(),
-                        )?;
-                        Tensor::cat(&[&slice, &pad], 1)?
-                    } else {
-                        slice
-                    };
-                    rows.push(row);
-                    offset = offset.saturating_add(len);
-                }
-                return Ok(Some(Tensor::cat(rows.as_slice(), 0)?));
+    if use_varlen
+        && let Some(params) = flash_params
+        && let (Some(cu_q), Some(cu_k)) = (
+            params.cumulative_seqlens_q.as_ref(),
+            params.logical_k.cumulative_seqlens.as_ref(),
+        )
+    {
+        let query_lens = sequence_lengths_from_cu(cu_q)?;
+        let total_q = query_lens.iter().try_fold(0usize, |acc, &len| {
+            if len == 0 {
+                return Err(candle_core::Error::Msg(
+                    "flash varlen query length must be non-zero".to_string(),
+                ));
             }
+            acc.checked_add(len).ok_or_else(|| {
+                candle_core::Error::Msg("flash varlen query length overflow".to_string())
+            })
+        })?;
+        let q_packed = if batch == 1 && q_len == total_q {
+            q.reshape((total_q, heads, head_dim))?
+        } else {
+            let mut q_chunks = Vec::with_capacity(query_lens.len());
+            for (row, &len) in query_lens.iter().enumerate() {
+                if row >= batch {
+                    candle_core::bail!(
+                        "flash varlen query row exceeds q batch: row={row} batch={batch}"
+                    );
+                }
+                if len > q_len {
+                    candle_core::bail!(
+                        "flash varlen query length exceeds padded q_len: row={row} len={len} q_len={q_len}"
+                    );
+                }
+                q_chunks.push(
+                    q.narrow(0, row, 1)?
+                        .narrow(1, 0, len)?
+                        .reshape((len, heads, head_dim))?,
+                );
+            }
+            Tensor::cat(q_chunks.as_slice(), 0)?
+        };
+        let k = k.flatten_to(1)?;
+        let v = v.flatten_to(1)?;
+        let out = flash_attn_varlen(
+            &q_packed,
+            &k,
+            &v,
+            cu_q,
+            cu_k,
+            params.max_q as usize,
+            params.logical_k.max as usize,
+            softmax_scale,
+            params.causal,
+        )?;
+
+        if batch == 1 && q_len == total_q {
+            return Ok(Some(out.reshape((1usize, total_q, heads, head_dim))?));
         }
+
+        let mut rows = Vec::with_capacity(query_lens.len());
+        let mut offset = 0usize;
+        for &len in &query_lens {
+            let slice = out
+                .narrow(0, offset, len)?
+                .reshape((1usize, len, heads, head_dim))?;
+            let row = if len < q_len {
+                let pad = Tensor::zeros(
+                    (1usize, q_len - len, heads, head_dim),
+                    out.dtype(),
+                    out.device(),
+                )?;
+                Tensor::cat(&[&slice, &pad], 1)?
+            } else {
+                slice
+            };
+            rows.push(row);
+            offset = offset.saturating_add(len);
+        }
+        return Ok(Some(Tensor::cat(rows.as_slice(), 0)?));
     }
 
     let causal = flash_params.map_or(causal_default, |p| p.causal);
@@ -691,6 +691,7 @@ pub fn supports_packed_varlen_sdpa(query: &Tensor) -> bool {
     query.device().is_metal() && query.dim(3).is_ok_and(valid_sdpa_head_dim)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_attention(
     q: &Tensor,
     k: &Tensor,
@@ -718,20 +719,18 @@ pub fn run_attention(
         }
     }
 
-    if let Some(params) = flash_params {
-        if let Some(out) = metal_dense_varlen_prefill_attention(q, k, v, params, softmax_scale)? {
-            return Ok(out);
-        }
+    if let Some(params) = flash_params
+        && let Some(out) = metal_dense_varlen_prefill_attention(q, k, v, params, softmax_scale)?
+    {
+        return Ok(out);
     }
 
-    if should_use_packed_varlen(q, k, flash_params) {
-        if let Some(params) = flash_params {
-            if let Some(out) =
-                packed_varlen_attention(q, k, v, mask, params, softmax_scale, causal, n_kv_groups)?
-            {
-                return Ok(out);
-            }
-        }
+    if should_use_packed_varlen(q, k, flash_params)
+        && let Some(params) = flash_params
+        && let Some(out) =
+            packed_varlen_attention(q, k, v, mask, params, softmax_scale, causal, n_kv_groups)?
+    {
+        return Ok(out);
     }
 
     run_attention_noflash(q, k, v, mask, softmax_scale, causal, n_kv_groups)
@@ -963,8 +962,8 @@ mod tests {
             (batch, num_heads, seq_len, head_dim),
             &device,
         )?;
-        let query_lens = vec![3usize, 2usize];
-        let kv_lens = vec![3usize, 2usize];
+        let query_lens = [3usize, 2usize];
+        let kv_lens = [3usize, 2usize];
         let total_kv: usize = kv_lens.iter().sum();
         let packed = Tensor::from_vec(
             (0..total_kv * num_kv_heads * head_dim)

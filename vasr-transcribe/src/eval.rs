@@ -2,12 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse};
+use crate::dataset::{audio_input_from_source, read_vasr_audios};
+use crate::{TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
-use asr_data::{
-    Audio, AudioChannel, AudioDb, AudioDbMode, AudioQuery, AudioSource, CerStats, normalize_for_cer,
-};
-use base64::Engine;
+use asr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 
@@ -154,14 +152,8 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
     }
 
     let timestamp = timestamp_file_name();
-    let db = AudioDb::open(&args.input, AudioDbMode::ReadOnly)
+    let mut records = read_vasr_audios(&args.input)
         .with_context(|| format!("failed to open AudioDb {}", args.input.display()))?;
-    let mut records = db
-        .query(&AudioQuery {
-            limit: args.limit.unwrap_or(asr_data::MAX_QUERY_LIMIT),
-            ..AudioQuery::default()
-        })
-        .with_context(|| format!("failed to read AudioDb {}", args.input.display()))?;
     if let Some(limit) = args.limit {
         records.truncate(limit);
     }
@@ -286,11 +278,27 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
     println!("\n{table}\n");
 }
 
+fn record_timeline(record: &Audio, timeline: EvalTimeline) -> Result<&asr_data::Timeline> {
+    record
+        .timeline(timeline.channel())
+        .map_err(|err| anyhow!("{err}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "audio {} is missing timeline '{}'",
+                record.audio_id(),
+                timeline.name()
+            )
+        })
+}
+
 fn validate_timeline(records: &[Audio], timeline: EvalTimeline) -> Result<()> {
     let mut missing = Vec::new();
     for record in records {
-        // asr-data 0.1.0 stores one canonical timeline directly on Audio.
-        if record.timeline.transcript().text.is_empty() {
+        let empty = match record_timeline(record, timeline) {
+            Ok(found) => found.reference_transcript().text.is_empty(),
+            Err(_) => true,
+        };
+        if empty {
             missing.push(record.audio_id());
         }
     }
@@ -314,34 +322,8 @@ fn validate_timeline(records: &[Audio], timeline: EvalTimeline) -> Result<()> {
 fn build_request(records: &[Audio], mono: bool) -> Result<TranscribeRequest> {
     let mut inputs = Vec::with_capacity(records.len());
     for record in records {
-        let input = match &record.source {
-            AudioSource::Path(path) => AudioInputDto {
-                url: Some(path.display().to_string()),
-                b64_str: None,
-                mono: Some(mono),
-                hotword: hotword_from_record(record),
-            },
-            AudioSource::Url(url) => AudioInputDto {
-                url: Some(url.clone()),
-                b64_str: None,
-                mono: Some(mono),
-                hotword: hotword_from_record(record),
-            },
-            AudioSource::Base64(data) => AudioInputDto {
-                url: None,
-                b64_str: Some(data.clone()),
-                mono: Some(mono),
-                hotword: hotword_from_record(record),
-            },
-            AudioSource::EncodedBytes(bytes) | AudioSource::PcmS16Le { bytes, .. } => {
-                AudioInputDto {
-                    url: None,
-                    b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-                    mono: Some(mono),
-                    hotword: hotword_from_record(record),
-                }
-            }
-        };
+        let input =
+            audio_input_from_source(&record.source, Some(mono), hotword_from_record(record));
         if input.url.is_none() && input.b64_str.is_none() {
             bail!("audio {} has no usable source", record.audio_id());
         }
@@ -561,10 +543,11 @@ fn align_counts(reference: &str, hypothesis: &str) -> AlignCounts {
                 (dp[i][j - 1] + 1, Op::Ins),
                 (dp[i - 1][j] + 1, Op::Del),
             ];
+            // 三个候选固定非空，`unwrap_or` 只用于消除 `Option`，兜底分支不会命中。
             let (cost, op) = candidates
                 .into_iter()
                 .min_by_key(|(cost, op)| (*cost, op.rank()))
-                .expect("non-empty candidates");
+                .unwrap_or(candidates[0]);
             dp[i][j] = cost;
             back[i][j] = op;
         }
@@ -624,8 +607,9 @@ impl Op {
 }
 
 fn reference_text(record: &Audio, timeline: EvalTimeline) -> Result<String> {
-    let _ = timeline;
-    Ok(record.timeline.transcript().text)
+    Ok(record_timeline(record, timeline)?
+        .reference_transcript()
+        .text)
 }
 
 fn hypothesis_text(item: &crate::InferenceData, timeline: EvalTimeline) -> String {
@@ -781,14 +765,13 @@ fn chinese_number_value(chars: &[char]) -> Option<u64> {
             has_unit = true;
             section += number.max(1) * unit;
             number = 0;
-        } else if let Some(unit) = chinese_large_unit(ch) {
+        } else {
+            let unit = chinese_large_unit(ch)?;
             has_unit = true;
             section += number;
             total += section.max(1) * unit;
             section = 0;
             number = 0;
-        } else {
-            return None;
         }
     }
 
@@ -813,10 +796,10 @@ fn hotword_from_record(record: &Audio) -> Option<String> {
         let Some(value) = record.metadata.get(key) else {
             continue;
         };
-        if let Some(text) = value.as_str() {
-            if !text.trim().is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.as_str()
+            && !text.trim().is_empty()
+        {
+            return Some(text.to_string());
         }
         if let Some(values) = value.as_array() {
             let joined = values
@@ -873,33 +856,50 @@ mod tests {
     use super::{EvalNormalizer, EvalTimeline, hypothesis_text, normalize_text, reference_text};
     use crate::InferenceData;
     use asr_data::{
-        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, Audio, AudioChannel,
-        DurationMs, TextSpan, TimeRange,
+        Annotation, Audio, AudioChannel, AudioEncoding, AudioFormat, AudioInfo, AudioSource,
+        Transcription,
     };
 
+    fn test_audio_info(channels: u16) -> AudioInfo {
+        AudioInfo {
+            sample_rate: 16_000,
+            channels,
+            frame_count: 16_000,
+            source_format: AudioFormat {
+                encoding: AudioEncoding::Unknown,
+                sample_rate: 16_000,
+                channels,
+            },
+        }
+    }
+
     fn add_reference(audio: &mut Audio, channel: AudioChannel, text: &str) {
+        let duration = audio.timeline_duration().unwrap_or(1_000);
         audio
-            .ensure_timeline(channel)
+            .ensure_timeline(channel, Some(duration))
             .expect("timeline")
-            .push(Annotation::new(
-                TimeRange::new(DurationMs(0), DurationMs(0)),
-                AnnotationPayload::Transcription(TextSpan {
-                    text: text.to_string(),
-                    tokens: Vec::new(),
-                    language: Some("en".to_string()),
-                }),
-                AnnotationSource::User,
-                AnnotationStatus::Final,
-            ));
+            .annotate_span_with(
+                0,
+                duration,
+                Annotation::Transcription(Transcription::new(text)),
+                true,
+                None,
+            )
+            .expect("reference");
     }
 
     #[test]
     fn timeline_selects_matching_reference_and_hypothesis() {
-        let mut audio = Audio::with_id("call-1", "https://example.com/call.wav");
+        let mut audio = Audio::with_id_from_info(
+            "call-1",
+            AudioSource::from_url("https://example.com/call.wav"),
+            &test_audio_info(2),
+        );
         add_reference(&mut audio, AudioChannel::Left, "left reference");
         add_reference(&mut audio, AudioChannel::Right, "right reference");
 
-        let mut inference = InferenceData::from_timeline("service", audio.mono_timeline());
+        let dummy = asr_data::Timeline::new("call-1", 1_000);
+        let mut inference = InferenceData::from_timeline("service", &dummy);
         inference.text.mono = "mono hypothesis".to_string();
         inference.text.left = "left hypothesis".to_string();
         inference.text.right = "right hypothesis".to_string();

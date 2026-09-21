@@ -4,11 +4,13 @@ pub mod error;
 pub mod layers;
 pub mod model_builder;
 pub mod models;
+pub mod timeline;
 pub mod traits;
 pub mod utils;
 
-pub use asr_data::audio;
+pub mod audio;
 
+pub use audio::{AudioInput, AudioLoader, SAMPLE_RATE_HZ, normalize_audio_input};
 pub use model_builder::{
     AsrQuantizationConfig, OfflineAsrBuildOutput, OfflineAsrBuildRequest, OfflineAsrBuildStats,
     OfflineAsrModelBuilder, build_offline_asr_model,
@@ -19,6 +21,10 @@ pub use modelhub::{download, modelscope, modelscope_cache_dir, set_cache_dir};
 pub use models::qwen3asr::{Qwen3ASR, Qwen3Asr};
 pub use models::qwen3asr::{qwen_outputs_to_timelines, qwen_transcribe_options};
 pub use models::sensevoice::{SenseVoiceLoadOptions, SenseVoiceOnline};
+pub use timeline::{
+    ASR_SOURCE, StreamEvent, VAD_SOURCE, activity_span, extend_predictions, offset_spans,
+    prediction_text, reference_text, timeline_from_spans, transcription_span,
+};
 pub use traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
 #[cfg(feature = "paged-attn")]
 pub use vasr_paged_attn;

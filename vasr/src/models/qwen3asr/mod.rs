@@ -18,8 +18,8 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "paged-attn")]
 use std::sync::mpsc;
 
+pub use crate::audio::AudioInput;
 pub use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
-pub use asr_data::audio::input::AudioInput;
 pub use builder::{Qwen3AsrBuilder, resolve_qwen3_asr_model_id};
 pub use capabilities::{qwen_outputs_to_timelines, qwen_transcribe_options};
 #[cfg(feature = "paged-attn")]

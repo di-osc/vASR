@@ -1,7 +1,9 @@
 use std::any::Any;
 
 use anyhow::Result;
-use asr_data::{Annotation, AudioChunk, Timeline, Waveform};
+use asr_data::{AudioChunk, Timeline, Waveform};
+
+pub use crate::timeline::StreamEvent;
 
 #[derive(Debug, Clone)]
 pub struct AsrOptions {
@@ -41,7 +43,7 @@ pub trait StreamingAsrModel: Send + Sync {
 }
 
 pub trait StreamingAsrSession: Send {
-    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<Annotation>>;
+    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<StreamEvent>>;
 
-    fn finish(&mut self) -> Result<Vec<Annotation>>;
+    fn finish(&mut self) -> Result<Vec<StreamEvent>>;
 }

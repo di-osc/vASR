@@ -159,11 +159,11 @@ impl OfflineFeatureExtractor {
         for frame_idx in 0..frames {
             let start = frame_idx * self.cfg.hop_length;
 
-            for i in 0..self.cfg.n_fft {
+            for (i, slot) in buf.iter_mut().enumerate() {
                 let idx = start as isize + i as isize - (self.cfg.n_fft / 2) as isize;
                 let src = reflect_index(idx, source_len);
                 let x = sample_at(src);
-                buf[i] = Complex::new(x * self.window[i], 0.0);
+                *slot = Complex::new(x * self.window[i], 0.0);
             }
 
             self.fft.process(&mut buf);

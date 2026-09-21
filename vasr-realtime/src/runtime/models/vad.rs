@@ -1,8 +1,10 @@
 use std::path::Path;
 
 use anyhow::Result;
-use asr_data::{Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, Waveform};
+use asr_data::Waveform;
 use candle_core::Device;
+use vasr::StreamEvent;
+use vasr::timeline::activity_span;
 use vasr_vad as model_vad;
 
 use crate::runtime::model::{StreamingVadSession, VadModel, VadOptions, VadSegment};
@@ -31,10 +33,9 @@ impl FireRedVadModel {
 
 impl VadModel for FireRedVadModel {
     fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
-        Ok(self
-            .inner
+        self.inner
             .detect(waveform, &model_options(options))
-            .map(model_segments)?)
+            .map(model_segments)
     }
 
     fn new_stream(&self, options: &VadOptions) -> Result<Box<dyn StreamingVadSession>> {
@@ -49,36 +50,28 @@ struct FireRedVadStream {
 }
 
 impl StreamingVadSession for FireRedVadStream {
-    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<asr_data::Annotation>> {
+    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         Ok(self
             .inner
             .push_chunk(chunk)?
             .into_iter()
-            .map(vad_event_annotation)
+            .map(vad_event)
             .collect())
     }
 
-    fn finish(&mut self) -> Result<Vec<asr_data::Annotation>> {
-        Ok(self
-            .inner
-            .finish()?
-            .into_iter()
-            .map(vad_event_annotation)
-            .collect())
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
+        Ok(self.inner.finish()?.into_iter().map(vad_event).collect())
     }
 }
 
-fn vad_event_annotation(event: model_vad::VadEvent) -> Annotation {
-    let status = match event.status {
-        model_vad::VadEventStatus::Partial => AnnotationStatus::Partial,
-        model_vad::VadEventStatus::Final => AnnotationStatus::Final,
-    };
-    Annotation::new(
-        event.range,
-        AnnotationPayload::Speech,
-        AnnotationSource::Model("firered_vad".to_string()),
-        status,
-    )
+fn vad_event(event: model_vad::VadEvent) -> StreamEvent {
+    let span = activity_span(event.range, "speech", "firered_vad");
+    StreamEvent {
+        range: span.range,
+        annotation: span.annotation,
+        source: span.source.unwrap_or_else(|| "firered_vad".to_string()),
+        is_final: matches!(event.status, model_vad::VadEventStatus::Final),
+    }
 }
 
 fn model_options(options: &VadOptions) -> model_vad::VadOptions {

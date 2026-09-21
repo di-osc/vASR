@@ -56,9 +56,13 @@ fn main() -> Result<()> {
         language: Batch::one(Some("English".to_string())),
         return_timestamps: false,
         max_new_tokens,
-        max_batch_size: 1,
+        // 并发解码序列数上限；`0` 表示使用调度器默认值。
+        decode_max_seqs: 1,
         max_batch_audio_sec: 0.0,
         chunk_max_sec: None,
+        // 解码长度预估参数：每秒 token 数与最小 token 数，保持与 `TranscribeOptions::default` 一致。
+        decode_tokens_per_sec: 4.25,
+        decode_min_tokens: 128,
         bucket_by_length: false,
     };
 
@@ -91,14 +95,15 @@ fn parse_dtype(value: &str) -> Result<DType> {
 }
 
 fn default_gpu_device() -> Result<Device> {
+    // 三个分支互斥（cfg 保证只编译一个），因此可以直接作为函数尾表达式返回。
     #[cfg(feature = "cuda")]
     {
-        return Device::new_cuda_with_stream(0).context("failed to create CUDA device 0");
+        Device::new_cuda_with_stream(0).context("failed to create CUDA device 0")
     }
 
     #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     {
-        return Device::new_metal(0).context("failed to create Metal device 0");
+        Device::new_metal(0).context("failed to create Metal device 0")
     }
 
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]

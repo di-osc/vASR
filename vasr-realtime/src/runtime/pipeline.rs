@@ -1,5 +1,5 @@
 use anyhow::Result;
-use asr_data::Annotation;
+use vasr::StreamEvent;
 
 use crate::runtime::model::{StreamingAsrSession, StreamingVadSession};
 
@@ -9,23 +9,23 @@ pub struct RealtimePipeline {
 }
 
 impl RealtimePipeline {
-    pub fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<Annotation>> {
-        let mut annotations = self.vad.push_chunk(chunk)?;
-        annotations.extend(self.asr.push_chunk(chunk)?);
-        Ok(annotations)
+    pub fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
+        let mut events = self.vad.push_chunk(chunk)?;
+        events.extend(self.asr.push_chunk(chunk)?);
+        Ok(events)
     }
 
-    pub fn finish(&mut self) -> Result<Vec<Annotation>> {
-        let mut annotations = self.finish_vad()?;
-        annotations.extend(self.finish_asr()?);
-        Ok(annotations)
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>> {
+        let mut events = self.finish_vad()?;
+        events.extend(self.finish_asr()?);
+        Ok(events)
     }
 
-    pub fn finish_vad(&mut self) -> Result<Vec<Annotation>> {
+    pub fn finish_vad(&mut self) -> Result<Vec<StreamEvent>> {
         self.vad.finish()
     }
 
-    pub fn finish_asr(&mut self) -> Result<Vec<Annotation>> {
+    pub fn finish_asr(&mut self) -> Result<Vec<StreamEvent>> {
         self.asr.finish()
     }
 }

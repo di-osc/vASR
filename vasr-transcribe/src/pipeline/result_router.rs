@@ -43,13 +43,13 @@ pub(super) fn spawn_global_result_router(
                 continue;
             };
             let mut completed = None;
-            if let Ok(mut pending) = pending_requests.lock() {
-                if let Some(request) = pending.get_mut(&request_item.request_id) {
-                    request.outcomes.push(routed.outcome);
-                    request.remaining = request.remaining.saturating_sub(1);
-                    if request.remaining == 0 {
-                        completed = pending.remove(&request_item.request_id);
-                    }
+            if let Ok(mut pending) = pending_requests.lock()
+                && let Some(request) = pending.get_mut(&request_item.request_id)
+            {
+                request.outcomes.push(routed.outcome);
+                request.remaining = request.remaining.saturating_sub(1);
+                if request.remaining == 0 {
+                    completed = pending.remove(&request_item.request_id);
                 }
             }
             if let Some(request) = completed {

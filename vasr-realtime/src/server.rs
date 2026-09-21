@@ -3,13 +3,12 @@ use crate::protocol::{
     SessionUpdateWarning,
 };
 use crate::runtime::{AsrModel, AsrOptions, RealtimePipeline, VadModel, VadOptions};
-use asr_data::{
-    Annotation, AnnotationPayload, AnnotationStatus, AudioBytesStream, TimeRange, Waveform,
-};
+use asr_data::{Annotation, TimeRange, Waveform};
 use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
-use vasr::OfflineAsrModel;
+use vasr::audio::AudioBytesStream;
+use vasr::{OfflineAsrModel, StreamEvent};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -594,7 +593,7 @@ impl RealtimeSession {
         let mut events = self.process_chunks(&chunks, false, request_event_id);
         if let Some(pipeline) = self.pipeline.as_mut() {
             match pipeline.finish_vad() {
-                Ok(annotations) => events.extend(events_from_annotations(
+                Ok(annotations) => events.extend(events_from_stream_events(
                     annotations,
                     &mut self.current_item_id,
                     &mut self.last_transcript,
@@ -648,8 +647,7 @@ impl RealtimeSession {
         let mut events = Vec::new();
         for chunk in chunks {
             self.asr_turn_has_audio = true;
-            self.asr_turn_samples
-                .extend_from_slice(&chunk.waveform.samples);
+            self.asr_turn_samples.extend_from_slice(&chunk.samples);
             let annotations = match self.pipeline.as_mut() {
                 Some(pipeline) => match pipeline.push_chunk(chunk) {
                     Ok(annotations) => annotations,
@@ -673,11 +671,11 @@ impl RealtimeSession {
                     continue;
                 }
             };
-            let speech_stopped = annotations.iter().any(|annotation| {
-                annotation.status == AnnotationStatus::Final
-                    && matches!(&annotation.payload, AnnotationPayload::Speech)
+            let speech_stopped = annotations.iter().any(|event| {
+                event.is_final
+                    && matches!(&event.annotation, Annotation::Activity(activity) if activity.event.as_deref() == Some("speech"))
             });
-            events.extend(events_from_annotations(
+            events.extend(events_from_stream_events(
                 annotations,
                 &mut self.current_item_id,
                 &mut self.last_transcript,
@@ -719,7 +717,7 @@ impl RealtimeSession {
             online_final
         };
         match final_annotations {
-            Ok(annotations) => events.extend(events_from_annotations(
+            Ok(annotations) => events.extend(events_from_stream_events(
                 annotations,
                 &mut self.current_item_id,
                 &mut self.last_transcript,
@@ -746,7 +744,7 @@ impl RealtimeSession {
         }
     }
 
-    fn transcribe_offline_turn(&self) -> anyhow::Result<Vec<Annotation>> {
+    fn transcribe_offline_turn(&self) -> anyhow::Result<Vec<StreamEvent>> {
         let Some(model) = &self.offline_asr_model else {
             return Ok(Vec::new());
         };
@@ -757,10 +755,16 @@ impl RealtimeSession {
         let timelines = model.transcribe(&[waveform], &self.offline_asr_options)?;
         Ok(timelines
             .into_iter()
-            .flat_map(|timeline| timeline.annotations)
-            .filter(|annotation| {
-                annotation.status == AnnotationStatus::Final
-                    && matches!(&annotation.payload, AnnotationPayload::Transcription(_))
+            .flat_map(|timeline| timeline.prediction)
+            .filter_map(|span| match span.annotation {
+                Annotation::Transcription(transcription) => Some(StreamEvent::transcription(
+                    span.range,
+                    transcription.text,
+                    transcription.language,
+                    span.source.as_deref().unwrap_or("offline_asr"),
+                    true,
+                )),
+                _ => None,
             })
             .collect())
     }
@@ -901,37 +905,39 @@ impl SessionUpdateError {
     }
 }
 
-fn events_from_annotations(
-    annotations: Vec<asr_data::Annotation>,
+fn events_from_stream_events(
+    events: Vec<StreamEvent>,
     current_item_id: &mut Option<String>,
     last_transcript: &mut String,
 ) -> Vec<ServerRealtimeEvent> {
-    annotations
+    events
         .into_iter()
-        .filter_map(|annotation| match annotation.payload {
-            AnnotationPayload::Speech if annotation.status == AnnotationStatus::Partial => {
+        .filter_map(|event| match event.annotation {
+            Annotation::Activity(activity)
+                if !event.is_final && activity.event.as_deref() == Some("speech") =>
+            {
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
                 Some(ServerRealtimeEvent::SpeechStarted {
                     event_id: event_id(),
                     item_id,
-                    audio_start_ms: annotation.range.start.0,
+                    audio_start_ms: event.range.start_ms as u64,
                 })
             }
-            AnnotationPayload::Speech if annotation.status == AnnotationStatus::Final => {
+            Annotation::Activity(activity)
+                if event.is_final && activity.event.as_deref() == Some("speech") =>
+            {
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
                 Some(ServerRealtimeEvent::SpeechStopped {
                     event_id: event_id(),
                     item_id,
-                    audio_end_ms: annotation.range.end.0,
+                    audio_end_ms: event.range.end_ms as u64,
                 })
             }
-            AnnotationPayload::Transcription(segment)
-                if annotation.status == AnnotationStatus::Partial =>
-            {
+            Annotation::Transcription(segment) if !event.is_final => {
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
@@ -941,7 +947,7 @@ fn events_from_annotations(
                     .unwrap_or_default()
                     .to_string();
                 *last_transcript = segment.text.clone();
-                let (start_ms, end_ms) = transcription_range(annotation.range);
+                let (start_ms, end_ms) = transcription_range(event.range);
                 Some(ServerRealtimeEvent::TranscriptionText {
                     event_id: event_id(),
                     item_id,
@@ -955,15 +961,13 @@ fn events_from_annotations(
                     itn: None,
                 })
             }
-            AnnotationPayload::Transcription(segment)
-                if annotation.status == AnnotationStatus::Final =>
-            {
+            Annotation::Transcription(segment) if event.is_final => {
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
                 *current_item_id = None;
                 last_transcript.clear();
-                let (start_ms, end_ms) = transcription_range(annotation.range);
+                let (start_ms, end_ms) = transcription_range(event.range);
                 Some(ServerRealtimeEvent::TranscriptionCompleted {
                     event_id: event_id(),
                     item_id,
@@ -985,7 +989,7 @@ fn transcription_range(range: TimeRange) -> (Option<u64>, Option<u64>) {
     if range == TimeRange::default() {
         (None, None)
     } else {
-        (Some(range.start.0), Some(range.end.0))
+        (Some(range.start_ms as u64), Some(range.end_ms as u64))
     }
 }
 
@@ -1015,24 +1019,23 @@ fn error_event(
 mod tests {
     use super::*;
     use crate::runtime::{StreamingAsrSession, StreamingVadSession};
-    use asr_data::{
-        Annotation, AnnotationSource, AudioChunk, DurationMs, TextSpan, Timeline, Token, Waveform,
-    };
+    use asr_data::{AudioChunk, Timeline, Waveform};
     use std::sync::Mutex;
+    use vasr::{StreamEvent, transcription_span};
 
     struct TestVadSession;
 
     impl StreamingVadSession for TestVadSession {
-        fn push_chunk(&mut self, _chunk: &AudioChunk) -> anyhow::Result<Vec<Annotation>> {
+        fn push_chunk(&mut self, _chunk: &AudioChunk) -> anyhow::Result<Vec<StreamEvent>> {
             Ok(Vec::new())
         }
 
-        fn finish(&mut self) -> anyhow::Result<Vec<Annotation>> {
-            Ok(vec![Annotation::new(
-                TimeRange::new(DurationMs(0), DurationMs(100)),
-                AnnotationPayload::Speech,
-                AnnotationSource::Model("test_vad".to_string()),
-                AnnotationStatus::Final,
+        fn finish(&mut self) -> anyhow::Result<Vec<StreamEvent>> {
+            Ok(vec![StreamEvent::activity(
+                TimeRange::new(0, 100),
+                "speech",
+                "test_vad",
+                true,
             )])
         }
     }
@@ -1040,20 +1043,17 @@ mod tests {
     struct TestAsrSession;
 
     impl StreamingAsrSession for TestAsrSession {
-        fn push_chunk(&mut self, _chunk: &AudioChunk) -> anyhow::Result<Vec<Annotation>> {
+        fn push_chunk(&mut self, _chunk: &AudioChunk) -> anyhow::Result<Vec<StreamEvent>> {
             Ok(Vec::new())
         }
 
-        fn finish(&mut self) -> anyhow::Result<Vec<Annotation>> {
-            Ok(vec![Annotation::new(
+        fn finish(&mut self) -> anyhow::Result<Vec<StreamEvent>> {
+            Ok(vec![StreamEvent::transcription(
                 TimeRange::default(),
-                AnnotationPayload::Transcription(TextSpan {
-                    text: "hello".to_string(),
-                    tokens: Vec::<Token>::new(),
-                    language: Some("en".to_string()),
-                }),
-                AnnotationSource::Model("test_asr".to_string()),
-                AnnotationStatus::Final,
+                "hello",
+                Some("en".to_string()),
+                "test_asr",
+                true,
             )])
         }
     }
@@ -1076,18 +1076,17 @@ mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("sample recorder lock poisoned"))?
                 .extend(waveforms.iter().map(|waveform| waveform.samples.len()));
-            let mut timeline = Timeline::new("test-offline");
-            timeline.push(Annotation::new(
-                TimeRange::default(),
-                AnnotationPayload::Transcription(TextSpan {
-                    text: "offline final".to_string(),
-                    tokens: Vec::new(),
-                    language: Some("en".to_string()),
-                }),
-                AnnotationSource::Model("test_offline_asr".to_string()),
-                AnnotationStatus::Final,
-            ));
-            Ok(vec![timeline])
+            vasr::timeline_from_spans(
+                "test-offline",
+                0,
+                [transcription_span(
+                    TimeRange::default(),
+                    "offline final",
+                    Some("en".to_string()),
+                    "test_offline_asr",
+                )],
+            )
+            .map(|timeline| vec![timeline])
         }
     }
 

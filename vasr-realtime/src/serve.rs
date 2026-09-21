@@ -98,7 +98,7 @@ pub struct RealtimeArgs {
 
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_realtime=info"
+        "warn,vasr_realtime=debug,vasr::models::qwen3asr=debug"
     } else {
         "warn,vasr_realtime=info"
     };

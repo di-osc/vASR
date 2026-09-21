@@ -536,7 +536,9 @@ fn get_device_info(dev: &CudaDevice) -> DeviceInfo {
 
     let map = DEVICE_INFO.get_or_init(|| Mutex::new(HashMap::new()));
     let key = dev.id();
-    let mut guard = map.lock().unwrap();
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(info) = guard.get(&key) {
         return *info;
     }
@@ -1653,6 +1655,7 @@ pub fn fused_qkv(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_fused_qkv_mmq_q8_0(
     q_w: &QTensor,
     k_w: &QTensor,
@@ -1674,7 +1677,7 @@ fn try_fused_qkv_mmq_q8_0(
         Some(t) => t,
         None => return Ok(None),
     };
-    if b_size <= Q8_MMVQ_MAX_BATCH || k % Q8_1_BLOCK_SIZE != 0 {
+    if b_size <= Q8_MMVQ_MAX_BATCH || !k.is_multiple_of(Q8_1_BLOCK_SIZE) {
         return Ok(None);
     }
     let Device::Cuda(dev) = q_w.device() else {

@@ -1,4 +1,7 @@
-fn main() {
+/// 按需编译 CUDA 量化算子。
+///
+/// 返回 `Result` 让 cargo 负责报错，避免在构建脚本里 `unwrap` 环境变量。
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "cuda")]
     {
         println!("cargo:rerun-if-changed=kernels/mmvq_gguf/mmvq_gguf.cu");
@@ -11,7 +14,7 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/rotary/cuda_compat.h");
         println!("cargo:rerun-if-changed=kernels/rotary/rotary.cu");
 
-        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         let out_file = out_dir.join("libqwen3_asr_q8_mmvq.a");
         bindgen_cuda::Builder::default()
             .kernel_paths(vec![
@@ -38,4 +41,5 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
+    Ok(())
 }

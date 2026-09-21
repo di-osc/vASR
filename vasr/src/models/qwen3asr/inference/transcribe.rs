@@ -440,7 +440,7 @@ pub fn decode_ids_with_metadata(
     }
     let mut out_langs: Vec<Vec<String>> = vec![Vec::new(); merged.audio_len];
     let mut out_texts: Vec<Vec<String>> = vec![Vec::new(); merged.audio_len];
-    for (chunk, ids) in merged.chunks.iter().zip(ids.into_iter()) {
+    for (chunk, ids) in merged.chunks.iter().zip(ids) {
         let raw = processor.tokenizer.decode(ids.as_slice())?;
         let forced = merged
             .forced_langs_norm
@@ -874,6 +874,7 @@ fn merge_generation_timings(dst: &mut TranscribeTimings, src: &GenerationTimings
         .saturating_add(src.tokens_generated);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_raw_prepared_batch(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
@@ -968,7 +969,7 @@ pub(crate) fn generate_raw_prepared_batch(
             );
         }
 
-        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
+        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids) {
             let raw = processor.tokenizer.decode(ids.as_slice())?;
             if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
                 tracing::debug!(
@@ -1133,6 +1134,7 @@ fn encode_prepared_audio_features_cpu(
     Ok((audio_features_cpu, timings))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_raw_prepared_batch_with_audio_features(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
@@ -1495,6 +1497,7 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
 }
 
 #[cfg(feature = "timing")]
+#[allow(clippy::too_many_arguments)]
 fn generate_raw_prepared_batch_timed(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
@@ -1628,7 +1631,7 @@ fn generate_raw_prepared_batch_timed(
         }
 
         let start_decode = std::time::Instant::now();
-        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
+        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids) {
             let token_count = ids.len();
             let raw = processor.tokenizer.decode(ids.as_slice())?;
             if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
@@ -2184,7 +2187,7 @@ pub fn transcribe(
     }
 
     let asr_batch = ChunkAsrBatch {
-        thinker: thinker,
+        thinker,
         processor,
         device,
         #[cfg(feature = "paged-attn")]
@@ -2572,6 +2575,7 @@ pub fn decode_cpu_audio_features_timed(
 }
 
 #[cfg(feature = "timing")]
+#[allow(clippy::too_many_arguments)]
 fn generate_raw_prepared_batch_with_audio_features_timed(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
@@ -2580,7 +2584,7 @@ fn generate_raw_prepared_batch_with_audio_features_timed(
     prepared: &[PreparedInputs],
     audio_features: &Tensor,
     max_new_tokens: usize,
-    decode_max_seqs: usize,
+    _decode_max_seqs: usize,
     eos_token_ids: &[u32],
     timings: &mut TranscribeTimings,
 ) -> Result<Vec<GeneratedRaw>> {
@@ -2610,7 +2614,7 @@ fn generate_raw_prepared_batch_with_audio_features_timed(
             audio_features,
             max_new_tokens,
             eos_token_ids,
-            decode_max_seqs,
+            _decode_max_seqs,
             pad_id,
             None,
         )?
@@ -2688,7 +2692,7 @@ pub fn decode_cpu_audio_features_dynamic(
         #[cfg(feature = "timing")]
         None,
     )?;
-    drop(poll_prepared);
+    let _ = poll_prepared;
     let (metas, batch_lens, _chunks_seen, _batches_seen) = source.into_parts();
     decode_ids_with_metadata(processor, ids, metas, batch_lens)
 }
@@ -2729,7 +2733,7 @@ pub fn decode_cpu_audio_features_dynamic_timed(
         pad_id,
         Some(&mut timings.generation),
     )?;
-    drop(poll_prepared);
+    let _ = poll_prepared;
     let (metas, batch_lens, chunks_seen, batches_seen) = source.into_parts();
     timings.chunks = timings.chunks.saturating_add(chunks_seen);
     timings.batches = timings.batches.saturating_add(batches_seen);
@@ -2810,7 +2814,7 @@ pub fn transcribe_timed(
     timings.chunks = chunks.len();
 
     let asr_batch = ChunkAsrBatch {
-        thinker: thinker,
+        thinker,
         processor,
         device,
         #[cfg(feature = "paged-attn")]
@@ -2862,7 +2866,7 @@ pub fn transcribe_timed(
     }
 
     let mut out: Vec<AsrTranscription> = Vec::with_capacity(audio.len());
-    for (langs, texts) in out_langs.into_iter().zip(out_texts.into_iter()) {
+    for (langs, texts) in out_langs.into_iter().zip(out_texts) {
         out.push(AsrTranscription {
             language: merge_languages(langs),
             text: texts.join(""),

@@ -698,7 +698,7 @@ impl DecodeCudaGraph {
     }
 
     pub fn captured_batch(&self) -> usize {
-        self.input_ids.dims().get(0).copied().unwrap_or(0)
+        self.input_ids.dims().first().copied().unwrap_or(0)
     }
 
     pub fn output_kind(&self) -> DecodeGraphOutputKind {

@@ -1,14 +1,10 @@
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
-    TimeRange, Timeline, Waveform,
-};
+use asr_data::{AudioActivity, AudioChunk, TimeRange, Timeline, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
 use gemm::Parallelism;
@@ -143,7 +139,7 @@ impl FsmnVadPostProcessor {
         let raw_segments = ms_segments
             .into_iter()
             .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
+                range: TimeRange::new(start as usize, end as usize),
                 probability: options.threshold,
             })
             .filter(|segment| segment_duration_ms(segment) >= options.min_speech_ms)
@@ -271,14 +267,18 @@ impl FsmnVadModel {
     }
 
     pub fn annotate(&self, waveform: &Waveform, options: &VadOptions) -> Timeline {
-        let mut timeline = Timeline::new("vad_audio");
-        timeline.duration = Some(DurationMs(waveform.duration_ms().round() as u64));
+        let duration = waveform.duration_ms().round() as usize;
+        let mut timeline = Timeline::new("vad_audio", duration);
         if let Ok(segments) = self.detect(waveform, options) {
             for segment in segments {
-                timeline.push(speech_annotation(
-                    ms_to_samples(segment.range.start.0),
-                    ms_to_samples(segment.range.end.0),
-                ));
+                // 写入预测轨道：参考标注不允许携带 source。
+                let _ = timeline.annotate_span_with(
+                    segment.range.start_ms,
+                    segment.range.end_ms,
+                    AudioActivity::new().with_event("speech"),
+                    false,
+                    Some(FSMN_VAD_SOURCE),
+                );
             }
         }
         timeline
@@ -392,7 +392,7 @@ impl FsmnVadModel {
         let raw_segments = ms_segments
             .into_iter()
             .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
+                range: TimeRange::new(start as usize, end as usize),
                 probability: options.threshold,
             })
             .filter(|segment| segment_duration_ms(segment) >= options.min_speech_ms)
@@ -447,7 +447,7 @@ impl FsmnVadModel {
         let raw_segments = ms_segments
             .into_iter()
             .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
+                range: TimeRange::new(start as usize, end as usize),
                 probability: options.threshold,
             })
             .filter(|segment| segment_duration_ms(segment) >= options.min_speech_ms)
@@ -536,7 +536,8 @@ impl FsmnVadModel {
         options: &VadOptions,
         min_silence_ms: u64,
     ) -> Result<Vec<VadSegment>> {
-        let local_waveform = waveform.slice_ms(segment.range.start.0, segment.range.end.0);
+        let local_waveform =
+            waveform.slice_ms(segment.range.start_ms as u64, segment.range.end_ms as u64);
         let mut refined_options = options.clone();
         refined_options.min_silence_ms = min_silence_ms;
         refined_options.max_segment_ms = 0;
@@ -544,16 +545,16 @@ impl FsmnVadModel {
         Ok(local_segments
             .into_iter()
             .map(|mut local| {
-                local.range.start.0 = local.range.start.0.saturating_add(segment.range.start.0);
-                local.range.end.0 = local
+                // 局部检测结果平移回原音频时间轴。
+                local.range.start_ms = local.range.start_ms.saturating_add(segment.range.start_ms);
+                local.range.end_ms = local
                     .range
-                    .end
-                    .0
-                    .saturating_add(segment.range.start.0)
-                    .min(segment.range.end.0);
+                    .end_ms
+                    .saturating_add(segment.range.start_ms)
+                    .min(segment.range.end_ms);
                 local
             })
-            .filter(|local| local.range.end.0 > local.range.start.0)
+            .filter(|local| local.range.end_ms > local.range.start_ms)
             .collect())
     }
 }
@@ -563,13 +564,15 @@ fn hard_split_segment(segment: &VadSegment, max_segment_ms: u64) -> Vec<VadSegme
         return vec![segment.clone()];
     }
 
+    // 时间轴坐标是 `usize` 毫秒，这里把选项里的 `u64` 阈值转换一次复用。
+    let max_segment_ms = max_segment_ms as usize;
     let mut split = Vec::new();
-    let mut start = segment.range.start.0;
-    let end = segment.range.end.0;
+    let mut start = segment.range.start_ms;
+    let end = segment.range.end_ms;
     while start < end {
         let next = start.saturating_add(max_segment_ms).min(end);
         split.push(VadSegment {
-            range: TimeRange::new(DurationMs(start), DurationMs(next)),
+            range: TimeRange::new(start, next),
             probability: segment.probability,
         });
         start = next;
@@ -578,7 +581,7 @@ fn hard_split_segment(segment: &VadSegment, max_segment_ms: u64) -> Vec<VadSegme
 }
 
 fn segment_duration_ms(segment: &VadSegment) -> u64 {
-    segment.range.end.0.saturating_sub(segment.range.start.0)
+    segment.range.end_ms.saturating_sub(segment.range.start_ms) as u64
 }
 
 fn fsmn_vad_device() -> Result<Device> {
@@ -622,8 +625,11 @@ fn fsmn_vad_cuda_device() -> Result<Device> {
 }
 
 fn build_e2e_model(options: &VadOptions) -> E2EVadModel {
-    let mut config = E2EVadConfig::default();
-    config.speech_noise_thres = options.threshold;
+    // 用结构体更新语法一次性构造，避免 Default 之后再逐字段赋值。
+    let config = E2EVadConfig {
+        speech_noise_thres: options.threshold,
+        ..E2EVadConfig::default()
+    };
     E2EVadModel::new(config)
 }
 
@@ -678,7 +684,7 @@ impl FsmnVadWeights {
             ..Default::default()
         })?;
 
-        let vb = VarBuilder::from_pth(&model_path, DType::F32, &device)
+        let vb = VarBuilder::from_pth(&model_path, DType::F32, device)
             .with_context(|| format!("failed to load FSMN VAD weights {}", model_path.display()))?;
         let encoder_vb = vb.pp("encoder");
         let in_linear1 = linear(400, 140, encoder_vb.pp("in_linear1").pp("linear"))?;
@@ -843,7 +849,7 @@ impl FsmnCpuWeights {
         let scores = run_with_vad_threads(num_threads, || {
             self.forward_frame_scores_cpu(feats, &mut cpu_caches, timing)
         })??;
-        for (cache, cpu_cache) in caches.iter_mut().zip(cpu_caches.into_iter()) {
+        for (cache, cpu_cache) in caches.iter_mut().zip(cpu_caches) {
             *cache = Tensor::from_vec(
                 cpu_cache,
                 (1usize, FSMN_VAD_PROJ_DIM, FSMN_VAD_CACHE_FRAMES, 1usize),
@@ -909,11 +915,12 @@ impl FsmnCpuBlock {
         })
     }
 
+    /// 单层 FSMN 前向：线性投影 + memory 卷积 + affine，并滚动更新 `cache`。
     fn forward(
         &self,
         input: Vec<f32>,
         frames: usize,
-        cache: &mut Vec<f32>,
+        cache: &mut [f32],
         idx: usize,
         timing: &mut FsmnVadForwardTiming,
     ) -> Result<Vec<f32>> {
@@ -1018,9 +1025,12 @@ fn tensor_caches_to_cpu(caches: &[Tensor]) -> Result<Vec<Vec<f32>>> {
         .collect()
 }
 
+/// 对 `input` 做 FSMN 卷积并滚动更新 `cache`。
+///
+/// `cache` 取切片而非 `&mut Vec`，避免调用方为借用检查额外构造容器。
 fn fsmn_block_memory_vec(
     input: &[f32],
-    cache: &mut Vec<f32>,
+    cache: &mut [f32],
     kernel: &[f32],
     frames: usize,
 ) -> Result<Vec<f32>> {
@@ -1035,7 +1045,7 @@ fn fsmn_block_memory_vec(
     }
 
     let channels = FSMN_VAD_PROJ_DIM;
-    let old_cache = cache.clone();
+    let old_cache = cache.to_vec();
     let mut out = input.to_vec();
     out.par_chunks_mut(channels)
         .enumerate()
@@ -1337,14 +1347,15 @@ impl FsmnVadSession {
         }
 
         let (full_chunks, tail) = split_full_chunks(input, FSMN_VAD_STREAM_SCORE_SAMPLES);
-        for chunk_slice in full_chunks.chunks_exact(FSMN_VAD_STREAM_SCORE_SAMPLES) {
+        let (chunks, _remainder) = full_chunks.as_chunks::<FSMN_VAD_STREAM_SCORE_SAMPLES>();
+        for chunk_slice in chunks {
             segments.extend(self.score_and_segment(chunk_slice, false)?);
         }
         self.pending.extend_from_slice(tail);
         Ok(segments
             .into_iter()
             .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
+                range: TimeRange::new(start as usize, end as usize),
                 probability: self.vad_options.threshold,
             })
             .collect())
@@ -1366,7 +1377,7 @@ impl FsmnVadSession {
         Ok(segments
             .into_iter()
             .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
+                range: TimeRange::new(start as usize, end as usize),
                 probability: self.vad_options.threshold,
             })
             .collect())
@@ -1465,13 +1476,13 @@ fn extract_cmvn_vector(text: &str, section: &str) -> Result<Vec<f32>> {
 
 impl StreamingVadSession for FsmnVadSession {
     fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<VadEvent>> {
-        if chunk.waveform.sample_rate != FSMN_VAD_SAMPLE_RATE {
+        if chunk.sample_rate != FSMN_VAD_SAMPLE_RATE {
             bail!(
                 "FSMN VAD expects 16kHz mono audio, got sample_rate={}",
-                chunk.waveform.sample_rate
+                chunk.sample_rate
             );
         }
-        let segments = self.push_samples_f32(&chunk.waveform.samples)?;
+        let segments = self.push_samples_f32(&chunk.samples)?;
         Ok(segments
             .into_iter()
             .map(|segment| VadEvent {
@@ -1682,7 +1693,7 @@ impl WavFrontend {
             .map(|&sample| f32::from(sample))
             .collect::<Vec<_>>();
         let fbank = self.compute_fbank_features(&waveform)?;
-        let lfr = self.apply_lfr(&fbank);
+        let lfr = self.apply_lfr(&fbank)?;
         Ok(self.apply_cmvn(&lfr))
     }
 
@@ -1692,7 +1703,7 @@ impl WavFrontend {
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
             .collect::<Vec<_>>();
         let fbank = self.compute_fbank_features(&waveform)?;
-        let lfr = self.apply_lfr(&fbank);
+        let lfr = self.apply_lfr(&fbank)?;
         Ok(self.apply_cmvn(&lfr))
     }
 
@@ -1700,7 +1711,8 @@ impl WavFrontend {
         let opt = FbankOptions {
             frame_opts: FrameExtractionOptions {
                 samp_freq: self.config.sample_rate as f32,
-                window_type: CStr::from_bytes_with_nul(b"hamming\0")?.as_ptr(),
+                // `c"hamming"` 字面量在编译期完成 NUL 终止校验。
+                window_type: c"hamming".as_ptr(),
                 dither: 0.0,
                 frame_shift_ms: self.config.frame_shift_ms,
                 frame_length_ms: self.config.frame_length_ms,
@@ -1730,10 +1742,15 @@ impl WavFrontend {
         )?)
     }
 
-    fn apply_lfr(&self, fbank: &Array2<f32>) -> Array2<f32> {
+    /// 按 LFR-m/LFR-n 把 fbank 特征拼接成 LFR 特征。
+    ///
+    /// # Errors
+    ///
+    /// 帧切片无法展平成一维视图时返回错误。
+    fn apply_lfr(&self, fbank: &Array2<f32>) -> Result<Array2<f32>> {
         let t = fbank.shape()[0];
         if t == 0 {
-            return Array2::zeros((0, self.config.n_mels * self.config.lfr_m));
+            return Ok(Array2::zeros((0, self.config.n_mels * self.config.lfr_m)));
         }
         let t_lfr = (t as f32 / self.config.lfr_n as f32).ceil() as usize;
         let left_padding_rows = (self.config.lfr_m - 1) / 2;
@@ -1755,7 +1772,7 @@ impl WavFrontend {
             let frame = padded.slice(s![start..end, ..]);
             let flat = frame
                 .into_shape_with_order(frame.len())
-                .expect("LFR frame reshape");
+                .map_err(|error| anyhow::anyhow!("failed to flatten LFR frame: {error}"))?;
             lfr.slice_mut(s![i, ..flat.len()]).assign(&flat);
             if end < start + self.config.lfr_m {
                 let last_row = padded.slice(s![padded.shape()[0] - 1, ..]);
@@ -1765,9 +1782,13 @@ impl WavFrontend {
                 }
             }
         }
-        lfr
+        Ok(lfr)
     }
 
+    /// 应用 CMVN 归一化。
+    ///
+    /// `cmvn_means` / `cmvn_vars` 缺失或维度不匹配时原样返回，因此下面的
+    /// broadcast 分支实际不可达，用 `let ... else` 兜底即可。
     fn apply_cmvn(&self, feats: &Array2<f32>) -> Array2<f32> {
         let (Some(means), Some(vars)) = (&self.cmvn_means, &self.cmvn_vars) else {
             return feats.to_owned();
@@ -1776,8 +1797,12 @@ impl WavFrontend {
         if means.len() != dim || vars.len() != dim {
             return feats.to_owned();
         }
-        let means = means.broadcast((frames, dim)).expect("CMVN mean broadcast");
-        let vars = vars.broadcast((frames, dim)).expect("CMVN var broadcast");
+        let Some(means) = means.broadcast((frames, dim)) else {
+            return feats.to_owned();
+        };
+        let Some(vars) = vars.broadcast((frames, dim)) else {
+            return feats.to_owned();
+        };
         (feats + &means) * vars
     }
 }
@@ -1799,8 +1824,8 @@ fn download_fsmn_vad() -> Result<PathBuf> {
             target.display()
         );
     }
-    block_on_async(modelhub::modelscope::download_model(FSMN_VAD_REPO, &cache))
-        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    let downloaded = block_on_async(modelhub::modelscope::download_model(FSMN_VAD_REPO, &cache))?;
+    downloaded.with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
     validate_fsmn_vad_model_dir(&target)?;
     Ok(target)
 }
@@ -1845,43 +1870,40 @@ fn nonempty_file(path: &Path) -> Result<bool> {
     Ok(meta.is_file() && meta.len() > 0)
 }
 
-fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
+/// 在独立线程上用一次性 tokio runtime 阻塞执行 `future`。
+///
+/// 返回值包一层 [`Result`]，让运行时创建失败与线程 panic 都能向上传播，
+/// 避免在库代码里使用 `unwrap` / `expect`。
+fn block_on_async<F: std::future::Future + Send>(future: F) -> Result<F::Output>
 where
     F::Output: Send,
 {
     std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                rt.block_on(future)
-            })
+        let handle = scope.spawn(|| -> Result<F::Output> {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+            Ok(runtime.block_on(future))
+        });
+        handle
             .join()
-            .expect("tokio download thread panicked")
+            .map_err(|_| anyhow::anyhow!("tokio download thread panicked"))?
     })
 }
 
+// 以下采样点 / 毫秒换算只在测试里的流式分段器与断言中使用。
+#[cfg(test)]
 fn sample_range(start: usize, end: usize) -> TimeRange {
-    TimeRange::new(
-        DurationMs(sample_to_ms(start)),
-        DurationMs(sample_to_ms(end)),
-    )
+    TimeRange::new(sample_to_ms(start), sample_to_ms(end))
 }
 
-fn sample_to_ms(sample: usize) -> u64 {
-    (sample as u64).saturating_mul(1000) / u64::from(FSMN_VAD_SAMPLE_RATE)
+#[cfg(test)]
+fn sample_to_ms(sample: usize) -> usize {
+    sample.saturating_mul(1000) / FSMN_VAD_SAMPLE_RATE as usize
 }
 
+#[cfg(test)]
 fn ms_to_samples(ms: u64) -> usize {
     (ms as usize).saturating_mul(FSMN_VAD_SAMPLE_RATE as usize) / 1000
-}
-
-fn speech_annotation(start: usize, end: usize) -> Annotation {
-    Annotation::new(
-        sample_range(start, end),
-        AnnotationPayload::Speech,
-        AnnotationSource::Model(FSMN_VAD_SOURCE.to_string()),
-        AnnotationStatus::Final,
-    )
 }
 
 #[cfg(test)]
@@ -1972,13 +1994,13 @@ mod tests {
         let segments = segmenter.push_probability(0.1);
 
         assert_eq!(segments.len(), 1);
-        assert!(segments[0].range.start.0 < sample_to_ms(2 * FSMN_VAD_CHUNK_SIZE));
+        assert!(segments[0].range.start_ms < sample_to_ms(2 * FSMN_VAD_CHUNK_SIZE));
     }
 
     #[test]
     fn hard_split_segment_respects_max_segment_ms() {
         let segment = VadSegment {
-            range: TimeRange::new(DurationMs(100), DurationMs(760)),
+            range: TimeRange::new(100, 760),
             probability: 0.9,
         };
 
@@ -1986,7 +2008,7 @@ mod tests {
 
         let ranges = split
             .iter()
-            .map(|segment| (segment.range.start.0, segment.range.end.0))
+            .map(|segment| (segment.range.start_ms, segment.range.end_ms))
             .collect::<Vec<_>>();
         assert_eq!(ranges, vec![(100, 350), (350, 600), (600, 760)]);
     }
@@ -2009,11 +2031,11 @@ mod tests {
         };
         let raw_segments = vec![
             VadSegment {
-                range: TimeRange::new(DurationMs(100), DurationMs(760)),
+                range: TimeRange::new(100, 760),
                 probability: 0.9,
             },
             VadSegment {
-                range: TimeRange::new(DurationMs(900), DurationMs(1300)),
+                range: TimeRange::new(900, 1300),
                 probability: 0.9,
             },
         ];
@@ -2242,7 +2264,7 @@ mod tests {
             for path in files {
                 let waveform = load_pcm16_wav(&path)?;
                 for segment in model.detect(&waveform, &VadOptions::default())? {
-                    ranges.push((segment.range.start.0, segment.range.end.0));
+                    ranges.push((segment.range.start_ms, segment.range.end_ms));
                 }
             }
             if device == "cpu" {
@@ -2316,10 +2338,12 @@ mod tests {
         .find(|path| path.join("model.pt").exists() && path.join("am.mvn").exists());
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/fsmn_vad_fasr_segments.json");
-        if !audio_dir.is_dir() || model_dir.is_none() || !fixture_path.exists() {
+        if !audio_dir.is_dir() || !fixture_path.exists() {
             return Ok(());
         }
-        let model_dir = model_dir.expect("checked above");
+        let Some(model_dir) = model_dir else {
+            return Ok(());
+        };
 
         let fixture: FasrVadFixture =
             serde_json::from_str(&std::fs::read_to_string(&fixture_path)?)?;
@@ -2343,7 +2367,7 @@ mod tests {
             let segments = model.detect(&waveform, &options)?;
             let actual = segments
                 .iter()
-                .map(|segment| [segment.range.start.0 as i32, segment.range.end.0 as i32])
+                .map(|segment| [segment.range.start_ms as i32, segment.range.end_ms as i32])
                 .collect::<Vec<_>>();
             assert_eq!(
                 actual.len(),
@@ -2416,9 +2440,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let (full_chunks, tail) = split_full_chunks(&samples, FSMN_VAD_CHUNK_SIZE);
-        let chunks = full_chunks
-            .chunks_exact(FSMN_VAD_CHUNK_SIZE)
-            .collect::<Vec<_>>();
+        let chunks = full_chunks.as_chunks::<FSMN_VAD_CHUNK_SIZE>().0;
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0][0], 0);

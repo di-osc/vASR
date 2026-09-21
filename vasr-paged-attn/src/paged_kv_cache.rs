@@ -102,17 +102,21 @@ pub fn slot_for_block_table_position(
         .map_err(|_| candle_core::Error::Msg(format!("paged slot overflows i64: {slot}")))
 }
 
-fn build_varlen_metadata(
-    query_lens: Option<Vec<usize>>,
-    kv_lens: Option<Vec<usize>>,
-    device: &Device,
-) -> Result<(
+/// `build_varlen_metadata` 的返回值：
+/// flash 参数、query/kv 的 cu_seqlens、最大 query 长度、最大 kv 长度。
+type VarlenMetadata = (
     Option<FlashParams>,
     Option<Tensor>,
     Option<Tensor>,
     Option<usize>,
     Option<usize>,
-)> {
+);
+
+fn build_varlen_metadata(
+    query_lens: Option<Vec<usize>>,
+    kv_lens: Option<Vec<usize>>,
+    device: &Device,
+) -> Result<VarlenMetadata> {
     let cu_seqlens_q = query_lens
         .as_ref()
         .map(|lens| cumulative_seqlens_from_lengths(lens.as_slice(), device))
@@ -261,11 +265,11 @@ impl PagedKvCache {
         }
 
         let dtype_bytes = dtype.size_in_bytes();
-        if dtype_bytes == 0 || 16 % dtype_bytes != 0 {
+        if dtype_bytes == 0 || !16usize.is_multiple_of(dtype_bytes) {
             candle_core::bail!("unsupported paged kv cache dtype: {dtype:?}");
         }
         let key_pack = 16 / dtype_bytes;
-        if head_dim % key_pack != 0 {
+        if !head_dim.is_multiple_of(key_pack) {
             candle_core::bail!(
                 "head_dim must be divisible by key cache pack size: head_dim={head_dim} pack={key_pack}"
             );
@@ -611,9 +615,10 @@ impl PagedKvCache {
                     candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
                 })?);
             }
-            for _ in table.len()..max_blocks {
-                block_table_host.push(0);
-            }
+            block_table_host.resize(
+                block_table_host.len() + max_blocks.saturating_sub(table.len()),
+                0,
+            );
         }
 
         let mut context_host = Vec::with_capacity(batch);
@@ -741,9 +746,10 @@ impl PagedKvCache {
                     candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
                 })?);
             }
-            for _ in table.len()..max_blocks {
-                block_table_host.push(0);
-            }
+            block_table_host.resize(
+                block_table_host.len() + max_blocks.saturating_sub(table.len()),
+                0,
+            );
         }
 
         let kv_lens = Some(query_lens.clone());
@@ -831,9 +837,10 @@ impl PagedKvCache {
                     candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
                 })?);
             }
-            for _ in table.len()..max_blocks {
-                block_table_host.push(0);
-            }
+            block_table_host.resize(
+                block_table_host.len() + max_blocks.saturating_sub(table.len()),
+                0,
+            );
         }
 
         let mut context_host = Vec::with_capacity(batch);
@@ -958,9 +965,10 @@ impl PagedKvCache {
                     candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
                 })?);
             }
-            for _ in table.len()..max_blocks {
-                block_table_host.push(0);
-            }
+            block_table_host.resize(
+                block_table_host.len() + max_blocks.saturating_sub(table.len()),
+                0,
+            );
         }
         let block_tables_tensor = Tensor::from_vec(block_table_host, (batch, max_blocks), device)?;
 
@@ -970,8 +978,8 @@ impl PagedKvCache {
 
         for step in 0..steps {
             let mut step_max_context = 0usize;
-            for seq in 0..batch {
-                let position = prompt_lens[seq].checked_add(step).ok_or_else(|| {
+            for (seq, &prompt_len) in prompt_lens.iter().enumerate() {
+                let position = prompt_len.checked_add(step).ok_or_else(|| {
                     candle_core::Error::Msg("batch decode slot position overflow".to_string())
                 })?;
                 let context_len = position.checked_add(1).ok_or_else(|| {

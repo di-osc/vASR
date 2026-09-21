@@ -38,13 +38,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 #[cfg(feature = "paged-attn")]
 use anyhow::bail;
-use asr_data::AudioLoader;
-#[cfg(feature = "paged-attn")]
-use asr_data::DurationMs;
-use asr_data::{Annotation, AudioSource, Timeline, Waveform};
+use asr_data::{AudioSource, TimeSpan, Timeline, Waveform};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use vasr::AudioLoader;
 #[cfg(feature = "paged-attn")]
 use vasr::models::qwen3asr::AudioFeatureEncodeTimings;
 #[cfg(feature = "timing")]
@@ -491,7 +489,7 @@ impl AsyncTranscribePipeline {
         let vad_stats = Arc::new(Mutex::new(VadStageStats::default()));
         let asr_stats = Arc::new(Mutex::new(AsrStageStats::default()));
 
-        let loader = self.loader.clone();
+        let loader = self.loader;
         let loader_handle = spawn_loader_worker(
             unique_inputs,
             loader,
@@ -587,6 +585,8 @@ pub struct PipelineCudaTrimSnapshot {
 
 struct PendingGlobalRequest {
     log_id: String,
+    /// 仅在 `paged-attn` 解码失败时用于回填失败结果。
+    #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
     failure_indices: Vec<usize>,
     remaining: usize,
     duplicate_indices: Vec<(usize, usize)>,
@@ -879,10 +879,10 @@ struct AsrSegmentJob {
     timing: TranscribeItemTiming,
     spans: TranscribeItemSpans,
     job_audio_seconds: f64,
-    speech_annotations: Vec<Annotation>,
+    speech_annotations: Vec<TimeSpan>,
     segment_index: usize,
     segment_count: usize,
-    offset: DurationMs,
+    offset: usize,
     waveform: Waveform,
 }
 
@@ -935,12 +935,13 @@ fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
             },
             segment_index,
             segment_count,
-            offset: segment.range.start,
+            offset: segment.range.start_ms,
             waveform,
         })
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_asr_worker(
     asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,
@@ -1099,24 +1100,21 @@ async fn collect_job_microbatch(
             Err(mpsc::error::TryRecvError::Disconnected) => return messages,
         }
     }
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(ASR_MICROBATCH_COLLECT_WAIT_MS),
-            vad_to_asr_rx.recv(),
-        )
-        .await
-        {
-            Ok(Some(envelope)) => match envelope.message {
-                #[cfg(feature = "paged-attn")]
-                Ok(AsrPipelineMessage::Segment(_)) => {
-                    _pending.push_back(envelope);
-                }
-                Ok(AsrPipelineMessage::Job(job)) => {
-                    messages.push(Ok(AsrPipelineMessage::Job(job)));
-                }
-                message => messages.push(message),
-            },
-            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
+    while let Ok(Some(envelope)) = tokio::time::timeout(
+        std::time::Duration::from_millis(ASR_MICROBATCH_COLLECT_WAIT_MS),
+        vad_to_asr_rx.recv(),
+    )
+    .await
+    {
+        match envelope.message {
+            #[cfg(feature = "paged-attn")]
+            Ok(AsrPipelineMessage::Segment(_)) => {
+                _pending.push_back(envelope);
+            }
+            Ok(AsrPipelineMessage::Job(job)) => {
+                messages.push(Ok(AsrPipelineMessage::Job(job)));
+            }
+            message => messages.push(message),
         }
     }
     messages
@@ -1156,7 +1154,7 @@ fn run_asr_jobs_batch(
     stats: Option<&Arc<Mutex<AsrStageStats>>>,
 ) -> Vec<RoutedTranscribeItemOutcome> {
     let mut outcomes = Vec::with_capacity(jobs.len());
-    let mut raw_jobs: Vec<(AsrJob, Vec<Annotation>)> = Vec::new();
+    let mut raw_jobs: Vec<(AsrJob, Vec<TimeSpan>)> = Vec::new();
 
     for mut job in jobs {
         let prepared = std::mem::replace(&mut job.prepared, VadPreparation::Disabled);
@@ -1183,7 +1181,10 @@ fn run_asr_jobs_batch(
                 let outcome = TranscribeItemOutcome {
                     index: job.index,
                     channel: job.channel,
-                    result: Ok(Timeline::new("offline_audio")),
+                    result: Ok(Timeline::new(
+                        "offline_audio",
+                        job.waveform.duration_ms().round() as usize,
+                    )),
                     audio_seconds: job.waveform.duration_seconds(),
                     timing: job.timing,
                     spans: job.spans,
@@ -1240,7 +1241,7 @@ fn run_asr_jobs_batch(
                         ),
                         mut timeline,
                     ),
-                    mut annotations,
+                    annotations,
                 ) in indices
                     .into_iter()
                     .zip(request_items)
@@ -1266,9 +1267,22 @@ fn run_asr_jobs_batch(
                             prefill_span_from_decode(asr_span, Some(batch_timing)),
                         ));
                     }
-                    if !annotations.is_empty() {
-                        annotations.extend(timeline.annotations);
-                        timeline.annotations = annotations;
+                    if !annotations.is_empty()
+                        && let Err(err) = vasr::extend_predictions(&mut timeline, annotations)
+                    {
+                        outcomes.push(route_outcome(
+                            request_item,
+                            TranscribeItemOutcome {
+                                index,
+                                channel,
+                                result: Err(err),
+                                audio_seconds,
+                                timing,
+                                spans,
+                                bad_component: Some("recognizer"),
+                            },
+                        ));
+                        continue;
                     }
                     outcomes.push(route_outcome(
                         request_item,
@@ -1496,7 +1510,7 @@ fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
             let speech_seconds = prepared
                 .segments
                 .iter()
-                .map(|segment| segment.range.duration().0 as f64 / 1000.0)
+                .map(|segment| segment.range.duration() as f64 / 1000.0)
                 .sum();
             (prepared.segments.len(), speech_seconds)
         }
@@ -1981,11 +1995,23 @@ fn outcome_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asr_data::{
-        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
-    };
+    use asr_data::TimeRange;
     use std::sync::{Arc, Mutex};
     use vasr::OfflineAsrModel as AsrModel;
+
+    fn test_transcription_timeline(audio_id: &str, text: &str, source: &str) -> Timeline {
+        vasr::timeline_from_spans(
+            audio_id,
+            0,
+            [vasr::transcription_span(
+                TimeRange::default(),
+                text,
+                None,
+                source,
+            )],
+        )
+        .expect("test timeline")
+    }
 
     #[test]
     fn default_stage_parallelism_is_nonzero() {
@@ -2056,7 +2082,7 @@ mod tests {
             speech_annotations: Vec::new(),
             segment_index: 0,
             segment_count: 1,
-            offset: DurationMs(0),
+            offset: 0,
             waveform: Waveform::new(vec![0.0; 1024 * 1024 + 1], 16_000),
         }));
         assert_eq!(vad_to_asr_message_memory_permits(&message), 5);
@@ -2104,16 +2130,7 @@ mod tests {
                 .push(waveforms.len());
             Ok(waveforms
                 .iter()
-                .map(|_| {
-                    let mut timeline = Timeline::new("fake_batch_asr");
-                    timeline.push(Annotation::new(
-                        Default::default(),
-                        AnnotationPayload::Transcription(TextSpan::new("ok")),
-                        AnnotationSource::Model("fake_batch_asr".to_string()),
-                        AnnotationStatus::Final,
-                    ));
-                    timeline
-                })
+                .map(|_| test_transcription_timeline("fake_batch_asr", "ok", "fake_batch_asr"))
                 .collect())
         }
     }
@@ -2133,7 +2150,7 @@ mod tests {
                 speech_annotations: Vec::new(),
                 segment_index: 0,
                 segment_count: 2,
-                offset: DurationMs(0),
+                offset: 0,
                 waveform: Waveform::new(vec![0.1; 160], 16_000),
             },
             AsrSegmentJob {
@@ -2146,26 +2163,20 @@ mod tests {
                 speech_annotations: Vec::new(),
                 segment_index: 1,
                 segment_count: 2,
-                offset: DurationMs(100),
+                offset: 100,
                 waveform: Waveform::new(vec![0.2; 160], 16_000),
             },
         ];
         prepare_segment_job_state(&mut state, segments.as_slice());
 
-        let mut ok_timeline = Timeline::new("fake_batch_asr");
-        ok_timeline.push(Annotation::new(
-            Default::default(),
-            AnnotationPayload::Transcription(TextSpan::new("ok")),
-            AnnotationSource::Model("fake_batch_asr".to_string()),
-            AnnotationStatus::Final,
-        ));
+        let ok_timeline = test_transcription_timeline("fake_batch_asr", "ok", "fake_batch_asr");
         let ok = finish_segment_asr_batch(
             &mut state,
             &segments[..1],
             Instant::now(),
             Ok((
                 SegmentAsrInference {
-                    targets: vec![(7, 0, DurationMs(0))],
+                    targets: vec![(7, 0, 0)],
                     segment_audio_seconds: 0.01,
                     active_job_count: 1,
                 },
@@ -2212,7 +2223,7 @@ mod tests {
             speech_annotations: Vec::new(),
             segment_index: 0,
             segment_count: 1,
-            offset: DurationMs(0),
+            offset: 0,
             waveform: Waveform::new(vec![0.1; 160], 16_000),
         }];
 
@@ -2260,7 +2271,7 @@ mod tests {
                 .outcome
                 .result
                 .as_ref()
-                .is_ok_and(|timeline| timeline.annotations.is_empty())
+                .is_ok_and(|timeline| timeline.span_count() == 0)
         );
         assert!(
             asr.seen_batch_sizes
@@ -2505,13 +2516,7 @@ mod tests {
 
     #[test]
     fn duplicate_transcribe_outcomes_are_expanded_to_original_indices() {
-        let mut timeline = Timeline::new("canonical");
-        timeline.push(Annotation::new(
-            Default::default(),
-            AnnotationPayload::Transcription(TextSpan::new("same result")),
-            AnnotationSource::Model("fake_batch_asr".to_string()),
-            AnnotationStatus::Final,
-        ));
+        let timeline = test_transcription_timeline("canonical", "same result", "fake_batch_asr");
         let outcomes = vec![
             TranscribeItemOutcome {
                 index: 10,
@@ -2547,7 +2552,7 @@ mod tests {
             expanded[2]
                 .result
                 .as_ref()
-                .is_ok_and(|timeline| { timeline.transcript().text.trim() == "same result" })
+                .is_ok_and(|timeline| vasr::prediction_text(timeline).trim() == "same result")
         );
         assert_eq!(expanded[3].bad_component, Some("loader"));
         assert!(expanded[3].result.is_err());

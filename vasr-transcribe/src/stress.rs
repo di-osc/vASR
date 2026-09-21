@@ -13,12 +13,13 @@ use clap::{ArgAction, Args};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use crate::dataset::read_audio_input_dtos;
 use crate::perf::timestamp_file_name;
 use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse, table::render_table};
 
 #[derive(Debug, Args)]
 pub struct StressArgs {
-    /// Text file containing one audio file path or URL per line.
+    /// Text file with one audio path/URL per line, or a vASR AudioDb (`.vasr`).
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
@@ -173,7 +174,7 @@ struct StressStats {
 
 pub async fn run_stress(args: StressArgs) -> Result<()> {
     validate_args(&args)?;
-    let mut sources = read_audio_sources(&args.input)?;
+    let mut sources = read_audio_input_dtos(&args.input, args.mono)?;
     if sources.is_empty() {
         bail!("input contains no audio sources: {}", args.input.display());
     }
@@ -222,7 +223,6 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
             args.server.clone(),
             Arc::clone(&sources),
             args.batch_size,
-            args.mono,
             args.retries,
             deadline,
             Arc::clone(&stop),
@@ -321,18 +321,7 @@ fn validate_args(args: &StressArgs) -> Result<()> {
     Ok(())
 }
 
-fn read_audio_sources(path: &Path) -> Result<Vec<String>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn shuffle_sources(sources: &mut [String]) {
+fn shuffle_sources(sources: &mut [AudioInputDto]) {
     let mut state = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -343,12 +332,12 @@ fn shuffle_sources(sources: &mut [String]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stress_worker(
     client: reqwest::Client,
     server: String,
-    sources: Arc<Vec<String>>,
+    sources: Arc<Vec<AudioInputDto>>,
     batch_size: usize,
-    mono: Option<bool>,
     retries: usize,
     deadline: Instant,
     stop: Arc<AtomicBool>,
@@ -358,7 +347,7 @@ async fn stress_worker(
     max_errors: usize,
 ) -> Result<()> {
     while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
-        let request = next_request(&sources, batch_size, mono, &next_source);
+        let request = next_request(&sources, batch_size, &next_source);
         let outcome = run_one_request(&client, &server, request, retries).await;
         let should_stop = record_outcome(&stats, outcome, stop_on_oom, max_errors)?;
         if should_stop {
@@ -369,22 +358,13 @@ async fn stress_worker(
 }
 
 fn next_request(
-    sources: &[String],
+    sources: &[AudioInputDto],
     batch_size: usize,
-    mono: Option<bool>,
     next_source: &AtomicUsize,
 ) -> TranscribeRequest {
     let start = next_source.fetch_add(batch_size, Ordering::Relaxed);
     let inputs = (0..batch_size)
-        .map(|offset| {
-            let source = sources[(start + offset) % sources.len()].clone();
-            AudioInputDto {
-                url: Some(source),
-                b64_str: None,
-                mono,
-                hotword: None,
-            }
-        })
+        .map(|offset| sources[(start + offset) % sources.len()].clone())
         .collect();
     TranscribeRequest { inputs }
 }
@@ -473,10 +453,10 @@ fn record_outcome(
         stats.latencies.push(outcome.latency_seconds);
     } else {
         stats.failed_requests = stats.failed_requests.saturating_add(1);
-        if stats.errors.len() < 20 {
-            if let Some(error) = outcome.error.as_deref() {
-                stats.errors.push(error.to_string());
-            }
+        if stats.errors.len() < 20
+            && let Some(error) = outcome.error.as_deref()
+        {
+            stats.errors.push(error.to_string());
         }
     }
     if outcome.oom {
@@ -741,11 +721,23 @@ mod tests {
         assert!(!contains_oom("connection refused"));
     }
 
+    fn sample_input(url: &str, mono: Option<bool>) -> AudioInputDto {
+        AudioInputDto {
+            url: Some(url.to_string()),
+            b64_str: None,
+            mono,
+            hotword: None,
+        }
+    }
+
     #[test]
     fn next_request_cycles_sources() {
-        let sources = vec!["a.wav".to_string(), "b.wav".to_string()];
+        let sources = vec![
+            sample_input("a.wav", Some(true)),
+            sample_input("b.wav", Some(true)),
+        ];
         let next = AtomicUsize::new(1);
-        let request = next_request(&sources, 3, Some(true), &next);
+        let request = next_request(&sources, 3, &next);
         let urls = request
             .inputs
             .iter()
@@ -758,10 +750,18 @@ mod tests {
 
     #[test]
     fn shuffle_preserves_sources() {
-        let mut sources = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut sources = vec![
+            sample_input("a", None),
+            sample_input("b", None),
+            sample_input("c", None),
+        ];
         shuffle_sources(&mut sources);
-        sources.sort();
+        let mut urls = sources
+            .iter()
+            .map(|input| input.url.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        urls.sort();
 
-        assert_eq!(sources, ["a", "b", "c"]);
+        assert_eq!(urls, ["a", "b", "c"]);
     }
 }

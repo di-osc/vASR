@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use asr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange,
-    Timeline, Token, Waveform,
-};
+use asr_data::{TimeRange, Timeline, Waveform};
 use candle_core::Device;
 use vasr::models::qwen3asr::{
     AudioInput, LoadOptions, Qwen3Asr, StreamOptions as RuntimeStreamOptions,
 };
+use vasr::{StreamEvent, timeline::ASR_SOURCE};
 
 use crate::runtime::model::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
 
@@ -58,46 +56,40 @@ struct Qwen3AsrStreamModel {
 }
 
 impl StreamingAsrSession for Qwen3AsrStreamModel {
-    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<Annotation>> {
+    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         let stream = self
             .inner
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.push_audio_chunk(&AudioInput::Waveform {
-            samples: &chunk.waveform.samples,
-            sample_rate: chunk.waveform.sample_rate,
+            samples: &chunk.samples,
+            sample_rate: chunk.sample_rate,
         })?;
         Ok(output
             .map(|output| {
-                vec![Annotation::new(
+                vec![StreamEvent::transcription(
                     TimeRange::default(),
-                    AnnotationPayload::Transcription(TextSpan {
-                        text: output.text,
-                        tokens: Vec::<Token>::new(),
-                        language: Some(output.language),
-                    }),
-                    AnnotationSource::Model("qwen3_asr".to_string()),
-                    AnnotationStatus::Partial,
+                    output.text,
+                    Some(output.language),
+                    ASR_SOURCE,
+                    false,
                 )]
             })
             .unwrap_or_default())
     }
 
-    fn finish(&mut self) -> Result<Vec<Annotation>> {
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
         let stream = self
             .inner
             .take()
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.finish()?;
-        Ok(vec![Annotation::new(
+        Ok(vec![StreamEvent::transcription(
             TimeRange::default(),
-            AnnotationPayload::Transcription(TextSpan {
-                text: output.text,
-                tokens: Vec::new(),
-                language: Some(output.language),
-            }),
-            AnnotationSource::Model("qwen3_asr".to_string()),
-            AnnotationStatus::Final,
+            output.text,
+            Some(output.language),
+            ASR_SOURCE,
+            true,
         )])
     }
 }

@@ -7,7 +7,7 @@ use std::time::Instant;
 use asr_data::AudioSource;
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
-use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
+use vasr::{AsrOptions, AudioLoader, OfflineAsrModel as AsrModel};
 use vasr_vad::{VadModel, VadOptions};
 
 use crate::pipeline::{
@@ -782,6 +782,42 @@ fn error_data(
     data
 }
 
+pub fn build_transcribe_service(
+    pipeline: Arc<GlobalAsyncTranscribePipeline>,
+) -> Arc<TranscribeService> {
+    #[cfg(feature = "cuda-graph")]
+    let baseline_cuda_used_bytes = pipeline
+        .memory_snapshot()
+        .cuda_memory
+        .map(|memory| memory.used_bytes);
+    let service_id = format!("transcribe-{}", uuid::Uuid::new_v4().simple());
+    pipeline.set_service_id(service_id.clone());
+    Arc::new(TranscribeService {
+        service_id,
+        pipeline,
+        active_requests: AtomicUsize::new(0),
+        #[cfg(feature = "cuda-graph")]
+        baseline_cuda_used_bytes,
+    })
+}
+
+pub fn build_transcribe_service_from_parts(
+    vad: Option<Arc<dyn VadModel>>,
+    asr: Arc<dyn AsrModel>,
+    asr_options: AsrOptions,
+    vad_options: VadOptions,
+    worker_options: PipelineWorkerOptions,
+) -> Arc<TranscribeService> {
+    build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start(
+        AudioLoader,
+        vad,
+        asr,
+        asr_options,
+        vad_options,
+        worker_options,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -923,40 +959,4 @@ mod tests {
             sentence_index: 0,
         }
     }
-}
-
-pub fn build_transcribe_service(
-    pipeline: Arc<GlobalAsyncTranscribePipeline>,
-) -> Arc<TranscribeService> {
-    #[cfg(feature = "cuda-graph")]
-    let baseline_cuda_used_bytes = pipeline
-        .memory_snapshot()
-        .cuda_memory
-        .map(|memory| memory.used_bytes);
-    let service_id = format!("transcribe-{}", uuid::Uuid::new_v4().simple());
-    pipeline.set_service_id(service_id.clone());
-    Arc::new(TranscribeService {
-        service_id,
-        pipeline,
-        active_requests: AtomicUsize::new(0),
-        #[cfg(feature = "cuda-graph")]
-        baseline_cuda_used_bytes,
-    })
-}
-
-pub fn build_transcribe_service_from_parts(
-    vad: Option<Arc<dyn VadModel>>,
-    asr: Arc<dyn AsrModel>,
-    asr_options: AsrOptions,
-    vad_options: VadOptions,
-    worker_options: PipelineWorkerOptions,
-) -> Arc<TranscribeService> {
-    build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start(
-        asr_data::AudioLoader,
-        vad,
-        asr,
-        asr_options,
-        vad_options,
-        worker_options,
-    )))
 }

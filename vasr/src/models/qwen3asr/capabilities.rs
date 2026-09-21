@@ -1,9 +1,8 @@
 use anyhow::Result;
-use asr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, TextSpan,
-    TimeRange, Timeline, Waveform,
-};
+use asr_data::{AudioChunk, Timeline, Waveform};
 
+use crate::audio::stream::chunk_range;
+use crate::timeline::{ASR_SOURCE, StreamEvent, language_span, transcription_span, waveform_range};
 use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
 
 #[cfg(feature = "paged-attn")]
@@ -123,46 +122,40 @@ struct Qwen3AsrStreamingSession {
 }
 
 impl StreamingAsrSession for Qwen3AsrStreamingSession {
-    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<Annotation>> {
+    fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<StreamEvent>> {
         let stream = self
             .inner
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.push_audio_chunk(&AudioInput::Waveform {
-            samples: &chunk.waveform.samples,
-            sample_rate: chunk.waveform.sample_rate,
+            samples: &chunk.samples,
+            sample_rate: chunk.sample_rate,
         })?;
         Ok(output
             .map(|output| {
-                vec![Annotation::new(
-                    chunk.range,
-                    AnnotationPayload::Transcription(TextSpan {
-                        text: output.text,
-                        tokens: Vec::new(),
-                        language: Some(output.language),
-                    }),
-                    AnnotationSource::Model("qwen3_asr".to_string()),
-                    AnnotationStatus::Partial,
+                vec![StreamEvent::transcription(
+                    chunk_range(chunk),
+                    output.text,
+                    Some(output.language),
+                    ASR_SOURCE,
+                    false,
                 )]
             })
             .unwrap_or_default())
     }
 
-    fn finish(&mut self) -> Result<Vec<Annotation>> {
+    fn finish(&mut self) -> Result<Vec<StreamEvent>> {
         let stream = self
             .inner
             .take()
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.finish()?;
-        Ok(vec![Annotation::new(
-            TimeRange::default(),
-            AnnotationPayload::Transcription(TextSpan {
-                text: output.text,
-                tokens: Vec::new(),
-                language: Some(output.language),
-            }),
-            AnnotationSource::Model("qwen3_asr".to_string()),
-            AnnotationStatus::Final,
+        Ok(vec![StreamEvent::transcription(
+            asr_data::TimeRange::default(),
+            output.text,
+            Some(output.language),
+            ASR_SOURCE,
+            true,
         )])
     }
 }
@@ -193,38 +186,27 @@ pub fn qwen_outputs_to_timelines(
             waveforms.len()
         );
     }
-    Ok(outputs
+    outputs
         .into_iter()
         .zip(waveforms)
         .map(|(output, waveform)| qwen_output_to_timeline(output, waveform))
-        .collect())
+        .collect::<Result<Vec<_>>>()
 }
 
-fn qwen_output_to_timeline(output: AsrTranscription, waveform: &Waveform) -> Timeline {
-    let mut timeline = Timeline::new("qwen3_asr_audio");
-    let range = TimeRange::new(
-        asr_data::DurationMs(0),
-        asr_data::DurationMs(waveform.duration_ms().round() as u64),
-    );
+fn qwen_output_to_timeline(output: AsrTranscription, waveform: &Waveform) -> Result<Timeline> {
+    let range = waveform_range(waveform);
+    let duration = waveform.duration_ms().round() as usize;
+    let mut spans = Vec::new();
     if !output.language.is_empty() {
-        timeline.push(Annotation::new(
-            range,
-            AnnotationPayload::Language(output.language.clone()),
-            AnnotationSource::Model("qwen3_asr".to_string()),
-            AnnotationStatus::Final,
-        ));
+        spans.push(language_span(range, output.language.clone(), ASR_SOURCE));
     }
-    timeline.push(Annotation::new(
+    spans.push(transcription_span(
         range,
-        AnnotationPayload::Transcription(TextSpan {
-            text: output.text,
-            tokens: Vec::new(),
-            language: Some(output.language),
-        }),
-        AnnotationSource::Model("qwen3_asr".to_string()),
-        AnnotationStatus::Final,
+        output.text,
+        Some(output.language),
+        ASR_SOURCE,
     ));
-    timeline
+    crate::timeline::timeline_from_spans("qwen3_asr_audio", duration, spans)
 }
 
 #[cfg(feature = "timing")]

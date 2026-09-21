@@ -1,3 +1,7 @@
+// 测试代码里 `unwrap` / `expect` 是表达断言失败的常规方式；
+// 工作区对非测试代码依然 deny 这两个 lint。
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use vasr_realtime::{RealtimeArgs, init_logging, run_realtime};
