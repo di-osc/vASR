@@ -12,7 +12,7 @@ path = "src/bin/vasr_realtime.rs"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"

@@ -98,13 +98,11 @@ impl StreamingResampler {
     ///
     /// rubato 无法按给定参数创建重采样器时返回错误。
     pub fn new(from_hz: u32, to_hz: u32, channels: u16) -> Result<Self> {
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
+        // rubato 5 起 `f_cutoff` 是 `Option`，用 builder 显式保留原来的 0.95 截止频率。
+        let params = SincInterpolationParameters::new(256, WindowFunction::BlackmanHarris2)
+            .f_cutoff(0.95)
+            .interpolation(SincInterpolationType::Linear)
+            .oversampling_factor(256);
         let ratio = f64::from(to_hz) / f64::from(from_hz);
         let inner = Async::<f32>::new_sinc(
             ratio,
