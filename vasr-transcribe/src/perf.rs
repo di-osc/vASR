@@ -56,11 +56,27 @@ pub struct PerfArgs {
     output: Option<PathBuf>,
 }
 
+/// 写入 perf 结果的单条音频引用。
+///
+/// 只保留可再次定位音频的地址和请求参数。base64、`data:` URI 等原始音频载荷不进入该结构。
+#[derive(Debug, Clone, Serialize)]
+struct PerfSavedInput {
+    /// 远程 URL 或本地路径。没有可保存的地址时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// 请求里显式指定的 mono 模式。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mono: Option<bool>,
+    /// 请求里的热词。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hotword: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PerfRequestResult {
     request_index: usize,
     batch_size: usize,
-    inputs: Vec<AudioInputDto>,
+    inputs: Vec<PerfSavedInput>,
     latency_seconds: f64,
     ok: bool,
     bad_items: usize,
@@ -279,7 +295,8 @@ async fn run_one_request(
     retries: usize,
 ) -> Result<PerfRequestResult> {
     let batch_size = request.inputs.len();
-    let inputs = request.inputs.clone();
+    // 结果只记音频引用，避免把 base64 等原始音频写进 JSON。
+    let inputs = saved_inputs(&request.inputs);
     let mut last_error = None;
     for attempt in 0..retries {
         let start = Instant::now();
@@ -520,6 +537,35 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
     (year, month as u64, day as u64)
 }
 
+/// 从请求输入抽出可写入结果的引用，丢掉原始音频载荷。
+///
+/// `url` 中的 HTTP(S)、`file://` 和本地路径会保留。`b64_str`，以及写在 `url` 里的
+/// `data:` 内嵌音频，不会保存。
+fn saved_inputs(inputs: &[AudioInputDto]) -> Vec<PerfSavedInput> {
+    inputs
+        .iter()
+        .map(|input| PerfSavedInput {
+            url: persistable_audio_ref(input.url.as_deref()),
+            mono: input.mono,
+            hotword: input.hotword.clone(),
+        })
+        .collect()
+}
+
+/// 保留音频地址；空串和内嵌音频返回 `None`。
+fn persistable_audio_ref(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || is_embedded_audio(value) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// `data:` URI 与 base64 一样是原始音频，不能写入结果。
+fn is_embedded_audio(value: &str) -> bool {
+    value.trim_start().starts_with("data:")
+}
+
 fn truncate_for_error(body: &str) -> String {
     const MAX: usize = 500;
     if body.len() <= MAX {
@@ -539,11 +585,54 @@ fn round6(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::format_utc_timestamp;
+    use super::{format_utc_timestamp, saved_inputs};
+    use crate::AudioInputDto;
 
     #[test]
     fn timestamp_file_name_uses_utc_calendar_format() {
         assert_eq!(format_utc_timestamp(0), "19700101_000000");
         assert_eq!(format_utc_timestamp(1_782_720_711), "20260629_081151");
+    }
+
+    #[test]
+    fn saved_inputs_keep_audio_refs_and_drop_payloads() {
+        let inputs = vec![
+            AudioInputDto {
+                url: Some("https://example.com/a.wav".to_string()),
+                b64_str: Some("AAAA".to_string()),
+                mono: Some(true),
+                hotword: None,
+            },
+            AudioInputDto {
+                url: Some("/data/a.wav".to_string()),
+                b64_str: None,
+                mono: None,
+                hotword: Some("热词".to_string()),
+            },
+            AudioInputDto {
+                url: None,
+                b64_str: Some("UklGRg==".to_string()),
+                mono: Some(false),
+                hotword: None,
+            },
+            AudioInputDto {
+                url: Some("data:audio/wav;base64,UklGRg==".to_string()),
+                b64_str: None,
+                mono: None,
+                hotword: None,
+            },
+        ];
+
+        let json = serde_json::to_value(saved_inputs(&inputs)).expect("saved inputs serialize");
+        let encoded = json.to_string();
+        assert!(!encoded.contains("b64_str"));
+        assert!(!encoded.contains("UklGRg"));
+        assert!(!encoded.contains("AAAA"));
+        assert_eq!(json[0]["url"], "https://example.com/a.wav");
+        assert_eq!(json[0]["mono"], true);
+        assert_eq!(json[1]["url"], "/data/a.wav");
+        assert_eq!(json[1]["hotword"], "热词");
+        assert!(json[2].get("url").is_none());
+        assert!(json[3].get("url").is_none());
     }
 }
