@@ -91,7 +91,7 @@ Evaluate ASR character error rate (CER) against a vASR SQLite AudioDb:
 ```bash
 cargo run -p vasr-transcribe --features metal -- eval \
   --input ./datasets/eval.vasr \
-  --server http://127.0.0.1:8867/inference \
+  --server http://127.0.0.1:8867/transcribe \
   --output ./outputs/benchmark.json
 ```
 

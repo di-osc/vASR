@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+use crate::model_builder::PagedWorkspaceStats;
 use crate::model_builder::{
     OfflineAsrBuildOutput, OfflineAsrBuildRequest, OfflineAsrBuildStats, OfflineAsrModelBuilder,
 };
@@ -118,6 +120,8 @@ fn build_qwen3_asr(req: OfflineAsrBuildRequest) -> Result<OfflineAsrBuildOutput>
     let mut cuda_graph_seqs = None;
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     let mut cuda_graph_context_tokens = None;
+    #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+    let mut paged_workspace = None;
     #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
     let cuda_graph_bytes = None;
     #[cfg(not(all(feature = "cuda-graph", feature = "paged-attn")))]
@@ -129,6 +133,12 @@ fn build_qwen3_asr(req: OfflineAsrBuildRequest) -> Result<OfflineAsrBuildOutput>
     if let Some(max_batch) = req.cuda_graph_max_batch.filter(|&n| n > 0) {
         let prewarm_start = Instant::now();
         let stats = qwen3_asr.prewarm_cuda_decode_graphs(max_batch)?;
+        paged_workspace = stats.paged_workspace.map(|workspace| PagedWorkspaceStats {
+            bytes: workspace.bytes,
+            floor_bytes: workspace.floor_bytes,
+            block_table_cols: workspace.block_table_cols,
+            batches: workspace.batches,
+        });
         if stats.graphs > 0 {
             cuda_graph_seqs = Some(stats.max_batch);
             cuda_graph_context_tokens = Some(stats.context_tokens);
@@ -184,6 +194,8 @@ fn build_qwen3_asr(req: OfflineAsrBuildRequest) -> Result<OfflineAsrBuildOutput>
             cuda_graph_bytes,
             cuda_graph_seqs,
             cuda_graph_context_tokens,
+            #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+            paged_workspace,
         },
     })
 }

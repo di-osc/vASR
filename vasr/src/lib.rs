@@ -11,6 +11,8 @@ pub mod utils;
 pub mod audio;
 
 pub use audio::{AudioInput, AudioLoader, SAMPLE_RATE_HZ, normalize_audio_input};
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+pub use model_builder::PagedWorkspaceStats;
 pub use model_builder::{
     AsrQuantizationConfig, OfflineAsrBuildOutput, OfflineAsrBuildRequest, OfflineAsrBuildStats,
     OfflineAsrModelBuilder, build_offline_asr_model,

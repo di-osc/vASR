@@ -896,6 +896,7 @@ impl PagedCacheRuntime {
                 context_tokens: graph_context_tokens,
                 memory_before: mem_before,
                 memory_after: mem_before,
+                paged_workspace: None,
             });
         }
         let mut captured = 0usize;
@@ -922,17 +923,22 @@ impl PagedCacheRuntime {
             .max(runtime_v2_workspace_bytes)
             .max(reserve_floor_bytes);
         crate::reserve_paged_attention_v2_workspace(device, v2_workspace_bytes)?;
-        if v2_workspace_bytes > 0 {
-            tracing::info!(
-                target: "vasr_transcribe::serve",
-                "CUDA paged-attn v2 workspace reserved | bytes={:.2}MiB runtime={:.2}MiB graph={:.2}MiB floor={:.2}MiB batches={:?} fixed_block_table_cols={graph_block_table_cols}",
-                bytes_to_mib(v2_workspace_bytes),
-                bytes_to_mib(runtime_v2_workspace_bytes),
-                bytes_to_mib(graph_v2_workspace_bytes),
-                bytes_to_mib(reserve_floor_bytes),
-                prewarm_batches,
-            );
-        }
+        // 批次列表留给模型加载日志里的数量摘要，避免启动时单独打出一整行 bucket。
+        let paged_workspace =
+            (v2_workspace_bytes > 0).then_some(crate::cuda_graph::PagedWorkspaceStats {
+                bytes: v2_workspace_bytes,
+                floor_bytes: reserve_floor_bytes,
+                block_table_cols: graph_block_table_cols,
+                batches: prewarm_batches.len(),
+            });
+        tracing::debug!(
+            "CUDA paged-attn v2 workspace reserved | bytes={:.2}MiB runtime={:.2}MiB graph={:.2}MiB floor={:.2}MiB batches={:?} fixed_block_table_cols={graph_block_table_cols}",
+            bytes_to_mib(v2_workspace_bytes),
+            bytes_to_mib(runtime_v2_workspace_bytes),
+            bytes_to_mib(graph_v2_workspace_bytes),
+            bytes_to_mib(reserve_floor_bytes),
+            prewarm_batches,
+        );
         for batch in prewarm_batches {
             let graph = DecodeCudaGraph::capture_batch_warmup(
                 thinker,
@@ -988,6 +994,7 @@ impl PagedCacheRuntime {
             context_tokens: graph_context_tokens,
             memory_before: mem_before,
             memory_after: mem_after,
+            paged_workspace,
         })
     }
 }

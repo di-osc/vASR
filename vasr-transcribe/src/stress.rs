@@ -24,7 +24,7 @@ pub struct StressArgs {
     input: PathBuf,
 
     /// Transcribe service endpoint.
-    #[arg(long, default_value = "http://127.0.0.1:8867/inference")]
+    #[arg(long, default_value = "http://127.0.0.1:8867/transcribe")]
     server: String,
 
     /// HTTP concurrency.

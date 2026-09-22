@@ -225,6 +225,18 @@ pub fn bytes_to_mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// paged-attn v2 workspace reserved before CUDA graph capture.
+///
+/// Batch ids stay out of this summary. The full bucket list is long and belongs
+/// in debug output, not the service startup line.
+#[derive(Debug, Clone, Copy)]
+pub struct PagedWorkspaceStats {
+    pub bytes: usize,
+    pub floor_bytes: usize,
+    pub block_table_cols: usize,
+    pub batches: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CudaGraphPrewarmStats {
     pub graphs: usize,
@@ -232,6 +244,7 @@ pub struct CudaGraphPrewarmStats {
     pub context_tokens: usize,
     pub memory_before: Option<CudaMemorySnapshot>,
     pub memory_after: Option<CudaMemorySnapshot>,
+    pub paged_workspace: Option<PagedWorkspaceStats>,
 }
 
 impl CudaGraphPrewarmStats {
@@ -242,6 +255,7 @@ impl CudaGraphPrewarmStats {
             context_tokens: 0,
             memory_before: None,
             memory_after: None,
+            paged_workspace: None,
         }
     }
 }

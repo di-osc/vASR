@@ -60,6 +60,19 @@ pub struct OfflineAsrBuildStats {
     pub cuda_graph_bytes: Option<usize>,
     pub cuda_graph_seqs: Option<usize>,
     pub cuda_graph_context_tokens: Option<usize>,
+    /// paged-attn v2 workspace reserved while capturing CUDA decode graphs.
+    #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+    pub paged_workspace: Option<PagedWorkspaceStats>,
+}
+
+/// Compact paged-attn workspace figures for the ASR load log.
+#[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+#[derive(Debug, Clone, Copy)]
+pub struct PagedWorkspaceStats {
+    pub bytes: usize,
+    pub floor_bytes: usize,
+    pub block_table_cols: usize,
+    pub batches: usize,
 }
 
 #[cfg(feature = "paged-attn")]

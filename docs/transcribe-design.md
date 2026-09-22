@@ -163,7 +163,7 @@ request 完成:
   再按原始输入顺序返回 HTTP JSON response
 ```
 
-这意味着内部 pipeline 已经是全局流式 decode：所有请求共享同一个 decode scheduler，chunk/segment 完成即聚合、完成即路由。HTTP `/transcribe` 和 `/inference` 仍是一次请求一次 JSON 响应，不是 SSE/WebSocket 流式 API。后续如果要做对外流式服务，可以复用 `RoutedTranscribeItemOutcome` 这一层事件。
+这意味着内部 pipeline 已经是全局流式 decode：所有请求共享同一个 decode scheduler，chunk/segment 完成即聚合、完成即路由。HTTP `/transcribe` 仍是一次请求一次 JSON 响应，不是 SSE/WebSocket 流式 API。后续如果要做对外流式服务，可以复用 `RoutedTranscribeItemOutcome` 这一层事件。
 
 ## Segment Batch 形成规则
 
@@ -204,15 +204,14 @@ input
 
 ## HTTP API
 
-HTTP 服务由 `vasr-transcribe serve` 启动，目前暴露三个接口：
+HTTP 服务由 `vasr-transcribe serve` 启动，目前暴露两个接口：
 
 ```text
 GET  /health
 POST /transcribe
-POST /inference
 ```
 
-`/transcribe` 和 `/inference` 是别名，使用完全相同的请求和响应结构。JSON body 上限是 512 MiB。
+JSON body 上限是 512 MiB。
 
 ### GET /health
 
@@ -224,7 +223,7 @@ POST /inference
 }
 ```
 
-### POST /transcribe 和 /inference
+### POST /transcribe
 
 请求示例：
 

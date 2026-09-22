@@ -279,6 +279,7 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_pipeline(&args.pipeline)?;
     configure_model_cache_dir(&args.pipeline);
+    log_service_start();
     let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start(
         AudioLoader,
         build_vad_model(&args.pipeline.vad)?,
@@ -308,6 +309,7 @@ pub fn build_async_transcribe_pipeline(
 ) -> Result<AsyncTranscribePipeline> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
+    log_service_start();
     let asr = load_asr_model_for_pipeline(
         pipeline,
         language.as_deref(),
@@ -330,6 +332,7 @@ pub fn build_global_transcribe_pipeline(
 ) -> Result<Arc<GlobalAsyncTranscribePipeline>> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
+    log_service_start();
     let asr = load_asr_model_for_pipeline(
         pipeline,
         language.as_deref(),
@@ -375,10 +378,18 @@ fn build_vad_model(vad_args: &VadCliArgs) -> Result<Option<Arc<dyn VadModel>>> {
     };
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "loaded vad | {:.3}s model={} device={}",
-        vad_load_start.elapsed().as_secs_f64(),
-        vad_model,
-        device_label(&vad_device),
+        "{}",
+        startup_log_line(
+            "vad",
+            &[
+                ("model", vad_model),
+                (
+                    "load",
+                    format_load_seconds(vad_load_start.elapsed().as_secs_f64()),
+                ),
+                ("device", device_label(&vad_device).to_string()),
+            ],
+        )
     );
     Ok(Some(vad))
 }
@@ -451,6 +462,37 @@ fn bytes_to_gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// 在加载 VAD 和 ASR 之前打印服务已经开始启动。
+fn log_service_start() {
+    tracing::info!(target: "vasr_transcribe::serve", "starting service");
+}
+
+/// 把加载耗时格式化成秒，不带单位后缀。
+fn format_load_seconds(seconds: f64) -> String {
+    format!("{seconds:.3}")
+}
+
+/// 把字节数格式化成 GiB，保留两位小数。
+fn format_gib(bytes: usize) -> String {
+    format!("{:.2}GiB", bytes_to_gib(bytes))
+}
+
+/// 拼一条启动日志：主体后只有一个竖线，属性用空格分隔。
+fn startup_log_line(subject: &str, fields: &[(&str, String)]) -> String {
+    let mut line = String::from(subject);
+    if fields.is_empty() {
+        return line;
+    }
+    line.push_str(" |");
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(value);
+    }
+    line
+}
+
 fn dtype_label(dtype: DType) -> &'static str {
     match dtype {
         DType::BF16 => "bf16",
@@ -464,63 +506,56 @@ fn dtype_label(dtype: DType) -> &'static str {
     }
 }
 
+/// 打印 ASR 加载结果和显存占用。
+///
+/// 显存行只保留整卡占用、参数、KV 和 CUDA graph。paged attention workspace 不写入启动日志。
 fn log_model_loaded(
+    model: &str,
+    dtype: DType,
     stats: &vasr::OfflineAsrBuildStats,
-    #[allow(unused_variables)] device: &Device,
+    device: &Device,
 ) {
-    let params = stats
-        .parameter_bytes
-        .map(|bytes| format!("{:.2}GiB", bytes_to_gib(bytes)))
-        .unwrap_or_else(|| "unknown".to_string());
-    let kv_cache = stats
-        .kv_cache_bytes
-        .map(|bytes| {
-            format!(
-                "{:.2}GiB/{}tok",
-                bytes_to_gib(bytes),
-                stats.kv_cache_tokens.unwrap_or(0)
-            )
-        })
-        .unwrap_or_else(|| "0.00GiB/0tok".to_string());
-    let cuda_graph = stats
-        .cuda_graph_bytes
-        .map(|bytes| {
-            format!(
-                "{:.2}GiB/{}seqs/{}tok",
-                bytes_to_gib(bytes),
-                stats.cuda_graph_seqs.unwrap_or(0),
-                stats.cuda_graph_context_tokens.unwrap_or(0)
-            )
-        })
-        .unwrap_or_else(|| "0.00GiB/0seqs/0tok".to_string());
-    let isq_quant = stats
-        .quantize_seconds
-        .map(|seconds| format!(" isq_quant={seconds:.3}s"))
-        .unwrap_or_default();
-    let isq_layers = stats
-        .quantized_layer_counts
-        .map(|(audio, text, other)| format!(" isq_layers=audio:{audio},text:{text},other:{other}"))
-        .unwrap_or_default();
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{}",
+        startup_log_line(
+            "asr",
+            &[
+                ("model", model.to_string()),
+                ("load", format_load_seconds(stats.build_seconds)),
+                ("device", device_label(device).to_string()),
+                ("dtype", dtype_label(dtype).to_string()),
+            ],
+        )
+    );
+
+    let mut gpu_fields = Vec::new();
+    // 没有 CUDA 显存快照时不写 used/total/free。
     #[cfg(all(feature = "cuda", feature = "paged-attn"))]
     if device.is_cuda()
         && let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device)
     {
-        let gpu_used = memory.used();
-        tracing::info!(
-            target: "vasr_transcribe::serve",
-            "loaded model | {elapsed_seconds:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph} gpu={:.2}/{:.2}GiB free={:.2}GiB",
-            bytes_to_gib(gpu_used),
-            bytes_to_gib(memory.total),
-            bytes_to_gib(memory.free),
-            elapsed_seconds = stats.build_seconds,
-        );
-        return;
+        gpu_fields.push(("used", format_gib(memory.used())));
+        gpu_fields.push(("total", format_gib(memory.total)));
+        gpu_fields.push(("free", format_gib(memory.free)));
     }
-
+    gpu_fields.push((
+        "params",
+        stats
+            .parameter_bytes
+            .map(format_gib)
+            .unwrap_or_else(|| "unknown".to_string()),
+    ));
+    if let Some(bytes) = stats.kv_cache_bytes {
+        gpu_fields.push(("kv", format_gib(bytes)));
+    }
+    if let Some(bytes) = stats.cuda_graph_bytes {
+        gpu_fields.push(("graph", format_gib(bytes)));
+    }
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "loaded model | {:.3}s{isq_quant}{isq_layers} params={params} kv={kv_cache} graph={cuda_graph}",
-        stats.build_seconds
+        "{}",
+        startup_log_line("gpu", &gpu_fields)
     );
 }
 
@@ -592,13 +627,6 @@ fn load_asr_model_for_pipeline(
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
 
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "starting service | model={} device={} dtype={}",
-        args.model,
-        device_label(&device),
-        dtype_label(dtype),
-    );
     let output = vasr::build_offline_asr_model(vasr::OfflineAsrBuildRequest {
         model: args.model.clone(),
         cache_dir: args.cache_dir.clone(),
@@ -633,7 +661,7 @@ fn load_asr_model_for_pipeline(
     })?;
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     configure_cuda_mempool_release_threshold(&device);
-    log_model_loaded(&output.stats, &device);
+    log_model_loaded(&args.model, dtype, &output.stats, &device);
     let base_asr = output.model;
     if scheduled {
         let asr_scheduler = InferenceScheduler::start("asr")?;
@@ -674,7 +702,7 @@ async fn serve_app(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "server ready | http://{addr} endpoints=health,transcribe,inference"
+        "server ready | http://{addr} endpoints=health,transcribe"
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = async move {
@@ -872,6 +900,36 @@ mod tests {
         .expect_err("fatal pipeline error must stop the HTTP server");
 
         assert!(error.to_string().contains("CUDA out of memory"));
+    }
+
+    #[test]
+    fn startup_log_line_keeps_one_separator() {
+        let line = startup_log_line(
+            "vad",
+            &[
+                ("model", "fsmn".to_string()),
+                ("load", "0.009".to_string()),
+                ("device", "cuda".to_string()),
+            ],
+        );
+        assert_eq!(line, "vad | model=fsmn load=0.009 device=cuda");
+
+        let gpu = startup_log_line(
+            "gpu",
+            &[
+                ("used", "19.45GiB".to_string()),
+                ("total", "23.52GiB".to_string()),
+                ("free", "4.07GiB".to_string()),
+                ("params", "1.75GiB".to_string()),
+                ("kv", "17.06GiB".to_string()),
+                ("graph", "0.516GiB".to_string()),
+            ],
+        );
+        assert_eq!(
+            gpu,
+            "gpu | used=19.45GiB total=23.52GiB free=4.07GiB params=1.75GiB kv=17.06GiB graph=0.516GiB"
+        );
+        assert_eq!(gpu.matches('|').count(), 1);
     }
 
     #[cfg(feature = "cuda")]

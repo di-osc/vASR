@@ -32,7 +32,6 @@ pub struct TranscribeService {
 pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
     Router::new()
         .route("/transcribe", post(handle_transcribe))
-        .route("/inference", post(handle_transcribe))
         .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT_BYTES))
         .with_state(service)
 }
