@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use anyhow::Result;
-use asr_data::{AudioChunk, Timeline, Waveform};
+use vasr_data::{AudioChunk, Timeline, Waveform};
 
 pub use crate::timeline::StreamEvent;
 

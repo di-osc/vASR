@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{AudioChunk, TimeRange, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::sigmoid};
 use gemm::Parallelism;
@@ -12,6 +11,7 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use rayon::prelude::*;
+use vasr_data::{AudioChunk, TimeRange, Waveform};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};
@@ -1449,7 +1449,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asr_data::AudioChunk;
+    use vasr_data::AudioChunk;
 
     fn realtime_options() -> VadOptions {
         VadOptions {

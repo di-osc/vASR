@@ -4,7 +4,6 @@ use super::{
     format_seconds, format_speed,
 };
 use anyhow::{Result, bail};
-use asr_data::Waveform;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -15,6 +14,7 @@ use vasr::models::qwen3asr::{
     Qwen3ASR,
 };
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
+use vasr_data::Waveform;
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug, Clone, Copy)]

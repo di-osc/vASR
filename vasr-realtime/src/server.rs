@@ -3,12 +3,12 @@ use crate::protocol::{
     SessionUpdateWarning,
 };
 use crate::runtime::{AsrModel, AsrOptions, RealtimePipeline, VadModel, VadOptions};
-use asr_data::{Annotation, TimeRange, Waveform};
 use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use vasr::audio::AudioBytesStream;
 use vasr::{OfflineAsrModel, StreamEvent};
+use vasr_data::{Annotation, TimeRange, Waveform};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -640,7 +640,7 @@ impl RealtimeSession {
 
     fn process_chunks(
         &mut self,
-        chunks: &[asr_data::AudioChunk],
+        chunks: &[vasr_data::AudioChunk],
         finalize_on_vad: bool,
         request_event_id: Option<&str>,
     ) -> Vec<ServerRealtimeEvent> {
@@ -1019,9 +1019,9 @@ fn error_event(
 mod tests {
     use super::*;
     use crate::runtime::{StreamingAsrSession, StreamingVadSession};
-    use asr_data::{AudioChunk, Timeline, Waveform};
     use std::sync::Mutex;
     use vasr::{StreamEvent, transcription_span};
+    use vasr_data::{AudioChunk, Timeline, Waveform};
 
     struct TestVadSession;
 

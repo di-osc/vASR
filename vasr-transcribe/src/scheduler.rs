@@ -7,7 +7,7 @@ use std::sync::{
 use std::thread;
 
 use anyhow::{Result, anyhow};
-use asr_data::{Timeline, Waveform};
+use vasr_data::{Timeline, Waveform};
 
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 
@@ -193,11 +193,11 @@ impl AsrModel for ScheduledAsrModel {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use asr_data::{Timeline, Waveform};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use vasr_data::{Timeline, Waveform};
 
     use super::{InferenceScheduler, ScheduledAsrModel};
     use vasr::{AsrOptions, OfflineAsrModel as AsrModel};

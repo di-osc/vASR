@@ -1,5 +1,5 @@
-use asr_data::{Annotation, Timeline};
 use serde::{Deserialize, Serialize};
+use vasr_data::{Annotation, Timeline};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioInputDto {

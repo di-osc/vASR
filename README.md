@@ -8,7 +8,7 @@ protocol DTOs, and HTTP/WebSocket service entry points.
 
 ## Crates
 
-- [`asr-data`](https://github.com/di-osc/asr-data): `Audio`, `Timeline`, `Annotation`, `Waveform`, and SQLite dataset storage.
+- `vasr-data`: `Audio`, `Timeline`, `Annotation`, `Waveform`, and SQLite dataset storage.
 - `vasr-audio`: audio source loading into normalized 16 kHz mono waveforms.
 - `vasr-runtime`: model capability traits, Qwen3-ASR ASR model wrapper, FSMN/FireRed VAD, offline/realtime pipelines.
 - `vasr-protocol`: fasr-compatible transcribe and realtime DTOs.

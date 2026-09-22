@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use asr_data::{
+use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
+use vasr_data::{
     Annotation, Audio, AudioActivity, AudioChannel, AudioEncoding, AudioFormat, AudioInfo,
     AudioSource, MAX_QUERY_LIMIT, Sentence, Speaker, TimeRange, TimeSpan, Token, Transcription,
 };
-use rusqlite::{Connection, OpenFlags};
-use serde::Deserialize;
 
 const APPLICATION_ID: i64 = 0x5641_5352; // "VASR"
 const LEGACY_SCHEMA_V1: i64 = 1;

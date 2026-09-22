@@ -1,5 +1,5 @@
 use anyhow::Result;
-use asr_data::{AudioChunk, Waveform};
+use vasr_data::{AudioChunk, Waveform};
 
 pub use vasr::{AsrOptions, StreamEvent, StreamingAsrModel, StreamingAsrSession};
 pub use vasr_vad::{VadOptions, VadSegment};

@@ -7,8 +7,8 @@ use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
-use asr_data::AudioSource;
 use clap::Args;
+use vasr_data::AudioSource;
 
 #[derive(Debug, Clone, Args)]
 pub struct RunTranscribeArgs {
@@ -331,8 +331,8 @@ pub fn resolve_output_json_path(
 #[cfg(test)]
 mod tests {
     use super::{collect_audio_inputs, collect_run_inputs, resolve_output_json_path};
-    use asr_data::{Audio, AudioDb, AudioEncoding, AudioFormat, AudioInfo, AudioSource};
     use std::path::Path;
+    use vasr_data::{Audio, AudioDb, AudioEncoding, AudioFormat, AudioInfo, AudioSource};
 
     fn test_audio_info() -> AudioInfo {
         AudioInfo {

@@ -4,7 +4,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use asr_data::{AudioActivity, AudioChunk, TimeRange, Timeline, Waveform};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
 use gemm::Parallelism;
@@ -12,6 +11,7 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use rayon::prelude::*;
+use vasr_data::{AudioActivity, AudioChunk, TimeRange, Timeline, Waveform};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};

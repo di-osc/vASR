@@ -4,7 +4,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use asr_data::AudioSource;
+use vasr_data::AudioSource;
 
 use super::{TranscribeInput, TranscribeItemOutcome};
 

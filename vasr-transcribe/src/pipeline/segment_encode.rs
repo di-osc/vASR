@@ -5,7 +5,6 @@ use super::{
     record_request_encode_stages,
 };
 use anyhow::Result;
-use asr_data::Waveform;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -13,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vasr::OfflineAsrModel as AsrModel;
 use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
+use vasr_data::Waveform;
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]

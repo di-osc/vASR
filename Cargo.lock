@@ -109,31 +109,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "asr-data"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75f8922018f09d5e8b70cb25b567980c8220bc46b7d393fffe660377a1b62686"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "reqwest 0.13.4",
- "rmp-serde",
- "rubato",
- "rusqlite",
- "rustfst",
- "serde",
- "serde_bytes",
- "serde_json",
- "symphonia",
- "thiserror 2.0.18",
- "tokio",
- "unicode-general-category",
- "unicode-width",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4732,7 +4707,6 @@ version = "0.1.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
- "asr-data",
  "bindgen_cuda",
  "bytemuck",
  "candle-core",
@@ -4759,10 +4733,34 @@ dependencies = [
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
+ "vasr-data",
  "vasr-flash-attn",
  "vasr-paged-attn",
  "vasr-quant",
  "vasr-vad",
+]
+
+[[package]]
+name = "vasr-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest 0.13.4",
+ "rmp-serde",
+ "rubato",
+ "rusqlite",
+ "rustfst",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "symphonia",
+ "thiserror 2.0.18",
+ "tokio",
+ "unicode-general-category",
+ "unicode-width",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -4810,7 +4808,6 @@ name = "vasr-realtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asr-data",
  "axum",
  "base64 0.22.1",
  "candle-core",
@@ -4823,6 +4820,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vasr",
+ "vasr-data",
  "vasr-vad",
 ]
 
@@ -4831,7 +4829,6 @@ name = "vasr-transcribe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asr-data",
  "axum",
  "base64 0.22.1",
  "candle-core",
@@ -4848,6 +4845,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vasr",
+ "vasr-data",
  "vasr-vad",
 ]
 
@@ -4856,7 +4854,6 @@ name = "vasr-vad"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asr-data",
  "candle-core",
  "candle-nn",
  "gemm 0.19.0",
@@ -4867,6 +4864,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "vasr-data",
 ]
 
 [[package]]

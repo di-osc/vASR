@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use asr_data::Waveform;
+use vasr_data::Waveform;
 use vasr_vad::{FireRedVadModel, VadOptions};
 
 const FIRERED_VAD_REPO: &str = "xukaituo/FireRedVAD";

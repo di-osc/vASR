@@ -1,5 +1,7 @@
 use anyhow::Result;
-use asr_data::{Annotation, AudioActivity, TimeRange, TimeSpan, Timeline, Transcription, Waveform};
+use vasr_data::{
+    Annotation, AudioActivity, TimeRange, TimeSpan, Timeline, Transcription, Waveform,
+};
 
 pub const ASR_SOURCE: &str = "qwen3_asr";
 pub const VAD_SOURCE: &str = "vad";

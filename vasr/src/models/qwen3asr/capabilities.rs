@@ -1,5 +1,5 @@
 use anyhow::Result;
-use asr_data::{AudioChunk, Timeline, Waveform};
+use vasr_data::{AudioChunk, Timeline, Waveform};
 
 use crate::audio::stream::chunk_range;
 use crate::timeline::{ASR_SOURCE, StreamEvent, language_span, transcription_span, waveform_range};
@@ -151,7 +151,7 @@ impl StreamingAsrSession for Qwen3AsrStreamingSession {
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.finish()?;
         Ok(vec![StreamEvent::transcription(
-            asr_data::TimeRange::default(),
+            vasr_data::TimeRange::default(),
             output.text,
             Some(output.language),
             ASR_SOURCE,

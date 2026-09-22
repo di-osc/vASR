@@ -4,9 +4,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use asr_data::AudioSource;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use vasr_data::AudioSource;
 
 use super::{
     DeduplicatedTranscribeInputs, PendingGlobalRequest, PipelineRequestId, RequestItemRef,

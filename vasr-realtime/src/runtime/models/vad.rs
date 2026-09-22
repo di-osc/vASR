@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use anyhow::Result;
-use asr_data::Waveform;
 use candle_core::Device;
 use vasr::StreamEvent;
 use vasr::timeline::activity_span;
+use vasr_data::Waveform;
 use vasr_vad as model_vad;
 
 use crate::runtime::model::{StreamingVadSession, VadModel, VadOptions, VadSegment};
@@ -50,7 +50,7 @@ struct FireRedVadStream {
 }
 
 impl StreamingVadSession for FireRedVadStream {
-    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
+    fn push_chunk(&mut self, chunk: &vasr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         Ok(self
             .inner
             .push_chunk(chunk)?

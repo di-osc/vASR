@@ -9,7 +9,6 @@ use super::{
     prefill_span_from_decode, record_asr_batch_stats, route_outcome,
 };
 use anyhow::{Result, bail};
-use asr_data::{TimeSpan, Timeline, Waveform};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +20,7 @@ use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{Qwen3ASR, StreamingMetadataDecoder, qwen_outputs_to_timelines};
+use vasr_data::{TimeSpan, Timeline, Waveform};
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]

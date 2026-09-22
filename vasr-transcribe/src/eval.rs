@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::dataset::{audio_input_from_source, read_vasr_audios};
 use crate::{TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
-use asr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use vasr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 
 use crate::perf::timestamp_file_name;
 use crate::table::render_table;
@@ -278,7 +278,7 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
     println!("\n{table}\n");
 }
 
-fn record_timeline(record: &Audio, timeline: EvalTimeline) -> Result<&asr_data::Timeline> {
+fn record_timeline(record: &Audio, timeline: EvalTimeline) -> Result<&vasr_data::Timeline> {
     record
         .timeline(timeline.channel())
         .map_err(|err| anyhow!("{err}"))?
@@ -855,7 +855,7 @@ fn round6(value: f64) -> f64 {
 mod tests {
     use super::{EvalNormalizer, EvalTimeline, hypothesis_text, normalize_text, reference_text};
     use crate::InferenceData;
-    use asr_data::{
+    use vasr_data::{
         Annotation, Audio, AudioChannel, AudioEncoding, AudioFormat, AudioInfo, AudioSource,
         Transcription,
     };
@@ -898,7 +898,7 @@ mod tests {
         add_reference(&mut audio, AudioChannel::Left, "left reference");
         add_reference(&mut audio, AudioChannel::Right, "right reference");
 
-        let dummy = asr_data::Timeline::new("call-1", 1_000);
+        let dummy = vasr_data::Timeline::new("call-1", 1_000);
         let mut inference = InferenceData::from_timeline("service", &dummy);
         inference.text.mono = "mono hypothesis".to_string();
         inference.text.left = "left hypothesis".to_string();

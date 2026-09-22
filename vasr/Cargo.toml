@@ -37,7 +37,7 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
 vasr-quant = { path = "../vasr-quant", default-features = false }
 vasr-flash-attn = { path = "../vasr-flash-attn", default-features = false, optional = true }
-asr-data = { workspace = true }
+vasr-data = { workspace = true }
 modelhub = "0.1.3"
 vasr-vad = { path = "../vasr-vad" }
 

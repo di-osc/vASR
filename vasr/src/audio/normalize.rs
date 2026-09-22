@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::input::AudioInput;
 use super::loader::{SAMPLE_RATE_HZ, peak_normalize};
-use asr_data::Waveform;
+use vasr_data::Waveform;
 
 pub fn normalize_audio_input(input: &AudioInput<'_>) -> Result<Vec<f32>> {
     let mut waveform = match input {

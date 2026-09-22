@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use asr_data::{TimeRange, Timeline, Waveform};
 use candle_core::Device;
 use vasr::models::qwen3asr::{
     AudioInput, LoadOptions, Qwen3Asr, StreamOptions as RuntimeStreamOptions,
 };
 use vasr::{StreamEvent, timeline::ASR_SOURCE};
+use vasr_data::{TimeRange, Timeline, Waveform};
 
 use crate::runtime::model::{AsrOptions, StreamingAsrModel, StreamingAsrSession};
 
@@ -56,7 +56,7 @@ struct Qwen3AsrStreamModel {
 }
 
 impl StreamingAsrSession for Qwen3AsrStreamModel {
-    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
+    fn push_chunk(&mut self, chunk: &vasr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         let stream = self
             .inner
             .as_mut()
