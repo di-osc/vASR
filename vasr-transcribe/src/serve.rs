@@ -20,10 +20,11 @@ use crate::pipeline::{
 };
 use crate::server::build_transcribe_service;
 
-const DEFAULT_MAX_NUM_SEQS: usize = 256;
+const DEFAULT_MAX_NUM_SEQS: usize = 512;
 const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
 const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
+const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.9;
 const DEFAULT_DECODE_TOKENS_PER_SEC: f64 = 4.25;
 const DEFAULT_DECODE_MIN_TOKENS: usize = 128;
 const DEFAULT_PROFILE_WINDOW_SECS: f64 = 5.0;
@@ -125,6 +126,14 @@ pub struct CommonModelArgs {
         env = "VASR_KV_PEAK_RATIO"
     )]
     pub kv_peak_ratio: f32,
+
+    /// Fraction of total GPU memory for weights plus KV. KV receives whatever remains after weights load.
+    #[arg(
+        long = "gpu-memory-utilization",
+        default_value_t = DEFAULT_GPU_MEMORY_UTILIZATION,
+        env = "VASR_GPU_MEMORY_UTILIZATION"
+    )]
+    pub gpu_memory_utilization: f32,
 
     /// Capture CUDA decode graphs with chunked Q8 lm_head next-id output. Automatically enabled for --isq 8.
     #[cfg(feature = "cuda-graph")]
@@ -451,6 +460,12 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if !args.kv_peak_ratio.is_finite() || !(0.0..=1.0).contains(&args.kv_peak_ratio) {
         bail!("--kv-peak-ratio must be finite and between 0.0 and 1.0");
     }
+    if !args.gpu_memory_utilization.is_finite()
+        || !(0.0..=1.0).contains(&args.gpu_memory_utilization)
+        || args.gpu_memory_utilization == 0.0
+    {
+        bail!("--gpu-memory-utilization must be finite and in (0.0, 1.0]");
+    }
     #[cfg(feature = "cuda-graph")]
     if args.cuda_graph_chunked_argmax_size == 0 {
         bail!("--cuda-graph-chunked-argmax-size must be greater than zero");
@@ -651,6 +666,7 @@ fn load_asr_model_for_pipeline(
             kv_peak_ratio: args.kv_peak_ratio,
             decode_tokens_per_sec: args.decode_tokens_per_sec,
             decode_min_tokens: args.decode_min_tokens,
+            gpu_memory_utilization: args.gpu_memory_utilization,
             #[cfg(feature = "cuda-graph")]
             cuda_graph_chunked_argmax: args.cuda_graph_chunked_argmax,
             #[cfg(feature = "cuda-graph")]
@@ -813,6 +829,7 @@ mod tests {
             decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
             decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
             kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
+            gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             #[cfg(feature = "cuda-graph")]
             cuda_graph_chunked_argmax: false,
             #[cfg(feature = "cuda-graph")]

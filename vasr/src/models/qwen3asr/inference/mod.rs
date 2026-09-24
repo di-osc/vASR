@@ -2,6 +2,7 @@
 
 #[cfg(feature = "paged-attn")]
 pub mod batch_scheduler;
+pub mod speech_rate;
 pub mod streaming;
 pub mod transcribe;
 pub mod types;

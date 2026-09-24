@@ -26,6 +26,8 @@ pub struct AsrRuntimeConfig {
     pub kv_peak_ratio: f32,
     pub decode_tokens_per_sec: f64,
     pub decode_min_tokens: usize,
+    /// 权重加载之后，KV 池占用总显存的比例。仅 CUDA 上的离线服务使用。
+    pub gpu_memory_utilization: f32,
     #[cfg(feature = "cuda-graph")]
     pub cuda_graph_chunked_argmax: bool,
     #[cfg(feature = "cuda-graph")]

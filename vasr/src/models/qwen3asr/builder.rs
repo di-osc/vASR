@@ -213,7 +213,15 @@ fn build_paged_cache_config(
     Ok((
         super::PagedCacheConfig {
             block_size: KV_BLOCK_SIZE,
-            memory: super::PagedCacheMemory::Blocks(sizing.total_blocks),
+            memory: if req.device.is_cuda() {
+                // 权重已经先加载。预算 = 比例 × 总显存 − 当前占用，把剩下的显存划给 KV。
+                super::PagedCacheMemory::GpuMemoryFraction {
+                    fraction: req.runtime.gpu_memory_utilization,
+                    reserved_bytes: 0,
+                }
+            } else {
+                super::PagedCacheMemory::Blocks(sizing.total_blocks)
+            },
             #[cfg(feature = "cuda-graph")]
             cuda_graph_context_tokens: Some(cuda_graph_context_tokens(
                 sizing.peak_blocks_per_seq * KV_BLOCK_SIZE,

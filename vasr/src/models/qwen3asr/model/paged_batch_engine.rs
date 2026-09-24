@@ -11,7 +11,9 @@ use crate::model::generation::{
     argmax_token_ids_from_logits, attention_masks_are_right_padded, count_audio_placeholders_batch,
     normalize_batch_for_paged_prefill, position_ids_for_step,
 };
-use crate::model::paged_cache_runtime::{PagedCacheRuntime, SharedPagedCacheRuntime};
+use crate::model::paged_cache_runtime::{
+    PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRuntime,
+};
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
@@ -119,6 +121,8 @@ pub struct PagedDecodeSlot {
     pub finished: bool,
     pub decode_step: usize,
     pub token_capacity: usize,
+    /// 预留已经用尽、还没遇到 EOS。槽位继续占着，等空闲 KV 补上来再解码。
+    pub awaiting_kv: bool,
 }
 
 impl PagedDecodeSlot {
@@ -152,6 +156,7 @@ impl PagedDecodeSlot {
                 .token_capacities
                 .get(row)
                 .ok_or_else(|| anyhow::anyhow!("missing token capacity for row {row}"))?,
+            awaiting_kv: false,
         })
     }
 }
@@ -178,7 +183,8 @@ fn decode_budget_exhausted(
     Ok(decode_step_required_tokens(prompt_len, generated_len_after_push)? > token_capacity)
 }
 
-fn warn_decode_budget_exhausted(
+/// 预留用尽、空闲池也补不出一块时，记下这条序列停在已写出的文本上。
+pub(crate) fn warn_decode_budget_exhausted(
     request_id: usize,
     prompt_len: usize,
     generated_len: usize,
@@ -193,6 +199,49 @@ fn warn_decode_budget_exhausted(
         token_capacity,
         next_token
     );
+}
+
+/// 给还没生成完的序列再补一块 KV。
+///
+/// 最后一块里还空着的位置先用掉。不够，并且空闲池至少还有一块时，再要一块。
+/// 池子是空的就返回 false，调用方继续占着槽位等别的序列结束，或者在确实无法继续时停住。
+pub(crate) fn try_grant_one_kv_block(
+    manager: &mut PagedBlockManager,
+    request_id: usize,
+    capacity: &mut usize,
+    block_table: &mut Vec<usize>,
+    prompt_len: usize,
+    generated_len: usize,
+) -> Result<bool> {
+    let block_size = manager.block_size().max(1);
+    let next_tokens = decode_step_required_tokens(prompt_len, generated_len)?;
+    let allocated_tokens = manager
+        .blocks_for_request(request_id)
+        .saturating_mul(block_size);
+    if allocated_tokens >= next_tokens {
+        // 预留的 token 数没有铺满最后一块，空位本来就属于这条序列。
+        *capacity = (*capacity).max(allocated_tokens);
+        return Ok(true);
+    }
+    if manager.free_blocks() == 0 {
+        return Ok(false);
+    }
+    let target = next_tokens.max(allocated_tokens.saturating_add(block_size));
+    if !manager.try_allocate_slots(request_id, target)? {
+        return Ok(false);
+    }
+    *capacity = manager
+        .blocks_for_request(request_id)
+        .saturating_mul(block_size);
+    *block_table = manager.block_ids(request_id)?.to_vec();
+    tracing::debug!(
+        "paged decode granted one KV block | request_id={} prompt_tokens={} generated_tokens={} capacity_tokens={}",
+        request_id,
+        prompt_len,
+        generated_len,
+        *capacity
+    );
+    Ok(true)
 }
 
 fn cuda_packed_prefill_enabled() -> bool {
@@ -247,7 +296,7 @@ pub fn paged_batch_decode_slots_at_step(
         .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
 
     let forward_indices: Vec<usize> = (0..slots.len())
-        .filter(|&i| !slots[i].finished && slots[i].decode_step == step)
+        .filter(|&i| !slots[i].finished && !slots[i].awaiting_kv && slots[i].decode_step == step)
         .collect();
     if forward_indices.is_empty() {
         return Ok(());
@@ -289,33 +338,26 @@ pub fn paged_batch_decode_slots_at_step(
             continue;
         }
         slots[i].generated.push(tok);
+        // 重复空转直接结束，空出的显存让给别的序列，不再往下补块。
+        if has_repeated_tail(&slots[i].generated) {
+            slots[i].finished = true;
+            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+            continue;
+        }
         if decode_budget_exhausted(
             slots[i].prompt_len_usize,
             slots[i].generated.len(),
             slots[i].token_capacity,
         )? {
-            warn_decode_budget_exhausted(
-                slots[i].request_id,
-                slots[i].prompt_len_usize,
-                slots[i].generated.len(),
-                slots[i].token_capacity,
-                tok,
-            );
-            slots[i].finished = true;
-            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
-            continue;
-        }
-        if has_repeated_tail(&slots[i].generated) {
-            slots[i].finished = true;
-            slots[i].decode_step = slots[i].decode_step.saturating_add(1);
-            continue;
+            // 这一步还写得下。下一步之前，调度把空出来的 KV 优先补给这条序列。
+            slots[i].awaiting_kv = true;
         }
         active_indices.push(i);
     }
 
     if active_indices.is_empty() {
         for slot in slots.iter_mut() {
-            if !slot.finished && slot.decode_step == step {
+            if !slot.finished && !slot.awaiting_kv && slot.decode_step == step {
                 slot.decode_step = slot.decode_step.saturating_add(1);
             }
         }
@@ -395,13 +437,13 @@ pub fn paged_batch_decode_slots_at_step_shared(
         .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
 
     let forward_indices: Vec<usize> = (0..slots.len())
-        .filter(|&i| !slots[i].finished && slots[i].decode_step == step)
+        .filter(|&i| !slots[i].finished && !slots[i].awaiting_kv && slots[i].decode_step == step)
         .collect();
     if forward_indices.is_empty() {
         return Ok(());
     }
 
-    let (cache, block_tables_active, prompt_lens_active_usize) = {
+    let (cache, block_tables_active, prompt_lens_active_usize, active_indices) = {
         let runtime_guard = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
@@ -443,33 +485,26 @@ pub fn paged_batch_decode_slots_at_step_shared(
                 continue;
             }
             slots[i].generated.push(tok);
+            // 重复空转直接结束，空出的显存让给别的序列，不再往下补块。
+            if has_repeated_tail(&slots[i].generated) {
+                slots[i].finished = true;
+                slots[i].decode_step = slots[i].decode_step.saturating_add(1);
+                continue;
+            }
             if decode_budget_exhausted(
                 slots[i].prompt_len_usize,
                 slots[i].generated.len(),
                 slots[i].token_capacity,
             )? {
-                warn_decode_budget_exhausted(
-                    slots[i].request_id,
-                    slots[i].prompt_len_usize,
-                    slots[i].generated.len(),
-                    slots[i].token_capacity,
-                    tok,
-                );
-                slots[i].finished = true;
-                slots[i].decode_step = slots[i].decode_step.saturating_add(1);
-                continue;
-            }
-            if has_repeated_tail(&slots[i].generated) {
-                slots[i].finished = true;
-                slots[i].decode_step = slots[i].decode_step.saturating_add(1);
-                continue;
+                // 这一步还写得下。下一步之前，调度把空出来的 KV 优先补给这条序列。
+                slots[i].awaiting_kv = true;
             }
             active_indices.push(i);
         }
 
         if active_indices.is_empty() {
             for slot in slots.iter_mut() {
-                if !slot.finished && slot.decode_step == step {
+                if !slot.finished && !slot.awaiting_kv && slot.decode_step == step {
                     slot.decode_step = slot.decode_step.saturating_add(1);
                 }
             }
@@ -489,12 +524,10 @@ pub fn paged_batch_decode_slots_at_step_shared(
             runtime_guard.cache_clone(),
             block_tables_active,
             prompt_lens_active_usize,
+            active_indices,
         )
     };
 
-    let active_indices: Vec<usize> = (0..slots.len())
-        .filter(|&i| !slots[i].finished && slots[i].decode_step == step)
-        .collect();
     let tokens_in: Vec<u32> = active_indices
         .iter()
         .map(|&i| {
@@ -558,7 +591,7 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
         let block_size = runtime_guard.manager().block_size();
         for &i in slot_indices {
             let slot = &mut slots[i];
-            if slot.finished {
+            if slot.finished || slot.awaiting_kv {
                 continue;
             }
             let num_tokens =
@@ -593,26 +626,19 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
                 continue;
             }
             slot.generated.push(tok);
+            // 重复空转直接结束，空出的显存让给别的序列，不再往下补块。
+            if has_repeated_tail(&slot.generated) {
+                slot.finished = true;
+                slot.decode_step = slot.decode_step.saturating_add(1);
+                continue;
+            }
             if decode_budget_exhausted(
                 slot.prompt_len_usize,
                 slot.generated.len(),
                 slot.token_capacity,
             )? {
-                warn_decode_budget_exhausted(
-                    slot.request_id,
-                    slot.prompt_len_usize,
-                    slot.generated.len(),
-                    slot.token_capacity,
-                    tok,
-                );
-                slot.finished = true;
-                slot.decode_step = slot.decode_step.saturating_add(1);
-                continue;
-            }
-            if has_repeated_tail(&slot.generated) {
-                slot.finished = true;
-                slot.decode_step = slot.decode_step.saturating_add(1);
-                continue;
+                // 这一步还写得下。下一步之前，调度把空出来的 KV 优先补给这条序列。
+                slot.awaiting_kv = true;
             }
             forward_indices.push(i);
         }
@@ -1534,24 +1560,38 @@ pub fn paged_batch_decode_step(
             continue;
         }
         state.generated[i].push(tok);
+        // 重复空转直接结束。这条路径没有别的序列会中途退块，所以能补就立刻补一块。
+        if has_repeated_tail(&state.generated[i]) {
+            state.finished[i] = true;
+            continue;
+        }
         if decode_budget_exhausted(
             state.prompt_lens_usize[i],
             state.generated[i].len(),
             state.token_capacities[i],
         )? {
-            warn_decode_budget_exhausted(
-                state.request_ids[i],
-                state.prompt_lens_usize[i],
-                state.generated[i].len(),
-                state.token_capacities[i],
-                tok,
-            );
-            state.finished[i] = true;
-            continue;
-        }
-        if has_repeated_tail(&state.generated[i]) {
-            state.finished[i] = true;
-            continue;
+            let request_id = state.request_ids[i];
+            let prompt_len = state.prompt_lens_usize[i];
+            let generated_len = state.generated[i].len();
+            let granted = try_grant_one_kv_block(
+                runtime.manager_mut(),
+                request_id,
+                &mut state.token_capacities[i],
+                &mut state.block_tables[i],
+                prompt_len,
+                generated_len,
+            )?;
+            if !granted {
+                warn_decode_budget_exhausted(
+                    request_id,
+                    prompt_len,
+                    generated_len,
+                    state.token_capacities[i],
+                    tok,
+                );
+                state.finished[i] = true;
+                continue;
+            }
         }
         tokens_in.push(tok);
     }
@@ -1830,7 +1870,10 @@ fn paged_batch_decode_forward_without_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeStepOutput, PagedBatchState, decode_step_required_tokens};
+    use super::{
+        DecodeStepOutput, PagedBatchState, decode_step_required_tokens, try_grant_one_kv_block,
+    };
+    use crate::model::paged_cache_runtime::PagedBlockManager;
 
     #[test]
     fn active_indices_skips_finished_rows() {
@@ -1856,6 +1899,54 @@ mod tests {
         assert_eq!(decode_step_required_tokens(31, 0)?, 32);
         assert_eq!(decode_step_required_tokens(32, 0)?, 33);
         assert_eq!(decode_step_required_tokens(64, 31)?, 96);
+        Ok(())
+    }
+
+    #[test]
+    fn grant_one_block_then_stops_when_the_pool_is_empty() -> anyhow::Result<()> {
+        // 块 0 保留，块 1 和块 2 可分配。先占一块，下一次只该再拿到一块。
+        let mut manager = PagedBlockManager::new(3, 32);
+        manager.allocate_slots(7, 32)?;
+        let mut capacity = 32usize;
+        let mut table = manager.block_ids(7)?.to_vec();
+        assert!(try_grant_one_kv_block(
+            &mut manager,
+            7,
+            &mut capacity,
+            &mut table,
+            32,
+            0
+        )?);
+        assert!(capacity >= 33);
+        assert_eq!(manager.blocks_for_request(7), 2);
+        assert_eq!(table.len(), 2);
+        assert!(!try_grant_one_kv_block(
+            &mut manager,
+            7,
+            &mut capacity,
+            &mut table,
+            32,
+            32
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn grant_uses_slack_in_the_last_block_before_taking_another() -> anyhow::Result<()> {
+        let mut manager = PagedBlockManager::new(4, 32);
+        manager.allocate_slots(1, 40)?;
+        let mut capacity = 40usize;
+        let mut table = manager.block_ids(1)?.to_vec();
+        assert!(try_grant_one_kv_block(
+            &mut manager,
+            1,
+            &mut capacity,
+            &mut table,
+            40,
+            0
+        )?);
+        assert_eq!(capacity, 64);
+        assert_eq!(manager.blocks_for_request(1), 2);
         Ok(())
     }
 

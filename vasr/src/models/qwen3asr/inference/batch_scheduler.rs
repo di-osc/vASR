@@ -24,6 +24,7 @@ use crate::model::paged_batch_engine::{
     PagedBatchConfig, PagedDecodeSlot, paged_batch_decode_slots_at_step,
     paged_batch_decode_slots_at_step_shared, paged_batch_decode_slots_mixed_steps_shared,
     paged_batch_free_slots, paged_batch_prefill, paged_batch_prefill_shared, paged_batch_run,
+    try_grant_one_kv_block, warn_decode_budget_exhausted,
 };
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
@@ -183,6 +184,8 @@ struct RunningSlot {
 pub struct PrefilledSequence {
     pub client_index: usize,
     pub slot: PagedDecodeSlot,
+    /// 按 4.25 token/秒预留的生成长度，供空闲工位挑选下一条。
+    pub predicted_generated: usize,
     pub prefill_done_at: Instant,
 }
 
@@ -306,6 +309,8 @@ pub struct PreparedAudioBatch {
     pub prepared: Vec<PreparedInputs>,
     pub audio_features: Tensor,
     pub audio_seconds: Vec<f64>,
+    /// 每段相对普通语速的倍率。缺省或长度不够时按 1 处理。
+    pub speech_rate_ratios: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -405,6 +410,7 @@ struct PrefillInputBuffer {
     prepared: Vec<PreparedInputs>,
     audio_features: Option<Tensor>,
     audio_seconds: Vec<f64>,
+    speech_rate_ratios: Vec<f64>,
     row_audio_lens: Vec<usize>,
     audio_offsets: Vec<usize>,
     waiting: VecDeque<usize>,
@@ -418,6 +424,7 @@ impl PrefillInputBuffer {
             &mut self.prepared,
             &mut self.audio_features,
             &mut self.audio_seconds,
+            &mut self.speech_rate_ratios,
             &mut self.row_audio_lens,
             &mut self.audio_offsets,
             &mut self.waiting,
@@ -443,6 +450,7 @@ impl PrefillInputBuffer {
             self.prepared.clear();
             self.audio_features = None;
             self.audio_seconds.clear();
+            self.speech_rate_ratios.clear();
             self.row_audio_lens.clear();
             self.audio_offsets.clear();
             return Ok(());
@@ -469,6 +477,11 @@ impl PrefillInputBuffer {
 
         self.prepared.drain(..drop_rows);
         self.audio_seconds.drain(..drop_rows);
+        if self.speech_rate_ratios.len() >= drop_rows {
+            self.speech_rate_ratios.drain(..drop_rows);
+        } else {
+            self.speech_rate_ratios.clear();
+        }
         self.row_audio_lens.drain(..drop_rows);
         self.audio_offsets.drain(..drop_rows);
         for offset in &mut self.audio_offsets {
@@ -636,33 +649,105 @@ fn prepared_prompt_len(row: &PreparedInputs) -> usize {
     row.attention_mask.iter().filter(|&&v| v != 0).count()
 }
 
-fn generated_token_budget(
-    audio_seconds: f64,
+/// 取这一行的语速倍率。没有单独估计时按普通语速 1。
+fn speech_rate_ratio_at(ratios: &[f64], row_index: usize) -> f64 {
+    ratios
+        .get(row_index)
+        .copied()
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.0)
+}
+
+fn prepared_generated_tokens(
+    audio_seconds: &[f64],
+    speech_rate_ratios: &[f64],
+    row_index: usize,
     generated_tokens_per_sec: f64,
-    min_generated_tokens: usize,
 ) -> usize {
-    let estimated = if audio_seconds.is_finite() && audio_seconds > 0.0 {
-        (audio_seconds * generated_tokens_per_sec).ceil() as usize
-    } else {
-        0
-    };
-    estimated.max(min_generated_tokens)
+    super::speech_rate::predicted_generated_tokens(
+        audio_seconds.get(row_index).copied().unwrap_or(0.0),
+        generated_tokens_per_sec,
+        speech_rate_ratio_at(speech_rate_ratios, row_index),
+    )
 }
 
 fn prepared_token_capacity(
     row: &PreparedInputs,
     audio_seconds: &[f64],
+    speech_rate_ratios: &[f64],
     row_index: usize,
     generated_tokens_per_sec: f64,
-    min_generated_tokens: usize,
 ) -> Result<usize> {
+    let generated = prepared_generated_tokens(
+        audio_seconds,
+        speech_rate_ratios,
+        row_index,
+        generated_tokens_per_sec,
+    );
     prepared_prompt_len(row)
-        .checked_add(generated_token_budget(
-            audio_seconds.get(row_index).copied().unwrap_or(0.0),
-            generated_tokens_per_sec,
-            min_generated_tokens,
-        ))
+        .checked_add(generated)
         .ok_or_else(|| anyhow::anyhow!("prepared token capacity overflow"))
+}
+
+/// 空闲工位出现时，领预测生成长度最长的那条。关闭长度规划时仍按到达顺序。
+fn pop_scheduled_prefilled(
+    prefilled: &mut VecDeque<PrefilledSequence>,
+) -> Option<PrefilledSequence> {
+    if !length_schedule_enabled()
+        || prefilled.len() <= 1
+        || prefilled.iter().all(|seq| seq.predicted_generated == 0)
+    {
+        return prefilled.pop_front();
+    }
+    let index = prefilled
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, seq)| (seq.predicted_generated, usize::MAX - seq.client_index))
+        .map(|(index, _)| index)?;
+    prefilled.remove(index)
+}
+
+fn length_schedule_enabled() -> bool {
+    std::env::var_os("VASR_DISABLE_LENGTH_SCHEDULE").is_none()
+}
+
+/// 两个工位的子集和划分。返回两侧作业下标，使长度和尽量接近总长的一半。
+#[cfg(test)]
+fn partition_two_slots(lengths: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let total = lengths.iter().copied().sum::<usize>();
+    let limit = total / 2;
+    let mut reachable = vec![false; limit.saturating_add(1)];
+    let mut previous = vec![None; limit.saturating_add(1)];
+    let mut chosen = vec![None; limit.saturating_add(1)];
+    reachable[0] = true;
+    for (item, &length) in lengths.iter().enumerate() {
+        if length == 0 || length > limit {
+            continue;
+        }
+        for sum in (0..=limit.saturating_sub(length)).rev() {
+            let next = sum.saturating_add(length);
+            if reachable[sum] && !reachable[next] {
+                reachable[next] = true;
+                previous[next] = Some(sum);
+                chosen[next] = Some(item);
+            }
+        }
+    }
+    let best = (0..=limit).rev().find(|&sum| reachable[sum]).unwrap_or(0);
+    let mut side_a = Vec::new();
+    let mut cursor = best;
+    while cursor != 0 {
+        let Some(item) = chosen[cursor] else {
+            break;
+        };
+        side_a.push(item);
+        cursor = previous[cursor].unwrap_or(0);
+    }
+    side_a.sort_unstable();
+    let side_b = (0..lengths.len())
+        .filter(|item| !side_a.contains(item))
+        .collect();
+    (side_a, side_b)
 }
 
 fn attach_prefilled_to_running(
@@ -675,7 +760,7 @@ fn attach_prefilled_to_running(
         if slot.is_some() {
             continue;
         }
-        let Some(prefilled) = prefilled.pop_front() else {
+        let Some(prefilled) = pop_scheduled_prefilled(prefilled) else {
             break;
         };
         #[cfg(feature = "timing")]
@@ -777,6 +862,113 @@ fn free_finished_running(
     Ok(freed)
 }
 
+/// 结束已经写完的序列，再把退回来的 KV 优先补给还没生成完的序列。
+///
+/// 每条只补一块，剩下的空闲块留给后面的 prefill。补上之后这条序列继续占着原来的槽位解码。
+/// 一块都补不到、旁边也没有还能往下写的序列时，把还在等的序列标成结束。
+/// 返回 true 时调用方要再退一次它们的显存。
+fn free_finished_and_grant_kv(
+    running: &mut [Option<RunningSlot>],
+    outputs: &mut [Vec<u32>],
+    runtime: &mut PagedCacheRuntime,
+    on_complete: Option<&mut dyn FnMut(usize, Vec<u32>) -> Result<()>>,
+    retain_outputs: bool,
+    prefilled_len: usize,
+) -> Result<bool> {
+    free_finished_running(running, outputs, runtime, on_complete, retain_outputs)?;
+    grant_freed_kv_to_awaiting(running, runtime)?;
+    Ok(release_awaiting_if_no_progress(running, prefilled_len))
+}
+
+/// 按槽位顺序，给每条预留已用尽的序列补一块 KV。
+fn grant_freed_kv_to_awaiting(
+    running: &mut [Option<RunningSlot>],
+    runtime: &mut PagedCacheRuntime,
+) -> Result<()> {
+    let pending: Vec<usize> = running
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            slot.as_ref().and_then(|entry| {
+                if entry.slot.awaiting_kv && !entry.slot.finished {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    for index in pending {
+        let Some(entry) = running[index].as_ref() else {
+            continue;
+        };
+        let request_id = entry.slot.request_id;
+        let prompt_len = entry.slot.prompt_len_usize;
+        let generated_len = entry.slot.generated.len();
+        let mut capacity = entry.slot.token_capacity;
+        let mut block_table = entry.slot.block_table.clone();
+        let granted = try_grant_one_kv_block(
+            runtime.manager_mut(),
+            request_id,
+            &mut capacity,
+            &mut block_table,
+            prompt_len,
+            generated_len,
+        )?;
+        if !granted {
+            continue;
+        }
+        let Some(entry) = running[index].as_mut() else {
+            continue;
+        };
+        entry.slot.token_capacity = capacity;
+        entry.slot.block_table = block_table;
+        entry.slot.awaiting_kv = false;
+    }
+    Ok(())
+}
+
+/// 没有序列还能往下写、也没有已经 prefill 好等着进空槽的序列时，结束还在等 KV 的序列。
+///
+/// 返回 true 表示有序列被标成结束，调用方要把它们的显存退回池子。
+fn release_awaiting_if_no_progress(
+    running: &mut [Option<RunningSlot>],
+    prefilled_len: usize,
+) -> bool {
+    let runnable = running.iter().any(|slot| {
+        slot.as_ref()
+            .is_some_and(|entry| !entry.slot.finished && !entry.slot.awaiting_kv)
+    });
+    if runnable {
+        return false;
+    }
+    // 还有空槽，并且 prefill 已经准备好下一条，先让那条跑起来，等它结束再把块补给还没写完的序列。
+    let free_slot = running.iter().any(|slot| slot.is_none());
+    if free_slot && prefilled_len > 0 {
+        return false;
+    }
+    let mut released = false;
+    for slot in running.iter_mut() {
+        let Some(entry) = slot.as_mut() else {
+            continue;
+        };
+        if entry.slot.finished || !entry.slot.awaiting_kv {
+            continue;
+        }
+        warn_decode_budget_exhausted(
+            entry.slot.request_id,
+            entry.slot.prompt_len_usize,
+            entry.slot.generated.len(),
+            entry.slot.token_capacity,
+            entry.slot.generated.last().copied().unwrap_or(0),
+        );
+        entry.slot.finished = true;
+        entry.slot.awaiting_kv = false;
+        released = true;
+    }
+    released
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_running_step_groups(
     running: &mut [Option<RunningSlot>],
@@ -810,6 +1002,7 @@ fn decode_running_step_groups(
                         finished: true,
                         decode_step: 0,
                         token_capacity: 0,
+                        awaiting_kv: false,
                     })
             })
             .collect();
@@ -959,6 +1152,7 @@ fn append_prepared_audio_batch(
     prepared: &mut Vec<PreparedInputs>,
     audio_features: &mut Option<Tensor>,
     audio_seconds: &mut Vec<f64>,
+    speech_rate_ratios: &mut Vec<f64>,
     row_audio_lens: &mut Vec<usize>,
     audio_offsets: &mut Vec<usize>,
     waiting: &mut VecDeque<usize>,
@@ -972,6 +1166,15 @@ fn append_prepared_audio_batch(
             "prepared audio seconds mismatch: prepared={} audio_seconds={}",
             batch.prepared.len(),
             batch.audio_seconds.len()
+        );
+    }
+    if !batch.speech_rate_ratios.is_empty()
+        && batch.speech_rate_ratios.len() != batch.prepared.len()
+    {
+        bail!(
+            "prepared speech-rate ratio mismatch: prepared={} ratios={}",
+            batch.prepared.len(),
+            batch.speech_rate_ratios.len()
         );
     }
     let start_idx = base_index.saturating_add(prepared.len());
@@ -1011,6 +1214,11 @@ fn append_prepared_audio_batch(
     }
     let count = batch.prepared.len();
     audio_seconds.append(&mut batch.audio_seconds);
+    if batch.speech_rate_ratios.is_empty() {
+        speech_rate_ratios.extend(std::iter::repeat_n(1.0, count));
+    } else {
+        speech_rate_ratios.append(&mut batch.speech_rate_ratios);
+    }
     prepared.append(&mut batch.prepared);
     waiting.extend(start_idx..start_idx.saturating_add(count));
     Ok(())
@@ -1104,6 +1312,7 @@ impl AsrBatchScheduler {
         prepared: &[PreparedInputs],
         audio_features: &Tensor,
         audio_seconds: &[f64],
+        speech_rate_ratios: &[f64],
         row_audio_lens: &[usize],
         audio_offsets: &[usize],
         waiting: &mut VecDeque<usize>,
@@ -1125,9 +1334,9 @@ impl AsrBatchScheduler {
                 prepared_token_capacity(
                     &prepared[client_index],
                     audio_seconds,
+                    speech_rate_ratios,
                     client_index,
                     self.config.generated_tokens_per_sec,
-                    self.config.min_generated_tokens,
                 )
             },
         )?;
@@ -1148,9 +1357,9 @@ impl AsrBatchScheduler {
                 prepared_token_capacity(
                     &prepared[client_index],
                     audio_seconds,
+                    speech_rate_ratios,
                     client_index,
                     self.config.generated_tokens_per_sec,
-                    self.config.min_generated_tokens,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1204,6 +1413,12 @@ impl AsrBatchScheduler {
             prefilled.push_back(PrefilledSequence {
                 client_index,
                 slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
+                predicted_generated: prepared_generated_tokens(
+                    audio_seconds,
+                    speech_rate_ratios,
+                    client_index,
+                    self.config.generated_tokens_per_sec,
+                ),
                 prefill_done_at,
             });
         }
@@ -1219,6 +1434,7 @@ impl AsrBatchScheduler {
         prepared: &[PreparedInputs],
         audio_features: &Tensor,
         audio_seconds: &[f64],
+        speech_rate_ratios: &[f64],
         row_audio_lens: &[usize],
         audio_offsets: &[usize],
         waiting: &mut VecDeque<usize>,
@@ -1252,9 +1468,9 @@ impl AsrBatchScheduler {
                 prepared_token_capacity(
                     &prepared[local_index],
                     audio_seconds,
+                    speech_rate_ratios,
                     local_index,
                     self.config.generated_tokens_per_sec,
-                    self.config.min_generated_tokens,
                 )
             },
         )?;
@@ -1285,9 +1501,9 @@ impl AsrBatchScheduler {
                 prepared_token_capacity(
                     &prepared[local_index],
                     audio_seconds,
+                    speech_rate_ratios,
                     local_index,
                     self.config.generated_tokens_per_sec,
-                    self.config.min_generated_tokens,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1336,10 +1552,20 @@ impl AsrBatchScheduler {
             t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_tokens);
         }
         let prefill_done_at = Instant::now();
-        for (wave_row, &client_index) in wave_client_indices.iter().enumerate() {
+        for (wave_row, (&client_index, &local_index)) in wave_client_indices
+            .iter()
+            .zip(wave_local_indices.iter())
+            .enumerate()
+        {
             prefilled.push_back(PrefilledSequence {
                 client_index,
                 slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
+                predicted_generated: prepared_generated_tokens(
+                    audio_seconds,
+                    speech_rate_ratios,
+                    local_index,
+                    self.config.generated_tokens_per_sec,
+                ),
                 prefill_done_at,
             });
         }
@@ -1390,6 +1616,7 @@ impl AsrBatchScheduler {
             inputs.prepared.as_slice(),
             features,
             inputs.audio_seconds.as_slice(),
+            inputs.speech_rate_ratios.as_slice(),
             inputs.row_audio_lens.as_slice(),
             inputs.audio_offsets.as_slice(),
             &mut inputs.waiting,
@@ -1472,13 +1699,22 @@ impl AsrBatchScheduler {
             let mut decode_debug = ContinuousDecodeDebug::default();
             loop {
                 decode_debug.record_finished(running.as_slice());
-                free_finished_running(
+                if free_finished_and_grant_kv(
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                     None,
                     true,
-                )?;
+                    prefilled.len(),
+                )? {
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                        None,
+                        true,
+                    )?;
+                }
                 attach_prefilled_to_running(
                     &mut prefilled,
                     running.as_mut_slice(),
@@ -1490,6 +1726,7 @@ impl AsrBatchScheduler {
                 for (slot_idx, entry) in running.iter().enumerate() {
                     if let Some(entry) = entry
                         && !entry.slot.finished
+                        && !entry.slot.awaiting_kv
                     {
                         active_steps.push((slot_idx, entry.slot.decode_step));
                     }
@@ -1540,13 +1777,22 @@ impl AsrBatchScheduler {
                 }
 
                 decode_debug.record_finished(running.as_slice());
-                free_finished_running(
+                if free_finished_and_grant_kv(
                     running.as_mut_slice(),
                     outputs.as_mut_slice(),
                     &mut runtime_guard,
                     None,
                     true,
-                )?;
+                    prefilled.len(),
+                )? {
+                    free_finished_running(
+                        running.as_mut_slice(),
+                        outputs.as_mut_slice(),
+                        &mut runtime_guard,
+                        None,
+                        true,
+                    )?;
+                }
                 attach_prefilled_to_running(
                     &mut prefilled,
                     running.as_mut_slice(),
@@ -1561,6 +1807,7 @@ impl AsrBatchScheduler {
                     prepared,
                     audio_features,
                     audio_seconds,
+                    &[],
                     row_audio_lens.as_slice(),
                     audio_offsets.as_slice(),
                     &mut waiting,
@@ -1650,13 +1897,22 @@ impl AsrBatchScheduler {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
                     decode_debug.record_finished(running.as_slice());
-                    free_finished_running(
+                    if free_finished_and_grant_kv(
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         None,
                         true,
-                    )?;
+                        prefilled.len(),
+                    )? {
+                        free_finished_running(
+                            running.as_mut_slice(),
+                            outputs.as_mut_slice(),
+                            &mut runtime_guard,
+                            None,
+                            true,
+                        )?;
+                    }
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -1669,6 +1925,7 @@ impl AsrBatchScheduler {
                 for (slot_idx, entry) in running.iter().enumerate() {
                     if let Some(entry) = entry
                         && !entry.slot.finished
+                        && !entry.slot.awaiting_kv
                     {
                         active_steps.push((slot_idx, entry.slot.decode_step));
                     }
@@ -1691,13 +1948,22 @@ impl AsrBatchScheduler {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
                     decode_debug.record_finished(running.as_slice());
-                    free_finished_running(
+                    if free_finished_and_grant_kv(
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
                         None,
                         true,
-                    )?;
+                        prefilled.len(),
+                    )? {
+                        free_finished_running(
+                            running.as_mut_slice(),
+                            outputs.as_mut_slice(),
+                            &mut runtime_guard,
+                            None,
+                            true,
+                        )?;
+                    }
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -2010,13 +2276,22 @@ impl AsrBatchScheduler {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
                     decode_debug.record_finished(running.as_slice());
-                    free_finished_running(
+                    if free_finished_and_grant_kv(
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                        Some(on_complete),
+                        Some(&mut *on_complete),
                         retain_outputs,
-                    )?;
+                        prefilled.len(),
+                    )? {
+                        free_finished_running(
+                            running.as_mut_slice(),
+                            outputs.as_mut_slice(),
+                            &mut runtime_guard,
+                            Some(&mut *on_complete),
+                            retain_outputs,
+                        )?;
+                    }
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -2030,6 +2305,7 @@ impl AsrBatchScheduler {
                 for (slot_idx, entry) in running.iter().enumerate() {
                     if let Some(entry) = entry
                         && !entry.slot.finished
+                        && !entry.slot.awaiting_kv
                     {
                         active_steps.push((slot_idx, entry.slot.decode_step));
                     }
@@ -2052,13 +2328,22 @@ impl AsrBatchScheduler {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
                     decode_debug.record_finished(running.as_slice());
-                    free_finished_running(
+                    if free_finished_and_grant_kv(
                         running.as_mut_slice(),
                         outputs.as_mut_slice(),
                         &mut runtime_guard,
-                        Some(on_complete),
+                        Some(&mut *on_complete),
                         retain_outputs,
-                    )?;
+                        prefilled.len(),
+                    )? {
+                        free_finished_running(
+                            running.as_mut_slice(),
+                            outputs.as_mut_slice(),
+                            &mut runtime_guard,
+                            Some(&mut *on_complete),
+                            retain_outputs,
+                        )?;
+                    }
                 }
                 attach_prefilled_to_running(
                     &mut prefilled,
@@ -2329,10 +2614,33 @@ mod tests {
     }
 
     #[test]
-    fn generated_token_budget_uses_minimum_for_short_audio() {
-        assert_eq!(super::generated_token_budget(0.1, 4.25, 128), 128);
-        assert_eq!(super::generated_token_budget(5.0, 4.25, 128), 128);
-        assert_eq!(super::generated_token_budget(30.0, 4.25, 128), 128);
+    fn generated_tokens_follow_duration_without_minimum() {
+        // ceil(秒 × 4.25 × 倍率)，没有 128 下限。
+        assert_eq!(
+            super::super::speech_rate::predicted_generated_tokens(0.1, 4.25, 1.0),
+            1
+        );
+        assert_eq!(
+            super::super::speech_rate::predicted_generated_tokens(5.0, 4.25, 1.0),
+            22
+        );
+        assert_eq!(
+            super::super::speech_rate::predicted_generated_tokens(30.0, 4.25, 1.0),
+            128
+        );
+    }
+
+    #[test]
+    fn two_slots_partition_balances_the_example() {
+        let (side_a, side_b) = super::partition_two_slots(&[8, 7, 6, 5, 4]);
+        let sum = |items: &[usize]| {
+            items
+                .iter()
+                .map(|&index| [8, 7, 6, 5, 4][index])
+                .sum::<usize>()
+        };
+        assert_eq!(sum(&side_a), 15);
+        assert_eq!(sum(&side_b), 15);
     }
 
     #[test]
@@ -2371,6 +2679,7 @@ mod tests {
                 prepared,
                 audio_features,
                 audio_seconds: vec![1.0, 2.0, 3.0],
+                speech_rate_ratios: vec![1.0, 1.0, 1.0],
             },
         )?;
         assert_eq!(inputs.waiting.pop_front(), Some(0));

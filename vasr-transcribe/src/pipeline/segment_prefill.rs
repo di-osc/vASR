@@ -478,10 +478,12 @@ fn try_recv_segment_encoded_message_for_coalesce(
 fn merge_prepared_audio_batches(batches: Vec<PreparedAudioBatch>) -> Result<PreparedAudioBatch> {
     let mut prepared = Vec::new();
     let mut audio_seconds = Vec::new();
+    let mut speech_rate_ratios = Vec::new();
     let mut audio_features = Vec::new();
     for batch in batches {
         prepared.extend(batch.prepared);
         audio_seconds.extend(batch.audio_seconds);
+        speech_rate_ratios.extend(batch.speech_rate_ratios);
         audio_features.push(batch.audio_features);
     }
 
@@ -504,6 +506,7 @@ fn merge_prepared_audio_batches(batches: Vec<PreparedAudioBatch>) -> Result<Prep
         prepared,
         audio_features,
         audio_seconds,
+        speech_rate_ratios,
     })
 }
 

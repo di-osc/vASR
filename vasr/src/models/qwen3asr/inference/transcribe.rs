@@ -442,6 +442,18 @@ pub fn decode_ids_with_metadata(
     let mut out_texts: Vec<Vec<String>> = vec![Vec::new(); merged.audio_len];
     for (chunk, ids) in merged.chunks.iter().zip(ids) {
         let raw = processor.tokenizer.decode(ids.as_slice())?;
+        // 只在显式打开时记下原文，用来核对特别长的生成。
+        if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+            let audio_seconds = chunk.wav.len() as f64 / f64::from(SAMPLE_RATE_HZ);
+            tracing::debug!(
+                target: "vasr::inference::transcribe",
+                orig_idx = chunk.orig_index,
+                tokens = ids.len(),
+                audio_seconds,
+                raw = raw.as_str(),
+                "raw ASR decode"
+            );
+        }
         let forced = merged
             .forced_langs_norm
             .get(chunk.orig_index)
@@ -552,6 +564,17 @@ impl StreamingMetadataDecoder {
             anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
         })?;
         let raw = processor.tokenizer.decode(ids.as_slice())?;
+        // 只在显式打开时记下原文，用来核对特别长的生成。
+        if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+            let audio_seconds = chunk.wav.len() as f64 / f64::from(SAMPLE_RATE_HZ);
+            tracing::debug!(
+                target: "vasr::inference::transcribe",
+                tokens = ids.len(),
+                audio_seconds,
+                raw = raw.as_str(),
+                "raw ASR decode"
+            );
+        }
         let forced = self
             .merged
             .forced_langs_norm
@@ -711,15 +734,24 @@ impl EncodedAsrBatch {
     fn groups_into_prepared_audio_batch(
         groups: Vec<EncodedPreparedGroup>,
         chunk_audio_seconds: &[f64],
+        chunks: &[ChunkItem],
     ) -> Result<PreparedAudioBatch> {
         let mut prepared = Vec::new();
         let mut audio_seconds = Vec::new();
+        let mut speech_rate_ratios = Vec::new();
         let mut audio_feature_parts = Vec::new();
         for group in groups {
             for &chunk_idx in &group.chunk_indices {
                 audio_seconds.push(*chunk_audio_seconds.get(chunk_idx).ok_or_else(|| {
                     anyhow::anyhow!("missing chunk audio seconds for chunk {chunk_idx}")
                 })?);
+                let chunk = chunks
+                    .get(chunk_idx)
+                    .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+                speech_rate_ratios.push(super::speech_rate::speech_rate_ratio(
+                    chunk.wav.as_slice(),
+                    SAMPLE_RATE_HZ,
+                ));
             }
             prepared.extend(group.prepared);
             audio_feature_parts.push(group.audio_features_cpu);
@@ -737,12 +769,17 @@ impl EncodedAsrBatch {
             prepared,
             audio_features,
             audio_seconds,
+            speech_rate_ratios,
         })
     }
 
     #[cfg(feature = "paged-attn")]
     pub fn into_prepared_audio_batch(self) -> Result<PreparedAudioBatch> {
-        Self::groups_into_prepared_audio_batch(self.groups, self.chunk_audio_seconds.as_slice())
+        Self::groups_into_prepared_audio_batch(
+            self.groups,
+            self.chunk_audio_seconds.as_slice(),
+            self.chunks.as_slice(),
+        )
     }
 
     #[cfg(feature = "paged-attn")]
@@ -750,8 +787,11 @@ impl EncodedAsrBatch {
         self,
     ) -> Result<(PreparedAudioBatch, EncodedAsrBatchMetadata)> {
         let (meta, groups) = self.into_meta_and_groups();
-        let prepared =
-            Self::groups_into_prepared_audio_batch(groups, meta.chunk_audio_seconds.as_slice())?;
+        let prepared = Self::groups_into_prepared_audio_batch(
+            groups,
+            meta.chunk_audio_seconds.as_slice(),
+            meta.chunks.as_slice(),
+        )?;
         Ok((prepared, meta))
     }
 
@@ -759,12 +799,21 @@ impl EncodedAsrBatch {
     pub fn to_prepared_audio_batch(&self) -> Result<PreparedAudioBatch> {
         let mut prepared = Vec::new();
         let mut audio_seconds = Vec::new();
+        let mut speech_rate_ratios = Vec::new();
         let mut audio_feature_parts = Vec::new();
         for group in &self.groups {
             for &chunk_idx in &group.chunk_indices {
                 audio_seconds.push(*self.chunk_audio_seconds.get(chunk_idx).ok_or_else(|| {
                     anyhow::anyhow!("missing chunk audio seconds for chunk {chunk_idx}")
                 })?);
+                let chunk = self
+                    .chunks
+                    .get(chunk_idx)
+                    .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
+                speech_rate_ratios.push(super::speech_rate::speech_rate_ratio(
+                    chunk.wav.as_slice(),
+                    SAMPLE_RATE_HZ,
+                ));
             }
             prepared.extend(group.prepared.clone());
             audio_feature_parts.push(group.audio_features_cpu.clone());
@@ -782,6 +831,7 @@ impl EncodedAsrBatch {
             prepared,
             audio_features,
             audio_seconds,
+            speech_rate_ratios,
         })
     }
 }
