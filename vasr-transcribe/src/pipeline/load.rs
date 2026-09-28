@@ -211,7 +211,7 @@ async fn send_next_loaded(
     loader_to_vad_tx: &mpsc::UnboundedSender<Result<LoadedJob, TranscribeItemOutcome>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
 ) -> Result<Option<usize>> {
-    let (mut message, task_stats) = match tasks.join_next().await {
+    let (message, task_stats) = match tasks.join_next().await {
         Some(Ok(result)) => result,
         Some(Err(error)) => (
             Err(TranscribeItemOutcome {
@@ -232,15 +232,12 @@ async fn send_next_loaded(
     };
     let worker_id = task_stats.worker_id;
     record_loader_task_stats(stats, &task_stats);
-    if let Ok(jobs) = &mut message {
-        for job in jobs {
-            job._queue_memory_permit =
-                Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
-        }
-    }
     match message {
         Ok(jobs) => {
-            for job in jobs {
+            for mut job in jobs {
+                // Publish each channel before reserving memory for the next one.
+                job._queue_memory_permit =
+                    Some(acquire_loaded_job_memory(loaded_queue_memory, &job).await?);
                 loader_to_vad_tx
                     .send(Ok(job))
                     .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
@@ -365,7 +362,7 @@ async fn send_global_loaded_result(
     job_routes: &Arc<Mutex<HashMap<usize, RequestItemRef>>>,
     stats: &Arc<Mutex<LoaderStageStats>>,
 ) -> Result<usize> {
-    let (mut message, task_stats) = result.unwrap_or_else(|error| {
+    let (message, task_stats) = result.unwrap_or_else(|error| {
         (
             Err(TranscribeItemOutcome {
                 index: 0,
@@ -384,7 +381,7 @@ async fn send_global_loaded_result(
     });
     let worker_id = task_stats.worker_id;
     record_loader_task_stats(stats, &task_stats);
-    if let Ok(jobs) = &mut message {
+    if let Ok(jobs) = &message {
         if jobs.is_empty() {
             return Ok(worker_id);
         }
@@ -402,6 +399,7 @@ async fn send_global_loaded_result(
                 jobs.len(),
             );
         }
+        // Register every channel before publishing any: downstream may finish immediately.
         if jobs.len() > 1 {
             let request_item = jobs[0].request_item;
             if let Some(request_item) = request_item {
@@ -420,14 +418,12 @@ async fn send_global_loaded_result(
                 }
             }
         }
-        for job in jobs {
-            job._queue_memory_permit =
-                Some(acquire_loaded_job_memory(loaded_queue_memory, job).await?);
-        }
     }
     match message {
         Ok(jobs) => {
-            for job in jobs {
+            for mut job in jobs {
+                job._queue_memory_permit =
+                    Some(acquire_loaded_job_memory(loaded_queue_memory, &job).await?);
                 loader_to_vad_tx
                     .send(Ok(job))
                     .map_err(|_| anyhow::anyhow!("loaded channel closed"))?;
@@ -440,3 +436,7 @@ async fn send_global_loaded_result(
             .map(|_| worker_id),
     }
 }
+
+#[cfg(test)]
+#[path = "load_tests.rs"]
+mod tests;
