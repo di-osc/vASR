@@ -71,6 +71,8 @@ const ASR_ENCODER_BATCH_COLLECT_WAIT_MS: u64 = 10;
 const ASR_PREFILL_COALESCE_WAIT_MS: u64 = 20;
 const GLOBAL_DECODE_IDLE_FLUSH_MS: u64 = 10;
 const COMPONENT_THROUGHPUT_LOG_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS: usize = 32;
+pub const DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS: f64 = 30.0;
 
 #[cfg(feature = "paged-attn")]
 fn asr_prefill_coalesce_wait() -> Duration {
@@ -87,6 +89,8 @@ pub struct PipelineWorkerOptions {
     pub num_vad_workers: usize,
     pub profile: bool,
     pub profile_window: Duration,
+    pub encoder_batch_max_segments: usize,
+    pub encoder_batch_max_audio_seconds: f64,
 }
 
 impl Default for PipelineWorkerOptions {
@@ -96,6 +100,8 @@ impl Default for PipelineWorkerOptions {
             num_vad_workers: 1,
             profile: false,
             profile_window: COMPONENT_THROUGHPUT_LOG_INTERVAL,
+            encoder_batch_max_segments: DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS,
+            encoder_batch_max_audio_seconds: DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS,
         }
     }
 }
@@ -105,6 +111,8 @@ impl PipelineWorkerOptions {
         ResolvedPipelineWorkerOptions {
             load_workers: resolve_worker_count(self.num_load_workers),
             vad_workers: resolve_worker_count(self.num_vad_workers),
+            encoder_batch_max_segments: self.encoder_batch_max_segments,
+            encoder_batch_max_audio_seconds: self.encoder_batch_max_audio_seconds,
         }
     }
 }
@@ -113,6 +121,8 @@ impl PipelineWorkerOptions {
 struct ResolvedPipelineWorkerOptions {
     load_workers: usize,
     vad_workers: usize,
+    encoder_batch_max_segments: usize,
+    encoder_batch_max_audio_seconds: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -468,9 +478,11 @@ impl AsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::info!(
             target: "vasr_transcribe::pipeline",
-            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
+            "pipeline config | loader_workers={} vad_workers={} encoder_batch_segments={} encoder_batch_audio_seconds={:.1} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
             loader_parallelism,
             vad_parallelism,
+            worker_options.encoder_batch_max_segments,
+            worker_options.encoder_batch_max_audio_seconds,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits)
         );
@@ -524,6 +536,8 @@ impl AsyncTranscribePipeline {
             None,
             None,
             None,
+            worker_options.encoder_batch_max_segments,
+            worker_options.encoder_batch_max_audio_seconds,
         );
 
         let mut outcomes = Vec::with_capacity(job_count);
@@ -651,9 +665,11 @@ impl GlobalAsyncTranscribePipeline {
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
         tracing::debug!(
             target: "vasr_transcribe::pipeline",
-            "global pipeline config | mode=serve loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded decode_idle_flush={}ms",
+            "global pipeline config | mode=serve loader_workers={} vad_workers={} encoder_batch_segments={} encoder_batch_audio_seconds={:.1} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded decode_idle_flush={}ms",
             loader_parallelism,
             vad_parallelism,
+            worker_options.encoder_batch_max_segments,
+            worker_options.encoder_batch_max_audio_seconds,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits),
             GLOBAL_DECODE_IDLE_FLUSH_MS
@@ -727,6 +743,8 @@ impl GlobalAsyncTranscribePipeline {
             Some(Arc::clone(&pending_requests)),
             Some(Arc::clone(&failed)),
             Some(fatal_error_tx.clone()),
+            worker_options.encoder_batch_max_segments,
+            worker_options.encoder_batch_max_audio_seconds,
         );
         spawn_global_result_router(asr_to_result_rx, pending_requests, job_routes);
 
@@ -952,6 +970,8 @@ fn spawn_asr_worker(
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     failed: Option<Arc<AtomicBool>>,
     fatal_error_tx: Option<watch::Sender<Option<String>>>,
+    encoder_batch_max_segments: usize,
+    encoder_batch_max_audio_seconds: f64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         #[cfg(not(feature = "paged-attn"))]
@@ -960,6 +980,8 @@ fn spawn_asr_worker(
             &pending_requests,
             &failed,
             &fatal_error_tx,
+            encoder_batch_max_segments,
+            encoder_batch_max_audio_seconds,
         );
         let mut pending = VecDeque::new();
         #[cfg(feature = "paged-attn")]
@@ -974,6 +996,8 @@ fn spawn_asr_worker(
             encoder_to_prefill_tx,
             Arc::clone(&stats),
             pending_requests.clone(),
+            encoder_batch_max_segments,
+            encoder_batch_max_audio_seconds,
         );
         #[cfg(feature = "paged-attn")]
         let segment_prefill_and_decoder_handles = {
@@ -2298,6 +2322,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS,
+            DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS,
         );
 
         for index in 0..3usize {

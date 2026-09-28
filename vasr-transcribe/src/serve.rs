@@ -16,8 +16,10 @@ use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 use vasr_vad::{FireRedVadModel, FsmnVadModel, VadModel, VadOptions};
 
 use crate::pipeline::{
-    AsyncTranscribePipeline, GlobalAsyncTranscribePipeline, PipelineWorkerOptions,
+    AsyncTranscribePipeline, DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS,
+    DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS, GlobalAsyncTranscribePipeline, PipelineWorkerOptions,
 };
+use crate::serve_tuning::{ResolvedServeTuning, ServeTuningOverrides, resolve_tuning};
 use crate::server::build_transcribe_service;
 
 const DEFAULT_MAX_NUM_SEQS: usize = 512;
@@ -25,9 +27,9 @@ const DEFAULT_ASR_MODEL: &str = "Qwen/Qwen3-ASR-0.6B";
 const DEFAULT_MAX_HOTWORD_TOKENS: usize = 128;
 const DEFAULT_KV_PEAK_RATIO: f32 = 0.25;
 const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.9;
-const DEFAULT_DECODE_TOKENS_PER_SEC: f64 = 4.25;
-const DEFAULT_DECODE_MIN_TOKENS: usize = 128;
 const DEFAULT_PROFILE_WINDOW_SECS: f64 = 5.0;
+#[cfg(feature = "cuda-graph")]
+const DEFAULT_CUDA_GRAPH_CHUNKED_ARGMAX_SIZE: usize = 4096;
 #[cfg(feature = "cuda")]
 const DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB: usize = 256;
 
@@ -99,7 +101,8 @@ pub struct CommonModelArgs {
     /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs and KV-cache block sizing.
     #[arg(
         long = "max-num-seqs",
-        default_value_t = DEFAULT_MAX_NUM_SEQS
+        default_value_t = DEFAULT_MAX_NUM_SEQS,
+        env = "VASR_MAX_NUM_SEQS"
     )]
     pub max_num_seqs: usize,
 
@@ -110,15 +113,6 @@ pub struct CommonModelArgs {
         env = "VASR_MAX_HOTWORD_TOKENS"
     )]
     pub max_hotword_tokens: usize,
-
-    /// Estimated ASR decode tokens generated per second of segment audio.
-    #[arg(long = "decode-tokens-per-sec", default_value_t = DEFAULT_DECODE_TOKENS_PER_SEC)]
-    pub decode_tokens_per_sec: f64,
-
-    /// Minimum runtime decode tokens reserved per ASR segment.
-    #[arg(long = "decode-min-tokens", default_value_t = DEFAULT_DECODE_MIN_TOKENS)]
-    pub decode_min_tokens: usize,
-
     /// Fraction of decode sequences expected to grow from base segment length to max segment length.
     #[arg(
         long = "kv-peak-ratio",
@@ -127,7 +121,7 @@ pub struct CommonModelArgs {
     )]
     pub kv_peak_ratio: f32,
 
-    /// Fraction of total GPU memory for weights plus KV. KV receives whatever remains after weights load.
+    /// Fraction of total GPU memory for weights plus KV. Lower values leave more room for audio encoder workspaces.
     #[arg(
         long = "gpu-memory-utilization",
         default_value_t = DEFAULT_GPU_MEMORY_UTILIZATION,
@@ -244,6 +238,22 @@ pub struct TranscribePipelineArgs {
     )]
     pub profile_window: f64,
 
+    /// Maximum combined audio duration sent to one ASR audio-encoder batch.
+    #[arg(
+        long = "encoder-batch-max-audio-seconds",
+        default_value_t = DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS,
+        env = "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS"
+    )]
+    pub encoder_batch_max_audio_seconds: f64,
+
+    /// Maximum number of VAD segments sent to one ASR audio-encoder batch.
+    #[arg(
+        long = "encoder-batch-max-segments",
+        default_value_t = DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS,
+        env = "VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS"
+    )]
+    pub encoder_batch_max_segments: usize,
+
     #[command(flatten)]
     pub vad: VadCliArgs,
 }
@@ -251,7 +261,7 @@ pub struct TranscribePipelineArgs {
 #[derive(Debug, Clone, Args)]
 pub struct ServeTranscribeArgs {
     #[command(flatten)]
-    pub pipeline: TranscribePipelineArgs,
+    pub pipeline: ServePipelineArgs,
 
     /// ASR language hint.
     #[arg(long, env = "VASR_LANGUAGE", default_value = "Chinese")]
@@ -264,6 +274,108 @@ pub struct ServeTranscribeArgs {
     /// Bind port.
     #[arg(long, default_value_t = 8867, env = "VASR_PORT")]
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeModelArgs {
+    /// Qwen3-ASR model: `Qwen3-ASR-0.6B` / `Qwen3-ASR-1.7B` auto-map to their repo ids, or pass a repo id / local directory directly.
+    #[arg(long, default_value = DEFAULT_ASR_MODEL, env = "VASR_MODEL")]
+    pub model: String,
+
+    /// vASR model cache directory.
+    #[arg(long = "cache-dir", default_value_os_t = vasr::modelscope_cache_dir())]
+    pub cache_dir: PathBuf,
+
+    /// Device: auto, cpu, metal, cuda.
+    #[arg(long, default_value = "auto", env = "VASR_DEVICE")]
+    pub device: String,
+
+    /// Enable in-situ quantization, for example 8 or q8_0.
+    #[arg(long, env = "VASR_ISQ")]
+    pub isq: Option<String>,
+
+    /// Maximum concurrent decode sequences. Also controls CUDA decode graph max seqs and KV-cache block sizing.
+    #[arg(long = "max-num-seqs", env = "VASR_MAX_NUM_SEQS")]
+    pub max_num_seqs: Option<usize>,
+
+    /// Maximum hotword/context tokens reserved in every ASR KV-cache sequence.
+    #[arg(long = "max-hotword-tokens", default_value_t = DEFAULT_MAX_HOTWORD_TOKENS, env = "VASR_MAX_HOTWORD_TOKENS")]
+    pub max_hotword_tokens: usize,
+
+    /// Fraction of total GPU memory for weights plus KV. Lower values leave more room for audio encoder workspaces.
+    #[arg(long = "gpu-memory-utilization", env = "VASR_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: Option<f32>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeVadArgs {
+    /// VAD model: firered or fsmn.
+    #[arg(long = "vad-model", default_value = "fsmn", env = "VASR_VAD_MODEL")]
+    pub vad_model: String,
+
+    /// VAD device: auto, cpu, cuda.
+    #[arg(long = "vad-device", default_value = "auto", env = "VASR_VAD_DEVICE")]
+    pub vad_device: String,
+
+    /// VAD speech probability threshold in (0, 1].
+    #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
+    pub vad_threshold: f32,
+
+    /// Minimum speech duration in milliseconds before a segment is confirmed; must be > 0.
+    #[arg(long, default_value_t = 250, env = "VASR_VAD_MIN_SPEECH_MS")]
+    pub vad_min_speech_ms: u64,
+
+    /// Minimum trailing silence in milliseconds before ending a speech segment; must be > 0.
+    #[arg(long, default_value_t = 800, env = "VASR_VAD_MIN_SILENCE_MS")]
+    pub vad_min_silence_ms: u64,
+
+    /// Symmetric padding in milliseconds added to detected speech segments before ASR; 0 disables padding.
+    #[arg(long = "vad-pad-ms", default_value_t = 0, env = "VASR_VAD_PAD_MS")]
+    pub vad_pad_ms: u64,
+
+    /// Maximum offline VAD segment duration in seconds before ASR; must be finite and > 0.
+    #[arg(
+        long = "vad-max-segment-sec",
+        default_value_t = 30.0,
+        env = "VASR_VAD_MAX_SEGMENT_SEC"
+    )]
+    pub vad_max_segment_sec: f32,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServePipelineArgs {
+    #[command(flatten)]
+    pub model: ServeModelArgs,
+
+    /// Number of audio load workers. 0 uses all available CPU cores.
+    #[arg(
+        long = "num-load-workers",
+        default_value_t = 2,
+        env = "VASR_NUM_LOAD_WORKERS"
+    )]
+    pub num_load_workers: usize,
+
+    /// Number of VAD workers. 0 uses all available CPU cores.
+    #[arg(
+        long = "num-vad-workers",
+        default_value_t = 2,
+        env = "VASR_NUM_VAD_WORKERS"
+    )]
+    pub num_vad_workers: usize,
+
+    /// Enable periodic service pipeline performance table.
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue, env = "VASR_PROFILE")]
+    pub profile: bool,
+
+    /// Maximum combined audio duration sent to one ASR audio-encoder batch.
+    #[arg(
+        long = "encoder-batch-max-audio-seconds",
+        env = "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS"
+    )]
+    pub encoder_batch_max_audio_seconds: Option<f64>,
+
+    #[command(flatten)]
+    pub vad: ServeVadArgs,
 }
 
 /// Backward-compatible alias for the HTTP serve entry point.
@@ -286,21 +398,90 @@ pub fn init_logging(verbose: bool) {
 }
 
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
-    validate_pipeline(&args.pipeline)?;
-    configure_model_cache_dir(&args.pipeline);
-    log_service_start();
+    validate_serve_pipeline(&args.pipeline)?;
+    vasr::set_cache_dir(args.pipeline.model.cache_dir.clone());
+    log_transcribe_start();
+    let vad_args = internal_vad_args(&args.pipeline.vad)?;
+    let vad_model = build_vad_model(&vad_args)?;
+    let device = resolve_device(&args.pipeline.model.device)?;
+    let hardware = match crate::serve_tuning::probe_hardware(&device) {
+        Ok(hardware) => Some(hardware),
+        Err(error) => {
+            tracing::warn!(target: "vasr_transcribe::serve", "automatic capacity probe unavailable ({error}); using baseline fallback values");
+            None
+        }
+    };
+    let model_profile = crate::serve_tuning::estimate_model_memory_profile(
+        &args.pipeline.model.model,
+        args.pipeline.model.isq.as_deref(),
+        if device.is_cuda() {
+            crate::serve_tuning::Backend::Cuda
+        } else if device.is_metal() {
+            crate::serve_tuning::Backend::Metal
+        } else {
+            crate::serve_tuning::Backend::Cpu
+        },
+    );
+    if model_profile.is_none() {
+        tracing::warn!(target: "vasr_transcribe::serve", "model memory profile unavailable for {:?}; using baseline fallback values", args.pipeline.model.model);
+    }
+    let overrides = serve_tuning_overrides(&args.pipeline)?;
+    let tuning = resolve_tuning(
+        hardware,
+        model_profile,
+        f64::from(args.pipeline.vad.vad_max_segment_sec),
+        args.pipeline.vad.vad_pad_ms,
+        args.pipeline.model.max_hotword_tokens,
+        env_parse("VASR_KV_PEAK_RATIO")?.unwrap_or(DEFAULT_KV_PEAK_RATIO),
+        overrides,
+    )?;
+    let pipeline = resolve_serve_pipeline(&args.pipeline, tuning)?;
+    validate_pipeline(&pipeline)?;
+    log_transcribe_tuning(
+        &pipeline,
+        if tuning.used_fallback {
+            "baseline"
+        } else {
+            "hardware"
+        },
+        tuning_value_source(
+            args.pipeline.model.max_num_seqs.is_some(),
+            "--max-num-seqs",
+            "VASR_MAX_NUM_SEQS",
+        ),
+        tuning_value_source(
+            args.pipeline.model.gpu_memory_utilization.is_some(),
+            "--gpu-memory-utilization",
+            "VASR_GPU_MEMORY_UTILIZATION",
+        ),
+        tuning_value_source(
+            args.pipeline.encoder_batch_max_audio_seconds.is_some(),
+            "--encoder-batch-max-audio-seconds",
+            "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS",
+        ),
+    );
+    let use_runtime_capacity =
+        args.pipeline.model.max_num_seqs.is_none() && (device.is_cuda() || device.is_metal());
+    let mut asr_options = asr_options_from_pipeline(&pipeline, args.language.clone());
+    if use_runtime_capacity {
+        // The paged cache knows the post-weight allocation capacity; let its scheduler use that
+        // runtime value instead of treating the pre-load estimate as a hard concurrency limit.
+        asr_options.decode_max_seqs = 0;
+    }
     let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start(
         AudioLoader,
-        build_vad_model(&args.pipeline.vad)?,
-        load_asr_model_for_pipeline(
-            &args.pipeline,
+        vad_model,
+        load_asr_model_for_pipeline_on_device(
+            &pipeline,
             args.language.as_deref(),
-            cuda_graph_max_batch(&args.pipeline.model),
+            cuda_graph_max_batch(&pipeline.model),
             false,
+            device,
+            tuning.reserved_gpu_bytes,
         )?,
-        asr_options_from_pipeline(&args.pipeline, args.language.clone()),
-        vad_options_from_pipeline(&args.pipeline),
-        worker_options_from_pipeline(&args.pipeline),
+        asr_options,
+        vad_options_from_pipeline(&pipeline),
+        worker_options_from_pipeline(&pipeline),
     ));
     let fatal_errors = pipeline.subscribe_fatal_errors();
     let transcribe_service = build_transcribe_service(pipeline);
@@ -312,13 +493,119 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     serve_app(app, addr, fatal_errors).await
 }
 
+fn validate_serve_pipeline(pipeline: &ServePipelineArgs) -> Result<()> {
+    if pipeline.model.model.trim().is_empty() {
+        bail!("--model must not be empty");
+    }
+    if pipeline.model.cache_dir.as_os_str().is_empty() {
+        bail!("--cache-dir must not be empty");
+    }
+    validate_vad_args(&internal_vad_args(&pipeline.vad)?)?;
+    Ok(())
+}
+
+fn resolve_serve_pipeline(
+    args: &ServePipelineArgs,
+    tuning: ResolvedServeTuning,
+) -> Result<TranscribePipelineArgs> {
+    let model = CommonModelArgs {
+        model: args.model.model.clone(),
+        cache_dir: args.model.cache_dir.clone(),
+        device: args.model.device.clone(),
+        isq: args.model.isq.clone(),
+        max_num_seqs: tuning.max_num_seqs,
+        max_hotword_tokens: args.model.max_hotword_tokens,
+        kv_peak_ratio: env_parse("VASR_KV_PEAK_RATIO")?.unwrap_or(DEFAULT_KV_PEAK_RATIO),
+        gpu_memory_utilization: tuning.gpu_memory_utilization,
+        #[cfg(feature = "cuda-graph")]
+        cuda_graph_chunked_argmax: false,
+        #[cfg(feature = "cuda-graph")]
+        cuda_graph_chunked_argmax_size: DEFAULT_CUDA_GRAPH_CHUNKED_ARGMAX_SIZE,
+        #[cfg(feature = "cuda")]
+        q8_prefill_lm_head_mmq: true,
+        #[cfg(feature = "cuda")]
+        q8_prefill_lm_head_mmq_max_logits_mib: DEFAULT_Q8_PREFILL_LM_HEAD_MMQ_MAX_LOGITS_MIB,
+    };
+    let vad = internal_vad_args(&args.vad)?;
+    Ok(TranscribePipelineArgs {
+        model,
+        num_load_workers: args.num_load_workers,
+        num_vad_workers: args.num_vad_workers,
+        profile: args.profile,
+        profile_window: env_parse("VASR_PROFILE_WINDOW")?.unwrap_or(DEFAULT_PROFILE_WINDOW_SECS),
+        encoder_batch_max_audio_seconds: tuning.encoder_batch_max_audio_seconds,
+        encoder_batch_max_segments: tuning.encoder_batch_max_segments,
+        vad,
+    })
+}
+
+fn serve_tuning_overrides(args: &ServePipelineArgs) -> Result<ServeTuningOverrides> {
+    Ok(ServeTuningOverrides {
+        max_num_seqs: args.model.max_num_seqs,
+        gpu_memory_utilization: args.model.gpu_memory_utilization,
+        encoder_batch_max_audio_seconds: args.encoder_batch_max_audio_seconds,
+        encoder_batch_max_segments: env_parse("VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS")?,
+    })
+}
+
+fn internal_vad_args(args: &ServeVadArgs) -> Result<VadCliArgs> {
+    Ok(VadCliArgs {
+        vad_model: args.vad_model.clone(),
+        vad_device: args.vad_device.clone(),
+        vad_threshold: args.vad_threshold,
+        vad_min_speech_ms: args.vad_min_speech_ms,
+        vad_min_silence_ms: args.vad_min_silence_ms,
+        vad_pad_ms: args.vad_pad_ms,
+        vad_num_threads: env_parse("VASR_VAD_NUM_THREADS")?.unwrap_or(0),
+        vad_max_segment_sec: args.vad_max_segment_sec,
+    })
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|error| anyhow::anyhow!("invalid {name} value {value:?}: {error}"))
+        })
+        .transpose()
+}
+
+fn tuning_value_source(has_value: bool, flag: &str, env_key: &str) -> &'static str {
+    let cli_value = std::env::args_os().any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == flag || argument.starts_with(&format!("{flag}="))
+    });
+    if cli_value {
+        "cli"
+    } else if std::env::var_os(env_key).is_some() {
+        "env"
+    } else if has_value {
+        "configured"
+    } else {
+        "auto"
+    }
+}
+
 pub fn build_async_transcribe_pipeline(
     pipeline: &TranscribePipelineArgs,
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
-    log_service_start();
+    log_transcribe_start();
+    let vad = build_vad_model(&pipeline.vad)?;
+    log_transcribe_tuning(
+        pipeline,
+        "not-run",
+        "configured",
+        "configured",
+        "configured",
+    );
     let asr = load_asr_model_for_pipeline(
         pipeline,
         language.as_deref(),
@@ -327,7 +614,7 @@ pub fn build_async_transcribe_pipeline(
     )?;
     Ok(AsyncTranscribePipeline::new(
         AudioLoader,
-        build_vad_model(&pipeline.vad)?,
+        vad,
         asr,
         asr_options_from_pipeline(pipeline, language),
     )
@@ -341,7 +628,15 @@ pub fn build_global_transcribe_pipeline(
 ) -> Result<Arc<GlobalAsyncTranscribePipeline>> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
-    log_service_start();
+    log_transcribe_start();
+    let vad = build_vad_model(&pipeline.vad)?;
+    log_transcribe_tuning(
+        pipeline,
+        "not-run",
+        "configured",
+        "configured",
+        "configured",
+    );
     let asr = load_asr_model_for_pipeline(
         pipeline,
         language.as_deref(),
@@ -350,7 +645,7 @@ pub fn build_global_transcribe_pipeline(
     )?;
     Ok(Arc::new(GlobalAsyncTranscribePipeline::start(
         AudioLoader,
-        build_vad_model(&pipeline.vad)?,
+        vad,
         asr,
         asr_options_from_pipeline(pipeline, language),
         vad_options_from_pipeline(pipeline),
@@ -363,7 +658,23 @@ pub fn validate_pipeline(pipeline: &TranscribePipelineArgs) -> Result<()> {
     if pipeline.profile_window <= 0.0 || !pipeline.profile_window.is_finite() {
         bail!("--profile-window must be a positive finite number");
     }
-    validate_vad_args(&pipeline.vad)
+    if !pipeline.encoder_batch_max_audio_seconds.is_finite()
+        || pipeline.encoder_batch_max_audio_seconds <= 0.0
+    {
+        bail!("--encoder-batch-max-audio-seconds must be finite and greater than zero");
+    }
+    if pipeline.encoder_batch_max_segments == 0 {
+        bail!("--encoder-batch-max-segments must be greater than zero");
+    }
+    validate_vad_args(&pipeline.vad)?;
+    let padded_vad_segment_seconds =
+        f64::from(pipeline.vad.vad_max_segment_sec) + 2.0 * pipeline.vad.vad_pad_ms as f64 / 1000.0;
+    if padded_vad_segment_seconds > pipeline.encoder_batch_max_audio_seconds {
+        bail!(
+            "--vad-max-segment-sec plus --vad-pad-ms exceeds --encoder-batch-max-audio-seconds; lower the VAD segment limit or raise the encoder batch duration"
+        );
+    }
+    Ok(())
 }
 
 fn configure_model_cache_dir(pipeline: &TranscribePipelineArgs) {
@@ -411,8 +722,6 @@ fn asr_options_from_pipeline(
         language,
         decode_max_seqs: pipeline.model.max_num_seqs,
         chunk_max_sec: None,
-        decode_tokens_per_sec: pipeline.model.decode_tokens_per_sec,
-        decode_min_tokens: pipeline.model.decode_min_tokens,
         ..AsrOptions::default()
     }
 }
@@ -423,6 +732,8 @@ fn worker_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> PipelineWo
         num_vad_workers: pipeline.num_vad_workers,
         profile: pipeline.profile,
         profile_window: std::time::Duration::from_secs_f64(pipeline.profile_window),
+        encoder_batch_max_segments: pipeline.encoder_batch_max_segments,
+        encoder_batch_max_audio_seconds: pipeline.encoder_batch_max_audio_seconds,
     }
 }
 
@@ -451,12 +762,6 @@ fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
     if args.max_num_seqs == 0 {
         bail!("--max-num-seqs must be greater than zero");
     }
-    if !args.decode_tokens_per_sec.is_finite() || args.decode_tokens_per_sec <= 0.0 {
-        bail!("--decode-tokens-per-sec must be finite and greater than zero");
-    }
-    if args.decode_min_tokens == 0 {
-        bail!("--decode-min-tokens must be greater than zero");
-    }
     if !args.kv_peak_ratio.is_finite() || !(0.0..=1.0).contains(&args.kv_peak_ratio) {
         bail!("--kv-peak-ratio must be finite and between 0.0 and 1.0");
     }
@@ -477,9 +782,47 @@ fn bytes_to_gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// 在加载 VAD 和 ASR 之前打印服务已经开始启动。
-fn log_service_start() {
-    tracing::info!(target: "vasr_transcribe::serve", "starting service");
+/// 在加载 VAD 和 ASR 之前打印统一的推理启动日志。
+fn log_transcribe_start() {
+    tracing::info!(target: "vasr_transcribe::serve", "starting transcription");
+}
+
+fn format_transcribe_tuning_log(
+    pipeline: &TranscribePipelineArgs,
+    probe: &str,
+    max_num_seqs_source: &str,
+    gpu_memory_utilization_source: &str,
+    encoder_batch_audio_seconds_source: &str,
+) -> String {
+    format!(
+        "transcribe tuning | probe={probe} max_num_seqs={}({max_num_seqs_source}) gpu_memory_budget_fraction={:.3}({gpu_memory_utilization_source}) encoder_batch_max_audio_seconds={:.1}({encoder_batch_audio_seconds_source}) encoder_batch_max_segments={} workers=load:{}/vad:{}",
+        pipeline.model.max_num_seqs,
+        pipeline.model.gpu_memory_utilization,
+        pipeline.encoder_batch_max_audio_seconds,
+        pipeline.encoder_batch_max_segments,
+        pipeline.num_load_workers,
+        pipeline.num_vad_workers,
+    )
+}
+
+fn log_transcribe_tuning(
+    pipeline: &TranscribePipelineArgs,
+    probe: &str,
+    max_num_seqs_source: &str,
+    gpu_memory_utilization_source: &str,
+    encoder_batch_audio_seconds_source: &str,
+) {
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{}",
+        format_transcribe_tuning_log(
+            pipeline,
+            probe,
+            max_num_seqs_source,
+            gpu_memory_utilization_source,
+            encoder_batch_audio_seconds_source,
+        )
+    );
 }
 
 /// 把加载耗时格式化成秒，不带单位后缀。
@@ -640,40 +983,65 @@ fn load_asr_model_for_pipeline(
 ) -> Result<Arc<dyn AsrModel>> {
     let args = &pipeline.model;
     let device = resolve_device(&args.device)?;
+    load_asr_model_for_pipeline_on_device(
+        pipeline,
+        language,
+        cuda_graph_max_batch,
+        scheduled,
+        device,
+        0,
+    )
+}
+
+fn load_asr_model_for_pipeline_on_device(
+    pipeline: &TranscribePipelineArgs,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] language: Option<&str>,
+    #[cfg_attr(
+        not(all(feature = "cuda-graph", feature = "paged-attn")),
+        allow(unused_variables)
+    )]
+    cuda_graph_max_batch: Option<usize>,
+    scheduled: bool,
+    device: Device,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))]
+    gpu_memory_reserved_bytes: usize,
+) -> Result<Arc<dyn AsrModel>> {
+    let args = &pipeline.model;
     let dtype = auto_dtype(&device)?;
 
-    let output = vasr::build_offline_asr_model(vasr::OfflineAsrBuildRequest {
-        model: args.model.clone(),
-        cache_dir: args.cache_dir.clone(),
-        device: device.clone(),
-        dtype,
-        progress: Progress::new(Arc::new(IndicatifProgressSink)),
-        quantization: vasr::AsrQuantizationConfig {
-            isq: args.isq.clone(),
-            #[cfg(feature = "cuda")]
-            q8_prefill_lm_head_mmq: args.q8_prefill_lm_head_mmq,
-            #[cfg(feature = "cuda")]
-            q8_prefill_lm_head_mmq_max_logits_bytes: args
-                .q8_prefill_lm_head_mmq_max_logits_mib
-                .saturating_mul(1024 * 1024),
-        },
-        #[cfg(feature = "paged-attn")]
-        runtime: vasr::AsrRuntimeConfig {
-            language: language.map(str::to_string),
-            max_num_seqs: args.max_num_seqs,
-            max_segment_sec: pipeline.vad.vad_max_segment_sec,
-            max_hotword_tokens: args.max_hotword_tokens,
-            kv_peak_ratio: args.kv_peak_ratio,
-            decode_tokens_per_sec: args.decode_tokens_per_sec,
-            decode_min_tokens: args.decode_min_tokens,
-            gpu_memory_utilization: args.gpu_memory_utilization,
-            #[cfg(feature = "cuda-graph")]
-            cuda_graph_chunked_argmax: args.cuda_graph_chunked_argmax,
-            #[cfg(feature = "cuda-graph")]
-            cuda_graph_chunked_argmax_size: args.cuda_graph_chunked_argmax_size,
-        },
-        #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
-        cuda_graph_max_batch,
+    let output = build_on_selected_device(&device, |selected_device| {
+        vasr::build_offline_asr_model(vasr::OfflineAsrBuildRequest {
+            model: args.model.clone(),
+            cache_dir: args.cache_dir.clone(),
+            device: selected_device.clone(),
+            dtype,
+            progress: Progress::new(Arc::new(IndicatifProgressSink)),
+            quantization: vasr::AsrQuantizationConfig {
+                isq: args.isq.clone(),
+                #[cfg(feature = "cuda")]
+                q8_prefill_lm_head_mmq: args.q8_prefill_lm_head_mmq,
+                #[cfg(feature = "cuda")]
+                q8_prefill_lm_head_mmq_max_logits_bytes: args
+                    .q8_prefill_lm_head_mmq_max_logits_mib
+                    .saturating_mul(1024 * 1024),
+            },
+            #[cfg(feature = "paged-attn")]
+            runtime: vasr::AsrRuntimeConfig {
+                language: language.map(str::to_string),
+                max_num_seqs: args.max_num_seqs,
+                max_segment_sec: pipeline.vad.vad_max_segment_sec,
+                max_hotword_tokens: args.max_hotword_tokens,
+                kv_peak_ratio: args.kv_peak_ratio,
+                gpu_memory_utilization: args.gpu_memory_utilization,
+                gpu_memory_reserved_bytes,
+                #[cfg(feature = "cuda-graph")]
+                cuda_graph_chunked_argmax: args.cuda_graph_chunked_argmax,
+                #[cfg(feature = "cuda-graph")]
+                cuda_graph_chunked_argmax_size: args.cuda_graph_chunked_argmax_size,
+            },
+            #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
+            cuda_graph_max_batch,
+        })
     })?;
     #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
     configure_cuda_mempool_release_threshold(&device);
@@ -688,6 +1056,13 @@ fn load_asr_model_for_pipeline(
     } else {
         Ok(base_asr)
     }
+}
+
+fn build_on_selected_device<T>(
+    selected_device: &Device,
+    build: impl FnOnce(&Device) -> Result<T>,
+) -> Result<T> {
+    build(selected_device)
 }
 
 #[cfg(all(feature = "cuda-graph", feature = "paged-attn"))]
@@ -780,10 +1155,14 @@ fn resolve_vad_device(value: &str) -> Result<Device> {
         "auto" => {
             #[cfg(feature = "cuda")]
             {
-                if let Ok(device) = Device::new_cuda(0) {
-                    return Ok(device);
+                match Device::new_cuda(0) {
+                    Ok(device) => return Ok(device),
+                    Err(error) => {
+                        tracing::warn!(target: "vasr_transcribe::serve", "VAD CUDA initialization failed; trying CPU: {error}")
+                    }
                 }
             }
+            tracing::info!(target: "vasr_transcribe::serve", "VAD auto device selected CPU");
             Ok(Device::Cpu)
         }
         "cpu" => Ok(Device::Cpu),
@@ -817,6 +1196,186 @@ async fn health() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Parser)]
+    struct TestServeCli {
+        #[command(flatten)]
+        args: ServeTranscribeArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct TestRunCli {
+        #[command(flatten)]
+        args: crate::run::RunTranscribeArgs,
+    }
+
+    #[test]
+    fn serve_help_hides_internal_tuning_flags() {
+        let help = TestServeCli::command().render_long_help().to_string();
+        for retained in [
+            "--max-hotword-tokens",
+            "--num-load-workers",
+            "--num-vad-workers",
+            "--encoder-batch-max-audio-seconds",
+            "--vad-model",
+            "--vad-threshold",
+            "--vad-min-speech-ms",
+            "--vad-min-silence-ms",
+            "--vad-pad-ms",
+            "--vad-max-segment-sec",
+        ] {
+            assert!(help.contains(retained), "serve help lost {retained}");
+        }
+        for flag in [
+            "--decode-tokens-per-sec",
+            "--decode-min-tokens",
+            "--kv-peak-ratio",
+            "--cuda-graph-chunked-argmax",
+            "--cuda-graph-chunked-argmax-size",
+            "--q8-prefill-lm-head-mmq",
+            "--q8-prefill-lm-head-mmq-max-logits-mib",
+            "--profile-window",
+            "--vad-num-threads",
+            "--encoder-batch-max-segments",
+        ] {
+            assert!(
+                !help.contains(flag),
+                "serve help unexpectedly contains {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_defaults_and_other_tuning_options_remain_unchanged() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let help = TestRunCli::command().render_long_help().to_string();
+        for retained in [
+            "--kv-peak-ratio",
+            "--profile-window",
+            "--vad-num-threads",
+            "--encoder-batch-max-segments",
+        ] {
+            assert!(help.contains(retained), "run help lost {retained}");
+        }
+        for removed in ["--decode-tokens-per-sec", "--decode-min-tokens"] {
+            assert!(
+                !help.contains(removed),
+                "run help unexpectedly contains {removed}"
+            );
+        }
+
+        let args = TestRunCli::try_parse_from(["test", "--input", "input.wav"])
+            .expect("run defaults should parse")
+            .args;
+        assert_eq!(args.pipeline.model.max_num_seqs, DEFAULT_MAX_NUM_SEQS);
+        assert_eq!(
+            args.pipeline.model.gpu_memory_utilization,
+            DEFAULT_GPU_MEMORY_UTILIZATION
+        );
+        assert_eq!(args.pipeline.num_load_workers, 1);
+        assert_eq!(args.pipeline.num_vad_workers, 1);
+        assert_eq!(args.pipeline.encoder_batch_max_audio_seconds, 30.0);
+        assert_eq!(args.pipeline.encoder_batch_max_segments, 32);
+        assert_eq!(args.pipeline.vad.vad_device, "cpu");
+    }
+
+    #[test]
+    fn serve_capacity_defaults_are_auto_and_workers_default_to_two() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let args = TestServeCli::try_parse_from(["test"])
+            .expect("serve defaults should parse")
+            .args;
+        assert_eq!(args.pipeline.model.max_num_seqs, None);
+        assert_eq!(args.pipeline.model.gpu_memory_utilization, None);
+        assert_eq!(args.pipeline.model.max_hotword_tokens, 128);
+        assert_eq!(args.pipeline.encoder_batch_max_audio_seconds, None);
+        assert_eq!(args.pipeline.num_load_workers, 2);
+        assert_eq!(args.pipeline.num_vad_workers, 2);
+        assert_eq!(args.pipeline.vad.vad_device, "auto");
+        assert_eq!(args.pipeline.model.device, "auto");
+    }
+
+    #[test]
+    fn selected_device_oom_is_returned_without_retrying_another_backend() {
+        let calls = std::cell::Cell::new(0);
+        let error = build_on_selected_device(&Device::Cpu, |_| -> Result<()> {
+            calls.set(calls.get() + 1);
+            Err(anyhow::anyhow!("CUDA out of memory"))
+        })
+        .expect_err("the selected device OOM must propagate");
+
+        assert_eq!(calls.get(), 1, "device loading must not be retried");
+        assert!(error.to_string().contains("CUDA out of memory"));
+    }
+
+    #[test]
+    fn serve_tuning_environment_values_reach_runtime_and_cli_wins() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let env_values = [
+            ("VASR_MAX_NUM_SEQS", "17"),
+            ("VASR_GPU_MEMORY_UTILIZATION", "0.73"),
+            ("VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS", "45"),
+            ("VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS", "6"),
+            ("VASR_KV_PEAK_RATIO", "0.4"),
+            ("VASR_PROFILE_WINDOW", "7"),
+            ("VASR_VAD_NUM_THREADS", "3"),
+        ];
+        let previous = env_values.map(|(key, _)| (key, std::env::var_os(key)));
+        unsafe {
+            for (key, value) in env_values {
+                std::env::set_var(key, value);
+            }
+        }
+
+        let parsed = TestServeCli::try_parse_from(["test"])
+            .expect("environment-backed serve tuning should parse");
+        let overrides = serve_tuning_overrides(&parsed.args.pipeline)
+            .expect("internal environment tuning should parse");
+        assert_eq!(overrides.max_num_seqs, Some(17));
+        assert_eq!(overrides.gpu_memory_utilization, Some(0.73));
+        assert_eq!(overrides.encoder_batch_max_audio_seconds, Some(45.0));
+        assert_eq!(overrides.encoder_batch_max_segments, Some(6));
+
+        let tuning = resolve_tuning(None, None, 30.0, 0, 128, 0.4, overrides)
+            .expect("manual environment values should be retained by fallback tuning");
+        let pipeline = resolve_serve_pipeline(&parsed.args.pipeline, tuning)
+            .expect("internal environment values should enter the pipeline");
+        assert_eq!(pipeline.model.kv_peak_ratio, 0.4);
+        assert_eq!(pipeline.profile_window, 7.0);
+        assert_eq!(pipeline.vad.vad_num_threads, 3);
+        assert_eq!(pipeline.encoder_batch_max_segments, 6);
+
+        let cli = TestServeCli::try_parse_from([
+            "test",
+            "--max-num-seqs",
+            "9",
+            "--gpu-memory-utilization",
+            "0.6",
+            "--encoder-batch-max-audio-seconds",
+            "50",
+        ])
+        .expect("CLI tuning values should parse");
+        assert_eq!(cli.args.pipeline.model.max_num_seqs, Some(9));
+        assert_eq!(cli.args.pipeline.model.gpu_memory_utilization, Some(0.6));
+        assert_eq!(
+            cli.args.pipeline.encoder_batch_max_audio_seconds,
+            Some(50.0)
+        );
+
+        unsafe {
+            for (key, old_value) in previous {
+                if let Some(value) = old_value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 
     fn default_model_args() -> CommonModelArgs {
         CommonModelArgs {
@@ -826,8 +1385,6 @@ mod tests {
             isq: None,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             max_hotword_tokens: DEFAULT_MAX_HOTWORD_TOKENS,
-            decode_tokens_per_sec: DEFAULT_DECODE_TOKENS_PER_SEC,
-            decode_min_tokens: DEFAULT_DECODE_MIN_TOKENS,
             kv_peak_ratio: DEFAULT_KV_PEAK_RATIO,
             gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             #[cfg(feature = "cuda-graph")]
@@ -848,6 +1405,8 @@ mod tests {
             num_vad_workers: 1,
             profile: false,
             profile_window: DEFAULT_PROFILE_WINDOW_SECS,
+            encoder_batch_max_segments: DEFAULT_ASR_ENCODER_BATCH_MAX_SEGMENTS,
+            encoder_batch_max_audio_seconds: DEFAULT_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS,
             vad: VadCliArgs {
                 vad_model: "fsmn".to_string(),
                 vad_device: "cpu".to_string(),
@@ -916,7 +1475,7 @@ mod tests {
         .await
         .expect_err("fatal pipeline error must stop the HTTP server");
 
-        assert!(error.to_string().contains("CUDA out of memory"));
+        assert!(error.to_string().contains("CUDA out of memory"), "{error}");
     }
 
     #[test]
@@ -947,6 +1506,35 @@ mod tests {
             "gpu | used=19.45GiB total=23.52GiB free=4.07GiB params=1.75GiB kv=17.06GiB graph=0.516GiB"
         );
         assert_eq!(gpu.matches('|').count(), 1);
+    }
+
+    #[test]
+    fn transcribe_tuning_log_uses_the_same_schema_for_configured_and_auto_values() {
+        let mut pipeline = default_pipeline_args();
+        pipeline.model.max_num_seqs = 107;
+        pipeline.model.gpu_memory_utilization = 1.0;
+        pipeline.encoder_batch_max_audio_seconds = 66.0;
+        pipeline.encoder_batch_max_segments = 20;
+        pipeline.num_load_workers = 2;
+        pipeline.num_vad_workers = 2;
+
+        let auto = format_transcribe_tuning_log(&pipeline, "hardware", "auto", "auto", "auto");
+        assert_eq!(
+            auto,
+            "transcribe tuning | probe=hardware max_num_seqs=107(auto) gpu_memory_budget_fraction=1.000(auto) encoder_batch_max_audio_seconds=66.0(auto) encoder_batch_max_segments=20 workers=load:2/vad:2"
+        );
+
+        let configured = format_transcribe_tuning_log(
+            &pipeline,
+            "not-run",
+            "configured",
+            "configured",
+            "configured",
+        );
+        assert_eq!(
+            configured,
+            "transcribe tuning | probe=not-run max_num_seqs=107(configured) gpu_memory_budget_fraction=1.000(configured) encoder_batch_max_audio_seconds=66.0(configured) encoder_batch_max_segments=20 workers=load:2/vad:2"
+        );
     }
 
     #[cfg(feature = "cuda")]

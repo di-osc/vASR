@@ -34,20 +34,28 @@ pub fn resolve_device(value: &str) -> Result<Device> {
 
 /// Auto-select the best available device.
 pub fn auto_device() -> Result<Device> {
-    // 三个分支互斥（cfg 保证只编译一个），因此可以直接作为函数尾表达式返回。
+    #[allow(unused_mut)]
+    let mut failures: Vec<String> = Vec::new();
     #[cfg(feature = "cuda")]
     {
-        Device::new_cuda(0).map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"))
+        match Device::new_cuda(0) {
+            Ok(device) => return Ok(device),
+            Err(err) => failures.push(format!("CUDA: {err}")),
+        }
     }
-    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+    #[cfg(feature = "metal")]
     {
-        Device::new_metal(0)
-            .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
+        match Device::new_metal(0) {
+            Ok(device) => return Ok(device),
+            Err(err) => failures.push(format!("Metal: {err}")),
+        }
     }
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
-    {
-        Ok(Device::Cpu)
+    if failures.is_empty() {
+        tracing::info!(target: "vasr_transcribe::device", "auto device selected CPU: no accelerator backend is enabled");
+    } else {
+        tracing::warn!(target: "vasr_transcribe::device", "accelerator initialization failed; falling back to CPU: {}", failures.join("; "));
     }
+    Ok(Device::Cpu)
 }
 
 /// Auto-select dtype for the given device.

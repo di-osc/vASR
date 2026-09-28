@@ -58,17 +58,9 @@ pub(super) fn spawn_segment_encoder_worker(
     encoded_tx: mpsc::UnboundedSender<SegmentEncoderOutput>,
     stats: Arc<Mutex<AsrStageStats>>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
+    max_segments: usize,
+    max_audio_seconds: f64,
 ) -> JoinHandle<()> {
-    let max_segments = encoder_batch_max_segments(
-        std::env::var("VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS")
-            .ok()
-            .as_deref(),
-    );
-    let max_audio_seconds = encoder_batch_max_audio_seconds(
-        std::env::var("VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS")
-            .ok()
-            .as_deref(),
-    );
     tokio::spawn(async move {
         let mut pending = None;
         loop {
@@ -93,14 +85,27 @@ pub(super) fn spawn_segment_encoder_worker(
                 .iter()
                 .map(|segment| segment.waveform.duration_seconds())
                 .sum::<f64>();
-            let batch = tokio::task::spawn_blocking({
-                let asr = Arc::clone(&asr);
-                let asr_options = asr_options.clone();
-                let segments = request.segments;
-                move || run_segment_asr_encode(asr.as_ref(), &segments, &asr_options)
-            })
-            .await
-            .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR audio encoder join error: {error}")));
+            let oversized_segment_seconds = request
+                .segments
+                .iter()
+                .map(|segment| segment.waveform.duration_seconds())
+                .find(|seconds| *seconds > max_audio_seconds);
+            let batch = if let Some(seconds) = oversized_segment_seconds {
+                Err(anyhow::anyhow!(
+                    "ASR encoder segment duration {seconds:.3}s exceeds --encoder-batch-max-audio-seconds={max_audio_seconds:.3}; reduce --vad-max-segment-sec or raise the encoder batch duration"
+                ))
+            } else {
+                tokio::task::spawn_blocking({
+                    let asr = Arc::clone(&asr);
+                    let asr_options = asr_options.clone();
+                    let segments = request.segments;
+                    move || run_segment_asr_encode(asr.as_ref(), &segments, &asr_options)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(anyhow::anyhow!("ASR audio encoder join error: {error}"))
+                })
+            };
             let encode_wall_seconds = encode_start.elapsed().as_secs_f64();
             let encode_span = StageSpan::new(encode_start, Instant::now());
             let encode_timings = batch
@@ -115,6 +120,17 @@ pub(super) fn spawn_segment_encoder_worker(
                 encode_wall_seconds,
             );
             let encode_failed = batch.is_err();
+            if let Err(error) = &batch {
+                tracing::warn!(
+                    target: "vasr_transcribe::pipeline",
+                    "ASR audio encoder batch failed | segments={} audio_seconds={:.3} max_audio_seconds={:.3} reason={} error={:#}",
+                    segments_for_result.len(),
+                    segment_audio_seconds,
+                    max_audio_seconds,
+                    request.reason,
+                    error
+                );
+            }
             let mut segments_for_result = segments_for_result;
             for segment in &mut segments_for_result {
                 segment.spans.audio_encoder = Some(encode_span);
@@ -161,40 +177,6 @@ pub(super) fn spawn_segment_encoder_worker(
     })
 }
 #[cfg(feature = "paged-attn")]
-const DEFAULT_ENCODER_BATCH_MAX_SEGMENTS: usize = 32;
-
-#[cfg(feature = "paged-attn")]
-const DEFAULT_ENCODER_BATCH_MAX_AUDIO_SECONDS: f64 = 120.0;
-
-#[cfg(feature = "paged-attn")]
-fn encoder_batch_max_audio_seconds(value: Option<&str>) -> f64 {
-    if let Some(value) = value {
-        match value.parse::<f64>() {
-            Ok(limit) if limit.is_finite() && limit > 0.0 => return limit,
-            _ => tracing::warn!(
-                target: "vasr_transcribe::pipeline",
-                "ignoring invalid VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS={value:?}; expected a finite positive number"
-            ),
-        }
-    }
-    DEFAULT_ENCODER_BATCH_MAX_AUDIO_SECONDS
-}
-
-#[cfg(feature = "paged-attn")]
-fn encoder_batch_max_segments(value: Option<&str>) -> usize {
-    if let Some(value) = value {
-        match value.parse::<usize>() {
-            Ok(limit) if limit > 0 => return limit,
-            _ => tracing::warn!(
-                target: "vasr_transcribe::pipeline",
-                "ignoring invalid VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS={value:?}; expected a positive integer"
-            ),
-        }
-    }
-    DEFAULT_ENCODER_BATCH_MAX_SEGMENTS
-}
-
-#[cfg(feature = "paged-attn")]
 async fn collect_encoder_segment_batch(
     first: SegmentEncodeRequest,
     request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeMessage>,
@@ -208,16 +190,16 @@ async fn collect_encoder_segment_batch(
     let max_segments = max_segments.max(1);
     let mut stage_start = first.stage_start;
     let mut audio_seconds = first.segment.waveform.duration_seconds();
-    // An individual oversized segment runs alone so it can still make progress.
-    if audio_seconds > max_audio_seconds {
-        tracing::warn!(
-            target: "vasr_transcribe::pipeline",
-            "encoder segment exceeds batch duration limit; encoding alone | audio_seconds={audio_seconds:.3} limit={max_audio_seconds:.3}"
-        );
-    }
+    let mut reason = if audio_seconds > max_audio_seconds {
+        "segment_exceeds_audio_limit"
+    } else {
+        "wait_timeout"
+    };
     let mut segments = vec![first.segment];
-    let mut reason = "wait_timeout";
     loop {
+        if audio_seconds > max_audio_seconds {
+            break;
+        }
         if segments.len() >= max_segments {
             reason = "segment_limit";
             break;
@@ -319,9 +301,91 @@ pub(super) fn run_segment_asr_encode(
         .collect::<HashSet<_>>()
         .len();
     let segment_audio_seconds: f64 = waveforms.iter().map(Waveform::duration_seconds).sum();
-    let encoded =
-        qwen3.encode_waveforms_audio_features_to_cpu(waveforms.as_slice(), asr_options)?;
+    let encoded = match qwen3
+        .encode_waveforms_audio_features_to_cpu(waveforms.as_slice(), asr_options)
+    {
+        Ok(encoded) => encoded,
+        Err(error) if is_cuda_oom(&error) && segments.len() > 1 => {
+            let split_at = split_encoder_batch_at_half_duration(segments);
+            tracing::warn!(
+                target: "vasr_transcribe::pipeline",
+                "retrying ASR audio encoder OOM with smaller batches | segments={} audio_seconds={:.3} split_at={}",
+                segments.len(),
+                segment_audio_seconds,
+                split_at
+            );
+            let left = run_segment_asr_encode(asr, &segments[..split_at], asr_options)?;
+            let right = run_segment_asr_encode(asr, &segments[split_at..], asr_options)?;
+            return merge_segment_asr_batches(left, right, segments);
+        }
+        Err(error) => return Err(error),
+    };
     let timings = encoded.audio_feature_encode_timings();
+    Ok(SegmentEncodedAsrBatch {
+        inference: SegmentAsrInference {
+            targets,
+            segment_audio_seconds,
+            active_job_count,
+        },
+        waveforms,
+        encoded,
+        timings,
+    })
+}
+
+#[cfg(feature = "paged-attn")]
+fn is_cuda_oom(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("cuda_error_out_of_memory") || message.contains("out of memory")
+}
+
+#[cfg(feature = "paged-attn")]
+fn split_encoder_batch_at_half_duration(segments: &[AsrSegmentJob]) -> usize {
+    let total_seconds = segments
+        .iter()
+        .map(|segment| segment.waveform.duration_seconds())
+        .sum::<f64>();
+    let halfway = total_seconds / 2.0;
+    let mut accumulated = 0.0;
+    for (index, segment) in segments.iter().take(segments.len() - 1).enumerate() {
+        accumulated += segment.waveform.duration_seconds();
+        if accumulated >= halfway {
+            return index + 1;
+        }
+    }
+    segments.len() / 2
+}
+
+#[cfg(feature = "paged-attn")]
+fn merge_segment_asr_batches(
+    left: SegmentEncodedAsrBatch,
+    right: SegmentEncodedAsrBatch,
+    segments: &[AsrSegmentJob],
+) -> Result<SegmentEncodedAsrBatch> {
+    let mut timings = left.timings;
+    timings.prepare_us = timings.prepare_us.saturating_add(right.timings.prepare_us);
+    timings.stack_us = timings.stack_us.saturating_add(right.timings.stack_us);
+    timings.forward_us = timings.forward_us.saturating_add(right.timings.forward_us);
+    timings.d2h_us = timings.d2h_us.saturating_add(right.timings.d2h_us);
+    timings.audio_tokens = timings
+        .audio_tokens
+        .saturating_add(right.timings.audio_tokens);
+
+    let mut targets = left.inference.targets;
+    targets.extend(right.inference.targets);
+    let mut waveforms = left.waveforms;
+    waveforms.extend(right.waveforms);
+    let encoded = EncodedAsrBatch::merge(vec![left.encoded, right.encoded])?;
+    let segment_audio_seconds = segments
+        .iter()
+        .map(|segment| segment.waveform.duration_seconds())
+        .sum();
+    let active_job_count = segments
+        .iter()
+        .map(|segment| segment.job_index)
+        .collect::<HashSet<_>>()
+        .len();
+
     Ok(SegmentEncodedAsrBatch {
         inference: SegmentAsrInference {
             targets,

@@ -42,21 +42,10 @@ fn load_dotenv() -> Result<()> {
     }
 
     let content = fs::read_to_string(path)?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for (key, value) in parse_dotenv_entries(&content) {
+        if env::var_os(&key).is_some() {
             continue;
         }
-
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() || env::var_os(key).is_some() {
-            continue;
-        }
-
-        let value = value.trim().trim_matches(['\'', '"']);
         unsafe {
             env::set_var(key, value);
         }
@@ -65,9 +54,170 @@ fn load_dotenv() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn parse_dotenv_entries(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = value.trim();
+            let value = if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            };
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_dotenv, parse_dotenv_entries};
+    use clap::{Parser, Subcommand};
+    use std::{env, fs, path::PathBuf, sync::Mutex, time::SystemTime};
+    use vasr_transcribe::ServeTranscribeArgs;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Parser)]
+    struct EnvTestCli {
+        #[command(subcommand)]
+        command: EnvTestCommand,
+    }
+
+    #[derive(Debug, Subcommand)]
+    enum EnvTestCommand {
+        Serve(ServeTranscribeArgs),
+    }
+
+    fn fresh_test_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("vasr-dotenv-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn parses_basic_dotenv_assignments_and_ignores_comments() {
+        assert_eq!(
+            parse_dotenv_entries(
+                "# comment\n\n VASR_MODEL = \"local model\" \nVASR_PORT=8867\ninvalid"
+            ),
+            vec![
+                ("VASR_MODEL".to_string(), "local model".to_string()),
+                ("VASR_PORT".to_string(), "8867".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_dotenv_from_current_directory_and_respects_environment_and_cli_priority() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let original_dir = env::current_dir().expect("current directory should be readable");
+        let test_dir = fresh_test_dir();
+        fs::create_dir_all(&test_dir).expect("test directory should be created");
+
+        let max_num_seqs_key = "VASR_MAX_NUM_SEQS";
+        let audio_seconds_key = "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS";
+        let old_max_num_seqs = env::var_os(max_num_seqs_key);
+        let old_audio_seconds = env::var_os(audio_seconds_key);
+        unsafe {
+            env::remove_var(max_num_seqs_key);
+            env::remove_var(audio_seconds_key);
+        }
+
+        fs::write(
+            test_dir.join(".env"),
+            "# dotenv values\nVASR_MAX_NUM_SEQS=17\nVASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS='45.0'\n",
+        )
+        .expect("dotenv file should be written");
+        env::set_current_dir(&test_dir).expect("test directory should become current");
+        load_dotenv().expect("dotenv should load");
+
+        let parsed = EnvTestCli::try_parse_from(["test", "serve"])
+            .expect("dotenv values should enter clap parsing");
+        let EnvTestCommand::Serve(args) = parsed.command;
+        assert_eq!(args.pipeline.model.max_num_seqs, Some(17));
+        assert_eq!(args.pipeline.encoder_batch_max_audio_seconds, Some(45.0));
+
+        let cli_wins = EnvTestCli::try_parse_from([
+            "test",
+            "serve",
+            "--max-num-seqs",
+            "9",
+            "--encoder-batch-max-audio-seconds",
+            "60",
+        ])
+        .expect("explicit command-line values should parse");
+        let EnvTestCommand::Serve(cli_args) = cli_wins.command;
+        assert_eq!(cli_args.pipeline.model.max_num_seqs, Some(9));
+        assert_eq!(
+            cli_args.pipeline.encoder_batch_max_audio_seconds,
+            Some(60.0)
+        );
+
+        unsafe {
+            env::set_var(max_num_seqs_key, "23");
+            env::remove_var(audio_seconds_key);
+        }
+        load_dotenv().expect("dotenv should preserve process environment values");
+        let parent_wins = EnvTestCli::try_parse_from(["test", "serve"])
+            .expect("process environment should be parsed");
+        let EnvTestCommand::Serve(parent_args) = parent_wins.command;
+        assert_eq!(parent_args.pipeline.model.max_num_seqs, Some(23));
+        assert_eq!(
+            parent_args.pipeline.encoder_batch_max_audio_seconds,
+            Some(45.0)
+        );
+
+        env::set_current_dir(&original_dir).expect("original directory should be restored");
+        unsafe {
+            env::remove_var(max_num_seqs_key);
+            env::remove_var(audio_seconds_key);
+            if let Some(value) = old_max_num_seqs {
+                env::set_var(max_num_seqs_key, value);
+            }
+            if let Some(value) = old_audio_seconds {
+                env::set_var(audio_seconds_key, value);
+            }
+        }
+        fs::remove_dir_all(test_dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn missing_dotenv_is_ignored() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let original_dir = env::current_dir().expect("current directory should be readable");
+        let test_dir = fresh_test_dir();
+        fs::create_dir_all(&test_dir).expect("test directory should be created");
+        env::set_current_dir(&test_dir).expect("test directory should become current");
+        load_dotenv().expect("missing dotenv should be ignored");
+        env::set_current_dir(&original_dir).expect("original directory should be restored");
+        fs::remove_dir_all(test_dir).expect("test directory should be removed");
+    }
+}
+
+fn main() -> Result<()> {
     load_dotenv()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_cli())
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
     match cli.command {

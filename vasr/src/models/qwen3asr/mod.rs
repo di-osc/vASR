@@ -13,6 +13,8 @@ use anyhow::Result;
 use candle_core::Device;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+pub const QWEN3_ASR_DECODE_TOKENS_PER_SEC: f64 = 4.25;
 #[cfg(feature = "paged-attn")]
 use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "paged-attn")]
@@ -356,8 +358,7 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
         DynamicPrefillProducer::with_shared_request_ids(
             config,
             Arc::clone(&self.next_paged_request_id),
@@ -384,8 +385,7 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
@@ -419,8 +419,7 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
@@ -456,8 +455,7 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()

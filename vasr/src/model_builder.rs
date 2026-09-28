@@ -24,10 +24,10 @@ pub struct AsrRuntimeConfig {
     pub max_segment_sec: f32,
     pub max_hotword_tokens: usize,
     pub kv_peak_ratio: f32,
-    pub decode_tokens_per_sec: f64,
-    pub decode_min_tokens: usize,
     /// 权重加载之后，KV 池占用总显存的比例。仅 CUDA 上的离线服务使用。
     pub gpu_memory_utilization: f32,
+    /// Bytes held back from the KV pool for encoder/graph workspaces and safety margin.
+    pub gpu_memory_reserved_bytes: usize,
     #[cfg(feature = "cuda-graph")]
     pub cuda_graph_chunked_argmax: bool,
     #[cfg(feature = "cuda-graph")]
@@ -86,8 +86,6 @@ pub struct KvCacheSizingStats {
     pub peak_ratio: f32,
     pub max_hotword_tokens: usize,
     pub decode_tokens_per_sec: f64,
-    pub decode_min_tokens: usize,
-    pub planning_decode_min_tokens: usize,
     pub fixed_prompt_tokens: usize,
     pub base_audio_prompt_tokens: usize,
     pub base_decode_tokens: usize,

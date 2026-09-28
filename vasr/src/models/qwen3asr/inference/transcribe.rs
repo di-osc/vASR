@@ -606,6 +606,13 @@ impl StreamingMetadataDecoder {
         self.merged.chunks.len()
     }
 
+    pub fn all_chunks_completed(&self) -> bool {
+        self.chunks_done
+            .iter()
+            .zip(&self.chunks_per_audio)
+            .all(|(done, total)| done >= total)
+    }
+
     fn batch_audio_index(&self, audio_index: usize) -> Result<(usize, usize)> {
         let mut cursor = 0usize;
         for (batch_index, &len) in self.batch_lens.iter().enumerate() {
@@ -2728,8 +2735,7 @@ pub fn decode_cpu_audio_features_dynamic(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    )
-    .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+    );
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2770,8 +2776,7 @@ pub fn decode_cpu_audio_features_dynamic_timed(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    )
-    .with_decode_budget(opts.decode_tokens_per_sec, opts.decode_min_tokens);
+    );
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,

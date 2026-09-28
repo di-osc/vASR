@@ -87,7 +87,6 @@ pub struct AsrBatchSchedulerConfig {
     prefill_max_wave: Option<usize>,
     pub continuous_batch: bool,
     pub generated_tokens_per_sec: f64,
-    pub min_generated_tokens: usize,
 }
 
 impl Default for AsrBatchSchedulerConfig {
@@ -97,8 +96,7 @@ impl Default for AsrBatchSchedulerConfig {
             explicit_decode_max_seqs: None,
             prefill_max_wave: prefill_max_wave_from_env(),
             continuous_batch: continuous_batch_enabled(),
-            generated_tokens_per_sec: 4.25,
-            min_generated_tokens: 128,
+            generated_tokens_per_sec: crate::models::qwen3asr::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
         }
     }
 }
@@ -111,16 +109,6 @@ impl AsrBatchSchedulerConfig {
             config.explicit_decode_max_seqs = Some(decode_max_seqs);
         }
         config
-    }
-
-    pub fn with_decode_budget(mut self, tokens_per_sec: f64, min_tokens: usize) -> Self {
-        if tokens_per_sec.is_finite() && tokens_per_sec > 0.0 {
-            self.generated_tokens_per_sec = tokens_per_sec;
-        }
-        if min_tokens > 0 {
-            self.min_generated_tokens = min_tokens;
-        }
-        self
     }
 
     pub fn prefill_max_wave(&self, runtime: &PagedCacheRuntime) -> usize {

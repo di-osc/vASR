@@ -6,7 +6,7 @@ use super::{
     RequestItemRef, RoutedTranscribeItemOutcome, StageSpan, TranscribeItemOutcome,
     TranscribeItemSpans, TranscribeItemTiming, allocated_batch_seconds, allocation_scale,
     global_pipeline_failure_outcomes, merge_optional_span, outcome_from_result,
-    prefill_span_from_decode, record_asr_batch_stats, route_outcome,
+    prefill_span_from_decode, record_asr_batch_stats,
 };
 use anyhow::{Result, bail};
 use std::cell::RefCell;
@@ -35,6 +35,7 @@ pub(super) struct SegmentJobState {
     segment_annotations: Vec<Option<Vec<TimeSpan>>>,
     segment_count: usize,
     segments_done: usize,
+    failure_reason: Option<String>,
 }
 
 #[derive(Default)]
@@ -154,23 +155,33 @@ fn run_global_segment_decode_worker(
                     producer_id,
                     result,
                 } => {
-                    let result = result.map(|mut output| {
-                        if let Some(ranges) = producer_chunk_ranges.get(&producer_id) {
+                    let result = result.and_then(|mut output| {
+                        let ranges = producer_chunk_ranges.get(&producer_id);
+                        if !output.sequences.is_empty() && ranges.is_none() {
+                            return Err(anyhow::anyhow!(
+                                "dynamic staged ASR prefill has no chunk metadata for producer={producer_id} sequences={}",
+                                output.sequences.len()
+                            ));
+                        }
+                        if let Some(ranges) = ranges {
                             for seq in &mut output.sequences {
                                 let local = seq.client_index;
-                                if let Some((local_start, global_start, _len)) =
+                                let Some((local_start, global_start, _len)) =
                                     ranges.iter().find(|(local_start, _, len)| {
                                         local >= *local_start
                                             && local < local_start.saturating_add(*len)
                                     })
-                                {
-                                    seq.client_index =
-                                        global_start.saturating_add(local - local_start);
-                                }
+                                else {
+                                    return Err(anyhow::anyhow!(
+                                        "dynamic staged ASR producer chunk index out of range: producer={producer_id} local_chunk={local} ranges={ranges:?}"
+                                    ));
+                                };
+                                seq.client_index =
+                                    global_start.saturating_add(local - local_start);
                             }
-                            output.total_rows = next_global_chunk;
                         }
-                        output
+                        output.total_rows = next_global_chunk;
+                        Ok(output)
                     });
                     if prefill_tx.send(result).is_err() {
                         break;
@@ -269,6 +280,10 @@ fn run_global_segment_decode_worker(
     );
     // 显式结束 `on_tick` 的可变借用以释放对回调上下文的借用；闭包不实现 `Drop`，用 `let _` 移动即可。
     let _ = on_tick;
+    if let Err(error) = decode_result {
+        let _ = forward_thread.join();
+        return Err(error);
+    }
     let _ = forward_thread.join();
     drain_global_decoder_meta(
         &meta_rx,
@@ -294,7 +309,6 @@ fn run_global_segment_decode_worker(
         &asr_to_result_tx,
     )?;
 
-    decode_result?;
     if !pending_chunks.borrow().is_empty() {
         bail!(
             "dynamic ASR streaming metadata missing for {} completed chunks",
@@ -399,15 +413,25 @@ fn drain_completed_chunks(
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
 ) -> Result<()> {
     let chunk_end = chunk_base.saturating_add(decoder.chunk_count());
+    if let Some((&stale_index, _)) = pending_chunks.first_key_value()
+        && stale_index < chunk_base
+    {
+        bail!(
+            "dynamic ASR completed chunk index is stale: index={} current_base={} current_end={}",
+            stale_index,
+            chunk_base,
+            chunk_end
+        );
+    }
     let ready: Vec<usize> = pending_chunks
-        .range(..chunk_end)
+        .range(chunk_base..chunk_end)
         .map(|(chunk_index, _)| *chunk_index)
         .collect();
     for chunk_index in ready {
         let Some(ids) = pending_chunks.remove(&chunk_index) else {
             continue;
         };
-        let local_chunk_index = chunk_index.saturating_sub(chunk_base);
+        let local_chunk_index = chunk_index - chunk_base;
         if let Some(outcomes) = accept_completed_chunk(
             qwen3,
             decoder,
@@ -434,22 +458,24 @@ fn drain_completed_chunks(
 fn reset_stream_decode_state_if_idle(
     pending_chunks: &BTreeMap<usize, Vec<u32>>,
     decoder: &mut StreamingMetadataDecoder,
-    state: &SegmentAsrState,
+    state: &mut SegmentAsrState,
     segments: &mut Vec<AsrSegmentJob>,
     waveforms: &mut Vec<Waveform>,
     batch_lens: &mut Vec<usize>,
     stage_starts: &mut Vec<Instant>,
     chunk_base: &mut usize,
 ) {
-    if !pending_chunks.is_empty() || !state.jobs.is_empty() || decoder.chunk_count() == 0 {
+    if !pending_chunks.is_empty() || !state.jobs.is_empty() || !decoder.all_chunks_completed() {
         return;
     }
-    *chunk_base = chunk_base.saturating_add(decoder.chunk_count());
-    *decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
-    segments.clear();
-    waveforms.clear();
-    batch_lens.clear();
-    stage_starts.clear();
+    if decoder.chunk_count() > 0 {
+        *chunk_base = chunk_base.saturating_add(decoder.chunk_count());
+        *decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
+        segments.clear();
+        waveforms.clear();
+        batch_lens.clear();
+        stage_starts.clear();
+    }
 }
 
 #[cfg(feature = "paged-attn")]
@@ -540,6 +566,7 @@ pub(super) fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &
                 segment_annotations: vec![None; segment.segment_count],
                 segment_count: segment.segment_count,
                 segments_done: 0,
+                failure_reason: None,
             });
         if !segment.speech_annotations.is_empty() {
             entry.speech_annotations = segment.speech_annotations.clone();
@@ -602,12 +629,85 @@ fn finish_segment_job(job: SegmentJobState) -> TranscribeItemOutcome {
 #[cfg(feature = "paged-attn")]
 fn routed_segment_job_outcome(job: SegmentJobState) -> RoutedTranscribeItemOutcome {
     let request_item = job.request_item;
-    let outcome = finish_segment_job(job);
+    let outcome = match job.failure_reason.clone() {
+        Some(reason) => outcome_from_result(
+            job.index,
+            job.channel,
+            job.audio_seconds,
+            job.timing,
+            job.spans,
+            Err(anyhow::anyhow!(reason)),
+        ),
+        None => finish_segment_job(job),
+    };
     match request_item {
         Some(request_item) => RoutedTranscribeItemOutcome::for_request(request_item, outcome),
         None => outcome.into(),
     }
 }
+
+#[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
+fn fail_segment_asr_batch(
+    state: &mut SegmentAsrState,
+    segments: &[AsrSegmentJob],
+    reason: &str,
+    asr_span: StageSpan,
+    prefill_span: Option<StageSpan>,
+    asr_timing: Option<TranscribeItemTiming>,
+    elapsed: f64,
+    total_audio_seconds: f64,
+    active_job_count: usize,
+) -> Vec<RoutedTranscribeItemOutcome> {
+    let affected: HashSet<usize> = segments.iter().map(|segment| segment.job_index).collect();
+    let mut finished_jobs = Vec::new();
+    for job_index in affected {
+        let job_segments = segments
+            .iter()
+            .filter(|segment| segment.job_index == job_index)
+            .collect::<Vec<_>>();
+        if let Some(job) = state.jobs.get_mut(&job_index) {
+            job.failure_reason.get_or_insert_with(|| reason.to_string());
+            job.spans.asr = Some(merge_optional_span(job.spans.asr, Some(asr_span)));
+            job.spans.prefill = Some(merge_optional_span(job.spans.prefill, prefill_span));
+            job.spans.decode = Some(merge_optional_span(job.spans.decode, Some(asr_span)));
+            let item_audio_seconds = job_segments
+                .iter()
+                .map(|segment| segment.waveform.duration_seconds())
+                .sum::<f64>();
+            job.timing.asr_seconds += allocated_batch_seconds(
+                item_audio_seconds,
+                total_audio_seconds,
+                active_job_count,
+                elapsed,
+            );
+            if let Some(asr_timing) = asr_timing {
+                job.timing.add_scaled(
+                    asr_timing,
+                    allocation_scale(item_audio_seconds, total_audio_seconds, active_job_count),
+                );
+            }
+            for segment in job_segments {
+                if let Some(done) = job.segment_annotations.get_mut(segment.segment_index)
+                    && done.is_none()
+                {
+                    *done = Some(Vec::new());
+                    job.segments_done = job.segments_done.saturating_add(1);
+                }
+            }
+            if job.segments_done >= job.segment_count {
+                finished_jobs.push(job_index);
+            }
+        }
+    }
+
+    finished_jobs
+        .into_iter()
+        .filter_map(|job_index| state.jobs.remove(&job_index))
+        .map(routed_segment_job_outcome)
+        .collect()
+}
+
 #[cfg(feature = "paged-attn")]
 pub(super) fn finish_segment_asr_batch(
     state: &mut SegmentAsrState,
@@ -698,93 +798,38 @@ pub(super) fn finish_segment_asr_batch(
                     timelines.len(),
                     segments.len()
                 );
-                let affected: HashSet<usize> =
-                    segments.iter().map(|segment| segment.job_index).collect();
-                let affected_count = affected.len();
-                for job_index in affected {
-                    if let Some(job) = state.jobs.remove(&job_index) {
-                        let request_item = job.request_item;
-                        let mut timing = job.timing;
-                        timing.asr_seconds += allocated_batch_seconds(
-                            segments
-                                .iter()
-                                .filter(|segment| segment.job_index == job_index)
-                                .map(|segment| segment.waveform.duration_seconds())
-                                .sum(),
-                            inference.segment_audio_seconds,
-                            affected_count,
-                            elapsed,
-                        );
-                        if let Some(asr_timing) = asr_timing {
-                            let item_audio_seconds = segments
-                                .iter()
-                                .filter(|segment| segment.job_index == job_index)
-                                .map(|segment| segment.waveform.duration_seconds())
-                                .sum();
-                            let scale = allocation_scale(
-                                item_audio_seconds,
-                                inference.segment_audio_seconds,
-                                affected_count,
-                            );
-                            timing.add_scaled(asr_timing, scale);
-                        }
-                        let mut spans = job.spans;
-                        spans.asr = Some(merge_optional_span(spans.asr, Some(asr_span)));
-                        spans.prefill = Some(merge_optional_span(spans.prefill, prefill_span));
-                        spans.decode = Some(merge_optional_span(spans.decode, Some(asr_span)));
-                        let outcome = outcome_from_result(
-                            job.index,
-                            job.channel,
-                            job.audio_seconds,
-                            timing,
-                            spans,
-                            Err(anyhow::anyhow!(err.clone())),
-                        );
-                        completed.push(route_outcome(request_item, outcome));
-                    }
-                }
+                completed.extend(fail_segment_asr_batch(
+                    state,
+                    segments,
+                    err.as_str(),
+                    asr_span,
+                    prefill_span,
+                    asr_timing,
+                    elapsed,
+                    inference.segment_audio_seconds,
+                    inference.active_job_count,
+                ));
             }
         }
         Err(error) => {
             let elapsed = stage_start.elapsed().as_secs_f64();
             let asr_span = StageSpan::new(stage_start, Instant::now());
             let prefill_span = prefill_span_from_decode(asr_span, asr_timing);
-            let reason = error.to_string();
-            let affected: HashSet<usize> =
-                segments.iter().map(|segment| segment.job_index).collect();
             let total_audio_seconds: f64 = segments
                 .iter()
                 .map(|segment| segment.waveform.duration_seconds())
                 .sum();
-            for job_index in affected {
-                if let Some(job) = state.jobs.remove(&job_index) {
-                    let request_item = job.request_item;
-                    let mut timing = job.timing;
-                    let mut spans = job.spans;
-                    spans.asr = Some(merge_optional_span(spans.asr, Some(asr_span)));
-                    spans.prefill = Some(merge_optional_span(spans.prefill, prefill_span));
-                    spans.decode = Some(merge_optional_span(spans.decode, Some(asr_span)));
-                    timing.asr_seconds += allocated_batch_seconds(
-                        segments
-                            .iter()
-                            .filter(|segment| segment.job_index == job_index)
-                            .map(|segment| segment.waveform.duration_seconds())
-                            .sum(),
-                        total_audio_seconds,
-                        1,
-                        elapsed,
-                    );
-                    let outcome = outcome_from_result(
-                        job.index,
-                        job.channel,
-                        job.audio_seconds,
-                        timing,
-                        spans,
-                        Err(anyhow::anyhow!(reason.clone())),
-                    );
-                    completed.push(route_outcome(request_item, outcome));
-                }
-            }
+            completed.extend(fail_segment_asr_batch(
+                state,
+                segments,
+                &format!("{error:#}"),
+                asr_span,
+                prefill_span,
+                asr_timing,
+                elapsed,
+                total_audio_seconds,
+                1,
+            ));
         }
     }
 

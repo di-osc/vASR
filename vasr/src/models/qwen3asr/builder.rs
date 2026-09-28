@@ -217,7 +217,7 @@ fn build_paged_cache_config(
                 // 权重已经先加载。预算 = 比例 × 总显存 − 当前占用，把剩下的显存划给 KV。
                 super::PagedCacheMemory::GpuMemoryFraction {
                     fraction: req.runtime.gpu_memory_utilization,
-                    reserved_bytes: 0,
+                    reserved_bytes: req.runtime.gpu_memory_reserved_bytes,
                 }
             } else {
                 super::PagedCacheMemory::Blocks(sizing.total_blocks)
@@ -264,13 +264,13 @@ fn estimate_kv_cache_sizing(
         fixed_prompt_tokens,
         req.runtime.max_hotword_tokens,
         KV_BASE_SEGMENT_SEC,
-        req.runtime.decode_tokens_per_sec,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
     )?;
     let peak = kv_tokens_for_segment(
         fixed_prompt_tokens,
         req.runtime.max_hotword_tokens,
         req.runtime.max_segment_sec,
-        req.runtime.decode_tokens_per_sec,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
     )?;
     let base_blocks = req
         .runtime
@@ -291,9 +291,7 @@ fn estimate_kv_cache_sizing(
         max_segment_sec: req.runtime.max_segment_sec,
         peak_ratio: req.runtime.kv_peak_ratio,
         max_hotword_tokens: req.runtime.max_hotword_tokens,
-        decode_tokens_per_sec: req.runtime.decode_tokens_per_sec,
-        decode_min_tokens: req.runtime.decode_min_tokens,
-        planning_decode_min_tokens: KV_BLOCK_SIZE,
+        decode_tokens_per_sec: super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
         fixed_prompt_tokens,
         base_audio_prompt_tokens: base.audio_prompt_tokens,
         base_decode_tokens: base.decode_tokens,
@@ -364,14 +362,13 @@ fn log_kv_cache_sizing(sizing: &crate::model_builder::KvCacheSizingStats) {
         ((sizing.max_num_seqs as f64) * f64::from(sizing.peak_ratio)).ceil() as usize;
     tracing::info!(
         target: "vasr::model_builder",
-        "planning paged kv cache | max_num_seqs={} vad_max_segment_sec={:.1}s kv_peak_ratio={:.2} max_hotword_tokens={}tok decode={:.2}tok/s runtime_min={}tok planning_min={}tok",
+        "planning paged kv cache | max_num_seqs={} vad_max_segment_sec={:.1}s kv_peak_ratio={:.2} max_hotword_tokens={}tok decode={:.2}tok/s block_min={}tok",
         sizing.max_num_seqs,
         sizing.max_segment_sec,
         sizing.peak_ratio,
         sizing.max_hotword_tokens,
         sizing.decode_tokens_per_sec,
-        sizing.decode_min_tokens,
-        sizing.planning_decode_min_tokens,
+        sizing.block_size,
     );
     tracing::info!(
         target: "vasr::model_builder",

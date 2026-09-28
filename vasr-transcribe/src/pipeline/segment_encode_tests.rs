@@ -22,17 +22,6 @@ fn request(job_index: usize, offset: usize, stage_start: Instant) -> SegmentEnco
     }
 }
 
-#[test]
-fn batch_limit_config_requires_positive_integer() {
-    assert_eq!(encoder_batch_max_segments(Some("7")), 7);
-    for value in [None, Some("0"), Some("-1"), Some("invalid"), Some("")] {
-        assert_eq!(
-            encoder_batch_max_segments(value),
-            DEFAULT_ENCODER_BATCH_MAX_SEGMENTS
-        );
-    }
-}
-
 #[tokio::test]
 async fn batch_limit_leaves_queued_segments_and_preserves_sort_and_stage_start() {
     let (tx, mut rx) = mpsc::unbounded_channel();

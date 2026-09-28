@@ -90,15 +90,21 @@
 
 ```text
 Loader:
-  默认 --num-load-workers=1
+  serve 默认 --num-load-workers=2；run 默认 --num-load-workers=1
   设置 N 时最多 N 个 load job in-flight
   设置 0 时使用 std::thread::available_parallelism()
 
 VAD:
-  默认 --num-vad-workers=1
+  serve 默认 --num-vad-workers=2；run 默认 --num-vad-workers=1
   设置 N 时最多 N 个 VAD job in-flight
   设置 0 时使用 std::thread::available_parallelism()
-  --vad-num-threads 控制单个 VAD 模型内部 CPU 线程数；vad-device=cuda 时不用于 CUDA kernel 并行度
+  VASR_VAD_NUM_THREADS 控制单个 VAD 模型内部 CPU 线程数；vad-device=cuda 时不用于 CUDA kernel 并行度
+
+`serve` 的 ASR 设备与 VAD 设备默认都是 `auto`。ASR 按 CUDA、Metal、CPU 顺序选取可初始化的后端；VAD 按 CUDA、CPU 顺序选择。设备确定后若模型加载或资源分配失败，启动会直接报错，不会换设备重试。
+
+未指定 `--max-num-seqs`、`--gpu-memory-utilization` 和 `--encoder-batch-max-audio-seconds` 时，`serve` 根据设备内存、模型大小、VAD 最大分段时长和 hotword 预留估算容量。CUDA KV cache 会为 encoder batch、CUDA graph 和 10% 安全余量预留内存。估算依赖的内存信息不可用时使用基线：512 并发、0.8 显存利用率、30 秒 / 32 段；基线分配仍然失败时直接退出。
+
+CLI 数值优先于进程环境变量，进程环境变量优先于当前工作目录的 `.env`，缺省项再使用自动值。`.env.example` 列出了可配置环境变量。所有子命令解析参数前都会加载 `.env`；文件不存在时忽略。
 
 ASR Worker:
   单 worker，负责把 VAD 后的 job/segment 路由到 fallback 或动态分阶段路径

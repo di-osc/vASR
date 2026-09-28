@@ -86,8 +86,6 @@ fn main() -> Result<()> {
         max_batch_audio_sec: 60.0,
         chunk_max_sec: None,
         // 解码长度预估参数：每秒 token 数与最小 token 数，保持与 `TranscribeOptions::default` 一致。
-        decode_tokens_per_sec: 4.25,
-        decode_min_tokens: 128,
         bucket_by_length: false,
     };
 

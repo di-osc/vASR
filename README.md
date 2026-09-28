@@ -15,3 +15,13 @@ vASR 是用 Rust 和 Candle 实现的 Qwen3-ASR 推理框架。离线转写和�
 - **量化与精度。** CPU 使用 f32，Metal 和 CUDA 使用 bf16。支持就地量化，例如 `q8_0`。
 - **时间线数据。** 音频、标注和识别结果落在 `Timeline` 上，数据集用 SQLite AudioDb 保存，评测直接对标注算字错误率。
 - **重复输入合并。** 同一请求里相同的音频只推理一次，结果按原始顺序展开。
+
+## 离线 HTTP 服务
+
+```bash
+vasr-transcribe serve
+```
+
+`serve` 默认按所选设备、模型和可用内存估算 ASR 并发与 encoder batch 容量，不执行启动基准测试。容量参数可通过 CLI 或环境变量覆盖，例如 `--max-num-seqs 64`、`--gpu-memory-utilization 0.8` 和 `--encoder-batch-max-audio-seconds 30`。显式容量超过估算的安全范围，或低于 VAD 最大分段加 padding 的要求时，服务会在启动阶段报错。
+
+服务也会在启动时读取当前工作目录下的 `.env`。仓库提供了 [`.env.example`](.env.example)；复制为 `.env` 后可在其中设置部署参数。优先级为 CLI 参数、已有进程环境变量、`.env`，最后是自动值。所有子命令都会加载 `.env`，文件不存在时会忽略。
