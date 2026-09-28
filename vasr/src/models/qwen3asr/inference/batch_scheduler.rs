@@ -46,6 +46,7 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
     if std::env::var_os("VASR_DEBUG_CUDA_MEM").is_none() {
         return;
     }
+    let _ = label;
     #[cfg(feature = "cuda-graph")]
     if let Some(mem) = cuda_memory_snapshot(device) {
         let current_pool = match (mem.pool_used_current, mem.pool_reserved_current) {
