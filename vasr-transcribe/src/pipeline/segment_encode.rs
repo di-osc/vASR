@@ -5,7 +5,7 @@ use super::{
     record_request_encode_stages,
 };
 use anyhow::Result;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -59,15 +59,34 @@ pub(super) fn spawn_segment_encoder_worker(
     stats: Arc<Mutex<AsrStageStats>>,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
 ) -> JoinHandle<()> {
+    let max_segments = encoder_batch_max_segments(
+        std::env::var("VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS")
+            .ok()
+            .as_deref(),
+    );
+    let max_audio_seconds = encoder_batch_max_audio_seconds(
+        std::env::var("VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS")
+            .ok()
+            .as_deref(),
+    );
     tokio::spawn(async move {
-        let mut pending = VecDeque::new();
-        while let Some(request) = match pending.pop_front() {
-            Some(request) => Some(request),
-            None => request_rx.recv().await,
-        } {
-            let SegmentEncodeMessage::Segment(request) = request;
-            let request =
-                collect_encoder_segment_batch(request, &mut request_rx, &mut pending).await;
+        let mut pending = None;
+        loop {
+            let first = match pending.take() {
+                Some(request) => request,
+                None => match request_rx.recv().await {
+                    Some(SegmentEncodeMessage::Segment(request)) => request,
+                    None => break,
+                },
+            };
+            let request = collect_encoder_segment_batch(
+                first,
+                &mut request_rx,
+                &mut pending,
+                max_segments,
+                max_audio_seconds,
+            )
+            .await;
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
             let segment_audio_seconds = segments_for_result
@@ -142,26 +161,85 @@ pub(super) fn spawn_segment_encoder_worker(
     })
 }
 #[cfg(feature = "paged-attn")]
+const DEFAULT_ENCODER_BATCH_MAX_SEGMENTS: usize = 32;
+
+#[cfg(feature = "paged-attn")]
+const DEFAULT_ENCODER_BATCH_MAX_AUDIO_SECONDS: f64 = 120.0;
+
+#[cfg(feature = "paged-attn")]
+fn encoder_batch_max_audio_seconds(value: Option<&str>) -> f64 {
+    if let Some(value) = value {
+        match value.parse::<f64>() {
+            Ok(limit) if limit.is_finite() && limit > 0.0 => return limit,
+            _ => tracing::warn!(
+                target: "vasr_transcribe::pipeline",
+                "ignoring invalid VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS={value:?}; expected a finite positive number"
+            ),
+        }
+    }
+    DEFAULT_ENCODER_BATCH_MAX_AUDIO_SECONDS
+}
+
+#[cfg(feature = "paged-attn")]
+fn encoder_batch_max_segments(value: Option<&str>) -> usize {
+    if let Some(value) = value {
+        match value.parse::<usize>() {
+            Ok(limit) if limit > 0 => return limit,
+            _ => tracing::warn!(
+                target: "vasr_transcribe::pipeline",
+                "ignoring invalid VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS={value:?}; expected a positive integer"
+            ),
+        }
+    }
+    DEFAULT_ENCODER_BATCH_MAX_SEGMENTS
+}
+
+#[cfg(feature = "paged-attn")]
 async fn collect_encoder_segment_batch(
     first: SegmentEncodeRequest,
     request_rx: &mut mpsc::UnboundedReceiver<SegmentEncodeMessage>,
-    _pending: &mut VecDeque<SegmentEncodeMessage>,
+    pending: &mut Option<SegmentEncodeRequest>,
+    max_segments: usize,
+    max_audio_seconds: f64,
 ) -> SegmentEncodeBatch {
+    // Start the collection window with the first received segment, not its upstream stage time.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(ASR_ENCODER_BATCH_COLLECT_WAIT_MS);
+    let max_segments = max_segments.max(1);
     let mut stage_start = first.stage_start;
+    let mut audio_seconds = first.segment.waveform.duration_seconds();
+    // An individual oversized segment runs alone so it can still make progress.
+    if audio_seconds > max_audio_seconds {
+        tracing::warn!(
+            target: "vasr_transcribe::pipeline",
+            "encoder segment exceeds batch duration limit; encoding alone | audio_seconds={audio_seconds:.3} limit={max_audio_seconds:.3}"
+        );
+    }
     let mut segments = vec![first.segment];
     let mut reason = "wait_timeout";
-    while let Ok(SegmentEncodeMessage::Segment(request)) = request_rx.try_recv() {
-        stage_start = stage_start.min(request.stage_start);
-        segments.push(request.segment);
-    }
     loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(ASR_ENCODER_BATCH_COLLECT_WAIT_MS),
-            request_rx.recv(),
-        )
-        .await
-        {
+        if segments.len() >= max_segments {
+            reason = "segment_limit";
+            break;
+        }
+        if audio_seconds >= max_audio_seconds {
+            reason = "audio_duration_limit";
+            break;
+        }
+        // timeout_at alone may accept an immediately ready recv even after the deadline.
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, request_rx.recv()).await {
             Ok(Some(SegmentEncodeMessage::Segment(request))) => {
+                let next_audio_seconds = request.segment.waveform.duration_seconds();
+                if audio_seconds + next_audio_seconds > max_audio_seconds {
+                    // Keep the first non-fitting segment for the next batch, in FIFO order.
+                    *pending = Some(request);
+                    reason = "audio_duration_limit";
+                    break;
+                }
+                audio_seconds += next_audio_seconds;
                 stage_start = stage_start.min(request.stage_start);
                 segments.push(request.segment);
             }
@@ -255,3 +333,7 @@ pub(super) fn run_segment_asr_encode(
         timings,
     })
 }
+
+#[cfg(all(test, feature = "paged-attn"))]
+#[path = "segment_encode_tests.rs"]
+mod tests;
