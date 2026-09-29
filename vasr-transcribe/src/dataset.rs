@@ -267,8 +267,7 @@ mod tests {
 
     #[test]
     fn reads_repo_schema2_dataset_if_present() {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datasets/lbg_400call-200.vasr");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datasets/call-100.vasr");
         if !path.exists() {
             return;
         }

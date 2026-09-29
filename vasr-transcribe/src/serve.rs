@@ -163,7 +163,7 @@ pub struct VadCliArgs {
     #[arg(long = "vad-model", default_value = "fsmn", env = "VASR_VAD_MODEL")]
     pub vad_model: String,
 
-    /// VAD device: auto, cpu, cuda.
+    /// VAD device: auto, cpu, metal, cuda.
     #[arg(long = "vad-device", default_value = "cpu", env = "VASR_VAD_DEVICE")]
     pub vad_device: String,
 
@@ -313,7 +313,7 @@ pub struct ServeVadArgs {
     #[arg(long = "vad-model", default_value = "fsmn", env = "VASR_VAD_MODEL")]
     pub vad_model: String,
 
-    /// VAD device: auto, cpu, cuda.
+    /// VAD device: auto, cpu, metal, cuda.
     #[arg(long = "vad-device", default_value = "auto", env = "VASR_VAD_DEVICE")]
     pub vad_device: String,
 
@@ -923,8 +923,8 @@ fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
         other => bail!("--vad-model must be fsmn or firered; got {other:?}"),
     }
     match vad.vad_device.trim().to_ascii_lowercase().as_str() {
-        "auto" | "cpu" | "cuda" | "gpu" => {}
-        other => bail!("--vad-device must be auto, cpu, or cuda; got {other:?}"),
+        "auto" | "cpu" | "metal" | "cuda" | "gpu" => {}
+        other => bail!("--vad-device must be auto, cpu, metal, or cuda; got {other:?}"),
     }
     if !vad.vad_threshold.is_finite() || vad.vad_threshold <= 0.0 || vad.vad_threshold > 1.0 {
         bail!("--vad-threshold must be finite and in (0, 1]");
@@ -1162,10 +1162,31 @@ fn resolve_vad_device(value: &str) -> Result<Device> {
                     }
                 }
             }
+            #[cfg(feature = "metal")]
+            {
+                match Device::new_metal(0) {
+                    Ok(device) => return Ok(device),
+                    Err(error) => {
+                        tracing::warn!(target: "vasr_transcribe::serve", "VAD Metal initialization failed; trying CPU: {error}")
+                    }
+                }
+            }
             tracing::info!(target: "vasr_transcribe::serve", "VAD auto device selected CPU");
             Ok(Device::Cpu)
         }
         "cpu" => Ok(Device::Cpu),
+        "metal" => {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0).map_err(|err| {
+                    anyhow::anyhow!("failed to create Metal device 0 for VAD: {err}")
+                })
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                bail!("--vad-device metal requires building with `--features metal`")
+            }
+        }
         "cuda" | "gpu" => {
             #[cfg(feature = "cuda")]
             {
@@ -1177,7 +1198,7 @@ fn resolve_vad_device(value: &str) -> Result<Device> {
                 bail!("--vad-device cuda requires building with `--features cuda`")
             }
         }
-        other => bail!("--vad-device must be auto, cpu, or cuda; got {other:?}"),
+        other => bail!("--vad-device must be auto, cpu, metal, or cuda; got {other:?}"),
     }
 }
 
@@ -1297,6 +1318,16 @@ mod tests {
         assert_eq!(args.pipeline.num_vad_workers, 2);
         assert_eq!(args.pipeline.vad.vad_device, "auto");
         assert_eq!(args.pipeline.model.device, "auto");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn serve_accepts_metal_vad_device() -> Result<()> {
+        let args = TestServeCli::try_parse_from(["test", "--vad-device", "metal"])
+            .expect("Metal VAD device should parse");
+        validate_vad_args(&internal_vad_args(&args.args.pipeline.vad)?)?;
+        assert!(resolve_vad_device("metal")?.is_metal());
+        Ok(())
     }
 
     #[test]
