@@ -84,6 +84,8 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
+    /// Per-sequence output cap used by continuous decode; mirrors the public ASR default.
+    pub max_new_tokens: usize,
     explicit_decode_max_seqs: Option<usize>,
     prefill_max_wave: Option<usize>,
     pub continuous_batch: bool,
@@ -94,6 +96,7 @@ impl Default for AsrBatchSchedulerConfig {
     fn default() -> Self {
         Self {
             max_num_seqs: 8,
+            max_new_tokens: 256,
             explicit_decode_max_seqs: None,
             prefill_max_wave: prefill_max_wave_from_env(),
             continuous_batch: continuous_batch_enabled(),
@@ -112,6 +115,15 @@ impl AsrBatchSchedulerConfig {
         config
     }
 
+    pub fn with_max_new_tokens(mut self, max_new_tokens: usize) -> Self {
+        self.max_new_tokens = if max_new_tokens == 0 {
+            256
+        } else {
+            max_new_tokens
+        };
+        self
+    }
+
     pub fn prefill_max_wave(&self, runtime: &PagedCacheRuntime) -> usize {
         self.prefill_max_wave
             .unwrap_or_else(|| self.continuous_max_num_seqs(runtime))
@@ -122,6 +134,21 @@ impl AsrBatchSchedulerConfig {
         self.explicit_decode_max_seqs
             .or_else(|| runtime_decode_max_seqs(runtime))
             .unwrap_or(self.max_num_seqs)
+    }
+
+    pub(crate) fn execution_max_num_seqs(
+        &self,
+        runtime: &PagedCacheRuntime,
+        device: &Device,
+    ) -> usize {
+        let override_limit = std::env::var("VASR_METAL_MAX_ACTIVE_SEQS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        execution_slots_for(
+            device.is_metal(),
+            self.continuous_max_num_seqs(runtime),
+            override_limit,
+        )
     }
 }
 
@@ -139,8 +166,58 @@ fn async_prefill_channel_capacity() -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn mixed_step_decode_enabled() -> bool {
-    std::env::var_os("VASR_DISABLE_MIXED_STEP_DECODE").is_none()
+fn mixed_step_decode_enabled_for(
+    is_metal: bool,
+    enable_override: bool,
+    disable_override: bool,
+) -> bool {
+    if disable_override {
+        return false;
+    }
+    !is_metal || enable_override
+}
+
+fn mixed_step_decode_enabled(device: &Device) -> bool {
+    mixed_step_decode_enabled_for(
+        device.is_metal(),
+        std::env::var_os("VASR_ENABLE_MIXED_STEP_DECODE").is_some(),
+        std::env::var_os("VASR_DISABLE_MIXED_STEP_DECODE").is_some(),
+    )
+}
+
+fn paged_decode_batch_size_for(
+    is_metal: bool,
+    override_size: Option<usize>,
+    active: usize,
+) -> usize {
+    if active == 0 {
+        return 0;
+    }
+    if !is_metal {
+        return active;
+    }
+    override_size
+        .filter(|&size| size > 0)
+        .unwrap_or(1)
+        .min(active)
+}
+
+fn paged_decode_batch_size(device: &Device, active: usize) -> usize {
+    let override_size = std::env::var("VASR_METAL_PAGED_DECODE_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    paged_decode_batch_size_for(device.is_metal(), override_size, active)
+}
+
+fn execution_slots_for(is_metal: bool, capacity: usize, override_limit: Option<usize>) -> usize {
+    let capacity = capacity.max(1);
+    if !is_metal {
+        return capacity;
+    }
+    override_limit
+        .filter(|&limit| limit > 0)
+        .unwrap_or(1)
+        .min(capacity)
 }
 
 fn runtime_decode_max_seqs(runtime: &PagedCacheRuntime) -> Option<usize> {
@@ -962,6 +1039,7 @@ fn release_awaiting_if_no_progress(
 fn decode_running_step_groups(
     running: &mut [Option<RunningSlot>],
     active_steps: &[(usize, usize)],
+    max_new_tokens: usize,
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
     runtime: &SharedPagedCacheRuntime,
@@ -969,12 +1047,13 @@ fn decode_running_step_groups(
     decode_debug: &mut ContinuousDecodeDebug,
     #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
 ) -> Result<()> {
+    let active_steps = filter_sequences_at_token_limit(running, active_steps, max_new_tokens);
     if active_steps.is_empty() {
         return Ok(());
     }
-    if mixed_step_decode_enabled() {
+    if mixed_step_decode_enabled(device) {
         let slot_indices: Vec<usize> = active_steps.iter().map(|&(slot_idx, _)| slot_idx).collect();
-        decode_debug.record_active(0, slot_indices.len());
+        let batch_size = paged_decode_batch_size(device, slot_indices.len()).max(1);
         let mut batch_slots: Vec<PagedDecodeSlot> = running
             .iter()
             .map(|entry| {
@@ -995,23 +1074,26 @@ fn decode_running_step_groups(
                     })
             })
             .collect();
-        #[cfg(feature = "timing")]
-        let start_decode = std::time::Instant::now();
-        paged_batch_decode_slots_mixed_steps_shared(
-            thinker,
-            device,
-            runtime,
-            batch_slots.as_mut_slice(),
-            slot_indices.as_slice(),
-            eos_token_ids,
-        )?;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_deref_mut() {
-            t.decode_us = t
-                .decode_us
-                .saturating_add(duration_to_us(start_decode.elapsed()));
-            t.steps = t.steps.saturating_add(1);
-            t.tokens_generated = t.tokens_generated.saturating_add(slot_indices.len());
+        for slot_group in slot_indices.chunks(batch_size) {
+            decode_debug.record_active(0, slot_group.len());
+            #[cfg(feature = "timing")]
+            let start_decode = std::time::Instant::now();
+            paged_batch_decode_slots_mixed_steps_shared(
+                thinker,
+                device,
+                runtime,
+                batch_slots.as_mut_slice(),
+                slot_group,
+                eos_token_ids,
+            )?;
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_deref_mut() {
+                t.decode_us = t
+                    .decode_us
+                    .saturating_add(duration_to_us(start_decode.elapsed()));
+                t.steps = t.steps.saturating_add(1);
+                t.tokens_generated = t.tokens_generated.saturating_add(slot_group.len());
+            }
         }
         for &slot_idx in &slot_indices {
             if let Some(entry) = running[slot_idx].as_mut() {
@@ -1020,45 +1102,74 @@ fn decode_running_step_groups(
         }
         return Ok(());
     }
-    let step_groups = group_running_by_decode_step(active_steps);
+    let step_groups = group_running_by_decode_step(&active_steps);
     for (step, slot_indices) in step_groups {
-        decode_debug.record_active(step, slot_indices.len());
-        let mut batch_slots: Vec<PagedDecodeSlot> = slot_indices
-            .iter()
-            .map(|&slot_idx| {
-                running[slot_idx]
-                    .as_ref()
-                    .map(|entry| entry.slot.clone())
-                    .ok_or_else(|| anyhow::anyhow!("missing running slot {slot_idx}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let batch_size = paged_decode_batch_size(device, slot_indices.len()).max(1);
+        for slot_group in slot_indices.chunks(batch_size) {
+            decode_debug.record_active(step, slot_group.len());
+            let mut batch_slots: Vec<PagedDecodeSlot> = slot_group
+                .iter()
+                .map(|&slot_idx| {
+                    running[slot_idx]
+                        .as_ref()
+                        .map(|entry| entry.slot.clone())
+                        .ok_or_else(|| anyhow::anyhow!("missing running slot {slot_idx}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        #[cfg(feature = "timing")]
-        let start_decode = std::time::Instant::now();
-        paged_batch_decode_slots_at_step_shared(
-            thinker,
-            device,
-            runtime,
-            batch_slots.as_mut_slice(),
-            step,
-            eos_token_ids,
-        )?;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_deref_mut() {
-            t.decode_us = t
-                .decode_us
-                .saturating_add(duration_to_us(start_decode.elapsed()));
-            t.steps = t.steps.saturating_add(1);
-            t.tokens_generated = t.tokens_generated.saturating_add(slot_indices.len());
-        }
+            #[cfg(feature = "timing")]
+            let start_decode = std::time::Instant::now();
+            paged_batch_decode_slots_at_step_shared(
+                thinker,
+                device,
+                runtime,
+                batch_slots.as_mut_slice(),
+                step,
+                eos_token_ids,
+            )?;
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_deref_mut() {
+                t.decode_us = t
+                    .decode_us
+                    .saturating_add(duration_to_us(start_decode.elapsed()));
+                t.steps = t.steps.saturating_add(1);
+                t.tokens_generated = t.tokens_generated.saturating_add(slot_group.len());
+            }
 
-        for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
-            if let Some(entry) = running[slot_idx].as_mut() {
-                entry.slot = slot.clone();
+            for (&slot_idx, slot) in slot_group.iter().zip(batch_slots.iter()) {
+                if let Some(entry) = running[slot_idx].as_mut() {
+                    entry.slot = slot.clone();
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Finish sequences that have already emitted their full output budget before another
+/// decoder step is submitted. Scan all slots (including those waiting for KV) so a capped
+/// sequence cannot wait indefinitely for another block.
+fn filter_sequences_at_token_limit(
+    running: &mut [Option<RunningSlot>],
+    active_steps: &[(usize, usize)],
+    max_new_tokens: usize,
+) -> Vec<(usize, usize)> {
+    for entry in running.iter_mut().flatten() {
+        if !entry.slot.finished && entry.slot.generated.len() >= max_new_tokens {
+            entry.slot.finished = true;
+            entry.slot.awaiting_kv = false;
+        }
+    }
+    active_steps
+        .iter()
+        .copied()
+        .filter(|&(slot_idx, _)| {
+            running
+                .get(slot_idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| !entry.slot.finished && !entry.slot.awaiting_kv)
+        })
+        .collect()
 }
 
 /// 右对齐填充后的一批 token 行，分别对应输入 id 与标签 id。
@@ -1271,6 +1382,28 @@ impl AsrBatchScheduler {
         }
 
         let request_id_base = self.allocate_request_id_base(batch);
+
+        // The legacy static micro-batch path calls the non-shared paged engine
+        // directly, so it must hold the same Metal gate across prefill and decode.
+        // Fetch the gate and release the cache mutex before waiting on it to keep
+        // lock ordering consistent with the shared staged path.
+        let execution_lock = if device.is_metal() {
+            Some(
+                runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?
+                    .model_execution_lock(),
+            )
+        } else {
+            None
+        };
+        let _execution_guard = execution_lock
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))
+            })
+            .transpose()?;
 
         let mut runtime_guard = runtime
             .lock()
@@ -1651,10 +1784,31 @@ impl AsrBatchScheduler {
             );
         }
 
+        // Unlike the asynchronous shared scheduler, this offline path calls the
+        // non-shared paged engine while retaining the runtime mutex. Acquire the
+        // device gate first to preserve a single lock order across all paths.
+        let execution_lock = if device.is_metal() {
+            Some(
+                runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?
+                    .model_execution_lock(),
+            )
+        } else {
+            None
+        };
+        let _execution_guard = execution_lock
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))
+            })
+            .transpose()?;
+
         let mut runtime_guard = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-        let max_num_seqs = self.config.continuous_max_num_seqs(&runtime_guard);
+        let max_num_seqs = self.config.execution_max_num_seqs(&runtime_guard, device);
         let max_slots = max_num_seqs.max(1).min(batch);
         let mut waiting: VecDeque<usize> = (0..batch).collect();
         let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
@@ -1865,7 +2019,7 @@ impl AsrBatchScheduler {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            self.config.continuous_max_num_seqs(&runtime_guard)
+            self.config.execution_max_num_seqs(&runtime_guard, device)
         };
         let max_slots = max_num_seqs.max(1);
         let mut prefill_inputs = PrefillInputBuffer::default();
@@ -1923,6 +2077,7 @@ impl AsrBatchScheduler {
                 decode_running_step_groups(
                     running.as_mut_slice(),
                     active_steps.as_slice(),
+                    self.config.max_new_tokens,
                     thinker,
                     device,
                     runtime,
@@ -2063,7 +2218,7 @@ impl AsrBatchScheduler {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            self.config.continuous_max_num_seqs(&runtime_guard)
+            self.config.execution_max_num_seqs(&runtime_guard, device)
         };
         let max_slots = max_num_seqs.max(1);
         let (message_tx, message_rx) =
@@ -2303,6 +2458,7 @@ impl AsrBatchScheduler {
                 decode_running_step_groups(
                     running.as_mut_slice(),
                     active_steps.as_slice(),
+                    self.config.max_new_tokens,
                     thinker,
                     device,
                     runtime,
@@ -2411,13 +2567,18 @@ impl AsrBatchScheduler {
                 let running_count = running.iter().filter(|entry| entry.is_some()).count();
                 let prefilled_count = prefilled.len();
                 if result.is_err() && (running_count > 0 || prefilled_count > 0) {
-                    tracing::warn!(
-                        target: "vasr_transcribe::pipeline",
-                        "cleaning paged KV after async decode error | running={running_count} prefilled={prefilled_count}",
-                    );
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            target: "vasr_transcribe::pipeline",
+                            running = running_count,
+                            prefilled = prefilled_count,
+                            error = %format!("{error:#}"),
+                            "cleaning paged KV after async decode error"
+                        );
+                    }
                 }
-            free_all_running(&mut runtime_guard, running.as_mut_slice());
-            free_all_prefilled(&mut runtime_guard, &mut prefilled);
+                free_all_running(&mut runtime_guard, running.as_mut_slice());
+                free_all_prefilled(&mut runtime_guard, &mut prefilled);
             });
         if let Err(error) = cleanup_result {
             if result.is_ok() {
@@ -2455,7 +2616,8 @@ pub fn run_paged_prepared_batch(
     pad_id: u32,
     audio_seconds: Option<&[f64]>,
 ) -> Result<Vec<Vec<u32>>> {
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
+        .with_max_new_tokens(max_new_tokens);
     let mut scheduler = AsrBatchScheduler::new(config);
     let default_audio_seconds;
     let audio_seconds = match audio_seconds {
@@ -2512,7 +2674,8 @@ pub fn run_paged_prepared_batch_timed(
     pad_id: u32,
     audio_seconds: Option<&[f64]>,
 ) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
-    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs);
+    let config = AsrBatchSchedulerConfig::from_decode_max_seqs(decode_max_seqs)
+        .with_max_new_tokens(max_new_tokens);
     let mut scheduler = AsrBatchScheduler::new(config);
     let mut timings = GenerationTimings::default();
     let default_audio_seconds;
@@ -2561,8 +2724,10 @@ pub fn run_paged_prepared_batch_timed(
 mod tests {
     use super::{
         AsrBatchSchedulerConfig, PrefillBatchReason, PrefillInputBuffer, PreparedAudioBatch,
-        collect_prefill_wave_by_kv, continuous_batch_enabled, dynamic_source_poll_may_block,
-        group_running_by_decode_step, pad_prepared_wave_for_prefill,
+        RunningSlot, collect_prefill_wave_by_kv, continuous_batch_enabled,
+        dynamic_source_poll_may_block, execution_slots_for, filter_sequences_at_token_limit,
+        group_running_by_decode_step, mixed_step_decode_enabled_for, pad_prepared_wave_for_prefill,
+        paged_decode_batch_size_for,
     };
     use std::collections::VecDeque;
 
@@ -2579,6 +2744,59 @@ mod tests {
     }
 
     #[test]
+    fn continuous_scheduler_uses_standard_default_token_limit() {
+        assert_eq!(AsrBatchSchedulerConfig::default().max_new_tokens, 256);
+        assert_eq!(
+            AsrBatchSchedulerConfig::default()
+                .with_max_new_tokens(0)
+                .max_new_tokens,
+            256
+        );
+        assert_eq!(
+            AsrBatchSchedulerConfig::default()
+                .with_max_new_tokens(17)
+                .max_new_tokens,
+            17
+        );
+    }
+
+    #[test]
+    fn continuous_decode_finishes_exactly_at_token_limit() {
+        let slot = |generated: usize| super::PagedDecodeSlot {
+            request_id: 1,
+            prompt_len_usize: 4,
+            prompt_len_i64: 4,
+            block_table: vec![],
+            next_id: 42,
+            generated: vec![7; generated],
+            finished: false,
+            decode_step: generated,
+            token_capacity: 1024,
+            awaiting_kv: false,
+        };
+        let mut running = vec![
+            Some(RunningSlot {
+                client_index: 0,
+                slot: slot(3),
+            }),
+            Some(RunningSlot {
+                client_index: 1,
+                slot: slot(4),
+            }),
+        ];
+        running[1].as_mut().unwrap().slot.awaiting_kv = true;
+        let active = vec![(0, 3), (1, 4)];
+
+        let remaining = filter_sequences_at_token_limit(&mut running, &active, 4);
+
+        assert_eq!(remaining, vec![(0, 3)]);
+        assert!(!running[0].as_ref().unwrap().slot.finished);
+        assert!(running[1].as_ref().unwrap().slot.finished);
+        assert!(!running[1].as_ref().unwrap().slot.awaiting_kv);
+        assert_eq!(running[1].as_ref().unwrap().client_index, 1);
+    }
+
+    #[test]
     fn group_running_by_decode_step_batches_same_step() {
         let groups = group_running_by_decode_step(&[(0, 2), (1, 2), (2, 0), (3, 1)]);
         assert_eq!(groups.len(), 3);
@@ -2588,6 +2806,34 @@ mod tests {
         assert_eq!(groups[1].1, vec![3]);
         assert_eq!(groups[2].0, 2);
         assert_eq!(groups[2].1, vec![0, 1]);
+    }
+
+    #[test]
+    fn metal_mixed_step_decode_is_opt_in() {
+        assert!(!mixed_step_decode_enabled_for(true, false, false));
+        assert!(mixed_step_decode_enabled_for(true, true, false));
+        assert!(!mixed_step_decode_enabled_for(true, true, true));
+        assert!(mixed_step_decode_enabled_for(false, false, false));
+        assert!(!mixed_step_decode_enabled_for(false, true, true));
+    }
+
+    #[test]
+    fn metal_paged_decode_batch_defaults_to_one_and_never_exceeds_active_rows() {
+        assert_eq!(paged_decode_batch_size_for(true, None, 8), 1);
+        assert_eq!(paged_decode_batch_size_for(true, Some(4), 8), 4);
+        assert_eq!(paged_decode_batch_size_for(true, Some(32), 8), 8);
+        assert_eq!(paged_decode_batch_size_for(true, Some(0), 8), 1);
+        assert_eq!(paged_decode_batch_size_for(false, None, 8), 8);
+        assert_eq!(paged_decode_batch_size_for(true, None, 0), 0);
+    }
+
+    #[test]
+    fn metal_execution_slot_limit_never_changes_kv_capacity() {
+        assert_eq!(execution_slots_for(true, 308, Some(1)), 1);
+        assert_eq!(execution_slots_for(true, 8, Some(32)), 8);
+        assert_eq!(execution_slots_for(true, 8, Some(0)), 1);
+        assert_eq!(execution_slots_for(true, 8, None), 1);
+        assert_eq!(execution_slots_for(false, 8, Some(1)), 8);
     }
 
     #[test]

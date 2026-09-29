@@ -500,11 +500,27 @@ pub fn decode_ids_with_metadata(
 pub struct StreamingMetadataDecoder {
     merged: EncodedAsrBatchMetadata,
     batch_lens: Vec<usize>,
-    out_langs: Vec<Vec<String>>,
-    out_texts: Vec<Vec<String>>,
+    out_langs: Vec<Vec<(usize, String)>>,
+    out_texts: Vec<Vec<(usize, String)>>,
+    completed_chunks: Vec<bool>,
     chunks_done: Vec<usize>,
     chunks_per_audio: Vec<usize>,
     audio_done: Vec<bool>,
+}
+
+#[cfg(feature = "paged-attn")]
+fn chunk_values_in_input_order(chunks: &[(usize, String)]) -> Vec<&str> {
+    let mut ordered: Vec<_> = chunks.iter().collect();
+    ordered.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
+    ordered
+        .into_iter()
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+#[cfg(feature = "paged-attn")]
+fn join_chunk_texts_in_input_order(chunks: &[(usize, String)]) -> String {
+    chunk_values_in_input_order(chunks).into_iter().collect()
 }
 
 #[cfg(feature = "paged-attn")]
@@ -520,6 +536,7 @@ impl StreamingMetadataDecoder {
             batch_lens: Vec::new(),
             out_langs: Vec::new(),
             out_texts: Vec::new(),
+            completed_chunks: Vec::new(),
             chunks_done: Vec::new(),
             chunks_per_audio: Vec::new(),
             audio_done: Vec::new(),
@@ -546,6 +563,8 @@ impl StreamingMetadataDecoder {
                 *count = count.saturating_add(1);
             }
         }
+        self.completed_chunks
+            .extend(std::iter::repeat_n(false, meta.chunks.len()));
         self.merged.chunks.extend(meta.chunks);
         self.merged
             .chunk_audio_seconds
@@ -560,13 +579,25 @@ impl StreamingMetadataDecoder {
         chunk_index: usize,
         ids: Vec<u32>,
     ) -> Result<Option<(usize, usize, AsrTranscription)>> {
-        let chunk = self.merged.chunks.get(chunk_index).ok_or_else(|| {
-            anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
+        let audio_index = self
+            .merged
+            .chunks
+            .get(chunk_index)
+            .map(|chunk| chunk.orig_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
+            })?;
+        let is_completed = self.completed_chunks.get(chunk_index).ok_or_else(|| {
+            anyhow::anyhow!("dynamic staged ASR completion index out of range: {chunk_index}")
         })?;
+        if *is_completed {
+            bail!("dynamic staged ASR chunk completed more than once: {chunk_index}");
+        }
         let raw = processor.tokenizer.decode(ids.as_slice())?;
         // 只在显式打开时记下原文，用来核对特别长的生成。
         if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
-            let audio_seconds = chunk.wav.len() as f64 / f64::from(SAMPLE_RATE_HZ);
+            let audio_seconds =
+                self.merged.chunks[chunk_index].wav.len() as f64 / f64::from(SAMPLE_RATE_HZ);
             tracing::debug!(
                 target: "vasr::inference::transcribe",
                 tokens = ids.len(),
@@ -578,28 +609,31 @@ impl StreamingMetadataDecoder {
         let forced = self
             .merged
             .forced_langs_norm
-            .get(chunk.orig_index)
+            .get(audio_index)
             .and_then(|x| x.as_deref());
         let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
-        self.out_langs[chunk.orig_index].push(lang);
-        self.out_texts[chunk.orig_index].push(text);
-        self.chunks_done[chunk.orig_index] = self.chunks_done[chunk.orig_index].saturating_add(1);
-        if self.audio_done[chunk.orig_index]
-            || self.chunks_done[chunk.orig_index] < self.chunks_per_audio[chunk.orig_index]
+        self.completed_chunks[chunk_index] = true;
+        self.out_langs[audio_index].push((chunk_index, lang));
+        self.out_texts[audio_index].push((chunk_index, text));
+        self.chunks_done[audio_index] = self.chunks_done[audio_index].saturating_add(1);
+        if self.audio_done[audio_index]
+            || self.chunks_done[audio_index] < self.chunks_per_audio[audio_index]
         {
             return Ok(None);
         }
-        self.audio_done[chunk.orig_index] = true;
-        let (batch_index, audio_index) = self.batch_audio_index(chunk.orig_index)?;
-        Ok(Some((
-            batch_index,
-            audio_index,
-            AsrTranscription {
-                language: merge_languages(self.out_langs[chunk.orig_index].clone()),
-                text: self.out_texts[chunk.orig_index].join(""),
-                timestamps: None,
-            },
-        )))
+        self.audio_done[audio_index] = true;
+        let transcription = AsrTranscription {
+            language: merge_languages(
+                chunk_values_in_input_order(&self.out_langs[audio_index])
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+            text: join_chunk_texts_in_input_order(&self.out_texts[audio_index]),
+            timestamps: None,
+        };
+        let (batch_index, batch_audio_index) = self.batch_audio_index(audio_index)?;
+        Ok(Some((batch_index, batch_audio_index, transcription)))
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -637,8 +671,13 @@ impl StreamingMetadataDecoder {
                 );
             }
             outputs.push(AsrTranscription {
-                language: merge_languages(self.out_langs[audio_index].clone()),
-                text: self.out_texts[audio_index].join(""),
+                language: merge_languages(
+                    chunk_values_in_input_order(&self.out_langs[audio_index])
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ),
+                text: join_chunk_texts_in_input_order(&self.out_texts[audio_index]),
                 timestamps: None,
             });
         }
@@ -983,6 +1022,11 @@ pub(crate) fn generate_raw_prepared_batch(
             stack_features(batch_prepared.as_slice(), device)?
         };
         log_cuda_mem(device, "after_stack_features");
+        #[cfg(feature = "paged-attn")]
+        let audio_features = with_metal_model_execution_and_sync(device, paged_runtime, || {
+            thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())
+        })?;
+        #[cfg(not(feature = "paged-attn"))]
         let audio_features =
             thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
         log_cuda_mem(device, "after_audio_encoder");
@@ -1180,15 +1224,85 @@ fn encode_prepared_audio_features_cpu(
         stack_features(prepared, device)?
     };
     timings.stack_us = duration_to_us(start_stack.elapsed());
-    let start_forward = std::time::Instant::now();
-    let audio_features =
-        thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
-    timings.forward_us = duration_to_us(start_forward.elapsed());
-    timings.audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
-    let start_d2h = std::time::Instant::now();
-    let audio_features_cpu = audio_features.to_device(&Device::Cpu)?;
-    timings.d2h_us = duration_to_us(start_d2h.elapsed());
+    #[cfg(feature = "paged-attn")]
+    let (audio_features_cpu, forward_us, d2h_us, audio_tokens) =
+        with_metal_model_execution(device, paged_runtime, || {
+            let start_forward = std::time::Instant::now();
+            let audio_features =
+                thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+            let forward_us = duration_to_us(start_forward.elapsed());
+            let audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
+            let start_d2h = std::time::Instant::now();
+            let audio_features_cpu = audio_features.to_device(&Device::Cpu)?;
+            let d2h_us = duration_to_us(start_d2h.elapsed());
+            Ok((audio_features_cpu, forward_us, d2h_us, audio_tokens))
+        })?;
+    #[cfg(not(feature = "paged-attn"))]
+    let (audio_features_cpu, forward_us, d2h_us, audio_tokens) = {
+        let start_forward = std::time::Instant::now();
+        let audio_features =
+            thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        let forward_us = duration_to_us(start_forward.elapsed());
+        let audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
+        let start_d2h = std::time::Instant::now();
+        let audio_features_cpu = audio_features.to_device(&Device::Cpu)?;
+        let d2h_us = duration_to_us(start_d2h.elapsed());
+        (audio_features_cpu, forward_us, d2h_us, audio_tokens)
+    };
+    timings.forward_us = forward_us;
+    timings.d2h_us = d2h_us;
+    timings.audio_tokens = audio_tokens;
     Ok((audio_features_cpu, timings))
+}
+
+#[cfg(feature = "paged-attn")]
+fn with_metal_model_execution<T>(
+    device: &Device,
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if device.is_metal()
+        && let Some(runtime) = paged_runtime
+    {
+        let execution_lock = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?
+            .model_execution_lock();
+        let _execution_guard = execution_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))?;
+        return operation();
+    }
+    operation()
+}
+
+#[cfg(feature = "paged-attn")]
+fn with_metal_model_execution_and_sync<T>(
+    device: &Device,
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_metal_model_execution(device, paged_runtime, || {
+        let result = operation();
+        if device.is_metal() {
+            let sync_result = device.synchronize();
+            return match result {
+                Ok(output) => {
+                    sync_result?;
+                    Ok(output)
+                }
+                Err(error) => {
+                    if let Err(sync_error) = sync_result {
+                        return Err(error.context(format!(
+                            "Metal synchronization also failed after encoder error: {sync_error}"
+                        )));
+                    }
+                    Err(error)
+                }
+            };
+        }
+        result
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1613,6 +1727,11 @@ fn generate_raw_prepared_batch_timed(
             .saturating_add(duration_to_us(start_stack.elapsed()));
 
         let start_audio = std::time::Instant::now();
+        #[cfg(feature = "paged-attn")]
+        let audio_features = with_metal_model_execution_and_sync(device, paged_runtime, || {
+            thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())
+        })?;
+        #[cfg(not(feature = "paged-attn"))]
         let audio_features =
             thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
         log_cuda_mem(device, "after_audio_encoder");
@@ -2735,7 +2854,8 @@ pub fn decode_cpu_audio_features_dynamic(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    );
+    )
+    .with_max_new_tokens(opts.max_new_tokens);
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2776,7 +2896,8 @@ pub fn decode_cpu_audio_features_dynamic_timed(
     let pad_id = paged_token_pad_id(processor)?;
     let config = crate::inference::batch_scheduler::AsrBatchSchedulerConfig::from_decode_max_seqs(
         opts.decode_max_seqs,
-    );
+    )
+    .with_max_new_tokens(opts.max_new_tokens);
     let mut scheduler = crate::inference::batch_scheduler::AsrBatchScheduler::new(config);
     let ids = scheduler.run_continuous_prepared_dynamic_async(
         thinker,
@@ -2980,5 +3101,24 @@ mod batch_grouping_tests {
         let groups = group_chunk_indices(&[0, 1, 2, 3], &chunks, 0.0)?;
         assert_eq!(groups, vec![vec![0, 1, 2, 3]]);
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "paged-attn"))]
+mod streaming_metadata_order_tests {
+    use super::join_chunk_texts_in_input_order;
+
+    #[test]
+    fn chunk_texts_are_joined_in_audio_order_not_completion_order() {
+        let completed = vec![
+            (2usize, "third".to_string()),
+            (0usize, "first".to_string()),
+            (1usize, "second".to_string()),
+        ];
+
+        assert_eq!(
+            join_chunk_texts_in_input_order(&completed),
+            "firstsecondthird"
+        );
     }
 }

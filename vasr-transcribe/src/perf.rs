@@ -9,6 +9,7 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::dataset::read_audio_input_dtos;
+use crate::quality::detect_repeated_pattern;
 use crate::{
     AudioInputDto, InferenceData, TranscribeRequest, TranscribeResponse, table::render_table,
 };
@@ -80,9 +81,18 @@ struct PerfRequestResult {
     latency_seconds: f64,
     ok: bool,
     bad_items: usize,
+    quality_passed_items: usize,
+    quality_audio_seconds: f64,
+    quality_anomalies: Vec<PerfQualityAnomaly>,
     audio_seconds: f64,
     data: Vec<InferenceData>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerfQualityAnomaly {
+    item_index: usize,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +102,9 @@ struct PerfSummary {
     failed_requests: usize,
     items: usize,
     bad_items: usize,
+    quality_passed_items: usize,
+    quality_audio_seconds: f64,
+    quality_audio_seconds_per_second: f64,
     concurrency: usize,
     batch_size: usize,
     wall_seconds: f64,
@@ -162,13 +175,15 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     .with_context(|| format!("perf failed: batch_size={batch_size} concurrency={concurrency}"))?;
     let summary = run.summary.clone();
     println!(
-        "perf DONE  | items={} bad={} failed={} elapsed={:.3}s audio={:.1}s speed={:.1}x",
+        "perf DONE  | items={} bad={} quality_passed={} failed={} elapsed={:.3}s audio={:.1}s speed={:.1}x quality_speed={:.1}x",
         summary.items,
         summary.bad_items,
+        summary.quality_passed_items,
         summary.failed_requests,
         summary.wall_seconds,
         summary.audio_seconds,
         summary.audio_seconds_per_second,
+        summary.quality_audio_seconds_per_second,
     );
     print_perf_summary_table(&summary);
 
@@ -307,7 +322,70 @@ async fn run_one_request(
                     .json::<TranscribeResponse>()
                     .await
                     .context("failed to decode transcribe response JSON")?;
-                let bad_items = response.data.iter().filter(|item| item.is_bad).count();
+                let data_count = response.data.len();
+                let mapping_complete = data_count == batch_size;
+                let mut quality_anomalies = Vec::new();
+                if !mapping_complete {
+                    quality_anomalies.push(PerfQualityAnomaly {
+                        item_index: data_count.min(batch_size),
+                        reason: format!(
+                            "response item count mismatch: expected {batch_size}, got {data_count}"
+                        ),
+                    });
+                }
+                for (item_index, item) in response.data.iter().enumerate() {
+                    let texts = [&item.text.mono, &item.text.left, &item.text.right];
+                    let non_empty = texts.iter().filter(|text| !text.trim().is_empty());
+                    let anomaly = if item.timings.audio <= 0.0 {
+                        Some("missing or invalid audio duration".to_string())
+                    } else if non_empty.clone().next().is_none() {
+                        Some("empty ASR output for non-empty audio".to_string())
+                    } else {
+                        non_empty
+                            .filter_map(|text| detect_repeated_pattern(text))
+                            .next()
+                    };
+                    if let Some(reason) = anomaly {
+                        quality_anomalies.push(PerfQualityAnomaly { item_index, reason });
+                    }
+                }
+                let quality_items = if mapping_complete {
+                    response
+                        .data
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, item)| {
+                            !item.is_bad
+                                && !quality_anomalies
+                                    .iter()
+                                    .any(|anomaly| anomaly.item_index == *index)
+                        })
+                        .map(|(_, item)| item)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let quality_audio_seconds = if quality_items.is_empty() {
+                    0.0
+                } else {
+                    quality_items.iter().map(|item| item.timings.audio).sum()
+                };
+                let bad_items = if mapping_complete {
+                    response
+                        .data
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, item)| {
+                            item.is_bad
+                                || quality_anomalies
+                                    .iter()
+                                    .any(|anomaly| anomaly.item_index == *index)
+                        })
+                        .count()
+                } else {
+                    batch_size
+                };
+                let quality_passed_items = quality_items.len();
                 let audio_seconds = response.inference_performance.total_audio_duration_seconds;
                 return Ok(PerfRequestResult {
                     request_index,
@@ -316,6 +394,9 @@ async fn run_one_request(
                     latency_seconds,
                     ok: true,
                     bad_items,
+                    quality_passed_items,
+                    quality_audio_seconds,
+                    quality_anomalies,
                     audio_seconds,
                     data: response.data,
                     error: None,
@@ -346,6 +427,12 @@ async fn run_one_request(
         latency_seconds: 0.0,
         ok: false,
         bad_items: batch_size,
+        quality_passed_items: 0,
+        quality_audio_seconds: 0.0,
+        quality_anomalies: vec![PerfQualityAnomaly {
+            item_index: 0,
+            reason: "request failed".to_string(),
+        }],
         audio_seconds: 0.0,
         data: Vec::new(),
         error: Some(
@@ -367,6 +454,18 @@ fn summarize(
     let failed_requests = requests.saturating_sub(successful_requests);
     let items: usize = results.iter().map(|result| result.batch_size).sum();
     let bad_items: usize = results.iter().map(|result| result.bad_items).sum();
+    let quality_passed_items: usize = results
+        .iter()
+        .map(|result| result.quality_passed_items)
+        .sum();
+    let quality_audio_seconds = if quality_passed_items == 0 {
+        0.0
+    } else {
+        results
+            .iter()
+            .map(|result| result.quality_audio_seconds)
+            .sum()
+    };
     let audio_seconds: f64 = results.iter().map(|result| result.audio_seconds).sum();
     let mut latencies = results
         .iter()
@@ -389,6 +488,11 @@ fn summarize(
     } else {
         0.0
     };
+    let quality_audio_seconds_per_second = if wall_seconds > 0.0 {
+        quality_audio_seconds / wall_seconds
+    } else {
+        0.0
+    };
     let rtf = if audio_seconds > 0.0 {
         wall_seconds / audio_seconds
     } else {
@@ -400,6 +504,9 @@ fn summarize(
         failed_requests,
         items,
         bad_items,
+        quality_passed_items,
+        quality_audio_seconds: round4(quality_audio_seconds),
+        quality_audio_seconds_per_second: round4(quality_audio_seconds_per_second),
         concurrency,
         batch_size,
         wall_seconds: round4(wall_seconds),
@@ -441,6 +548,10 @@ fn print_perf_summary_table(summary: &PerfSummary) {
         [
             vec!["items".to_string(), summary.items.to_string()],
             vec!["bad items".to_string(), summary.bad_items.to_string()],
+            vec![
+                "quality passed".to_string(),
+                summary.quality_passed_items.to_string(),
+            ],
             vec!["requests".to_string(), summary.requests.to_string()],
             vec![
                 "successful".to_string(),
@@ -460,6 +571,14 @@ fn print_perf_summary_table(summary: &PerfSummary) {
             vec![
                 "speed".to_string(),
                 format!("{:.1}x", summary.audio_seconds_per_second),
+            ],
+            vec![
+                "quality audio".to_string(),
+                format!("{:.1}s", summary.quality_audio_seconds),
+            ],
+            vec![
+                "quality speed".to_string(),
+                format!("{:.1}x", summary.quality_audio_seconds_per_second),
             ],
             vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
             vec![

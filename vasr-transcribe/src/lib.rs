@@ -9,6 +9,7 @@ mod legacy_audiodb;
 pub mod perf;
 pub mod pipeline;
 pub mod protocol;
+mod quality;
 pub mod run;
 mod scheduler;
 pub mod serve;

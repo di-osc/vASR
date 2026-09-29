@@ -25,6 +25,8 @@ pub struct TranscribeService {
     pub service_id: String,
     pub pipeline: Arc<GlobalAsyncTranscribePipeline>,
     pub active_requests: AtomicUsize,
+    serialize_metal_batches: bool,
+    metal_request_lock: tokio::sync::Mutex<()>,
     #[cfg(feature = "cuda-graph")]
     pub baseline_cuda_used_bytes: Option<usize>,
 }
@@ -96,10 +98,23 @@ async fn handle_transcribe(
         start_stats.mono_false
     );
 
-    let outcomes = service
-        .pipeline
-        .run_with_log_id(request_id.clone(), inputs)
-        .await;
+    // Single-item calls avoid the batch-only CER outliers and Metal SIGSEGV observed with
+    // mixed-audio requests. Keep the public request and response batch shape unchanged.
+    let _metal_request_guard = if service.serialize_metal_batches {
+        Some(service.metal_request_lock.lock().await)
+    } else {
+        None
+    };
+    let input_batches = split_request_items(inputs, service.serialize_metal_batches);
+    let mut outcomes = Vec::new();
+    for (batch_index, batch) in input_batches.into_iter().enumerate() {
+        let batch_log_id = if service.serialize_metal_batches {
+            format!("{request_id}-item-{batch_index}")
+        } else {
+            request_id.clone()
+        };
+        outcomes.extend(service.pipeline.run_with_log_id(batch_log_id, batch).await);
+    }
     let mut total_audio_duration_seconds = 0.0;
     let mut component_timing = TranscribeItemTiming::default();
     let mut active_spans = Vec::new();
@@ -784,6 +799,7 @@ fn error_data(
 pub fn build_transcribe_service(
     pipeline: Arc<GlobalAsyncTranscribePipeline>,
 ) -> Arc<TranscribeService> {
+    let serialize_metal_batches = pipeline.requires_serial_metal_requests();
     #[cfg(feature = "cuda-graph")]
     let baseline_cuda_used_bytes = pipeline
         .memory_snapshot()
@@ -795,9 +811,21 @@ pub fn build_transcribe_service(
         service_id,
         pipeline,
         active_requests: AtomicUsize::new(0),
+        serialize_metal_batches,
+        metal_request_lock: tokio::sync::Mutex::new(()),
         #[cfg(feature = "cuda-graph")]
         baseline_cuda_used_bytes,
     })
+}
+
+fn split_request_items<T>(items: Vec<T>, singleton_batches: bool) -> Vec<Vec<T>> {
+    if singleton_batches {
+        items.into_iter().map(|item| vec![item]).collect()
+    } else if items.is_empty() {
+        Vec::new()
+    } else {
+        vec![items]
+    }
 }
 
 pub fn build_transcribe_service_from_parts(
@@ -821,8 +849,28 @@ pub fn build_transcribe_service_from_parts(
 mod tests {
     use std::time::Instant;
 
-    use super::{StageSpan, active_spans_seconds, clean_call_boundary_noise, merge_channel_data};
+    use super::{
+        StageSpan, active_spans_seconds, clean_call_boundary_noise, merge_channel_data,
+        split_request_items,
+    };
     use crate::protocol::{InferenceData, SentenceResult, TextResult};
+
+    #[test]
+    fn metal_request_splits_inputs_into_single_item_batches_in_order() {
+        assert_eq!(
+            split_request_items(vec![0, 1, 2], true),
+            vec![vec![0], vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn other_backends_keep_request_batching_unchanged() {
+        assert_eq!(
+            split_request_items(vec![0, 1, 2], false),
+            vec![vec![0, 1, 2]]
+        );
+        assert!(split_request_items::<usize>(Vec::new(), true).is_empty());
+    }
 
     #[test]
     fn merge_channel_data_combines_left_and_right_text() {

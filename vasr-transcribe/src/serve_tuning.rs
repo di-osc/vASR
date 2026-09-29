@@ -87,8 +87,16 @@ pub(super) fn resolve_tuning(
         .saturating_sub(model.weight_bytes);
     let safety_margin_bytes = (memory_after_weights as f64 * SAFETY_MARGIN_RATIO).ceil() as u64;
     let encoder_budget_bytes = (memory_after_weights as f64 * ENCODER_MEMORY_RATIO).floor() as u64;
-    let auto_segments = (((memory_after_weights / BYTES_PER_GIB) as usize).saturating_mul(2))
-        .clamp(1, MAX_AUTO_ENCODER_SEGMENTS);
+    // Initial M4 Pro A/B runs showed CER degradation when Metal collected multiple
+    // encoder segments. Keep this at one until mixed-segment Metal batching passes
+    // full-dataset CER parity.
+    // An explicit VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS remains available for A/B tests.
+    let auto_segments = if hardware.backend == Backend::Metal {
+        1
+    } else {
+        (((memory_after_weights / BYTES_PER_GIB) as usize).saturating_mul(2))
+            .clamp(1, MAX_AUTO_ENCODER_SEGMENTS)
+    };
     let segments = overrides
         .encoder_batch_max_segments
         .unwrap_or(auto_segments);
@@ -635,10 +643,46 @@ mod tests {
             .expect("higher CPU/Metal profile should resolve");
 
             assert!(high.max_num_seqs > low.max_num_seqs);
-            assert!(high.encoder_batch_max_audio_seconds > low.encoder_batch_max_audio_seconds);
+            if backend == Backend::Cpu {
+                assert!(high.encoder_batch_max_audio_seconds > low.encoder_batch_max_audio_seconds);
+            } else {
+                assert_eq!(high.encoder_batch_max_segments, 1);
+            }
             assert!(high.max_num_seqs <= 512);
             assert_eq!(low.reserved_gpu_bytes, 0);
             assert_eq!(high.reserved_gpu_bytes, 0);
         }
+    }
+
+    #[test]
+    fn metal_encoder_batch_defaults_to_single_segment_and_honors_override() {
+        let (mut hardware, profile, _) = input(32);
+        hardware.backend = Backend::Metal;
+        let automatic = resolve_tuning(
+            Some(hardware),
+            Some(profile),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides::default(),
+        )
+        .expect("Metal profile should resolve");
+        assert_eq!(automatic.encoder_batch_max_segments, 1);
+
+        let overridden = resolve_tuning(
+            Some(hardware),
+            Some(profile),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides {
+                encoder_batch_max_segments: Some(7),
+                ..ServeTuningOverrides::default()
+            },
+        )
+        .expect("explicit Metal encoder batching override should be retained");
+        assert_eq!(overridden.encoder_batch_max_segments, 7);
     }
 }

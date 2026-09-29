@@ -84,6 +84,38 @@ pub(crate) fn use_paged_attn_on_device(device: &Device) -> bool {
 }
 
 #[cfg(feature = "paged-attn")]
+pub(crate) fn metal_paged_prefill_fallback_enabled(
+    legacy_enable_override: bool,
+    disable_override: bool,
+) -> bool {
+    legacy_enable_override && !disable_override
+}
+
+#[cfg(feature = "paged-attn")]
+pub(crate) fn metal_paged_attention_fallback_enabled(
+    enable_varlen_override: bool,
+    disable_fallback_override: bool,
+) -> bool {
+    !enable_varlen_override && !disable_fallback_override
+}
+
+#[cfg(feature = "paged-attn")]
+pub(crate) fn metal_paged_prefill_fallback_active() -> bool {
+    metal_paged_prefill_fallback_enabled(
+        std::env::var_os("VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID").is_some(),
+        std::env::var_os("VASR_DISABLE_METAL_PAGED_PREFILL_HYBRID").is_some(),
+    )
+}
+
+#[cfg(feature = "paged-attn")]
+pub(crate) fn metal_paged_attention_fallback_active() -> bool {
+    metal_paged_attention_fallback_enabled(
+        std::env::var_os("VASR_ENABLE_METAL_PAGED_VARLEN_PREFILL").is_some(),
+        std::env::var_os("VASR_DISABLE_METAL_PAGED_PREFILL_HYBRID").is_some(),
+    )
+}
+
+#[cfg(feature = "paged-attn")]
 fn should_use_paged_attention(device: &Device, _batch: usize) -> bool {
     if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
         return false;
@@ -263,7 +295,7 @@ fn metal_hybrid_paged_prefill_enabled(
         && batch > 1
         && paged_runtime.is_some()
         && audio_features.is_some()
-        && std::env::var_os("VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID").is_some()
+        && metal_paged_prefill_fallback_active()
 }
 
 #[cfg(feature = "paged-attn")]
@@ -1544,6 +1576,7 @@ mod tests {
     use super::normalize_batch_for_paged_prefill;
     use super::{
         attention_mask_is_dense, attention_masks_are_dense, decode_slot_and_context_len,
+        metal_paged_attention_fallback_enabled, metal_paged_prefill_fallback_enabled,
         position_ids_for_step, prompt_lens_from_attention_masks,
     };
     #[cfg(feature = "paged-attn")]
@@ -1603,6 +1636,24 @@ mod tests {
 
         let padded_rows: Vec<&[u32]> = vec![&[1, 1], &[0, 1]];
         assert!(!attention_masks_are_dense(padded_rows.as_slice()));
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn metal_paged_prefill_fallback_is_safe_by_default() {
+        assert!(!metal_paged_prefill_fallback_enabled(false, false));
+        assert!(metal_paged_prefill_fallback_enabled(true, false));
+        assert!(!metal_paged_prefill_fallback_enabled(false, true));
+        assert!(!metal_paged_prefill_fallback_enabled(true, true));
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn metal_paged_attention_uses_reference_fallback_by_default() {
+        assert!(metal_paged_attention_fallback_enabled(false, false));
+        assert!(!metal_paged_attention_fallback_enabled(true, false));
+        assert!(!metal_paged_attention_fallback_enabled(false, true));
+        assert!(!metal_paged_attention_fallback_enabled(true, true));
     }
 
     #[cfg(feature = "paged-attn")]

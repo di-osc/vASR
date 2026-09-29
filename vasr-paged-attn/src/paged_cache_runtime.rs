@@ -1,7 +1,7 @@
 #[cfg(feature = "cuda-graph")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(feature = "cuda-graph")]
 use candle_core::Tensor;
@@ -516,6 +516,7 @@ pub struct PagedCacheRuntime {
     cache: PagedKvCache,
     manager: PagedBlockManager,
     stats: PagedCacheStats,
+    model_execution_lock: ModelExecutionLock,
     #[cfg(feature = "cuda-graph")]
     cuda_graph_max_batch: usize,
     #[cfg(feature = "cuda-graph")]
@@ -530,6 +531,20 @@ pub struct PagedCacheRuntime {
     cuda_decode_graph_disabled_keys: HashSet<CudaDecodeGraphKey>,
     #[cfg(feature = "cuda-graph")]
     cuda_decode_graphs: HashMap<CudaDecodeGraphKey, DecodeCudaGraph>,
+}
+
+/// Shared gate for model forwards that use a paged cache runtime.
+///
+/// Metal inference currently runs encoder, prefill, and decode work on separate pipeline
+/// threads. Serializing their model forwards avoids overlapping operations on a shared Metal
+/// device while still allowing CPU-side preparation and scheduling to run concurrently.
+#[derive(Debug, Clone, Default)]
+pub struct ModelExecutionLock(Arc<Mutex<()>>);
+
+impl ModelExecutionLock {
+    pub fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, ()>> {
+        self.0.lock()
+    }
 }
 
 impl PagedCacheRuntime {
@@ -586,6 +601,7 @@ impl PagedCacheRuntime {
             cache,
             manager: PagedBlockManager::new(num_blocks, config.block_size),
             stats,
+            model_execution_lock: ModelExecutionLock::default(),
             #[cfg(feature = "cuda-graph")]
             cuda_graph_max_batch: 0,
             #[cfg(feature = "cuda-graph")]
@@ -609,6 +625,10 @@ impl PagedCacheRuntime {
 
     pub fn cache_clone(&self) -> PagedKvCache {
         self.cache.clone()
+    }
+
+    pub fn model_execution_lock(&self) -> ModelExecutionLock {
+        self.model_execution_lock.clone()
     }
 
     pub fn manager(&self) -> &PagedBlockManager {
@@ -1003,13 +1023,20 @@ pub type SharedPagedCacheRuntime = Arc<Mutex<PagedCacheRuntime>>;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
+
     use candle_core::DType;
     #[cfg(feature = "cuda-graph")]
     use candle_core::{Device, Tensor};
 
     #[cfg(feature = "cuda")]
     use super::blocks_for_byte_budget;
-    use super::{PagedBlockManager, bytes_per_paged_block};
+    use super::{ModelExecutionLock, PagedBlockManager, bytes_per_paged_block};
     #[cfg(feature = "cuda-graph")]
     use super::{PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime};
 
@@ -1017,6 +1044,34 @@ mod tests {
     fn bytes_per_paged_block_matches_qwen3_asr_defaults() -> anyhow::Result<()> {
         let bytes = bytes_per_paged_block(28, 8, 128, 32, DType::BF16)?;
         assert_eq!(bytes, 3_670_016);
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_model_execution_lock_serializes_device_work() -> anyhow::Result<()> {
+        let lock = ModelExecutionLock::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let workers = (0..2)
+            .map(|_| {
+                let lock = lock.clone();
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                thread::spawn(move || {
+                    let _guard = lock.lock().expect("model execution lock");
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("worker panicked"))?;
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

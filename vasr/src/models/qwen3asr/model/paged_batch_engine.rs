@@ -165,6 +165,24 @@ pub fn paged_batch_free_slots(runtime: &mut PagedCacheRuntime, request_ids: &[us
     runtime.manager_mut().free_many(request_ids);
 }
 
+fn with_model_execution<T>(
+    device: &Device,
+    runtime: &SharedPagedCacheRuntime,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if device.is_metal() {
+        let execution_lock = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?
+            .model_execution_lock();
+        let _execution_guard = execution_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))?;
+        return operation();
+    }
+    operation()
+}
+
 fn decode_step_required_tokens(
     prompt_len: usize,
     generated_len_before_step: usize,
@@ -551,15 +569,17 @@ pub fn paged_batch_decode_slots_at_step_shared(
         step,
         device,
     )?;
-    let decode_output = paged_batch_decode_forward_shared(
-        thinker,
-        runtime,
-        &cache,
-        &input_ids_new,
-        &position_ids_new,
-        &input_metadata,
-    )?;
-    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
+    let next_active = with_model_execution(device, runtime, || {
+        let decode_output = paged_batch_decode_forward_shared(
+            thinker,
+            runtime,
+            &cache,
+            &input_ids_new,
+            &position_ids_new,
+            &input_metadata,
+        )?;
+        next_token_ids_from_decode_output(decode_output, active_batch)
+    })?;
     for (slot_idx, &i) in active_indices.iter().enumerate() {
         slots[i].next_id = *next_active
             .get(slot_idx)
@@ -712,15 +732,17 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
         context_lens.as_slice(),
         device,
     )?;
-    let decode_output = paged_batch_decode_forward_shared(
-        thinker,
-        runtime,
-        &cache,
-        &input_ids_new,
-        &position_ids_new,
-        &input_metadata,
-    )?;
-    let next_active = next_token_ids_from_decode_output(decode_output, active_batch)?;
+    let next_active = with_model_execution(device, runtime, || {
+        let decode_output = paged_batch_decode_forward_shared(
+            thinker,
+            runtime,
+            &cache,
+            &input_ids_new,
+            &position_ids_new,
+            &input_metadata,
+        )?;
+        next_token_ids_from_decode_output(decode_output, active_batch)
+    })?;
     for (slot_idx, &i) in forward_indices.iter().enumerate() {
         slots[i].next_id = *next_active
             .get(slot_idx)
@@ -1137,19 +1159,21 @@ pub fn paged_batch_prefill_shared(
         )
     };
 
-    let result = paged_batch_prefill_with_allocated(
-        thinker,
-        device,
-        &cache,
-        block_tables,
-        request_ids.clone(),
-        token_capacities,
-        input_ids,
-        attention_mask,
-        audio_features,
-        config,
-        prefill_next_id_chunk_size,
-    );
+    let result = with_model_execution(device, runtime, || {
+        paged_batch_prefill_with_allocated(
+            thinker,
+            device,
+            &cache,
+            block_tables,
+            request_ids.clone(),
+            token_capacities,
+            input_ids,
+            attention_mask,
+            audio_features,
+            config,
+            prefill_next_id_chunk_size,
+        )
+    });
 
     match result {
         Ok(state) => Ok(state),

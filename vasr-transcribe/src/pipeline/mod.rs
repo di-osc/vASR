@@ -758,6 +758,23 @@ impl GlobalAsyncTranscribePipeline {
         }
     }
 
+    /// Metal currently handles the labeled workload reliably when each input is submitted as
+    /// its own pipeline request. The HTTP layer uses this to preserve API batching while
+    /// avoiding the observed mixed-audio CER outliers and process crashes.
+    pub fn requires_serial_metal_requests(&self) -> bool {
+        #[cfg(any(feature = "paged-attn", feature = "cuda-graph"))]
+        {
+            self.asr
+                .as_any()
+                .downcast_ref::<Qwen3ASR>()
+                .is_some_and(|model| model.device().is_metal())
+        }
+        #[cfg(not(any(feature = "paged-attn", feature = "cuda-graph")))]
+        {
+            false
+        }
+    }
+
     pub fn set_service_id(&self, service_id: String) {
         if let Ok(mut current) = self.service_id.lock() {
             *current = service_id;

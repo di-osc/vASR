@@ -200,7 +200,7 @@ fn paged_prefill_attention_mask(
 
 #[cfg(feature = "paged-attn")]
 fn metal_hybrid_paged_prefill_enabled() -> bool {
-    std::env::var_os("VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID").is_some()
+    crate::model::generation::metal_paged_attention_fallback_active()
 }
 
 #[cfg(feature = "paged-attn")]

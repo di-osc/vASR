@@ -10,6 +10,7 @@ use serde::Serialize;
 use vasr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 
 use crate::perf::timestamp_file_name;
+use crate::quality::detect_repeated_pattern;
 use crate::table::render_table;
 
 #[derive(Debug, Args)]
@@ -108,6 +109,8 @@ struct ItemResult {
     error_rate: f64,
     duration_s: Option<f64>,
     is_bad: bool,
+    service_is_bad: bool,
+    quality_anomaly: Option<String>,
     bad_reason: Option<String>,
     bad_component: Option<String>,
 }
@@ -129,6 +132,9 @@ struct Summary {
     error_rate: f64,
     accuracy_percent: f64,
     error_rate_percent: f64,
+    quality_passed_items: usize,
+    quality_passed_audio_seconds: f64,
+    quality_passed_speed: f64,
     service_performance: serde_json::Value,
 }
 
@@ -206,6 +212,21 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
             );
         }
     }
+    let quality_anomalies: Vec<_> = items
+        .iter()
+        .filter(|item| item.quality_anomaly.is_some())
+        .collect();
+    if !quality_anomalies.is_empty() {
+        println!("quality anomalies: {}", quality_anomalies.len());
+        for item in quality_anomalies.iter().take(5) {
+            println!(
+                "  {:03} {} {}",
+                item.index,
+                item.audio_id,
+                item.quality_anomaly.as_deref().unwrap_or("")
+            );
+        }
+    }
 
     let output = args
         .output
@@ -254,6 +275,18 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
                 format!("{:.1}x", summary.speedup_audio_seconds_per_second),
             ],
             vec!["rtf".to_string(), format!("{:.6}", summary.rtf)],
+            vec![
+                "quality passed".to_string(),
+                summary.quality_passed_items.to_string(),
+            ],
+            vec![
+                "quality audio".to_string(),
+                format!("{:.1}s", summary.quality_passed_audio_seconds),
+            ],
+            vec![
+                "quality speed".to_string(),
+                format!("{:.1}x", summary.quality_passed_speed),
+            ],
             vec![
                 "cer weighted".to_string(),
                 format!("{:.6}", summary.cer_weighted),
@@ -398,11 +431,25 @@ fn extract_items(
             let counts = align_counts(&reference_normalized, &hypothesis_normalized);
             let reference_length = counts.reference_chars;
             let cer = counts.cer();
+            let quality_anomaly = detect_item_quality_anomaly(
+                &reference_normalized,
+                &hypothesis_normalized,
+                &hypothesis,
+                cer,
+            );
             let accuracy = if reference_length == 0 {
                 0.0
             } else {
                 counts.correct() as f64 / reference_length as f64
             };
+
+            let service_is_bad = response_item.map(|item| item.is_bad).unwrap_or(true);
+            let response_bad_reason = response_item.and_then(|item| item.bad_reason.clone());
+            let response_bad_component = response_item.and_then(|item| item.bad_component.clone());
+            let is_bad = service_is_bad || quality_anomaly.is_some();
+            let bad_reason = response_bad_reason.or_else(|| quality_anomaly.clone());
+            let bad_component = response_bad_component
+                .or_else(|| quality_anomaly.as_ref().map(|_| "quality".to_string()));
 
             Ok(ItemResult {
                 index,
@@ -423,9 +470,11 @@ fn extract_items(
                 duration_s: response_item
                     .map(|item| item.timings.audio)
                     .filter(|duration| *duration > 0.0),
-                is_bad: response_item.map(|item| item.is_bad).unwrap_or(true),
-                bad_reason: response_item.and_then(|item| item.bad_reason.clone()),
-                bad_component: response_item.and_then(|item| item.bad_component.clone()),
+                is_bad,
+                service_is_bad,
+                quality_anomaly,
+                bad_reason,
+                bad_component,
             })
         })
         .collect()
@@ -466,6 +515,22 @@ fn summarize(items: &[ItemResult], response: &TranscribeResponse) -> Result<Summ
         (insertions + deletions + substitutions) as f64 / reference_length as f64
     };
     let performance = &response.inference_performance;
+    let quality_passed: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            !item.is_bad
+                && !item.reference_normalized.is_empty()
+                && !item.hypothesis_normalized.is_empty()
+        })
+        .collect();
+    let quality_passed_audio_seconds = if quality_passed.is_empty() {
+        0.0
+    } else {
+        quality_passed
+            .iter()
+            .filter_map(|item| item.duration_s)
+            .sum()
+    };
     let service_performance =
         serde_json::to_value(&response.inference_performance).context("encode service perf")?;
 
@@ -485,6 +550,13 @@ fn summarize(items: &[ItemResult], response: &TranscribeResponse) -> Result<Summ
         error_rate: round6(error_rate),
         accuracy_percent: round2(accuracy * 100.0),
         error_rate_percent: round2(error_rate * 100.0),
+        quality_passed_items: quality_passed.len(),
+        quality_passed_audio_seconds: round4(quality_passed_audio_seconds),
+        quality_passed_speed: round4(if performance.batch_wall_seconds > 0.0 {
+            quality_passed_audio_seconds / performance.batch_wall_seconds
+        } else {
+            0.0
+        }),
         service_performance,
     })
 }
@@ -624,6 +696,23 @@ fn normalize_text(text: &str, normalizer: EvalNormalizer) -> String {
     match normalizer {
         EvalNormalizer::Simple => normalize_for_cer(text, true),
         EvalNormalizer::Bench => normalize_bench_text(text),
+    }
+}
+
+fn detect_item_quality_anomaly(
+    reference: &str,
+    hypothesis: &str,
+    raw_hypothesis: &str,
+    cer: f64,
+) -> Option<String> {
+    if !reference.is_empty() && hypothesis.is_empty() {
+        Some("empty ASR output for non-empty reference".to_string())
+    } else if let Some(reason) = detect_repeated_pattern(raw_hypothesis) {
+        Some(reason)
+    } else if !reference.is_empty() && cer >= 1.0 {
+        Some(format!("CER exceeds 100% ({:.1}%)", cer * 100.0))
+    } else {
+        None
     }
 }
 
@@ -853,7 +942,10 @@ fn round6(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalNormalizer, EvalTimeline, hypothesis_text, normalize_text, reference_text};
+    use super::{
+        EvalNormalizer, EvalTimeline, detect_item_quality_anomaly, hypothesis_text, normalize_text,
+        reference_text,
+    };
     use crate::InferenceData;
     use vasr_data::{
         Annotation, Audio, AudioChannel, AudioEncoding, AudioFormat, AudioInfo, AudioSource,
@@ -954,5 +1046,28 @@ mod tests {
             normalize_text("ＡＢＣ，一百二十三", EvalNormalizer::Simple),
             "ＡＢＣ一百二十三"
         );
+    }
+
+    #[test]
+    fn quality_gate_rejects_empty_repeated_and_extreme_cer_outputs() {
+        assert_eq!(
+            detect_item_quality_anomaly("reference", "", "", 1.0).as_deref(),
+            Some("empty ASR output for non-empty reference")
+        );
+        assert!(
+            detect_item_quality_anomaly(
+                "reference",
+                "iburibiribiribiribiribiribiribiribiribiribir",
+                "iburibiribiribiribiribiribiribiribiribiribir",
+                0.8,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            detect_item_quality_anomaly("reference", "unrelated", "unrelated", 1.2).as_deref(),
+            Some("CER exceeds 100% (120.0%)")
+        );
+        assert!(detect_item_quality_anomaly("reference", "unrelated", "unrelated", 1.0).is_some());
+        assert!(detect_item_quality_anomaly("reference", "near", "near", 0.5).is_none());
     }
 }

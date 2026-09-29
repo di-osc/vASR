@@ -358,7 +358,8 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_max_new_tokens(opts.max_new_tokens);
         DynamicPrefillProducer::with_shared_request_ids(
             config,
             Arc::clone(&self.next_paged_request_id),
@@ -385,12 +386,13 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_max_new_tokens(opts.max_new_tokens);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            config.continuous_max_num_seqs(&runtime_guard).max(1)
+            config.execution_max_num_seqs(&runtime_guard, self.device.as_ref())
         };
         let mut scheduler = AsrBatchScheduler::new(config);
         scheduler.run_continuous_prefilled_dynamic(
@@ -419,12 +421,13 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_max_new_tokens(opts.max_new_tokens);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            config.continuous_max_num_seqs(&runtime_guard).max(1)
+            config.execution_max_num_seqs(&runtime_guard, self.device.as_ref())
         };
         let mut scheduler = AsrBatchScheduler::new(config);
         scheduler.run_continuous_prefilled_dynamic_with_completed(
@@ -455,12 +458,13 @@ impl Qwen3ASR {
             );
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
-        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs);
+        let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
+            .with_max_new_tokens(opts.max_new_tokens);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            config.continuous_max_num_seqs(&runtime_guard).max(1)
+            config.execution_max_num_seqs(&runtime_guard, self.device.as_ref())
         };
         let mut scheduler = AsrBatchScheduler::new(config);
         scheduler.run_global_continuous_prefilled_dynamic_with_completed(
