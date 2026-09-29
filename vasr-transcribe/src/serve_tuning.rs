@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use candle_core::Device;
+use vasr::ExecutionPolicy;
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MAX_NUM_SEQS: usize = 512;
@@ -10,6 +11,8 @@ const SAFETY_MARGIN_RATIO: f64 = 0.10;
 const ENCODER_MEMORY_RATIO: f64 = 0.25;
 const MAX_AUTO_ENCODER_AUDIO_SECONDS: f64 = 120.0;
 const MAX_AUTO_ENCODER_SEGMENTS: usize = 32;
+/// Metal 自动模式下单批 encoder 的默认段数（完整数据集验证过的候选）。
+const METAL_AUTO_ENCODER_SEGMENTS: usize = 8;
 const MAX_AUTO_NUM_SEQS: usize = 512;
 const MIN_KV_DECODE_TOKENS: usize = 32;
 const ESTIMATED_FIXED_PROMPT_TOKENS: usize = 128;
@@ -53,6 +56,8 @@ pub(super) struct ResolvedServeTuning {
     pub encoder_batch_max_segments: usize,
     pub reserved_gpu_bytes: usize,
     pub used_fallback: bool,
+    /// 启动时解析一次的统一执行策略，随模型与 runtime 传递。
+    pub execution: ExecutionPolicy,
 }
 
 pub(super) fn resolve_tuning(
@@ -64,14 +69,15 @@ pub(super) fn resolve_tuning(
     kv_peak_ratio: f32,
     overrides: ServeTuningOverrides,
 ) -> Result<ResolvedServeTuning> {
+    let is_metal = hardware.is_some_and(|hardware| hardware.backend == Backend::Metal);
     let Some((hardware, model)) = hardware.zip(model) else {
-        return fallback_tuning(vad_max_segment_seconds, vad_pad_ms, overrides);
+        return fallback_tuning(vad_max_segment_seconds, vad_pad_ms, is_metal, overrides);
     };
     if hardware.total_memory_bytes == 0
         || model.kv_bytes_per_token == 0
         || model.encoder_bytes_per_audio_second == 0
     {
-        return fallback_tuning(vad_max_segment_seconds, vad_pad_ms, overrides);
+        return fallback_tuning(vad_max_segment_seconds, vad_pad_ms, is_metal, overrides);
     }
     if hardware.available_memory_bytes == 0 {
         bail!("insufficient memory: selected device reports no available memory");
@@ -87,12 +93,12 @@ pub(super) fn resolve_tuning(
         .saturating_sub(model.weight_bytes);
     let safety_margin_bytes = (memory_after_weights as f64 * SAFETY_MARGIN_RATIO).ceil() as u64;
     let encoder_budget_bytes = (memory_after_weights as f64 * ENCODER_MEMORY_RATIO).floor() as u64;
-    // Initial M4 Pro A/B runs showed CER degradation when Metal collected multiple
-    // encoder segments. Keep this at one until mixed-segment Metal batching passes
-    // full-dataset CER parity.
-    // An explicit VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS remains available for A/B tests.
+    // 多段 encoder 批量：此前 Metal 上出现 CER 退化的根因是 encoder/prefill/decode
+    // 的 Metal forward 未串行化（见 docs/performance/m4-pro-qwen3-asr-2026-09-29.md），
+    // 该问题已由共享 ModelExecutionLock 修复。这里放开到验证过的默认段数，
+    // 并用 VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS 继续做 4/8/16/32 的精度扫描。
     let auto_segments = if hardware.backend == Backend::Metal {
-        1
+        METAL_AUTO_ENCODER_SEGMENTS
     } else {
         (((memory_after_weights / BYTES_PER_GIB) as usize).saturating_mul(2))
             .clamp(1, MAX_AUTO_ENCODER_SEGMENTS)
@@ -191,6 +197,12 @@ pub(super) fn resolve_tuning(
     } else {
         0
     };
+    // 内存安全容量与执行批量分开：容量用于 KV 规划，执行批量按统一策略收窄。
+    let execution = ExecutionPolicy::resolve_backend(
+        hardware.backend == Backend::Metal,
+        max_num_seqs,
+        overrides.max_num_seqs.is_some(),
+    );
     Ok(ResolvedServeTuning {
         max_num_seqs,
         gpu_memory_utilization: utilization,
@@ -198,6 +210,7 @@ pub(super) fn resolve_tuning(
         encoder_batch_max_segments: segments,
         reserved_gpu_bytes,
         used_fallback: false,
+        execution,
     })
 }
 
@@ -228,6 +241,7 @@ fn expected_kv_tokens_per_sequence(
 fn fallback_tuning(
     vad_max_segment_seconds: f64,
     vad_pad_ms: u64,
+    is_metal: bool,
     overrides: ServeTuningOverrides,
 ) -> Result<ResolvedServeTuning> {
     let minimum_audio_seconds = vad_max_segment_seconds + 2.0 * vad_pad_ms as f64 / 1000.0;
@@ -263,6 +277,11 @@ fn fallback_tuning(
         encoder_batch_max_segments: segments,
         reserved_gpu_bytes: 0,
         used_fallback: true,
+        execution: ExecutionPolicy::resolve_backend(
+            is_metal,
+            max_num_seqs,
+            overrides.max_num_seqs.is_some(),
+        ),
     })
 }
 
@@ -434,7 +453,8 @@ fn probe_host_memory() -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, HardwareProfile, ModelMemoryProfile, ServeTuningOverrides, resolve_tuning,
+        Backend, HardwareProfile, METAL_AUTO_ENCODER_SEGMENTS, ModelMemoryProfile,
+        ServeTuningOverrides, resolve_tuning,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -646,7 +666,7 @@ mod tests {
             if backend == Backend::Cpu {
                 assert!(high.encoder_batch_max_audio_seconds > low.encoder_batch_max_audio_seconds);
             } else {
-                assert_eq!(high.encoder_batch_max_segments, 1);
+                assert_eq!(high.encoder_batch_max_segments, METAL_AUTO_ENCODER_SEGMENTS);
             }
             assert!(high.max_num_seqs <= 512);
             assert_eq!(low.reserved_gpu_bytes, 0);
@@ -655,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_encoder_batch_defaults_to_single_segment_and_honors_override() {
+    fn metal_encoder_batch_defaults_to_validated_segments_and_honors_override() {
         let (mut hardware, profile, _) = input(32);
         hardware.backend = Backend::Metal;
         let automatic = resolve_tuning(
@@ -668,7 +688,10 @@ mod tests {
             ServeTuningOverrides::default(),
         )
         .expect("Metal profile should resolve");
-        assert_eq!(automatic.encoder_batch_max_segments, 1);
+        assert_eq!(
+            automatic.encoder_batch_max_segments,
+            METAL_AUTO_ENCODER_SEGMENTS
+        );
 
         let overridden = resolve_tuning(
             Some(hardware),

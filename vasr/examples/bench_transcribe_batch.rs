@@ -87,6 +87,7 @@ fn main() -> Result<()> {
         chunk_max_sec: None,
         // 解码长度预估参数：每秒 token 数与最小 token 数，保持与 `TranscribeOptions::default` 一致。
         bucket_by_length: false,
+        execution: None,
     };
 
     let audio_path = Path::new(&audio);

@@ -3,6 +3,7 @@ use std::any::Any;
 use anyhow::Result;
 use vasr_data::{AudioChunk, Timeline, Waveform};
 
+pub use crate::models::qwen3asr::ExecutionPolicy;
 pub use crate::timeline::StreamEvent;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,8 @@ pub struct AsrOptions {
     /// Maximum total audio duration (seconds) per ASR pool. `0` disables duration grouping.
     pub max_batch_audio_sec: f32,
     pub chunk_max_sec: Option<f32>,
+    /// 启动时解析一次的统一执行策略。`None` 时调度器按设备与容量自行推导。
+    pub execution: Option<ExecutionPolicy>,
 }
 
 impl Default for AsrOptions {
@@ -24,6 +27,7 @@ impl Default for AsrOptions {
             decode_max_seqs: 0,
             max_batch_audio_sec: 60.0,
             chunk_max_sec: None,
+            execution: None,
         }
     }
 }

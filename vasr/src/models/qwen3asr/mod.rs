@@ -29,6 +29,7 @@ pub use inference::batch_scheduler::{
     AsrBatchScheduler, AsrBatchSchedulerConfig, DynamicPrefillProducer, PrefillStageOutput,
     PrefilledSequence, PreparedAudioBatch, PreparedAudioBatchPoll,
 };
+pub use inference::execution::ExecutionPolicy;
 pub use inference::streaming::AsrStream;
 #[cfg(feature = "paged-attn")]
 pub use inference::transcribe::EncodedAsrBatchPoll;
@@ -359,7 +360,8 @@ impl Qwen3ASR {
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let pad_id = inference::transcribe::paged_token_pad_id(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_max_new_tokens(opts.max_new_tokens);
+            .with_max_new_tokens(opts.max_new_tokens)
+            .with_execution_policy(opts.execution);
         DynamicPrefillProducer::with_shared_request_ids(
             config,
             Arc::clone(&self.next_paged_request_id),
@@ -387,7 +389,8 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_max_new_tokens(opts.max_new_tokens);
+            .with_max_new_tokens(opts.max_new_tokens)
+            .with_execution_policy(opts.execution);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
@@ -422,7 +425,8 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_max_new_tokens(opts.max_new_tokens);
+            .with_max_new_tokens(opts.max_new_tokens)
+            .with_execution_policy(opts.execution);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()
@@ -459,7 +463,8 @@ impl Qwen3ASR {
         };
         let eos_token_ids = inference::transcribe::build_eos_token_ids(self.processor.as_ref())?;
         let config = AsrBatchSchedulerConfig::from_decode_max_seqs(opts.decode_max_seqs)
-            .with_max_new_tokens(opts.max_new_tokens);
+            .with_max_new_tokens(opts.max_new_tokens)
+            .with_execution_policy(opts.execution);
         let max_slots = {
             let runtime_guard = runtime
                 .lock()

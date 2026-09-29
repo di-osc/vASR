@@ -1,7 +1,9 @@
 #[cfg(feature = "cuda-graph")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 #[cfg(feature = "cuda-graph")]
 use candle_core::Tensor;
@@ -538,12 +540,37 @@ pub struct PagedCacheRuntime {
 /// Metal inference currently runs encoder, prefill, and decode work on separate pipeline
 /// threads. Serializing their model forwards avoids overlapping operations on a shared Metal
 /// device while still allowing CPU-side preparation and scheduling to run concurrently.
+///
+/// 同时累计等待该锁的时间与获取次数，便于性能报告直接给出锁等待统计，而不必靠推测
+/// 判断某一阶段是否被 forward 串行化卡住。
 #[derive(Debug, Clone, Default)]
-pub struct ModelExecutionLock(Arc<Mutex<()>>);
+pub struct ModelExecutionLock {
+    gate: Arc<Mutex<()>>,
+    /// 累计等待纳秒数，用整数保存以避免浮点原子操作。
+    waited_nanos: Arc<AtomicU64>,
+    /// 累计成功获取次数。
+    acquisitions: Arc<AtomicU64>,
+}
 
 impl ModelExecutionLock {
+    /// 获取模型 forward 互斥锁，并记录本次等待时长与获取次数。
     pub fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, ()>> {
-        self.0.lock()
+        let started = Instant::now();
+        let guard = self.gate.lock();
+        if guard.is_ok() {
+            self.waited_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        }
+        guard
+    }
+
+    /// 返回 `(累计获取次数, 累计等待秒数)`，供诊断与性能报告使用。
+    pub fn wait_stats(&self) -> (u64, f64) {
+        (
+            self.acquisitions.load(Ordering::Relaxed),
+            self.waited_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        )
     }
 }
 
@@ -629,6 +656,11 @@ impl PagedCacheRuntime {
 
     pub fn model_execution_lock(&self) -> ModelExecutionLock {
         self.model_execution_lock.clone()
+    }
+
+    /// 返回模型 forward 执行锁的累计 `(获取次数, 等待秒数)`，用于锁等待诊断。
+    pub fn model_execution_wait_stats(&self) -> (u64, f64) {
+        self.model_execution_lock.wait_stats()
     }
 
     pub fn manager(&self) -> &PagedBlockManager {

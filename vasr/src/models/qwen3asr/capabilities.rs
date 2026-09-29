@@ -170,6 +170,7 @@ pub fn qwen_transcribe_options(options: &AsrOptions) -> TranscribeOptions {
         max_batch_audio_sec: options.max_batch_audio_sec,
         chunk_max_sec: options.chunk_max_sec,
         bucket_by_length: !super::inference::utils::continuous_paged_batch_enabled(),
+        execution: options.execution,
     }
 }
 

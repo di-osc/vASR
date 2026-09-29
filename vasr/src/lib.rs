@@ -21,7 +21,7 @@ pub use model_builder::{
 pub use model_builder::{AsrRuntimeConfig, KvCacheSizingStats};
 pub use modelhub::{download, modelscope, modelscope_cache_dir, set_cache_dir};
 pub use models::qwen3asr::QWEN3_ASR_DECODE_TOKENS_PER_SEC;
-pub use models::qwen3asr::{Qwen3ASR, Qwen3Asr};
+pub use models::qwen3asr::{ExecutionPolicy, Qwen3ASR, Qwen3Asr};
 pub use models::qwen3asr::{qwen_outputs_to_timelines, qwen_transcribe_options};
 pub use models::sensevoice::{SenseVoiceLoadOptions, SenseVoiceOnline};
 pub use timeline::{

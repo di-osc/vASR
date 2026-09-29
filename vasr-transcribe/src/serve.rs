@@ -383,9 +383,10 @@ pub type TranscribeArgs = ServeTranscribeArgs;
 
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_transcribe=debug,vasr::models::qwen3asr=debug"
+        "warn,vasr_transcribe=debug,vasr::models::qwen3asr=debug,vasr::execution=info"
     } else {
-        "warn,vasr_transcribe=info"
+        // 默认就打印启动时解析出的统一执行策略，便于性能报告复现配置。
+        "warn,vasr_transcribe=info,vasr::execution=info"
     };
     let filter = std::env::var("VASR_LOG").unwrap_or_else(|_| default.to_string());
 
@@ -460,12 +461,17 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS",
         ),
     );
-    let use_runtime_capacity =
-        args.pipeline.model.max_num_seqs.is_none() && (device.is_cuda() || device.is_metal());
     let mut asr_options = asr_options_from_pipeline(&pipeline, args.language.clone());
-    if use_runtime_capacity {
-        // The paged cache knows the post-weight allocation capacity; let its scheduler use that
-        // runtime value instead of treating the pre-load estimate as a hard concurrency limit.
+    if device.is_metal() {
+        // Metal：使用服务解析出的安全容量，并附加启动时解析出的统一执行策略，
+        // 不再退回调度器内部的默认 8 或只跑 1 个活跃槽位。
+        asr_options.decode_max_seqs = tuning.max_num_seqs;
+        asr_options.execution = Some(tuning.execution);
+        tuning
+            .execution
+            .log_resolved("serve", "metal", tuning.max_num_seqs);
+    } else if args.pipeline.model.max_num_seqs.is_none() && device.is_cuda() {
+        // CUDA：paged cache 知道权重加载后的实际容量，交给运行时（CUDA graph）决定。
         asr_options.decode_max_seqs = 0;
     }
     let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start(

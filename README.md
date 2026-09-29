@@ -22,6 +22,23 @@ vASR 是用 Rust 和 Candle 实现的 Qwen3-ASR 推理框架。离线转写和�
 vasr-transcribe serve
 ```
 
-`serve` 默认按所选设备、模型和可用内存估算 ASR 并发与 encoder batch 容量，不执行启动基准测试。容量参数可通过 CLI 或环境变量覆盖，例如 `--max-num-seqs 64`、`--gpu-memory-utilization 0.8` 和 `--encoder-batch-max-audio-seconds 30`。显式容量超过估算的安全范围，或低于 VAD 最大分段加 padding 的要求时，服务会在启动阶段报错。
+`serve` 默认按所选设备、模型和可用内存估算 KV 容量，再解析出实际执行批量，启动日志会打印最终生效的策略：
+
+```
+serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mixed_step=true prefill_wave=8
+```
+
+日常启动不需要手写并发参数。需要覆盖时可用 CLI 参数（`--max-num-seqs`、`--gpu-memory-utilization`、`--encoder-batch-max-audio-seconds`）或环境变量（`VASR_METAL_MAX_ACTIVE_SEQS`、`VASR_METAL_PAGED_DECODE_BATCH_SIZE`、`VASR_PREFILL_MAX_WAVE`、`VASR_DISABLE_MIXED_STEP_DECODE`）。显式容量超过估算的安全范围，或低于 VAD 最大分段加 padding 的要求时，服务会在启动阶段报错。
 
 服务也会在启动时读取当前工作目录下的 `.env`。仓库提供了 [`.env.example`](.env.example)；复制为 `.env` 后可在其中设置部署参数。优先级为 CLI 参数、已有进程环境变量、`.env`，最后是自动值。所有子命令都会加载 `.env`，文件不存在时会忽略。
+
+## 性能
+
+Apple M4 Pro（Metal）上 `Qwen3-ASR-0.6B` 跑 `datasets/call-100.vasr`（99 条 / 5025 音频秒），并发 14：
+
+| 配置 | 吞吐 | 加权 CER |
+| --- | ---: | ---: |
+| 基线（1 活跃槽 / 1 decode 行 / mixed-step 关闭） | 21.80× | 0.167497 |
+| 默认（32 活跃槽 / 32 decode 行 / mixed-step 开启） | 43.84× | 0.167858 |
+
+默认配置相比基线提升 **2.01×**，`example1.vasr` 保持 0 CER，30 分钟持续来流 1598 请求零失败、零 OOM。默认策略的容量扫描、CER 抖动的根因定位（仅由 decode 行批处理触发）与完整测量数据见 [docs/performance/m4-pro-qwen3-asr-2026-09-30.md](docs/performance/m4-pro-qwen3-asr-2026-09-30.md)。

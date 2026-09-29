@@ -3,6 +3,8 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::execution::ExecutionPolicy;
+
 #[derive(Debug, Clone)]
 pub enum Batch<T> {
     One(T),
@@ -62,6 +64,8 @@ pub struct TranscribeOptions {
     pub chunk_max_sec: Option<f32>,
     /// If true, bucket chunked audio by length before batching to reduce padding overhead.
     pub bucket_by_length: bool,
+    /// 启动时解析一次的统一执行策略。`None` 时调度器按设备与容量自行推导。
+    pub execution: Option<ExecutionPolicy>,
 }
 
 impl Default for TranscribeOptions {
@@ -75,6 +79,7 @@ impl Default for TranscribeOptions {
             max_batch_audio_sec: 180.0,
             chunk_max_sec: None,
             bucket_by_length: true,
+            execution: None,
         }
     }
 }

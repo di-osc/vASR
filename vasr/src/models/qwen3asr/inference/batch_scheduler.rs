@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
 
+use crate::inference::execution::ExecutionPolicy;
 #[cfg(feature = "timing")]
 use crate::model::generation::GenerationTimings;
 use crate::model::paged_batch_engine::{
@@ -81,6 +82,31 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
     let _ = device;
 }
 
+/// 记录模型 forward 执行锁的累计等待统计。
+///
+/// Metal 上 encoder、prefill、decode 共用一个 forward 锁，这个日志让性能报告能直接
+/// 看到锁等待是否成为瓶颈，而不必从各阶段耗时反推。默认仅在 `VASR_DEBUG_LOCK_WAIT`
+/// 开启时输出，避免日常启动刷屏。
+fn log_model_execution_lock_wait(runtime: &SharedPagedCacheRuntime) {
+    if std::env::var_os("VASR_DEBUG_LOCK_WAIT").is_none() {
+        return;
+    }
+    let Ok(guard) = runtime.lock() else {
+        return;
+    };
+    let (acquisitions, waited_seconds) = guard.model_execution_wait_stats();
+    if acquisitions == 0 {
+        return;
+    }
+    tracing::info!(
+        target: "vasr_transcribe::pipeline",
+        "model_forward_lock | acquisitions={} waited={:.3}s avg_wait_ms={:.3}",
+        acquisitions,
+        waited_seconds,
+        waited_seconds * 1000.0 / acquisitions as f64,
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
@@ -90,6 +116,8 @@ pub struct AsrBatchSchedulerConfig {
     prefill_max_wave: Option<usize>,
     pub continuous_batch: bool,
     pub generated_tokens_per_sec: f64,
+    /// 启动时解析一次的统一执行策略。`None` 时按设备与容量自行推导。
+    execution: Option<ExecutionPolicy>,
 }
 
 impl Default for AsrBatchSchedulerConfig {
@@ -101,6 +129,7 @@ impl Default for AsrBatchSchedulerConfig {
             prefill_max_wave: prefill_max_wave_from_env(),
             continuous_batch: continuous_batch_enabled(),
             generated_tokens_per_sec: crate::models::qwen3asr::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+            execution: None,
         }
     }
 }
@@ -124,10 +153,34 @@ impl AsrBatchSchedulerConfig {
         self
     }
 
+    /// 附加启动时解析出的统一执行策略。
+    #[must_use]
+    pub fn with_execution_policy(mut self, execution: Option<ExecutionPolicy>) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    /// 解析本次调度实际使用的执行策略。
+    ///
+    /// 优先使用调用方传入的策略；未传入时按设备与容量推导。无论哪条路径，结果都会被
+    /// 约束在本次解析出的安全容量以内，保证不会越过内存预算。
+    fn effective_execution(&self, runtime: &PagedCacheRuntime, device: &Device) -> ExecutionPolicy {
+        let capacity = self.continuous_max_num_seqs(runtime).max(1);
+        let explicit_capacity =
+            self.explicit_decode_max_seqs.is_some() || runtime_decode_max_seqs(runtime).is_some();
+        let policy = self
+            .execution
+            .unwrap_or_else(|| ExecutionPolicy::resolve(device, capacity, explicit_capacity));
+        policy.clamped_to(capacity)
+    }
+
     pub fn prefill_max_wave(&self, runtime: &PagedCacheRuntime) -> usize {
-        self.prefill_max_wave
-            .unwrap_or_else(|| self.continuous_max_num_seqs(runtime))
-            .max(1)
+        // 有统一策略时以策略为准（其中已包含环境变量覆盖）；否则退回旧行为。
+        let capacity = self.continuous_max_num_seqs(runtime).max(1);
+        if let Some(policy) = self.execution {
+            return policy.prefill_wave.clamp(1, capacity);
+        }
+        self.prefill_max_wave.unwrap_or(capacity).max(1)
     }
 
     pub fn continuous_max_num_seqs(&self, runtime: &PagedCacheRuntime) -> usize {
@@ -141,14 +194,7 @@ impl AsrBatchSchedulerConfig {
         runtime: &PagedCacheRuntime,
         device: &Device,
     ) -> usize {
-        let override_limit = std::env::var("VASR_METAL_MAX_ACTIVE_SEQS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok());
-        execution_slots_for(
-            device.is_metal(),
-            self.continuous_max_num_seqs(runtime),
-            override_limit,
-        )
+        self.effective_execution(runtime, device).active_slots
     }
 }
 
@@ -164,60 +210,6 @@ fn async_prefill_channel_capacity() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(usize::MAX)
-}
-
-fn mixed_step_decode_enabled_for(
-    is_metal: bool,
-    enable_override: bool,
-    disable_override: bool,
-) -> bool {
-    if disable_override {
-        return false;
-    }
-    !is_metal || enable_override
-}
-
-fn mixed_step_decode_enabled(device: &Device) -> bool {
-    mixed_step_decode_enabled_for(
-        device.is_metal(),
-        std::env::var_os("VASR_ENABLE_MIXED_STEP_DECODE").is_some(),
-        std::env::var_os("VASR_DISABLE_MIXED_STEP_DECODE").is_some(),
-    )
-}
-
-fn paged_decode_batch_size_for(
-    is_metal: bool,
-    override_size: Option<usize>,
-    active: usize,
-) -> usize {
-    if active == 0 {
-        return 0;
-    }
-    if !is_metal {
-        return active;
-    }
-    override_size
-        .filter(|&size| size > 0)
-        .unwrap_or(1)
-        .min(active)
-}
-
-fn paged_decode_batch_size(device: &Device, active: usize) -> usize {
-    let override_size = std::env::var("VASR_METAL_PAGED_DECODE_BATCH_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    paged_decode_batch_size_for(device.is_metal(), override_size, active)
-}
-
-fn execution_slots_for(is_metal: bool, capacity: usize, override_limit: Option<usize>) -> usize {
-    let capacity = capacity.max(1);
-    if !is_metal {
-        return capacity;
-    }
-    override_limit
-        .filter(|&limit| limit > 0)
-        .unwrap_or(1)
-        .min(capacity)
 }
 
 fn runtime_decode_max_seqs(runtime: &PagedCacheRuntime) -> Option<usize> {
@@ -1040,6 +1032,7 @@ fn decode_running_step_groups(
     running: &mut [Option<RunningSlot>],
     active_steps: &[(usize, usize)],
     max_new_tokens: usize,
+    execution: &ExecutionPolicy,
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
     runtime: &SharedPagedCacheRuntime,
@@ -1051,9 +1044,9 @@ fn decode_running_step_groups(
     if active_steps.is_empty() {
         return Ok(());
     }
-    if mixed_step_decode_enabled(device) {
+    if execution.mixed_step {
         let slot_indices: Vec<usize> = active_steps.iter().map(|&(slot_idx, _)| slot_idx).collect();
-        let batch_size = paged_decode_batch_size(device, slot_indices.len()).max(1);
+        let batch_size = execution.decode_rows.min(slot_indices.len()).max(1);
         let mut batch_slots: Vec<PagedDecodeSlot> = running
             .iter()
             .map(|entry| {
@@ -1104,7 +1097,7 @@ fn decode_running_step_groups(
     }
     let step_groups = group_running_by_decode_step(&active_steps);
     for (step, slot_indices) in step_groups {
-        let batch_size = paged_decode_batch_size(device, slot_indices.len()).max(1);
+        let batch_size = execution.decode_rows.min(slot_indices.len()).max(1);
         for slot_group in slot_indices.chunks(batch_size) {
             decode_debug.record_active(step, slot_group.len());
             let mut batch_slots: Vec<PagedDecodeSlot> = slot_group
@@ -2015,11 +2008,14 @@ impl AsrBatchScheduler {
         pad_id: u32,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
-        let max_num_seqs = {
+        let (max_num_seqs, execution) = {
             let runtime_guard = runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-            self.config.execution_max_num_seqs(&runtime_guard, device)
+            (
+                self.config.execution_max_num_seqs(&runtime_guard, device),
+                self.config.effective_execution(&runtime_guard, device),
+            )
         };
         let max_slots = max_num_seqs.max(1);
         let mut prefill_inputs = PrefillInputBuffer::default();
@@ -2078,6 +2074,7 @@ impl AsrBatchScheduler {
                     running.as_mut_slice(),
                     active_steps.as_slice(),
                     self.config.max_new_tokens,
+                    &execution,
                     thinker,
                     device,
                     runtime,
@@ -2385,6 +2382,13 @@ impl AsrBatchScheduler {
         mut on_tick: Option<&mut dyn FnMut() -> Result<()>>,
         #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
+        // 解析本次连续解码实际使用的执行策略（活跃槽位、decode 行数、mixed-step）。
+        let execution = {
+            let runtime_guard = runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+            self.config.effective_execution(&runtime_guard, device)
+        };
         let mut prefilled: VecDeque<PrefilledSequence> = VecDeque::new();
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots.max(1)).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = Vec::new();
@@ -2459,6 +2463,7 @@ impl AsrBatchScheduler {
                     running.as_mut_slice(),
                     active_steps.as_slice(),
                     self.config.max_new_tokens,
+                    &execution,
                     thinker,
                     device,
                     runtime,
@@ -2557,6 +2562,7 @@ impl AsrBatchScheduler {
             decode_debug.log_summary(max_slots);
             log_cuda_mem_debug(device, "decode_done");
             async_debug.log_summary();
+            log_model_execution_lock_wait(runtime);
             Ok(std::mem::take(&mut outputs))
         })();
 
@@ -2725,10 +2731,10 @@ mod tests {
     use super::{
         AsrBatchSchedulerConfig, PrefillBatchReason, PrefillInputBuffer, PreparedAudioBatch,
         RunningSlot, collect_prefill_wave_by_kv, continuous_batch_enabled,
-        dynamic_source_poll_may_block, execution_slots_for, filter_sequences_at_token_limit,
-        group_running_by_decode_step, mixed_step_decode_enabled_for, pad_prepared_wave_for_prefill,
-        paged_decode_batch_size_for,
+        dynamic_source_poll_may_block, filter_sequences_at_token_limit,
+        group_running_by_decode_step, pad_prepared_wave_for_prefill,
     };
+    use crate::inference::execution::ExecutionPolicy;
     use std::collections::VecDeque;
 
     use candle_core::{Device, Tensor};
@@ -2809,31 +2815,29 @@ mod tests {
     }
 
     #[test]
-    fn metal_mixed_step_decode_is_opt_in() {
-        assert!(!mixed_step_decode_enabled_for(true, false, false));
-        assert!(mixed_step_decode_enabled_for(true, true, false));
-        assert!(!mixed_step_decode_enabled_for(true, true, true));
-        assert!(mixed_step_decode_enabled_for(false, false, false));
-        assert!(!mixed_step_decode_enabled_for(false, true, true));
+    fn metal_policy_enables_mixed_step_and_uses_validated_slots() {
+        // 自动模式下 Metal 不再退回“1 槽 / 1 行 / mixed-step 关闭”。
+        let policy = ExecutionPolicy::resolve_backend(true, 8, false);
+        assert!(policy.mixed_step);
+        assert_eq!(policy.active_slots, 8);
+        assert_eq!(policy.decode_rows, policy.active_slots);
+        assert!(policy.prefill_wave <= policy.active_slots);
     }
 
     #[test]
-    fn metal_paged_decode_batch_defaults_to_one_and_never_exceeds_active_rows() {
-        assert_eq!(paged_decode_batch_size_for(true, None, 8), 1);
-        assert_eq!(paged_decode_batch_size_for(true, Some(4), 8), 4);
-        assert_eq!(paged_decode_batch_size_for(true, Some(32), 8), 8);
-        assert_eq!(paged_decode_batch_size_for(true, Some(0), 8), 1);
-        assert_eq!(paged_decode_batch_size_for(false, None, 8), 8);
-        assert_eq!(paged_decode_batch_size_for(true, None, 0), 0);
+    fn policy_decode_rows_never_exceeds_active_slots() {
+        let policy = ExecutionPolicy::resolve_backend(true, 4, true);
+        assert_eq!(policy.active_slots, 4);
+        assert!(policy.decode_rows <= policy.active_slots);
+        assert!(policy.prefill_wave <= policy.active_slots);
     }
 
     #[test]
-    fn metal_execution_slot_limit_never_changes_kv_capacity() {
-        assert_eq!(execution_slots_for(true, 308, Some(1)), 1);
-        assert_eq!(execution_slots_for(true, 8, Some(32)), 8);
-        assert_eq!(execution_slots_for(true, 8, Some(0)), 1);
-        assert_eq!(execution_slots_for(true, 8, None), 1);
-        assert_eq!(execution_slots_for(false, 8, Some(1)), 8);
+    fn non_metal_policy_keeps_capacity_as_execution_width() {
+        let policy = ExecutionPolicy::resolve_backend(false, 8, false);
+        assert_eq!(policy.active_slots, 8);
+        assert_eq!(policy.decode_rows, 8);
+        assert_eq!(policy.prefill_wave, 8);
     }
 
     #[test]

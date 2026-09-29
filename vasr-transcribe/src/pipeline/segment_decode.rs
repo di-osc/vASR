@@ -144,8 +144,6 @@ fn run_global_segment_decode_worker(
     let mut stream_stage_starts = Vec::new();
     let mut stream_chunk_base = 0usize;
     let pending_chunks = RefCell::new(BTreeMap::new());
-    let deferred_completed = RefCell::new(Vec::new());
-    let defer_until_stream_idle = qwen3.device().is_metal();
 
     let forward_thread = std::thread::spawn(move || {
         let mut next_global_chunk = 0usize;
@@ -256,8 +254,14 @@ fn run_global_segment_decode_worker(
                 stream_chunk_base,
             )?
         };
-        deferred_completed.borrow_mut().extend(completed);
-        let stream_was_reset = reset_stream_decode_state_if_idle(
+        // 每个条目独立完成、返回和回收；不再等到全局 decode 空闲再统一返回，
+        // 否则持续来流会让短请求的结果一直排在其他请求后面。
+        for outcome in completed {
+            if asr_to_result_tx.blocking_send(outcome).is_err() {
+                bail!("ASR result router closed");
+            }
+        }
+        reset_stream_decode_state_if_idle(
             &pending_chunks.borrow(),
             &mut stream_decoder,
             segment_state,
@@ -267,16 +271,6 @@ fn run_global_segment_decode_worker(
             &mut stream_stage_starts,
             &mut stream_chunk_base,
         );
-        let ready = take_completed_after_idle_reset(
-            &mut deferred_completed.borrow_mut(),
-            defer_until_stream_idle,
-            stream_was_reset,
-        );
-        for outcome in ready {
-            if asr_to_result_tx.blocking_send(outcome).is_err() {
-                bail!("ASR result router closed");
-            }
-        }
         Ok(())
     };
 
@@ -319,8 +313,13 @@ fn run_global_segment_decode_worker(
         stream_stage_starts.as_slice(),
         stream_chunk_base,
     )?;
-    deferred_completed.borrow_mut().extend(completed);
-    let stream_was_reset = reset_stream_decode_state_if_idle(
+    // 解码结束时同样逐条返回，保持与 tick 路径一致的生命周期。
+    for outcome in completed {
+        if asr_to_result_tx.blocking_send(outcome).is_err() {
+            bail!("ASR result router closed");
+        }
+    }
+    reset_stream_decode_state_if_idle(
         &pending_chunks.borrow(),
         &mut stream_decoder,
         segment_state,
@@ -330,16 +329,6 @@ fn run_global_segment_decode_worker(
         &mut stream_stage_starts,
         &mut stream_chunk_base,
     );
-    let ready = take_completed_after_idle_reset(
-        &mut deferred_completed.borrow_mut(),
-        defer_until_stream_idle,
-        stream_was_reset,
-    );
-    for outcome in ready {
-        if asr_to_result_tx.blocking_send(outcome).is_err() {
-            bail!("ASR result router closed");
-        }
-    }
 
     if !pending_chunks.borrow().is_empty() {
         bail!(
@@ -492,9 +481,9 @@ fn reset_stream_decode_state_if_idle(
     batch_lens: &mut Vec<usize>,
     stage_starts: &mut Vec<Instant>,
     chunk_base: &mut usize,
-) -> bool {
+) {
     if !pending_chunks.is_empty() || !state.jobs.is_empty() || !decoder.all_chunks_completed() {
-        return false;
+        return;
     }
     if decoder.chunk_count() > 0 {
         *chunk_base = chunk_base.saturating_add(decoder.chunk_count());
@@ -504,19 +493,6 @@ fn reset_stream_decode_state_if_idle(
         batch_lens.clear();
         stage_starts.clear();
     }
-    true
-}
-
-#[cfg(feature = "paged-attn")]
-fn take_completed_after_idle_reset<T>(
-    completed: &mut Vec<T>,
-    defer_until_stream_idle: bool,
-    stream_was_reset: bool,
-) -> Vec<T> {
-    if defer_until_stream_idle && !stream_was_reset {
-        return Vec::new();
-    }
-    std::mem::take(completed)
 }
 
 #[cfg(feature = "paged-attn")]
@@ -591,35 +567,6 @@ fn release_stream_segment_audio(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::take_completed_after_idle_reset;
-
-    #[test]
-    fn metal_results_wait_until_stream_state_is_reset() {
-        let mut completed = vec![10, 20];
-
-        assert!(take_completed_after_idle_reset(&mut completed, true, false).is_empty());
-        assert_eq!(completed, vec![10, 20]);
-
-        assert_eq!(
-            take_completed_after_idle_reset(&mut completed, true, true),
-            vec![10, 20]
-        );
-        assert!(completed.is_empty());
-    }
-
-    #[test]
-    fn non_metal_results_keep_streaming_without_an_idle_reset() {
-        let mut completed = vec![10, 20];
-
-        assert_eq!(
-            take_completed_after_idle_reset(&mut completed, false, false),
-            vec![10, 20]
-        );
-        assert!(completed.is_empty());
-    }
-}
 #[cfg(feature = "paged-attn")]
 pub(super) fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegmentJob]) {
     for segment in segments {

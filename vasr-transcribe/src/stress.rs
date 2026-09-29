@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -62,6 +62,13 @@ pub struct StressArgs {
     /// GPU memory sampling interval.
     #[arg(long = "sample-interval-ms", default_value_t = 100)]
     sample_interval_ms: u64,
+
+    /// Disable GPU memory sampling entirely.
+    ///
+    /// Sampling needs `nvidia-smi`, so on Apple Metal hosts it is skipped automatically;
+    /// pass this to skip it explicitly (for example to silence the notice).
+    #[arg(long = "no-gpu-sample", default_value_t = false)]
+    no_gpu_sample: bool,
 
     /// Stop when an OOM response is observed.
     #[arg(long, default_value_t = false)]
@@ -134,6 +141,7 @@ struct StressConfig<'a> {
     retries: usize,
     gpu: usize,
     sample_interval_ms: u64,
+    gpu_sampling: bool,
     stop_on_oom: bool,
     max_errors: usize,
 }
@@ -182,7 +190,18 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
         shuffle_sources(&mut sources);
     }
     let sources = Arc::new(sources);
-    sample_gpu_memory(args.gpu).with_context(|| format!("failed to sample GPU {}", args.gpu))?;
+
+    // GPU memory sampling needs `nvidia-smi`, which only exists on NVIDIA hosts. On Apple
+    // Metal (or any host without it) degrade gracefully instead of aborting the run.
+    let gpu_sampling = !args.no_gpu_sample && nvidia_smi_available();
+    if gpu_sampling {
+        sample_gpu_memory(args.gpu)
+            .with_context(|| format!("failed to sample GPU {}", args.gpu))?;
+    } else if !args.no_gpu_sample {
+        println!(
+            "stress NOTE   | nvidia-smi unavailable, GPU memory sampling disabled (use --no-gpu-sample to silence)"
+        );
+    }
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -208,13 +227,17 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(StressStats::default()));
     let gpu_samples = Arc::new(Mutex::new(Vec::new()));
 
-    let sampler = tokio::spawn(spawn_gpu_sampler(
-        args.gpu,
-        started,
-        Duration::from_millis(args.sample_interval_ms),
-        Arc::clone(&stop),
-        Arc::clone(&gpu_samples),
-    ));
+    let sampler = if gpu_sampling {
+        Some(tokio::spawn(spawn_gpu_sampler(
+            args.gpu,
+            started,
+            Duration::from_millis(args.sample_interval_ms),
+            Arc::clone(&stop),
+            Arc::clone(&gpu_samples),
+        )))
+    } else {
+        None
+    };
 
     let mut workers = JoinSet::new();
     for _ in 0..args.concurrency {
@@ -237,7 +260,9 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
         result.context("stress worker task panicked")??;
     }
     stop.store(true, Ordering::Release);
-    sampler.await.context("GPU sampler task panicked")??;
+    if let Some(sampler) = sampler {
+        sampler.await.context("GPU sampler task panicked")??;
+    }
 
     let wall_seconds = started.elapsed().as_secs_f64();
     let stats = take_mutex(stats, "stress stats")?;
@@ -254,14 +279,18 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
         summary.wall_seconds,
         summary.requests_per_second
     );
-    println!(
-        "gpu MEM      | base={:.2}GiB peak={:.2}GiB delta={:.2}GiB avg={:.2}GiB samples={}",
-        mib_to_gib(gpu.base_used_mib),
-        mib_to_gib(gpu.peak_used_mib),
-        gpu.delta_used_mib as f64 / 1024.0,
-        gpu.avg_used_mib / 1024.0,
-        gpu.samples
-    );
+    if gpu.samples > 0 {
+        println!(
+            "gpu MEM      | base={:.2}GiB peak={:.2}GiB delta={:.2}GiB avg={:.2}GiB samples={}",
+            mib_to_gib(gpu.base_used_mib),
+            mib_to_gib(gpu.peak_used_mib),
+            gpu.delta_used_mib as f64 / 1024.0,
+            gpu.avg_used_mib / 1024.0,
+            gpu.samples
+        );
+    } else {
+        println!("gpu MEM      | unavailable (no nvidia-smi)");
+    }
     print_summary_table(&summary, &gpu);
 
     let timestamp = timestamp_file_name();
@@ -286,6 +315,7 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
                 retries: args.retries,
                 gpu: args.gpu,
                 sample_interval_ms: args.sample_interval_ms,
+                gpu_sampling,
                 stop_on_oom: args.stop_on_oom,
                 max_errors: args.max_errors,
             },
@@ -465,6 +495,32 @@ fn record_outcome(
     Ok((stop_on_oom && outcome.oom) || (max_errors > 0 && stats.failed_requests >= max_errors))
 }
 
+/// Whether `nvidia-smi` can be executed on this host.
+///
+/// Metal/Apple hosts have no `nvidia-smi`, so GPU memory sampling must be skipped rather
+/// than treated as a fatal error.
+fn nvidia_smi_available() -> bool {
+    Command::new("nvidia-smi")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Render a GPU memory figure in GiB, or `n/a` when no samples were collected.
+fn format_gpu_gib(samples: usize, mib: u64) -> String {
+    if samples == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.2}GiB", mib_to_gib(mib))
+    }
+}
+
+/// Poll GPU memory until `stop` is set.
+///
+/// A sampling failure stops sampling instead of failing the whole stress run, so a
+/// transient `nvidia-smi` problem cannot discard an otherwise valid result.
 async fn spawn_gpu_sampler(
     gpu: usize,
     started: Instant,
@@ -473,16 +529,23 @@ async fn spawn_gpu_sampler(
     samples: Arc<Mutex<Vec<GpuSample>>>,
 ) -> Result<()> {
     loop {
-        let sample = sample_gpu_memory(gpu)?;
-        samples
-            .lock()
-            .map_err(|_| anyhow!("GPU samples lock poisoned"))?
-            .push(GpuSample {
-                elapsed_ms: started.elapsed().as_millis(),
-                used_mib: sample.0,
-                free_mib: sample.1,
-                total_mib: sample.2,
-            });
+        match sample_gpu_memory(gpu) {
+            Ok(sample) => {
+                samples
+                    .lock()
+                    .map_err(|_| anyhow!("GPU samples lock poisoned"))?
+                    .push(GpuSample {
+                        elapsed_ms: started.elapsed().as_millis(),
+                        used_mib: sample.0,
+                        free_mib: sample.1,
+                        total_mib: sample.2,
+                    });
+            }
+            Err(err) => {
+                eprintln!("gpu MEM      | sampling stopped: {err:#}");
+                return Ok(());
+            }
+        }
         if stop.load(Ordering::Acquire) {
             break;
         }
@@ -662,15 +725,19 @@ fn print_summary_table(summary: &StressSummary, gpu: &StressGpuSummary) {
             vec!["gpu".to_string(), gpu.gpu.to_string()],
             vec![
                 "gpu base".to_string(),
-                format!("{:.2}GiB", mib_to_gib(gpu.base_used_mib)),
+                format_gpu_gib(gpu.samples, gpu.base_used_mib),
             ],
             vec![
                 "gpu peak".to_string(),
-                format!("{:.2}GiB", mib_to_gib(gpu.peak_used_mib)),
+                format_gpu_gib(gpu.samples, gpu.peak_used_mib),
             ],
             vec![
                 "gpu delta".to_string(),
-                format!("{:.2}GiB", gpu.delta_used_mib as f64 / 1024.0),
+                if gpu.samples == 0 {
+                    "n/a".to_string()
+                } else {
+                    format!("{:.2}GiB", gpu.delta_used_mib as f64 / 1024.0)
+                },
             ],
         ],
     );

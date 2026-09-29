@@ -84,6 +84,7 @@ fn main() -> Result<()> {
         max_batch_audio_sec: 0.0,
         chunk_max_sec: None,
         bucket_by_length: false,
+        execution: None,
     };
 
     let audio_path = Path::new(&audio);

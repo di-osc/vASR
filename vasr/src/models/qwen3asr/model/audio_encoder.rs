@@ -1102,6 +1102,146 @@ mod tests {
     use candle_nn::Linear;
     use vasr_quant::isq_linear::IsqLinear;
 
+    /// 确定性伪随机权重后端，用于验证多段 encoder 在非零权重下仍然 batch 不变。
+    ///
+    /// `VarBuilder::zeros` 会把所有中间量压成 0，padding / 窗口边界写错也看不出来；
+    /// 这里按张量名做稳定哈希，生成非零、可复现且幅度适中的权重。
+    struct SeededBackend;
+
+    /// FNV-1a，把张量名映射成一个稳定的 64 位种子。
+    fn fingerprint(name: &str) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in name.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    impl candle_nn::var_builder::SimpleBackend for SeededBackend {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            _init: candle_nn::Init,
+            dtype: candle_core::DType,
+            device: &candle_core::Device,
+        ) -> candle_core::Result<candle_core::Tensor> {
+            let count = shape.elem_count();
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ fingerprint(name);
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                // xorshift64*：稳定、快速，不引入外部 RNG 依赖。
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let x = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+                // 映射到 [-0.5, 0.5)，避免随机权重把激活值推到溢出。
+                values.push(((x >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32);
+            }
+            candle_core::Tensor::from_vec(values, shape, device)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(
+            &self,
+            _name: &str,
+            _dtype: candle_core::DType,
+            _device: &candle_core::Device,
+        ) -> candle_core::Result<candle_core::Tensor> {
+            candle_core::bail!("SeededBackend 需要形状，请使用 get 而不是 get_unchecked")
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            true
+        }
+    }
+
+    /// 构造一个用于数值对比的测试配置。
+    fn test_config() -> AudioEncoderConfig {
+        AudioEncoderConfig {
+            num_mel_bins: 4,
+            encoder_layers: 1,
+            encoder_attention_heads: 1,
+            encoder_ffn_dim: 8,
+            d_model: 4,
+            dropout: 0.0,
+            attention_dropout: 0.0,
+            activation_function: "gelu".to_string(),
+            activation_dropout: 0.0,
+            scale_embedding: false,
+            initializer_range: 0.02,
+            max_source_positions: 64,
+            n_window: 5,
+            output_dim: 6,
+            n_window_infer: 20,
+            conv_chunksize: 8,
+            downsample_hidden_size: 2,
+        }
+    }
+
+    /// 用给定权重后端加载 tower，并按 batch-vs-per-sample 方式比较输出。
+    fn assert_batched_matches_per_sample(
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+        zeros: bool,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        let cfg = test_config();
+        let vb = if zeros {
+            candle_nn::VarBuilder::zeros(dtype, device)
+        } else {
+            candle_nn::VarBuilder::from_backend(Box::new(SeededBackend), dtype, device.clone())
+        };
+        let tower = AudioTower::load(&cfg, vb, false, None, &Progress::disabled())?;
+
+        let batch = 3usize;
+        let frames = 10usize;
+        let lens = [10usize, 7usize, 4usize];
+        let feats: Vec<f32> = (0..batch * cfg.num_mel_bins * frames)
+            .map(|i| (i as f32) / 100.0)
+            .collect();
+        let input_features =
+            candle_core::Tensor::from_vec(feats, (batch, cfg.num_mel_bins, frames), device)?;
+
+        let batched = tower.forward_with_lens(&input_features, &lens)?;
+        let weight_dtype = tower.conv2d1.weight().dtype();
+        let mut per_sample = Vec::with_capacity(batch);
+        for (idx, &len) in lens.iter().enumerate() {
+            let input = input_features
+                .narrow(0, idx, 1)?
+                .squeeze(0)?
+                .narrow(1, 0, len)?;
+            // `forward_one` 是测试辅助路径，不负责 dtype 转换，这里手动对齐权重 dtype。
+            let input = super::cast_input_features_to_weight_dtype(&input, weight_dtype)?;
+            per_sample.push(tower.forward_one(&input)?);
+        }
+        let expected = candle_core::Tensor::cat(&per_sample.iter().collect::<Vec<_>>(), 0)?;
+
+        if batched.dims() != expected.dims() {
+            anyhow::bail!(
+                "batched dims mismatch: batched={:?} expected={:?}",
+                batched.dims(),
+                expected.dims()
+            );
+        }
+        let got = batched
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec2::<f32>()?;
+        let exp = expected
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec2::<f32>()?;
+        let mut max_abs = 0f32;
+        for (row_g, row_e) in got.iter().zip(exp.iter()) {
+            for (&a, &b) in row_g.iter().zip(row_e.iter()) {
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        if max_abs > tolerance {
+            anyhow::bail!("batched forward mismatch: max_abs={max_abs} tolerance={tolerance}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_sinusoidal_positional_embedding_shape() -> anyhow::Result<()> {
         let device = candle_core::Device::Cpu;
@@ -1225,12 +1365,15 @@ mod tests {
         let input_features = candle_core::Tensor::from_vec(feats, (batch, mel, frames), &device)?;
 
         let batched = tower.forward_with_lens(&input_features, &lens)?;
+        let weight_dtype = tower.conv2d1.weight().dtype();
         let mut per_sample = Vec::with_capacity(batch);
         for (idx, &len) in lens.iter().enumerate() {
             let input = input_features
                 .narrow(0, idx, 1)?
                 .squeeze(0)?
                 .narrow(1, 0, len)?;
+            // `forward_one` 是测试辅助路径，不负责 dtype 转换，这里手动对齐权重 dtype。
+            let input = super::cast_input_features_to_weight_dtype(&input, weight_dtype)?;
             per_sample.push(tower.forward_one(&input)?);
         }
         let expected = candle_core::Tensor::cat(&per_sample.iter().collect::<Vec<_>>(), 0)?;
@@ -1255,6 +1398,32 @@ mod tests {
             anyhow::bail!("batched forward mismatch: max_abs={max_abs}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_nonzero_weights_batched_forward_matches_per_sample() -> anyhow::Result<()> {
+        // 零权重测试无法暴露 padding / 窗口边界错误；这里用非零权重复验多段拼接。
+        assert_batched_matches_per_sample(
+            &candle_core::Device::Cpu,
+            candle_core::DType::F32,
+            false,
+            1e-4,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_nonzero_weights_batched_forward_matches_per_sample_f32() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        assert_batched_matches_per_sample(&device, candle_core::DType::F32, false, 1e-3)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_nonzero_weights_batched_forward_matches_per_sample_bf16() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        // BF16 精度较低，放宽到 1e-1；重点验证多段 padding / 边界是否一致。
+        assert_batched_matches_per_sample(&device, candle_core::DType::BF16, false, 1e-1)
     }
 
     #[cfg(feature = "metal")]
