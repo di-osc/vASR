@@ -1421,8 +1421,21 @@ fn nonempty_file(path: &Path) -> Result<bool> {
 fn firered_vad_device() -> Result<Device> {
     match std::env::var("VASR_VAD_DEVICE").as_deref() {
         Ok("cuda") => Ok(Device::new_cuda(0)?),
+        Ok("metal") => {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0)
+                    .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                bail!("VASR_VAD_DEVICE=metal requires building with `--features metal`")
+            }
+        }
         Ok("cpu") | Err(_) => Ok(Device::Cpu),
-        Ok(other) => bail!("unsupported VASR_VAD_DEVICE={other:?}; expected cpu or cuda"),
+        Ok(other) => {
+            bail!("unsupported VASR_VAD_DEVICE={other:?}; expected cpu, metal, or cuda")
+        }
     }
 }
 
@@ -1450,6 +1463,16 @@ where
 mod tests {
     use super::*;
     use vasr_data::AudioChunk;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn firered_vad_device_accepts_metal() -> Result<()> {
+        // SAFETY: the test sets the process environment before device resolution.
+        unsafe { std::env::set_var("VASR_VAD_DEVICE", "metal") };
+        let device = firered_vad_device()?;
+        assert!(device.is_metal());
+        Ok(())
+    }
 
     fn realtime_options() -> VadOptions {
         VadOptions {
@@ -1543,6 +1566,35 @@ mod tests {
         };
         stream.push_chunk(&chunk)?;
         stream.finish()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires a local FireRedVAD checkpoint and Metal device"]
+    fn forward_probs_match_cpu_and_metal() -> Result<()> {
+        let root = std::env::var("VASR_FIRERED_VAD_ROOT")?;
+        let model_dir =
+            resolve_firered_vad_model_dir(std::path::Path::new(&root), FIRERED_OFFLINE_MODEL_DIR)?;
+        let cpu = FireRedVadWeights::load_on_device(&model_dir, &Device::Cpu, false)?;
+        let metal = FireRedVadWeights::load_on_device(&model_dir, &Device::new_metal(0)?, false)?;
+        let samples = (0..16_000)
+            .map(|index| ((index as f32 * 0.017).sin() * 0.1).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let feats = cpu.frontend.extract(&samples)?;
+        let cpu_probs = cpu.forward_probs(&feats, 0)?;
+        let metal_probs = metal.forward_probs(&feats, 0)?;
+        assert_eq!(cpu_probs.len(), metal_probs.len());
+
+        let max_diff = cpu_probs
+            .iter()
+            .zip(&metal_probs)
+            .map(|(cpu_prob, metal_prob)| (cpu_prob - metal_prob).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CPU/Metal forward probabilities diverged: max_diff={max_diff}"
+        );
         Ok(())
     }
 }

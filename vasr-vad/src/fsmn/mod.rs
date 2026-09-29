@@ -604,6 +604,16 @@ fn fsmn_vad_device() -> Result<Device> {
                 );
             }
         }
+        Some("metal") => {
+            #[cfg(feature = "metal")]
+            {
+                return fsmn_vad_metal_device();
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                bail!("VASR_VAD_DEVICE=metal requires building with `--features metal`");
+            }
+        }
         Some("cpu") => {}
         None => {
             #[cfg(any(feature = "cuda", feature = "cuda-vad"))]
@@ -611,7 +621,9 @@ fn fsmn_vad_device() -> Result<Device> {
                 return fsmn_vad_cuda_device();
             }
         }
-        Some(other) => bail!("unknown VASR_VAD_DEVICE {other:?}; expected cpu or cuda"),
+        Some(other) => {
+            bail!("unknown VASR_VAD_DEVICE {other:?}; expected cpu, metal, or cuda")
+        }
     }
     Ok(Device::Cpu)
 }
@@ -623,6 +635,17 @@ fn fsmn_vad_cuda_device() -> Result<Device> {
     tracing::info!(
         target: "vasr_vad::fsmn",
         "FSMN VAD using CUDA device 0"
+    );
+    Ok(device)
+}
+
+#[cfg(feature = "metal")]
+fn fsmn_vad_metal_device() -> Result<Device> {
+    let device = Device::new_metal(0)
+        .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))?;
+    tracing::info!(
+        target: "vasr_vad::fsmn",
+        "FSMN VAD using Metal device 0"
     );
     Ok(device)
 }
@@ -1918,6 +1941,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fsmn_vad_device_accepts_metal() -> Result<()> {
+        // SAFETY: the test sets the process environment before device resolution.
+        unsafe { std::env::set_var("VASR_VAD_DEVICE", "metal") };
+        let device = fsmn_vad_device()?;
+        assert!(device.is_metal());
+        Ok(())
+    }
+
     fn unique_tmp_dir(prefix: &str) -> Result<PathBuf> {
         let mut dir = std::env::temp_dir();
         let now = SystemTime::now()
@@ -2150,6 +2183,42 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires a local FSMN VAD checkpoint and Metal device"]
+    fn forward_frame_scores_match_cpu_and_metal() -> Result<()> {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let model_dir = workspace.join(".cache/fsmn-vad");
+        let wav = workspace.join("raw_audios/audio (13).wav");
+        if !model_dir.exists() || !wav.exists() {
+            return Ok(());
+        }
+
+        let cpu = FsmnVadWeights::load_on_device(&model_dir, &Device::Cpu)?;
+        let metal = FsmnVadWeights::load_on_device(&model_dir, &Device::new_metal(0)?)?;
+        let waveform = load_pcm16_wav(&wav)?;
+        let pcm = samples_f32_to_i16(&waveform.samples);
+        let feats = cpu.frontend.extract_features_from_pcm(&pcm)?;
+
+        let mut cpu_caches = cpu.zero_caches()?;
+        let mut metal_caches = metal.zero_caches()?;
+        let cpu_scores = cpu.forward_frame_scores(&feats, &mut cpu_caches, 0)?;
+        let metal_scores = metal.forward_frame_scores(&feats, &mut metal_caches, 0)?;
+        assert_eq!(cpu_scores.len(), metal_scores.len());
+
+        let max_diff = cpu_scores
+            .iter()
+            .zip(&metal_scores)
+            .flat_map(|(cpu_frame, metal_frame)| cpu_frame.iter().zip(metal_frame))
+            .map(|(cpu_score, metal_score)| (cpu_score - metal_score).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CPU/Metal forward scores diverged: max_diff={max_diff}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn forward_frame_scores_cpu_fast_path_matches_candle_path() -> Result<()> {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -2282,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "benchmark FSMN VAD on raw_audios; set VASR_VAD_DEVICE=cpu|cuda"]
+    #[ignore = "benchmark FSMN VAD on raw_audios; set VASR_VAD_DEVICE=cpu|metal|cuda"]
     fn fsmn_vad_benchmark_raw_audios() -> Result<()> {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let audio_dir = workspace.join("raw_audios");

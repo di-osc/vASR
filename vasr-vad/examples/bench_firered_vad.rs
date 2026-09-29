@@ -177,9 +177,10 @@ fn parse_args() -> Result<Args> {
     }
     if let Some(device) = &device
         && device != "cpu"
+        && device != "metal"
         && device != "cuda"
     {
-        bail!("--device must be cpu or cuda");
+        bail!("--device must be cpu, metal, or cuda");
     }
 
     Ok(Args {
@@ -198,7 +199,7 @@ fn print_help() {
 Options:\n\
   --audio PATH      WAV file to benchmark (default: assets/vad_example.wav)\n\
   --model PATH      FireRedVAD VAD directory; defaults to known local/cache paths\n\
-  --device DEVICE   cpu or cuda; equivalent to VASR_VAD_DEVICE\n\
+  --device DEVICE   cpu, metal, or cuda; equivalent to VASR_VAD_DEVICE\n\
   --warmup N        warmup iterations (default: 1)\n\
   --repeat N        measured iterations (default: 5)\n\
   -h, --help        show this help"

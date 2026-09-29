@@ -22,6 +22,7 @@ modelhub = "0.1.3"
 
 [features]
 default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 cuda-vad = ["cuda"]
 
