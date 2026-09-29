@@ -806,7 +806,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   const int max_num_partitions = threadgroups_per_grid.z;
   const int thread_idx = thread_position_in_threadgroup.x;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const uint32_t context_len = context_lens[seq_idx];
+  // Keep context-bound index arithmetic signed, matching the kernel's
+  // compile-time block constants and avoiding implicit sign conversions.
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
   if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= context_len) {
     // No work to do. Terminate the thread block.
     return;
@@ -1174,7 +1176,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int num_heads = threadgroups_per_grid.x;
   const int head_idx = threadgroup_position_in_grid.x;
   const int seq_idx = threadgroup_position_in_grid.y;
-  const uint32_t context_len = context_lens[seq_idx];
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
   const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
   if (num_partitions == 1 && !use_sinks) {
     // No need to reduce. Only copy tmp_out to out.

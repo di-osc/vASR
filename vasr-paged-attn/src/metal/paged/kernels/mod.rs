@@ -227,7 +227,9 @@ impl Kernels {
         ];
 
         for file in main_files {
-            if !included_files.contains(file) {
+            // Mark top-level files before preprocessing so that a file included by
+            // an earlier kernel is not emitted again as a later top-level file.
+            if included_files.insert(file.to_string()) {
                 if let Some(content) = file_system.get(file) {
                     match preprocess_includes(
                         content,
@@ -358,8 +360,8 @@ pub fn call_reshape_and_cache(
     );
 
     let constants = Some(ConstantValues::new(vec![(
-        10,
-        Value::Bool(/* use_fp8_scales */ k_v_scale.is_some()),
+        50,
+        Value::Bool(/* reshape_use_fp8_scales */ k_v_scale.is_some()),
     )]));
 
     let pipeline = kernels.load_pipeline_with_constants(device, name, constants)?;
@@ -794,8 +796,8 @@ pub fn call_gather_kv_cache(
     );
 
     let constants = Some(ConstantValues::new(vec![(
-        10,
-        Value::Bool(/* use_fp8_scales */ k_v_scale.is_some()),
+        60,
+        Value::Bool(/* gather_use_fp8_scales */ k_v_scale.is_some()),
     )]));
 
     let pipeline = kernels.load_pipeline_with_constants(device, name, constants)?;
@@ -861,4 +863,18 @@ pub fn call_gather_kv_cache(
     };
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_paged_attention_kernels_compile_without_duplicate_symbols() -> anyhow::Result<()> {
+        let candle_device = candle_core::Device::new_metal(0)?;
+        let device = candle_device.as_metal_device()?;
+
+        Kernels::new().load_library(device)?;
+        Ok(())
+    }
 }

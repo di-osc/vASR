@@ -25,7 +25,7 @@ template <> inline bfloat16_t from_cache<uchar, bfloat16_t>(uchar v) {
   return (bfloat16_t)fp8_e4m3_to_float(v);
 }
 
-constant bool use_fp8_scales [[function_constant(10)]];
+constant bool gather_use_fp8_scales [[function_constant(60)]];
 
 /// Gather K and V from paged KV cache into contiguous output tensors.
 ///
@@ -48,9 +48,9 @@ template <typename CACHE_T, typename OUT_T>
     device OUT_T *__restrict__ v_out
     [[buffer(3)]], // [num_tokens, kv_heads, head_size]
     const device float *__restrict__ k_scale
-    [[buffer(4), function_constant(use_fp8_scales)]],
+    [[buffer(4), function_constant(gather_use_fp8_scales)]],
     const device float *__restrict__ v_scale
-    [[buffer(5), function_constant(use_fp8_scales)]],
+    [[buffer(5), function_constant(gather_use_fp8_scales)]],
     const device int *__restrict__ block_table
     [[buffer(6)]], // [batch, max_blocks]
     const device int *__restrict__ cu_seq_lens [[buffer(7)]], // [batch + 1]
@@ -112,7 +112,7 @@ template <typename CACHE_T, typename OUT_T>
     const long v_src_idx = (long)block_id * v_block_stride +
                            head_idx * v_head_stride + d * block_size + slot;
 
-    if (use_fp8_scales) {
+    if (gather_use_fp8_scales) {
       k_out[out_base + i] = OUT_T(
           (float)from_cache<CACHE_T, OUT_T>(key_cache[k_src_idx]) * (*k_scale));
       v_out[out_base + i] =
@@ -134,9 +134,9 @@ template <typename CACHE_T, typename OUT_T>
       device out_type *__restrict__ k_out [[buffer(2)]],                       \
       device out_type *__restrict__ v_out [[buffer(3)]],                       \
       const device float *__restrict__ k_scale                                 \
-      [[buffer(4), function_constant(use_fp8_scales)]],                        \
+      [[buffer(4), function_constant(gather_use_fp8_scales)]],                \
       const device float *__restrict__ v_scale                                 \
-      [[buffer(5), function_constant(use_fp8_scales)]],                        \
+      [[buffer(5), function_constant(gather_use_fp8_scales)]],                \
       const device int *__restrict__ block_table [[buffer(6)]],                \
       const device int *__restrict__ cu_seq_lens [[buffer(7)]],                \
       device const int &num_tokens [[buffer(8)]],                              \
