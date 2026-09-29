@@ -4,9 +4,14 @@
 
 本机是 Apple M4 Pro（Metal 4，48 GB 统一内存）。`vasr-transcribe` 用 `metal` feature。换到 NVIDIA 机器时改成 `--features cuda`。
 
+### 数据布局
+
+- 当前 checkout 已提供 `datasets/call-100.vasr`（SQLite vASR AudioDb），可直接作为 `perf` 的输入。
+- `perf` 会直接读取 `.vasr` 数据库中的音频 source，不需要先执行旧版 `benchmark` 或 `extract-audio` 子命令。
+
 ### Transcribe
 
-- 覆盖安装适配本机硬件的最新命令行。已安装的二进制可能还是旧子命令（`benchmark`、`extract-audio`），必须 `--force`。
+- 覆盖安装适配本机硬件的当前命令行。已安装的二进制可能还是旧版本（仍暴露 `benchmark`、`extract-audio` 等子命令），必须 `--force`。
 
 ```bash
 cargo install --path vasr-transcribe --force --features metal
