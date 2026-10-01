@@ -4,7 +4,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use vasr_data::AudioSource;
+use asr_data::AudioSource;
 
 use super::{TranscribeInput, TranscribeItemOutcome};
 
@@ -27,6 +27,11 @@ enum AudioSourceDedupKey {
     Base64(String),
     EncodedBytes(Vec<u8>),
     LocalFileContent { len: u64, hash: u64 },
+    ModelScope {
+        repo_id: String,
+        file_path: String,
+        revision: String,
+    },
 }
 
 pub(super) fn deduplicate_transcribe_inputs(
@@ -72,6 +77,15 @@ fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey> {
             Some(AudioSourceDedupKey::Url(url.clone()))
         }
         AudioSource::Base64(encoded) => Some(AudioSourceDedupKey::Base64(encoded.clone())),
+        AudioSource::ModelScope {
+            repo_id,
+            file_path,
+            revision,
+        } => Some(AudioSourceDedupKey::ModelScope {
+            repo_id: repo_id.clone(),
+            file_path: file_path.clone(),
+            revision: revision.clone(),
+        }),
         AudioSource::EncodedBytes(bytes) => Some(AudioSourceDedupKey::EncodedBytes(bytes.clone())),
         AudioSource::PcmS16Le {
             bytes,

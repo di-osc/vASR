@@ -18,7 +18,7 @@ serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mi
 | eval 加速比（2 轮均值） | 21.72× | 45.44× | **2.09×** |
 | 加权 CER | 0.167497 | 0.167858 | +0.000361 |
 | 平均 CER | 0.223759 | 0.224968 | +0.001209 |
-| `example1.vasr` CER | 0.000000 | 0.000000 | 持平 |
+| `datasets/example1` CER | 0.000000 | 0.000000 | 持平 |
 | 失败 / 坏条目 | 0 / 99 | 0 / 99 | 持平 |
 
 **达到了 2× 吞吐目标，但加权 CER 比基线高 0.000361（+0.22% 相对，6 个字符 / 16651）**。这个差异的成因已完整定位（见下节），并且经用户确认后接受。
@@ -27,7 +27,7 @@ serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mi
 
 - 机器：Apple M4 Pro，48 GB 统一内存；Metal 后端；ASR dtype BF16。
 - 模型：`Qwen/Qwen3-ASR-0.6B`（28 层，16 attention heads，8 KV heads，head_dim 128，KV block 32）。
-- 数据集：`datasets/call-100.vasr`，99 条，5025.0118 音频秒；全部声明单声道 8 kHz，评测用 mono。
+- 数据集：`datasets/call-100`，99 条，5025.0118 音频秒；全部声明单声道 8 kHz，评测用 mono。
 - 评测：`--normalizer bench`，`--timeline mono`；perf 默认并发 14 / batch 1。
 - 基线二进制：HEAD `80326cf` 构建，不使用任何覆盖参数。
 
@@ -121,7 +121,7 @@ Caused by: failed to run nvidia-smi: No such file or directory
 
 ## 容量扫描
 
-固定并发 14 / batch 1，`call-100.vasr` 全量：
+固定并发 14 / batch 1，`datasets/call-100` 全量：
 
 | 活跃槽 | perf 加速比 | eval 加速比 | 加权 CER |
 | ---: | ---: | ---: | ---: |
@@ -169,7 +169,7 @@ Caused by: failed to run nvidia-smi: No such file or directory
 
 ## 并发 / Batch 扫描
 
-固定候选默认配置（32 槽），`call-100.vasr` 全量，batch ∈ {1, 4, 10} × 并发 ∈ {1, 4, 8, 14, 28}，共 15 组：
+固定候选默认配置（32 槽），`datasets/call-100` 全量，batch ∈ {1, 4, 10} × 并发 ∈ {1, 4, 8, 14, 28}，共 15 组：
 
 | 并发 | batch 1 | batch 4 | batch 10 |
 | ---: | ---: | ---: | ---: |
@@ -204,7 +204,7 @@ Caused by: failed to run nvidia-smi: No such file or directory
 - 服务端日志在整段压测中 **0 条 WARN / ERROR**。
 - 客户端错误列表为 0 条；`items == requests == successful`，无遗漏、无异常重复。
 - 短音频在负载下正常返回：并发 1 时 p50 仅 0.9s（见并发扫描），长稳期间 p50 14.1s 是 14 路并发下的排队结果。
-- 压测结束后立即做 drain 校验：`example1.vasr` 仍返回 CER 0.000000、100% 准确，服务状态正常。
+- 压测结束后立即做 drain 校验：`datasets/example1` 仍返回 CER 0.000000、100% 准确，服务状态正常。
 
 **KV 回收确认**：服务进程 RSS 在长稳期间持续采样为
 
@@ -254,8 +254,8 @@ CER 不受机器状态影响：所有配置在多次运行间完全确定性且�
 - **VAD 持续吞吐（目标 800×）未测量。** 需要单独的 VAD-only 负载与基线对照，本次未执行。
 - **基线长稳对照未执行。** 30 分钟长稳只跑了候选；基线的持续吞吐参照其短时测量（21.80×）推断，未实测。
 - **逐阶段耗时分解未采集。** 计划要求补齐 VAD / 特征提取 / encoder / prefill / decode 各自的计算、排队与锁等待统计。本次只落地了锁等待统计（`VASR_DEBUG_LOCK_WAIT=1`），未采集完整的逐阶段时间线表。
-- **多数据集 CER 验证仅覆盖 `call-100.vasr` 与 `example1.vasr`。** 其他数据集上的抖动方向未知。
-- **`example1.vasr` 只有 1 条**（11 个字符），其 0 CER 是必要的回归信号，但统计效力有限。
+- **多数据集 CER 验证仅覆盖 `datasets/call-100` 与 `datasets/example1`。** 其他数据集上的抖动方向未知。
+- **`datasets/example1` 只有 1 条**（11 个字符），其 0 CER 是必要的回归信号，但统计效力有限。
 
 ## 复现
 
@@ -269,9 +269,9 @@ vasr-transcribe serve --model Qwen3-ASR-0.6B
 另一个终端：
 
 ```bash
-vasr-transcribe perf -i datasets/call-100.vasr --concurrency 14 --batch-size 1
-vasr-transcribe eval -i datasets/call-100.vasr --timeline mono --normalizer bench
-vasr-transcribe eval -i datasets/example1.vasr --timeline mono --normalizer bench
+vasr-transcribe perf -i datasets/call-100 --concurrency 14 --batch-size 1
+vasr-transcribe eval -i datasets/call-100 --timeline mono --normalizer bench
+vasr-transcribe eval -i datasets/example1 --timeline mono --normalizer bench
 ```
 
 启动日志的第一行即给出最终生效策略。诊断开关：`VASR_DEBUG_LOCK_WAIT=1`（forward 锁等待）。
@@ -279,7 +279,7 @@ vasr-transcribe eval -i datasets/example1.vasr --timeline mono --normalizer benc
 长稳压测（非 NVIDIA 主机会自动跳过显存采样）：
 
 ```bash
-vasr-transcribe stress -i datasets/call-100.vasr --concurrency 14 --batch-size 1 \
+vasr-transcribe stress -i datasets/call-100 --concurrency 14 --batch-size 1 \
   --shuffle --duration-sec 1800
 ```
 

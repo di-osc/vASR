@@ -1054,6 +1054,8 @@ impl PagedCacheRuntime {
 pub type SharedPagedCacheRuntime = Arc<Mutex<PagedCacheRuntime>>;
 
 #[cfg(test)]
+// 测试里 `expect` / `unwrap` 是表达断言失败的常规方式。
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::sync::{
         Arc,

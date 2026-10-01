@@ -7,7 +7,7 @@ use std::sync::{
 use std::thread;
 
 use anyhow::{Result, anyhow};
-use vasr_data::{Timeline, Waveform};
+use asr_data::{Timeline, Waveform};
 
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 
@@ -197,7 +197,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use vasr_data::{Timeline, Waveform};
+    use asr_data::{Timeline, Waveform};
 
     use super::{InferenceScheduler, ScheduledAsrModel};
     use vasr::{AsrOptions, OfflineAsrModel as AsrModel};

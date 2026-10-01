@@ -4,7 +4,8 @@ use candle_metal_kernels::metal::{
     Value,
 };
 use objc2_metal::{MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLMathMode, MTLSize};
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::{collections::HashMap, ffi::c_void};
 
 pub mod utils;
@@ -36,13 +37,25 @@ impl<T> From<std::sync::PoisonError<T>> for MetalKernelError {
     }
 }
 
-type Pipelines = HashMap<(String, Option<ConstantValues>), ComputePipelineState>;
+type Pipelines = HashMap<(u64, String, Option<ConstantValues>), ComputePipelineState>;
 
-static LIBRARY: OnceLock<Library> = OnceLock::new();
+static LIBRARIES: OnceLock<RwLock<HashMap<u64, Library>>> = OnceLock::new();
+static PIPELINES: OnceLock<Arc<RwLock<Pipelines>>> = OnceLock::new();
+static PIPELINES_CREATED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn pipeline_cache_stats() -> (usize, usize) {
+    (
+        PIPELINES_CREATED.load(Ordering::Relaxed),
+        PIPELINES
+            .get()
+            .and_then(|p| p.read().ok().map(|p| p.len()))
+            .unwrap_or(0),
+    )
+}
 
 #[derive(Debug)]
 pub struct Kernels {
-    pipelines: RwLock<Pipelines>,
+    pipelines: Arc<RwLock<Pipelines>>,
 }
 
 impl Default for Kernels {
@@ -53,14 +66,23 @@ impl Default for Kernels {
 
 impl Kernels {
     pub fn new() -> Self {
-        let pipelines = RwLock::new(Pipelines::new());
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        let disabled = *DISABLED
+            .get_or_init(|| std::env::var_os("VASR_METAL_DISABLE_PIPELINE_CACHE").is_some());
+        let pipelines = if disabled {
+            Arc::new(RwLock::new(Pipelines::new()))
+        } else {
+            Arc::clone(PIPELINES.get_or_init(|| Arc::new(RwLock::new(Pipelines::new()))))
+        };
         Self { pipelines }
     }
 
     /// Load the library from precompiled metallib, falling back to runtime compilation if needed.
     /// If this has been previously loaded it will just fetch it from cache.
     pub fn load_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
-        if let Some(lib) = LIBRARY.get() {
+        let device_id = device.as_ref().registryID();
+        let mut libraries = LIBRARIES.get_or_init(RwLock::default).write()?;
+        if let Some(lib) = libraries.get(&device_id) {
             Ok(lib.clone())
         } else {
             // Try to load precompiled metallib first (faster startup)
@@ -84,7 +106,8 @@ impl Kernels {
                 // Fall back to runtime compilation if precompiled lib is not available.
                 self.compile_kernels_at_runtime(device)?
             };
-            Ok(LIBRARY.get_or_init(|| lib).clone())
+            libraries.insert(device_id, lib.clone());
+            Ok(lib)
         }
     }
 
@@ -292,16 +315,17 @@ impl Kernels {
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipelineState, MetalKernelError> {
         let mut pipelines = self.pipelines.write()?;
-        let key = (name, constants);
+        let key = (device.as_ref().registryID(), name, constants);
         if let Some(pipeline) = pipelines.get(&key) {
             Ok(pipeline.clone())
         } else {
-            let (name, constants) = key;
+            let (device_id, name, constants) = key;
             let func = self.load_function(device, name.clone(), constants.as_ref())?;
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
-            pipelines.insert((name, constants), pipeline.clone());
+            PIPELINES_CREATED.fetch_add(1, Ordering::Relaxed);
+            pipelines.insert((device_id, name, constants), pipeline.clone());
 
             Ok(pipeline)
         }
@@ -868,6 +892,27 @@ pub fn call_gather_kv_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_is_reused_across_kernel_instances() -> anyhow::Result<()> {
+        let candle_device = candle_core::Device::new_metal(0)?;
+        let device = candle_device.as_metal_device()?;
+        let first = Kernels::new().load_pipeline_with_constants(
+            device,
+            "reshape_and_cache_kv_float_cache_float".into(),
+            Some(ConstantValues::new(vec![(50, Value::Bool(false))])),
+        )?;
+        let second = Kernels::new().load_pipeline_with_constants(
+            device,
+            "reshape_and_cache_kv_float_cache_float".into(),
+            Some(ConstantValues::new(vec![(50, Value::Bool(false))])),
+        )?;
+        assert!(
+            std::ptr::eq(first.as_ref(), second.as_ref()),
+            "dispatches must reuse the same pipeline object"
+        );
+        Ok(())
+    }
 
     #[test]
     fn runtime_paged_attention_kernels_compile_without_duplicate_symbols() -> anyhow::Result<()> {

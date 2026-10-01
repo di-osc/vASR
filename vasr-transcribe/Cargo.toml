@@ -18,14 +18,14 @@ clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.18"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 rmp-serde = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tabled = "0.22"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt"] }
-vasr-data = { workspace = true }
+asr-data = { workspace = true }
 vasr = { path = "../vasr" }
 vasr-vad = { path = "../vasr-vad" }
 uuid = "1"

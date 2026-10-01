@@ -12,7 +12,7 @@ The 17.85×–21.99× audio throughput below is the observed range during qualit
 
 - Machine: Apple M4 Pro, 48 GB unified memory; backend Metal; ASR dtype BF16.
 - Model: `Qwen/Qwen3-ASR-0.6B` (`vasr-transcribe serve --model Qwen3-ASR-0.6B`).
-- Dataset: `datasets/call-100.vasr`, 99 records and 5,025.0118 audio seconds. All records declare one 8 kHz channel; evaluation used mono.
+- Dataset: `datasets/call-100`, 99 records and 5,025.0118 audio seconds. All records declare one 8 kHz channel; evaluation used mono.
 - Source base: `f09b07c` with the working-tree changes in this report.
 - The service used its automatically selected capacity; no manual concurrency or batch-capacity override was supplied.
 - Evaluation results are in `/tmp/vasr-cer-locktest.json`, `/tmp/vasr-cer-locktest-2.json`, `/tmp/vasr-cer-final-1.json`, and `/tmp/vasr-cer-final-4.json`. They contain transcript text and remain outside the repository.
@@ -75,5 +75,5 @@ vasr-transcribe serve --model Qwen3-ASR-0.6B
 In another terminal, run the full-dataset quality evaluation:
 
 ```bash
-vasr-transcribe eval -i datasets/call-100.vasr --timeline mono --normalizer bench
+vasr-transcribe eval -i datasets/call-100 --timeline mono --normalizer bench
 ```

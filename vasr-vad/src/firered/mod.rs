@@ -11,7 +11,7 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use rayon::prelude::*;
-use vasr_data::{AudioChunk, TimeRange, Waveform};
+use asr_data::{AudioChunk, TimeRange, Waveform};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};
@@ -1462,7 +1462,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vasr_data::AudioChunk;
+    use asr_data::AudioChunk;
 
     #[cfg(feature = "metal")]
     #[test]

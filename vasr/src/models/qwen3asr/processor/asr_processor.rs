@@ -152,22 +152,33 @@ impl AsrProcessor {
         // zero-padded waveform boundary behavior; feature mode is an opt-in experiment.
         #[cfg(feature = "timing")]
         let start_feature_extract = std::time::Instant::now();
-        let feats = if pad_to_batch_max {
-            match feature_padding_mode_from_env()? {
-                FeaturePaddingMode::Feature => extract_features_with_feature_padding(&wavs)?,
-                FeaturePaddingMode::Waveform => extract_features_with_waveform_padding(&wavs)?,
-                FeaturePaddingMode::WaveformFull => {
-                    extract_features_with_full_waveform_padding(&wavs)?
-                }
-            }
-        } else {
-            let mut feats: Vec<feature_extractor::Features> = wavs
-                .par_iter()
-                .map(|wav| feature_extractor::extract_features(wav))
-                .collect::<Result<Vec<_>>>()?;
-            pad_feature_batch_to_max_frames(feats.as_mut_slice())?;
-            feats
-        };
+        let feats = crate::profiling::measure(
+            "feature_extract",
+            &candle_core::Device::Cpu,
+            || -> anyhow::Result<_> {
+                let feats = if pad_to_batch_max {
+                    match feature_padding_mode_from_env()? {
+                        FeaturePaddingMode::Feature => {
+                            extract_features_with_feature_padding(&wavs)?
+                        }
+                        FeaturePaddingMode::Waveform => {
+                            extract_features_with_waveform_padding(&wavs)?
+                        }
+                        FeaturePaddingMode::WaveformFull => {
+                            extract_features_with_full_waveform_padding(&wavs)?
+                        }
+                    }
+                } else {
+                    let mut feats: Vec<feature_extractor::Features> = wavs
+                        .par_iter()
+                        .map(|wav| feature_extractor::extract_features(wav))
+                        .collect::<Result<Vec<_>>>()?;
+                    pad_feature_batch_to_max_frames(feats.as_mut_slice())?;
+                    feats
+                };
+                Ok(feats)
+            },
+        )?;
         #[cfg(feature = "timing")]
         {
             timings.feature_extract_us = duration_to_us(start_feature_extract.elapsed());

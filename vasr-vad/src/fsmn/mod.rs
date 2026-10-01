@@ -11,7 +11,7 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use rayon::prelude::*;
-use vasr_data::{AudioActivity, AudioChunk, TimeRange, Timeline, Waveform};
+use asr_data::{AudioChunk, Speech, TimeRange, Timeline, Waveform};
 
 use crate::traits::run_with_vad_threads;
 use crate::{StreamingVadSession, VadEvent, VadEventStatus, VadModel, VadOptions, VadSegment};
@@ -275,10 +275,10 @@ impl FsmnVadModel {
         if let Ok(segments) = self.detect(waveform, options) {
             for segment in segments {
                 // 写入预测轨道：参考标注不允许携带 source。
-                let _ = timeline.annotate_span_with(
+                let _ = timeline.annotate_with(
                     segment.range.start_ms,
                     segment.range.end_ms,
-                    AudioActivity::new().with_event("speech"),
+                    Speech::new(),
                     false,
                     Some(FSMN_VAD_SOURCE),
                 );

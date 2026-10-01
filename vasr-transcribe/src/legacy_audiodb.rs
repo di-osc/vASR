@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use vasr_data::{
-    Annotation, Audio, AudioActivity, AudioChannel, AudioEncoding, AudioFormat, AudioInfo,
-    AudioSource, MAX_QUERY_LIMIT, Sentence, Speaker, TimeRange, TimeSpan, Token, Transcription,
+use asr_data::{
+    Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource,
+    MAX_QUERY_LIMIT, Sentence, Speaker, Speech, TimeRange, Token, Transcription,
 };
 
 const APPLICATION_ID: i64 = 0x5641_5352; // "VASR"
@@ -212,16 +212,13 @@ fn audio_info_from_metadata(
     }
 }
 
-fn convert_annotations(annotations: &[LegacyAnnotation]) -> (Vec<TimeSpan>, Vec<TimeSpan>) {
+fn convert_annotations(annotations: &[LegacyAnnotation]) -> (Vec<AudioEvent>, Vec<AudioEvent>) {
     let mut reference = Vec::new();
     let mut prediction = Vec::new();
     for annotation in annotations {
         if annotation.status == LegacyStatus::Deleted {
             continue;
         }
-        let Some(payload) = convert_payload(annotation) else {
-            continue;
-        };
         let is_reference = matches!(annotation.source, LegacySource::User)
             && matches!(
                 annotation.status,
@@ -232,14 +229,18 @@ fn convert_annotations(annotations: &[LegacyAnnotation]) -> (Vec<TimeSpan>, Vec<
         } else {
             Some(prediction_source(&annotation.source))
         };
-        let mut span = TimeSpan::new(annotation.range, payload, source);
-        if !annotation.id.trim().is_empty() {
-            span.id.clone_from(&annotation.id);
-        }
-        if is_reference {
-            reference.push(span);
+        let id = if annotation.id.trim().is_empty() {
+            String::new()
         } else {
-            prediction.push(span);
+            annotation.id.clone()
+        };
+        let Some(event) = convert_payload(annotation, id, source) else {
+            continue;
+        };
+        if is_reference {
+            reference.push(event);
+        } else {
+            prediction.push(event);
         }
     }
     (reference, prediction)
@@ -260,40 +261,135 @@ fn prediction_source(source: &LegacySource) -> String {
     }
 }
 
-fn convert_payload(annotation: &LegacyAnnotation) -> Option<Annotation> {
+/// 把一条旧标注转成新事件模型里的 [`AudioEvent`]。
+///
+/// 旧模型把 token / 句子 / 语种 / 说话人分散在不同 span 里，新模型统一收进
+/// [`Speech`]。这里做尽力而为的映射：token 作为句子挂到转写上，语种挂到语音上，
+/// 说话人挂到语音上。
+fn convert_payload(
+    annotation: &LegacyAnnotation,
+    id: String,
+    source: Option<String>,
+) -> Option<AudioEvent> {
+    let range = annotation.range;
     match &annotation.payload {
-        LegacyPayload::Speech => Some(activity("speech", annotation.confidence)),
-        LegacyPayload::Silence => Some(activity("silence", annotation.confidence)),
-        LegacyPayload::Token(token) => Some(Annotation::Token(token.clone())),
-        LegacyPayload::Transcription(span) => Some(Annotation::Transcription(Transcription {
-            text: span.text.clone(),
-            tokens: span.tokens.clone(),
-            language: span.language.clone(),
+        LegacyPayload::Speech => Some(AudioEvent::Speech(Speech {
+            id,
+            range,
+            source,
             confidence: annotation.confidence,
+            language: None,
+            speaker: None,
+            transcription: None,
         })),
-        LegacyPayload::Sentence(span) => Some(Annotation::Sentence(Sentence {
-            text: span.text.clone(),
-            tokens: span.tokens.clone(),
-            language: span.language.clone(),
-        })),
-        LegacyPayload::Speaker(name) => {
-            let mut speaker = Speaker::new(name.clone());
-            if let Some(confidence) = annotation.confidence {
-                speaker = speaker.with_confidence(confidence);
-            }
-            Some(Annotation::Speaker(speaker))
+        LegacyPayload::Silence => Some(AudioEvent::Base {
+            id,
+            range,
+            source,
+            name: "silence".to_string(),
+            confidence: annotation.confidence,
+        }),
+        LegacyPayload::Token(token) => {
+            let sentence = Sentence {
+                text: token.text.clone(),
+                range: token.range.unwrap_or(range),
+                tokens: vec![token.clone()],
+            };
+            let transcription = Transcription {
+                text: token.text.clone(),
+                sentences: vec![sentence],
+                confidence: token.confidence,
+            };
+            Some(speech_with_transcription(id, range, source, None, transcription))
         }
-        LegacyPayload::Language(tag) => Some(Annotation::Language(tag.clone())),
+        LegacyPayload::Transcription(span) => {
+            let transcription = legacy_transcription(span, range, annotation.confidence);
+            Some(speech_with_transcription(
+                id,
+                range,
+                source,
+                span.language.clone(),
+                transcription,
+            ))
+        }
+        LegacyPayload::Sentence(span) => {
+            let sentence = Sentence {
+                text: span.text.clone(),
+                range,
+                tokens: span.tokens.clone(),
+            };
+            let transcription = Transcription {
+                text: span.text.clone(),
+                sentences: vec![sentence],
+                confidence: None,
+            };
+            Some(speech_with_transcription(
+                id,
+                range,
+                source,
+                span.language.clone(),
+                transcription,
+            ))
+        }
+        LegacyPayload::Speaker(name) => Some(AudioEvent::Speech(Speech {
+            id,
+            range,
+            source,
+            confidence: annotation.confidence,
+            language: None,
+            speaker: Some(Speaker::new(name.clone())),
+            transcription: None,
+        })),
+        LegacyPayload::Language(tag) => Some(AudioEvent::Speech(Speech {
+            id,
+            range,
+            source,
+            confidence: annotation.confidence,
+            language: Some(tag.clone()),
+            speaker: None,
+            transcription: None,
+        })),
         LegacyPayload::Hotword(_)
         | LegacyPayload::AcousticEvent(_)
         | LegacyPayload::Diagnostic(_) => None,
     }
 }
 
-fn activity(event: &str, confidence: Option<f32>) -> Annotation {
-    let mut activity = AudioActivity::new().with_event(event);
-    if let Some(confidence) = confidence {
-        activity = activity.with_confidence(confidence);
+fn legacy_transcription(
+    span: &LegacyTextSpan,
+    range: TimeRange,
+    confidence: Option<f32>,
+) -> Transcription {
+    let sentences = if span.tokens.is_empty() {
+        Vec::new()
+    } else {
+        vec![Sentence {
+            text: span.text.clone(),
+            range,
+            tokens: span.tokens.clone(),
+        }]
+    };
+    Transcription {
+        text: span.text.clone(),
+        sentences,
+        confidence,
     }
-    Annotation::Activity(activity)
+}
+
+fn speech_with_transcription(
+    id: String,
+    range: TimeRange,
+    source: Option<String>,
+    language: Option<String>,
+    transcription: Transcription,
+) -> AudioEvent {
+    AudioEvent::Speech(Speech {
+        id,
+        range,
+        source,
+        confidence: None,
+        language,
+        speaker: None,
+        transcription: Some(transcription),
+    })
 }

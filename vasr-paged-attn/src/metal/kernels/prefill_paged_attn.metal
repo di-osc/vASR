@@ -1062,9 +1062,11 @@ template<typename T, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_
 
     const int qh_base_idx = threadgroup_position_in_grid.x;
     const int kv_head_idx = threadgroup_position_in_grid.y;
-    const int token_chunk_idx = threadgroup_position_in_grid.z;
-
-    const int chunk_start = token_chunk_idx * TOKEN_CHUNK_SIZE;
+    // Shared KV tiles must never span request boundaries.
+    const int group_seq = threadgroup_position_in_grid.z % num_seqs;
+    const int token_chunk_idx = threadgroup_position_in_grid.z / num_seqs;
+    const int chunk_start = (int)query_start_len[group_seq] + token_chunk_idx * TOKEN_CHUNK_SIZE;
+    if (chunk_start >= (int)query_start_len[group_seq + 1]) return;
     const int token_start = chunk_start + lane;
 
     constexpr int NUM_BLOCK_VECS = BLOCK_SIZE / VEC_SIZE;
@@ -1146,7 +1148,9 @@ template<typename T, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_
 
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
-    const bool lane_active = token_start < num_query_tokens;
+    const bool lane_active = token_start < (int)query_start_len[seq_idx + 1];
+    const int token_idx_in_seq = token_start - (int)query_start_len[seq_idx]
+        + (int)seq_len_full - ((int)query_start_len[seq_idx + 1] - (int)query_start_len[seq_idx]);
 
     // Load Q
     const int64_t q_off = (int64_t)token_start * q_stride_tokens + (int64_t)query_head_idx * q_stride_heads;
@@ -1193,7 +1197,7 @@ template<typename T, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_
             for (int b = 0; b < BLOCK_SIZE; ++b) {
                 const int token_idx_in_full = block_in_full + b;
 
-                bool in_context = (token_idx_in_full < (int)seq_len_full);
+                bool in_context = (token_idx_in_full < (int)seq_len_full) && (token_idx_in_full <= token_idx_in_seq);
                 bool in_window = (token_idx_in_full >= start_token_idx);
                 in_contexts[b] = in_context && in_window;
 
@@ -1333,8 +1337,11 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     const int lane = tid;
     const int qh_base_idx = threadgroup_position_in_grid.x;
     const int kv_head_idx = threadgroup_position_in_grid.y;
-    const int token_chunk_idx = threadgroup_position_in_grid.z;
-    const int chunk_start = token_chunk_idx * TOKEN_CHUNK_SIZE;
+    // Shared KV tiles must never span request boundaries.
+    const int group_seq = threadgroup_position_in_grid.z % num_seqs;
+    const int token_chunk_idx = threadgroup_position_in_grid.z / num_seqs;
+    const int chunk_start = (int)query_start_len[group_seq] + token_chunk_idx * TOKEN_CHUNK_SIZE;
+    if (chunk_start >= (int)query_start_len[group_seq + 1]) return;
     const int token_start = chunk_start + lane;
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
 
@@ -1390,7 +1397,7 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
-    const bool lane_active = token_start < num_query_tokens;
+    const bool lane_active = token_start < (int)query_start_len[seq_idx + 1];
     const int token_idx_in_seq = token_start - seq_start;
 
     const int64_t q_off = (int64_t)token_start * q_stride_tokens + (int64_t)query_head_idx * q_stride_heads;
@@ -1442,8 +1449,10 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
                 #pragma unroll
                 for (int k_vec_idx = 0; k_vec_idx < NUM_VECS; ++k_vec_idx) {
                     int d = k_vec_idx * VEC_SIZE;
-                    k_vec_local[k_vec_idx] =
-                        *reinterpret_cast<threadgroup const K_vec*>(kv_smem + d * BLOCK_SIZE + b);
+                    #pragma unroll
+                    for (int j = 0; j < VEC_SIZE; ++j) {
+                        reinterpret_cast<thread T*>(&k_vec_local[k_vec_idx])[j] = kv_smem[(d + j) * BLOCK_SIZE + b];
+                    }
                 }
                 float qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
                 if (softcapping != 1.0f) {

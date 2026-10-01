@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use vasr::audio::AudioBytesStream;
 use vasr::{OfflineAsrModel, StreamEvent};
-use vasr_data::{Annotation, TimeRange, Waveform};
+use asr_data::{AudioEvent, TimeRange, Waveform};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -640,7 +640,7 @@ impl RealtimeSession {
 
     fn process_chunks(
         &mut self,
-        chunks: &[vasr_data::AudioChunk],
+        chunks: &[asr_data::AudioChunk],
         finalize_on_vad: bool,
         request_event_id: Option<&str>,
     ) -> Vec<ServerRealtimeEvent> {
@@ -673,7 +673,10 @@ impl RealtimeSession {
             };
             let speech_stopped = annotations.iter().any(|event| {
                 event.is_final
-                    && matches!(&event.annotation, Annotation::Activity(activity) if activity.event.as_deref() == Some("speech"))
+                    && matches!(
+                        &event.event,
+                        AudioEvent::Speech(speech) if speech.transcription.is_none()
+                    )
             });
             events.extend(events_from_stream_events(
                 annotations,
@@ -756,15 +759,18 @@ impl RealtimeSession {
         Ok(timelines
             .into_iter()
             .flat_map(|timeline| timeline.prediction)
-            .filter_map(|span| match span.annotation {
-                Annotation::Transcription(transcription) => Some(StreamEvent::transcription(
-                    span.range,
-                    transcription.text,
-                    transcription.language,
-                    span.source.as_deref().unwrap_or("offline_asr"),
+            .filter_map(|event| {
+                let transcription = event.transcription()?;
+                let range = event.range();
+                let language = event.language().map(str::to_owned);
+                let source = event.source().unwrap_or("offline_asr").to_string();
+                Some(StreamEvent::transcription(
+                    range,
+                    transcription.text.clone(),
+                    language,
+                    &source,
                     true,
-                )),
-                _ => None,
+                ))
             })
             .collect())
     }
@@ -912,75 +918,70 @@ fn events_from_stream_events(
 ) -> Vec<ServerRealtimeEvent> {
     events
         .into_iter()
-        .filter_map(|event| match event.annotation {
-            Annotation::Activity(activity)
-                if !event.is_final && activity.event.as_deref() == Some("speech") =>
-            {
+        .filter_map(|event| match event.event {
+            // VAD 只发语音活动，没有转写。
+            AudioEvent::Speech(speech) if speech.transcription.is_none() => {
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
-                Some(ServerRealtimeEvent::SpeechStarted {
-                    event_id: event_id(),
-                    item_id,
-                    audio_start_ms: event.range.start_ms as u64,
-                })
+                if event.is_final {
+                    Some(ServerRealtimeEvent::SpeechStopped {
+                        event_id: event_id(),
+                        item_id,
+                        audio_end_ms: event.range.end_ms as u64,
+                    })
+                } else {
+                    Some(ServerRealtimeEvent::SpeechStarted {
+                        event_id: event_id(),
+                        item_id,
+                        audio_start_ms: event.range.start_ms as u64,
+                    })
+                }
             }
-            Annotation::Activity(activity)
-                if event.is_final && activity.event.as_deref() == Some("speech") =>
-            {
+            // 带转写的语音就是 ASR 结果。
+            AudioEvent::Speech(speech) => {
+                let transcription = speech.transcription?;
+                let language = speech.language;
                 let item_id = current_item_id
                     .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
                     .clone();
-                Some(ServerRealtimeEvent::SpeechStopped {
-                    event_id: event_id(),
-                    item_id,
-                    audio_end_ms: event.range.end_ms as u64,
-                })
-            }
-            Annotation::Transcription(segment) if !event.is_final => {
-                let item_id = current_item_id
-                    .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
-                    .clone();
-                let delta = segment
-                    .text
-                    .strip_prefix(last_transcript.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                *last_transcript = segment.text.clone();
                 let (start_ms, end_ms) = transcription_range(event.range);
-                Some(ServerRealtimeEvent::TranscriptionText {
-                    event_id: event_id(),
-                    item_id,
-                    delta,
-                    text: segment.text,
-                    start_ms,
-                    end_ms,
-                    language: segment.language,
-                    emotion: "UNKNOWN".to_string(),
-                    speech_type: None,
-                    itn: None,
-                })
+                if event.is_final {
+                    *current_item_id = None;
+                    last_transcript.clear();
+                    Some(ServerRealtimeEvent::TranscriptionCompleted {
+                        event_id: event_id(),
+                        item_id,
+                        text: transcription.text,
+                        start_ms,
+                        end_ms,
+                        language,
+                        emotion: "UNKNOWN".to_string(),
+                        speech_type: None,
+                        itn: None,
+                    })
+                } else {
+                    let delta = transcription
+                        .text
+                        .strip_prefix(last_transcript.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    *last_transcript = transcription.text.clone();
+                    Some(ServerRealtimeEvent::TranscriptionText {
+                        event_id: event_id(),
+                        item_id,
+                        delta,
+                        text: transcription.text,
+                        start_ms,
+                        end_ms,
+                        language,
+                        emotion: "UNKNOWN".to_string(),
+                        speech_type: None,
+                        itn: None,
+                    })
+                }
             }
-            Annotation::Transcription(segment) if event.is_final => {
-                let item_id = current_item_id
-                    .get_or_insert_with(|| format!("item_{}", uuid::Uuid::new_v4().simple()))
-                    .clone();
-                *current_item_id = None;
-                last_transcript.clear();
-                let (start_ms, end_ms) = transcription_range(event.range);
-                Some(ServerRealtimeEvent::TranscriptionCompleted {
-                    event_id: event_id(),
-                    item_id,
-                    text: segment.text,
-                    start_ms,
-                    end_ms,
-                    language: segment.language,
-                    emotion: "UNKNOWN".to_string(),
-                    speech_type: None,
-                    itn: None,
-                })
-            }
-            _ => None,
+            AudioEvent::Base { .. } => None,
         })
         .collect()
 }
@@ -1021,7 +1022,7 @@ mod tests {
     use crate::runtime::{StreamingAsrSession, StreamingVadSession};
     use std::sync::Mutex;
     use vasr::{StreamEvent, transcription_span};
-    use vasr_data::{AudioChunk, Timeline, Waveform};
+    use asr_data::{AudioChunk, Timeline, Waveform};
 
     struct TestVadSession;
 

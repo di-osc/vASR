@@ -191,6 +191,8 @@ pub struct QLinear {
     #[cfg(feature = "cuda")]
     module_kind: IsqModuleKind,
     module_path: Arc<str>,
+    #[cfg(feature = "metal")]
+    metal_quant_batch_mm: bool,
 }
 
 impl std::fmt::Debug for LinearX {
@@ -288,6 +290,10 @@ impl LinearX {
             #[cfg(feature = "cuda")]
             module_kind,
             module_path: Arc::from(module_path),
+            #[cfg(feature = "metal")]
+            metal_quant_batch_mm: metal_quant_batch_mm_flag(
+                std::env::var("VASR_METAL_QUANT_BATCH_MM").ok().as_deref(),
+            ),
         }))
     }
 
@@ -329,6 +335,33 @@ impl LinearX {
 impl candle_core::Module for LinearX {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         LinearX::forward(self, x)
+    }
+}
+
+#[cfg(feature = "metal")]
+fn metal_quant_batch_mm_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(feature = "metal")]
+fn metal_quant_batch_mm_shape(
+    enabled: bool,
+    is_metal: bool,
+    is_quantized: bool,
+    is_prefill: bool,
+    dims: &[usize],
+) -> Option<(usize, usize)> {
+    if !enabled || !is_metal || !is_quantized || is_prefill {
+        return None;
+    }
+    match dims {
+        &[batch, 1, hidden] if batch > 1 && hidden > 0 => Some((batch, hidden)),
+        _ => None,
     }
 }
 
@@ -386,6 +419,28 @@ impl QLinear {
         } else {
             x.to_dtype(DType::F32)?
         };
+        // Candle treats [batch, 1, hidden] as separate matrix-vector dispatches.
+        // Opt in at layer construction to a single quantized matrix-matrix call.
+        #[cfg(feature = "metal")]
+        let batch_mm_shape = metal_quant_batch_mm_shape(
+            self.metal_quant_batch_mm,
+            xs.device().is_metal(),
+            matches!(self.matmul.as_ref(), QMatMul::QTensor(weight) if weight.device().is_metal()),
+            linear_is_prefill(),
+            xs.dims(),
+        );
+        #[cfg(feature = "metal")]
+        let mut ys = if let Some((batch, hidden)) = batch_mm_shape {
+            let output = self
+                .matmul
+                .as_ref()
+                .forward(&xs.reshape((batch, hidden))?)?;
+            let (_, out_dim) = output.dims2()?;
+            output.reshape((batch, 1, out_dim))?
+        } else {
+            self.matmul.as_ref().forward(&xs)?
+        };
+        #[cfg(not(feature = "metal"))]
         let mut ys = self.matmul.as_ref().forward(&xs)?;
         if let Some(bias) = &self.bias {
             ys = ys.broadcast_add(&bias.to_dtype(DType::F32)?.to_device(x.device())?)?;
@@ -847,6 +902,150 @@ mod tests {
         module_path_matches_not_convert, parse_isq_dtype, resolve_isq_dtype, set_linear_is_prefill,
     };
     use candle_core::quantized::GgmlDType;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_quant_batch_mm_only_accepts_opted_in_quantized_decode() {
+        use super::metal_quant_batch_mm_shape;
+        for batch in [1, 2, 8, 16, 32] {
+            let expected = (batch > 1).then_some((batch, 1024));
+            assert_eq!(
+                metal_quant_batch_mm_shape(true, true, true, false, &[batch, 1, 1024]),
+                expected
+            );
+        }
+        for dims in [
+            &[32, 1024][..],
+            &[32, 2, 1024],
+            &[0, 1, 1024],
+            &[32, 1, 0],
+            &[2, 16, 1, 1024],
+        ] {
+            assert_eq!(
+                metal_quant_batch_mm_shape(true, true, true, false, dims),
+                None
+            );
+        }
+        for (enabled, metal, quantized, prefill) in [
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                metal_quant_batch_mm_shape(enabled, metal, quantized, prefill, &[32, 1, 1024]),
+                None
+            );
+        }
+        assert!(!super::metal_quant_batch_mm_flag(None));
+        for value in ["", "0", "false", "no", "garbage"] {
+            assert!(!super::metal_quant_batch_mm_flag(Some(value)));
+        }
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(super::metal_quant_batch_mm_flag(Some(value)));
+        }
+    }
+
+    // Explicit GPU test: run only after concurrent throughput measurements finish.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires Metal GPU; compares quantized batch MM with row MV"]
+    fn metal_quant_batch_mm_matches_row_mv_qwen06b_dimensions() -> anyhow::Result<()> {
+        use candle_core::quantized::{QMatMul, QTensor};
+        use candle_core::{DType, Device, Tensor};
+        use std::sync::Arc;
+        let device = Device::new_metal(0)?;
+        // Local Qwen3-ASR-0.6B config: hidden=1024, q=16*128, kv=8*128, intermediate=3072.
+        // Shapes are (out, in): q, k/v, o, gate/up, down, and quantized tied lm_head.
+        for (out_dim, in_dim) in [
+            (2048, 1024),
+            (1024, 1024),
+            (1024, 2048),
+            (3072, 1024),
+            (1024, 3072),
+            (151936, 1024),
+        ] {
+            let weights: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| (((i * 17 + i / in_dim * 13) % 127) as f32 - 63.0) / 1024.0)
+                .collect();
+            let weight = Tensor::from_vec(weights, (out_dim, in_dim), &Device::Cpu)?;
+            for quant in [GgmlDType::Q8_0, GgmlDType::Q6K, GgmlDType::Q5_0, GgmlDType::Q4_0] {
+                let matmul = Arc::new(QMatMul::from_qtensor(QTensor::quantize_onto(
+                    &weight, quant, &device,
+                )?)?);
+                anyhow::ensure!(
+                    matches!(matmul.as_ref(), QMatMul::QTensor(_)),
+                    "dense dequantization env overrides must be disabled for this regression"
+                );
+                for dtype in [DType::F32, DType::BF16] {
+                    for has_bias in [false, true] {
+                        let bias = if has_bias {
+                            Some(
+                                Tensor::from_vec(
+                                    (0..out_dim)
+                                        .map(|i| (i % 11) as f32 / 128.0)
+                                        .collect::<Vec<_>>(),
+                                    out_dim,
+                                    &device,
+                                )?
+                                .to_dtype(dtype)?,
+                            )
+                        } else {
+                            None
+                        };
+                        let legacy = super::QLinear {
+                            matmul: matmul.clone(),
+                            bias,
+                            output_dtype: dtype,
+                            dtype: quant,
+                            #[cfg(feature = "cuda")]
+                            module_kind: super::IsqModuleKind::Text,
+                            module_path: Arc::from("test.qwen06b"),
+                            metal_quant_batch_mm: false,
+                        };
+                        let mut candidate = legacy.clone();
+                        candidate.metal_quant_batch_mm = true;
+                        let _decode_guard = set_linear_is_prefill(false);
+                        for batch in [1, 2, 8, 16, 32] {
+                            let input = Tensor::from_vec(
+                                (0..batch * in_dim)
+                                    .map(|i| {
+                                        (((i * 7 + i / in_dim * 5) % 97) as f32 - 48.0) / 256.0
+                                    })
+                                    .collect::<Vec<_>>(),
+                                (batch, 1, in_dim),
+                                &device,
+                            )?
+                            .to_dtype(dtype)?;
+                            let expected = legacy.forward(&input)?;
+                            let actual = candidate.forward(&input)?;
+                            assert_eq!(actual.dims(), &[batch, 1, out_dim]);
+                            assert_eq!(actual.dtype(), dtype);
+                            let expected = expected
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()?;
+                            let actual = actual
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()?;
+                            for (index, (actual, expected)) in
+                                actual.iter().zip(&expected).enumerate()
+                            {
+                                // Quantized MM uses a different reduction order/internal precision.
+                                let tolerance = 0.01 + 0.01 * expected.abs();
+                                assert!(
+                                    actual.is_finite() && (actual - expected).abs() <= tolerance,
+                                    "quant={quant:?} dtype={dtype:?} bias={has_bias} shape=({batch},1,{in_dim})->{out_dim} index={index} actual={actual} expected={expected}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_parse_isq_dtype_aliases() -> anyhow::Result<()> {

@@ -1,6 +1,12 @@
 # vASR
 
-vASR 是用 Rust 和 Candle 实现的 Qwen3-ASR 推理框架。离线转写和实时识别共用同一套模型运行时：音频按时间线组织，请求进入全局流水线后连续批处理，而不是每个请求单独占住 GPU。
+基于 Rust 与 Candle 的通用语音识别推理框架，支持离线音频转写与实时语音识别。
+
+## 简介
+
+vASR 面向本地部署和语音识别服务，提供通用的推理运行时与服务基础设施，将模型推理、语音活动检测（VAD）、音频分段、请求调度与结果评测整合在一个 Rust 工作空间中。当前已实现 Qwen3-ASR 模型支持。框架支持 Apple Silicon（Metal）、NVIDIA GPU（CUDA）和 CPU，并提供离线 HTTP 转写服务与 WebSocket 实时识别服务，可用于录音转写、批量音频处理和实时语音应用。
+
+离线转写与实时识别共用同一套模型运行时。请求进入全局流水线后，通过连续批处理、分段编码和 PagedAttention 提高计算资源利用率；音频、标注与识别结果统一按时间线组织，配套工具支持数据集管理、吞吐测试和识别质量评测。
 
 ## 特点
 
@@ -14,6 +20,7 @@ vASR 是用 Rust 和 Candle 实现的 Qwen3-ASR 推理框架。离线转写和�
 - **VAD。** 离线默认使用 FunASR FSMN，把长音频切成语音段；无语音输入直接返回空结果。实时使用 FireRed Stream-VAD。
 - **量化与精度。** CPU 使用 f32，Metal 和 CUDA 使用 bf16。支持就地量化，例如 `q8_0`。
 - **时间线数据。** 音频、标注和识别结果落在 `Timeline` 上，数据集用 SQLite AudioDb 保存，评测直接对标注算字错误率。
+- **音频与元信息分离。** 数据集是一个目录：SQLite 库只存元信息和标注，音频以独立文件放在同级的 `assets/`，库里记相对路径，整个目录可以随意搬迁。
 - **重复输入合并。** 同一请求里相同的音频只推理一次，结果按原始顺序展开。
 
 ## 离线 HTTP 服务
@@ -32,9 +39,22 @@ serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mi
 
 服务也会在启动时读取当前工作目录下的 `.env`。仓库提供了 [`.env.example`](.env.example)；复制为 `.env` 后可在其中设置部署参数。优先级为 CLI 参数、已有进程环境变量、`.env`，最后是自动值。所有子命令都会加载 `.env`，文件不存在时会忽略。
 
+## 数据集
+
+数据集现在是单个 SQLite 文件 `datasets/<name>.db`。音频不再拆到 `assets/`，而是以 ModelScope 数据集引用（`repo_id` + 仓库内相对路径 + `revision`）存进库里，读取时由 modelhub 下载或命中缓存：
+
+```text
+datasets/
+├── call-100.db
+├── call-200.db
+└── example1.db
+```
+
+`perf`、`eval`、`stress`、`run` 的 `-i` 接受 `.db` / `.vasr` / `.vasr.msgpack` 数据文件。旧的“拆成数据集目录”的 `pack` 子命令已经移除。
+
 ## 推理速度
 
-测量环境：Apple M4 Pro（48 GB 统一内存，Metal，bf16）。模型 `Qwen3-ASR-0.6B`，数据集 `datasets/call-100.vasr`（99 条，合计 5025 音频秒，单条 3.6–705 秒）。并发 14 / batch 1。
+测量环境：Apple M4 Pro（48 GB 统一内存，Metal，bf16）。模型 `Qwen3-ASR-0.6B`，数据集 `datasets/call-100.db`（99 条，合计 5025 音频秒，单条 3.6–705 秒）。并发 14 / batch 1。
 
 | 指标 | 默认配置 | 基线（1 活跃槽 / 1 decode 行） |
 | --- | ---: | ---: |
@@ -44,7 +64,7 @@ serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mi
 | 延迟 p50 | 14.7 s | 30.3 s |
 | 延迟 p99 | 38.3 s | 62.4 s |
 
-即每秒可转写约 44 秒音频，比基线快 **2.01×**。`eval` 口径（含评测开销）为 45.4×。单条短音频（`example1.vasr`，4.2 秒）耗时 0.153 秒，约 27.6×——短音频受固定开销影响，倍速低于长音频批量。
+即每秒可转写约 44 秒音频，比基线快 **2.01×**。`eval` 口径（含评测开销）为 45.4×。单条短音频（`datasets/example1.db`，4.2 秒）耗时 0.153 秒，约 27.6×——短音频受固定开销影响，倍速低于长音频批量。
 
 吞吐随并发上升并很快饱和，服务内部流水线在单个客户端下也能跑满：
 
@@ -61,8 +81,8 @@ serve 执行策略 | device=metal capacity=512 active_slots=32 decode_rows=32 mi
 服务起来后（见上一节），另开终端：
 
 ```bash
-vasr-transcribe perf -i datasets/call-100.vasr --concurrency 14 --batch-size 1
-vasr-transcribe eval -i datasets/call-100.vasr --timeline mono --normalizer bench
+vasr-transcribe perf -i datasets/call-100.db --concurrency 14 --batch-size 1
+vasr-transcribe eval -i datasets/call-100.db --timeline mono --normalizer bench
 ```
 
 ### 与基线的质量对照
@@ -70,6 +90,6 @@ vasr-transcribe eval -i datasets/call-100.vasr --timeline mono --normalizer benc
 | 指标 | 基线 | 默认配置 |
 | --- | ---: | ---: |
 | 加权 CER | 0.167497 | 0.167858 |
-| `example1.vasr` CER | 0.000000 | 0.000000 |
+| `datasets/example1.db` CER | 0.000000 | 0.000000 |
 
 默认配置的加权 CER 比基线高 0.000361（+0.22% 相对）。经隔离实验确认，该偏移只由 decode 行批处理触发（把 decode 行降到 1 时逐项错误数与基线完全相同），encoder 多段与 prefill wave 均已排除，且它是吞吐收益的唯一来源。完整数据、容量扫描与根因分析见 [docs/performance/m4-pro-qwen3-asr-2026-09-30.md](docs/performance/m4-pro-qwen3-asr-2026-09-30.md)。

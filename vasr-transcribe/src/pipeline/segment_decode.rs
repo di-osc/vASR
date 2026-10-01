@@ -20,7 +20,7 @@ use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{Qwen3ASR, StreamingMetadataDecoder, qwen_outputs_to_timelines};
-use vasr_data::{TimeSpan, Timeline, Waveform};
+use asr_data::{AudioEvent, Timeline, Waveform};
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]
@@ -31,8 +31,8 @@ pub(super) struct SegmentJobState {
     timing: TranscribeItemTiming,
     spans: TranscribeItemSpans,
     audio_seconds: f64,
-    speech_annotations: Vec<TimeSpan>,
-    segment_annotations: Vec<Option<Vec<TimeSpan>>>,
+    speech_annotations: Vec<AudioEvent>,
+    segment_annotations: Vec<Option<Vec<AudioEvent>>>,
     segment_count: usize,
     segments_done: usize,
     failure_reason: Option<String>,
@@ -137,17 +137,13 @@ fn run_global_segment_decode_worker(
     let runtime_options = vasr::models::qwen3asr::qwen_transcribe_options(&asr_options);
     let (prefill_tx, prefill_rx) = std_mpsc::channel();
     let (meta_tx, meta_rx) = std_mpsc::channel();
-    let mut stream_decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
-    let mut stream_segments = Vec::new();
-    let mut stream_waveforms = Vec::new();
-    let mut stream_batch_lens = Vec::new();
-    let mut stream_stage_starts = Vec::new();
-    let mut stream_chunk_base = 0usize;
+    let mut stream_batches = StreamBatchRegistry::default();
     let pending_chunks = RefCell::new(BTreeMap::new());
 
     let forward_thread = std::thread::spawn(move || {
         let mut next_global_chunk = 0usize;
-        let mut producer_chunk_ranges: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        let mut producer_chunk_ranges: HashMap<usize, Vec<(usize, usize, usize, usize)>> =
+            HashMap::new();
         let mut producer_chunk_counts: HashMap<usize, usize> = HashMap::new();
         while let Some(message) = decoder_rx.blocking_recv() {
             match message {
@@ -156,7 +152,7 @@ fn run_global_segment_decode_worker(
                     result,
                 } => {
                     let result = result.and_then(|mut output| {
-                        let ranges = producer_chunk_ranges.get(&producer_id);
+                        let ranges = producer_chunk_ranges.get_mut(&producer_id);
                         if !output.sequences.is_empty() && ranges.is_none() {
                             return Err(anyhow::anyhow!(
                                 "dynamic staged ASR prefill has no chunk metadata for producer={producer_id} sequences={}",
@@ -166,19 +162,23 @@ fn run_global_segment_decode_worker(
                         if let Some(ranges) = ranges {
                             for seq in &mut output.sequences {
                                 let local = seq.client_index;
-                                let Some((local_start, global_start, _len)) =
-                                    ranges.iter().find(|(local_start, _, len)| {
+                                let Some((local_start, global_start, _len, remaining)) =
+                                    ranges.iter_mut().find(|(local_start, _, len, _)| {
                                         local >= *local_start
                                             && local < local_start.saturating_add(*len)
                                     })
                                 else {
                                     return Err(anyhow::anyhow!(
-                                        "dynamic staged ASR producer chunk index out of range: producer={producer_id} local_chunk={local} ranges={ranges:?}"
+                                        "dynamic staged ASR producer chunk index out of range: producer={producer_id} local_chunk={local}"
                                     ));
                                 };
                                 seq.client_index =
-                                    global_start.saturating_add(local - local_start);
+                                    global_start.saturating_add(local - *local_start);
+                                *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                                    anyhow::anyhow!("prefill metadata range emitted too many sequences")
+                                })?;
                             }
+                            ranges.retain(|(_, _, _, remaining)| *remaining > 0);
                         }
                         output.total_rows = next_global_chunk;
                         Ok(output)
@@ -191,12 +191,17 @@ fn run_global_segment_decode_worker(
                     producer_id,
                     result,
                 } => {
+                    // Producers are created serially; seeing a newer producer
+                    // means all messages from older producers have been sent.
+                    producer_chunk_ranges.retain(|&id, _| id >= producer_id);
+                    producer_chunk_counts.retain(|&id, _| id >= producer_id);
                     if let Ok(SegmentPreparedEvent::Prepared(prepared)) = &result {
                         let chunk_count = prepared.meta.chunk_len();
                         let local_start = producer_chunk_counts.entry(producer_id).or_default();
                         producer_chunk_ranges.entry(producer_id).or_default().push((
                             *local_start,
                             next_global_chunk,
+                            chunk_count,
                             chunk_count,
                         ));
                         *local_start = local_start.saturating_add(chunk_count);
@@ -231,12 +236,8 @@ fn run_global_segment_decode_worker(
     let mut on_tick = || -> Result<()> {
         drain_global_decoder_meta(
             &meta_rx,
-            &mut stream_decoder,
+            &mut stream_batches,
             segment_state,
-            &mut stream_segments,
-            &mut stream_waveforms,
-            &mut stream_batch_lens,
-            &mut stream_stage_starts,
             &asr_to_result_tx,
             &stats,
         )?;
@@ -245,13 +246,8 @@ fn run_global_segment_decode_worker(
             drain_completed_chunks(
                 qwen3,
                 &mut pending_chunks,
-                &mut stream_decoder,
+                &mut stream_batches,
                 segment_state,
-                stream_segments.as_mut_slice(),
-                stream_waveforms.as_mut_slice(),
-                stream_batch_lens.as_slice(),
-                stream_stage_starts.as_slice(),
-                stream_chunk_base,
             )?
         };
         // 每个条目独立完成、返回和回收；不再等到全局 decode 空闲再统一返回，
@@ -261,16 +257,7 @@ fn run_global_segment_decode_worker(
                 bail!("ASR result router closed");
             }
         }
-        reset_stream_decode_state_if_idle(
-            &pending_chunks.borrow(),
-            &mut stream_decoder,
-            segment_state,
-            &mut stream_segments,
-            &mut stream_waveforms,
-            &mut stream_batch_lens,
-            &mut stream_stage_starts,
-            &mut stream_chunk_base,
-        );
+        stream_batches.retire_completed(|batch| batch.decoder.all_chunks_completed());
         Ok(())
     };
 
@@ -293,25 +280,16 @@ fn run_global_segment_decode_worker(
     let _ = forward_thread.join();
     drain_global_decoder_meta(
         &meta_rx,
-        &mut stream_decoder,
+        &mut stream_batches,
         segment_state,
-        &mut stream_segments,
-        &mut stream_waveforms,
-        &mut stream_batch_lens,
-        &mut stream_stage_starts,
         &asr_to_result_tx,
         &stats,
     )?;
     let completed = drain_completed_chunks(
         qwen3,
         &mut pending_chunks.borrow_mut(),
-        &mut stream_decoder,
+        &mut stream_batches,
         segment_state,
-        stream_segments.as_mut_slice(),
-        stream_waveforms.as_mut_slice(),
-        stream_batch_lens.as_slice(),
-        stream_stage_starts.as_slice(),
-        stream_chunk_base,
     )?;
     // 解码结束时同样逐条返回，保持与 tick 路径一致的生命周期。
     for outcome in completed {
@@ -319,16 +297,7 @@ fn run_global_segment_decode_worker(
             bail!("ASR result router closed");
         }
     }
-    reset_stream_decode_state_if_idle(
-        &pending_chunks.borrow(),
-        &mut stream_decoder,
-        segment_state,
-        &mut stream_segments,
-        &mut stream_waveforms,
-        &mut stream_batch_lens,
-        &mut stream_stage_starts,
-        &mut stream_chunk_base,
-    );
+    stream_batches.retire_completed(|batch| batch.decoder.all_chunks_completed());
 
     if !pending_chunks.borrow().is_empty() {
         bail!(
@@ -340,15 +309,68 @@ fn run_global_segment_decode_worker(
 }
 
 #[cfg(feature = "paged-attn")]
-#[allow(clippy::too_many_arguments)]
+struct StreamDecodeBatch {
+    decoder: StreamingMetadataDecoder,
+    segments: Vec<AsrSegmentJob>,
+    waveforms: Vec<Waveform>,
+    batch_lens: Vec<usize>,
+    stage_starts: Vec<Instant>,
+}
+
+/// Global IDs never change, while completed batches can be dropped independently.
+#[cfg(feature = "paged-attn")]
+struct StreamBatchRegistry<T> {
+    batches: BTreeMap<usize, (usize, T)>,
+    next_chunk: usize,
+}
+
+#[cfg(feature = "paged-attn")]
+impl<T> Default for StreamBatchRegistry<T> {
+    fn default() -> Self {
+        Self {
+            batches: BTreeMap::new(),
+            next_chunk: 0,
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+impl<T> StreamBatchRegistry<T> {
+    fn push(&mut self, chunks: usize, batch: T) -> Result<()> {
+        if chunks == 0 {
+            bail!("streaming metadata batch contains no chunks");
+        }
+        let end = self
+            .next_chunk
+            .checked_add(chunks)
+            .ok_or_else(|| anyhow::anyhow!("streaming global chunk index overflow"))?;
+        self.batches.insert(self.next_chunk, (end, batch));
+        self.next_chunk = end;
+        Ok(())
+    }
+
+    fn get_mut(&mut self, global_chunk: usize) -> Result<(&mut T, usize)> {
+        if let Some((&start, (end, batch))) = self.batches.range_mut(..=global_chunk).next_back()
+            && global_chunk < *end
+        {
+            return Ok((batch, global_chunk - start));
+        }
+        bail!(
+            "streaming completion has no active metadata: chunk={global_chunk} next={}",
+            self.next_chunk
+        )
+    }
+
+    fn retire_completed(&mut self, complete: impl Fn(&T) -> bool) {
+        self.batches.retain(|_, (_, batch)| !complete(batch));
+    }
+}
+
+#[cfg(feature = "paged-attn")]
 fn handle_global_decoder_message(
     message: SegmentPrefillMessage,
-    decoder: &mut StreamingMetadataDecoder,
+    batches: &mut StreamBatchRegistry<StreamDecodeBatch>,
     state: &mut SegmentAsrState,
-    segments: &mut Vec<AsrSegmentJob>,
-    waveforms: &mut Vec<Waveform>,
-    batch_lens: &mut Vec<usize>,
-    stage_starts: &mut Vec<Instant>,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
 ) -> Result<()> {
@@ -358,14 +380,20 @@ fn handle_global_decoder_message(
             result: Ok(SegmentPreparedEvent::Prepared(prepared)),
             ..
         } => {
+            let chunk_count = prepared.meta.chunk_len();
             let segment_count = prepared.segments.len();
-            decoder.push_metadata(prepared.meta, prepared.waveforms.len());
+            let audio_count = prepared.waveforms.len();
             prepare_segment_job_state(state, prepared.segments.as_slice());
-            batch_lens.push(prepared.waveforms.len());
-            waveforms.extend(prepared.waveforms);
-            segments.extend(prepared.segments);
-            stage_starts.extend(std::iter::repeat_n(prepared.stage_start, segment_count));
-            Ok(())
+            batches.push(
+                chunk_count,
+                StreamDecodeBatch {
+                    decoder: StreamingMetadataDecoder::new(vec![prepared.meta], vec![audio_count]),
+                    segments: prepared.segments,
+                    waveforms: prepared.waveforms,
+                    batch_lens: vec![audio_count],
+                    stage_starts: vec![prepared.stage_start; segment_count],
+                },
+            )
         }
         SegmentPrefillMessage::Prepared {
             result: Err(failure),
@@ -391,108 +419,53 @@ fn handle_global_decoder_message(
 }
 
 #[cfg(feature = "paged-attn")]
-#[allow(clippy::too_many_arguments)]
 fn drain_global_decoder_meta(
     meta_rx: &std_mpsc::Receiver<SegmentPrefillMessage>,
-    decoder: &mut StreamingMetadataDecoder,
+    batches: &mut StreamBatchRegistry<StreamDecodeBatch>,
     state: &mut SegmentAsrState,
-    segments: &mut Vec<AsrSegmentJob>,
-    waveforms: &mut Vec<Waveform>,
-    batch_lens: &mut Vec<usize>,
-    stage_starts: &mut Vec<Instant>,
     asr_to_result_tx: &mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: &Arc<Mutex<AsrStageStats>>,
 ) -> Result<()> {
     for message in meta_rx.try_iter() {
-        handle_global_decoder_message(
-            message,
-            decoder,
-            state,
-            segments,
-            waveforms,
-            batch_lens,
-            stage_starts,
-            asr_to_result_tx,
-            stats,
-        )?;
+        handle_global_decoder_message(message, batches, state, asr_to_result_tx, stats)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "paged-attn")]
-#[allow(clippy::too_many_arguments)]
 fn drain_completed_chunks(
     qwen3: &Qwen3ASR,
     pending_chunks: &mut BTreeMap<usize, Vec<u32>>,
-    decoder: &mut StreamingMetadataDecoder,
+    batches: &mut StreamBatchRegistry<StreamDecodeBatch>,
     state: &mut SegmentAsrState,
-    segments: &mut [AsrSegmentJob],
-    waveforms: &mut [Waveform],
-    batch_lens: &[usize],
-    stage_starts: &[Instant],
-    chunk_base: usize,
 ) -> Result<Vec<RoutedTranscribeItemOutcome>> {
-    let chunk_end = chunk_base.saturating_add(decoder.chunk_count());
-    if let Some((&stale_index, _)) = pending_chunks.first_key_value()
-        && stale_index < chunk_base
-    {
-        bail!(
-            "dynamic ASR completed chunk index is stale: index={} current_base={} current_end={}",
-            stale_index,
-            chunk_base,
-            chunk_end
-        );
-    }
-    let ready: Vec<usize> = pending_chunks
-        .range(chunk_base..chunk_end)
-        .map(|(chunk_index, _)| *chunk_index)
-        .collect();
+    // A completion can arrive before its Prepared message is drained. Keep
+    // future global IDs pending until metadata registers their fixed range.
+    let ready = pending_chunks
+        .range(..batches.next_chunk)
+        .map(|(&chunk, _)| chunk)
+        .collect::<Vec<_>>();
     let mut completed = Vec::new();
-    for chunk_index in ready {
-        let Some(ids) = pending_chunks.remove(&chunk_index) else {
-            continue;
-        };
-        let local_chunk_index = chunk_index - chunk_base;
+    for chunk in ready {
+        let (batch, local_chunk) = batches.get_mut(chunk)?;
+        let ids = pending_chunks
+            .remove(&chunk)
+            .ok_or_else(|| anyhow::anyhow!("missing pending streaming completion"))?;
         if let Some(outcomes) = accept_completed_chunk(
             qwen3,
-            decoder,
+            &mut batch.decoder,
             state,
-            segments,
-            waveforms,
-            batch_lens,
-            stage_starts,
-            local_chunk_index,
+            &mut batch.segments,
+            &mut batch.waveforms,
+            &batch.batch_lens,
+            &batch.stage_starts,
+            local_chunk,
             ids,
         )? {
             completed.extend(outcomes);
         }
     }
     Ok(completed)
-}
-
-#[cfg(feature = "paged-attn")]
-#[allow(clippy::too_many_arguments)]
-fn reset_stream_decode_state_if_idle(
-    pending_chunks: &BTreeMap<usize, Vec<u32>>,
-    decoder: &mut StreamingMetadataDecoder,
-    state: &mut SegmentAsrState,
-    segments: &mut Vec<AsrSegmentJob>,
-    waveforms: &mut Vec<Waveform>,
-    batch_lens: &mut Vec<usize>,
-    stage_starts: &mut Vec<Instant>,
-    chunk_base: &mut usize,
-) {
-    if !pending_chunks.is_empty() || !state.jobs.is_empty() || !decoder.all_chunks_completed() {
-        return;
-    }
-    if decoder.chunk_count() > 0 {
-        *chunk_base = chunk_base.saturating_add(decoder.chunk_count());
-        *decoder = StreamingMetadataDecoder::new(Vec::new(), Vec::new());
-        segments.clear();
-        waveforms.clear();
-        batch_lens.clear();
-        stage_starts.clear();
-    }
 }
 
 #[cfg(feature = "paged-attn")]
@@ -852,4 +825,38 @@ pub(super) fn finish_segment_asr_batch(
     }
 
     completed
+}
+
+#[cfg(all(test, feature = "paged-attn"))]
+mod stream_batch_lifecycle_tests {
+    use super::StreamBatchRegistry;
+
+    #[test]
+    fn long_request_does_not_pin_completed_short_requests_or_reuse_global_ids() -> anyhow::Result<()>
+    {
+        let mut batches = StreamBatchRegistry::default();
+        batches.push(2, vec![false, false])?;
+        // Complete out of order while one old request keeps the stream active.
+        batches.get_mut(1)?.0[1] = true;
+        for _ in 0..1000 {
+            let global = batches.next_chunk;
+            batches.push(1, vec![false])?;
+            let (batch, local) = batches.get_mut(global)?;
+            assert_eq!(local, 0);
+            batch[local] = true;
+            batches.retire_completed(|batch| batch.iter().all(|&done| done));
+            assert_eq!(batches.batches.len(), 1);
+            assert!(batches.get_mut(global).is_err());
+            assert!(!batches.get_mut(0)?.0[0]);
+        }
+        batches.get_mut(0)?.0[0] = true;
+        batches.retire_completed(|batch| batch.iter().all(|&done| done));
+        assert!(batches.batches.is_empty());
+        let global = batches.next_chunk;
+        batches.push(2, vec![false, false])?;
+        assert_eq!(batches.get_mut(global + 1)?.1, 1);
+        assert!(batches.get_mut(global - 1).is_err());
+        assert!(batches.get_mut(global + 2).is_err());
+        Ok(())
+    }
 }

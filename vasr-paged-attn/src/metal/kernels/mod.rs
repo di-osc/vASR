@@ -271,7 +271,7 @@ pub fn call_varlen_prefill(
         MTLSize {
             width: num_queries_per_kv as usize,
             height: num_kv_heads as usize,
-            depth: num_token_chunks as usize,
+            depth: (num_token_chunks * num_seqs as u64) as usize,
         },
         MTLSize {
             width: TOKEN_CHUNK_SIZE as usize,
@@ -368,7 +368,7 @@ pub fn call_dense_varlen_prefill(
         MTLSize {
             width: num_queries_per_kv as usize,
             height: num_kv_heads as usize,
-            depth: num_token_chunks as usize,
+            depth: (num_token_chunks * num_seqs as u64) as usize,
         },
         MTLSize {
             width: TOKEN_CHUNK_SIZE as usize,

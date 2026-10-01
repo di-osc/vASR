@@ -1,5 +1,5 @@
 use anyhow::Result;
-use vasr_data::{AudioChunk, TimeRange, Waveform};
+use asr_data::{AudioChunk, TimeRange, Waveform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadEventStatus {

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use vasr_data::Waveform;
+use asr_data::Waveform;
 use vasr_vad::{FsmnVadForwardTiming, FsmnVadModel, VadOptions};
 
 const FSMN_VAD_REPO: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";

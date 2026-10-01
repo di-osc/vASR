@@ -1576,11 +1576,13 @@ mod tests {
     use super::normalize_batch_for_paged_prefill;
     use super::{
         attention_mask_is_dense, attention_masks_are_dense, decode_slot_and_context_len,
-        metal_paged_attention_fallback_enabled, metal_paged_prefill_fallback_enabled,
         position_ids_for_step, prompt_lens_from_attention_masks,
     };
     #[cfg(feature = "paged-attn")]
     use super::{attention_mask_is_right_padded, attention_masks_are_right_padded};
+    // 这两个 helper 只在 `paged-attn` 下定义，用到它们的测试由 `metal-paged-attn` 门控。
+    #[cfg(feature = "metal-paged-attn")]
+    use super::{metal_paged_attention_fallback_enabled, metal_paged_prefill_fallback_enabled};
 
     #[test]
     fn test_position_ids_for_step_matches_get_rope_index_last_col() -> anyhow::Result<()> {

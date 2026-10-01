@@ -6,7 +6,7 @@ use std::sync::{
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use vasr_data::AudioSource;
+use asr_data::AudioSource;
 
 use super::{
     DeduplicatedTranscribeInputs, PendingGlobalRequest, PipelineRequestId, RequestItemRef,

@@ -1,3 +1,6 @@
+// 测试里 `expect` 是表达断言失败的常规方式，与 lib 保持一致的豁免。
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::Path};
@@ -27,7 +30,7 @@ enum Command {
     Serve(ServeTranscribeArgs),
     /// Transcribe local audio files and write `{stem}-transcription.json` outputs.
     Run(RunTranscribeArgs),
-    /// Evaluate service CER with a labeled vASR MessagePack dataset.
+    /// Evaluate service CER with a labeled vASR dataset.
     Eval(EvalArgs),
     /// Measure the fastest completion time for an audio source set.
     Perf(PerfArgs),
@@ -35,6 +38,13 @@ enum Command {
     Stress(StressArgs),
 }
 
+/// 读取当前目录下的 `.env`，只注入进程里还不存在的键。
+///
+/// 已存在的环境变量优先，CLI 参数又优先于环境变量，因此这里不覆盖已有值。
+///
+/// # Errors
+///
+/// `.env` 存在但读取失败时返回错误；文件不存在时直接返回 `Ok(())`。
 fn load_dotenv() -> Result<()> {
     let path = Path::new(".env");
     if !path.exists() {
@@ -54,6 +64,7 @@ fn load_dotenv() -> Result<()> {
     Ok(())
 }
 
+/// 解析 `.env` 内容：跳过空行和注释，拆掉值两侧成对的引号。
 fn parse_dotenv_entries(content: &str) -> Vec<(String, String)> {
     content
         .lines()
@@ -79,6 +90,28 @@ fn parse_dotenv_entries(content: &str) -> Vec<(String, String)> {
             Some((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// 加载 `.env`，在 tokio 运行时上执行选中的子命令。
+fn main() -> Result<()> {
+    load_dotenv()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_cli())
+}
+
+/// 解析 CLI 并把子命令分发到对应的实现。
+async fn run_cli() -> Result<()> {
+    let cli = Cli::parse();
+    init_logging(cli.verbose);
+    match cli.command {
+        Command::Serve(args) => run_transcribe(args).await,
+        Command::Run(args) => run_local(args).await,
+        Command::Eval(args) => run_eval(args).await,
+        Command::Perf(args) => run_perf(args).await,
+        Command::Stress(args) => run_stress(args).await,
+    }
 }
 
 #[cfg(test)]
@@ -206,25 +239,5 @@ mod tests {
         load_dotenv().expect("missing dotenv should be ignored");
         env::set_current_dir(&original_dir).expect("original directory should be restored");
         fs::remove_dir_all(test_dir).expect("test directory should be removed");
-    }
-}
-
-fn main() -> Result<()> {
-    load_dotenv()?;
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run_cli())
-}
-
-async fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
-    init_logging(cli.verbose);
-    match cli.command {
-        Command::Serve(args) => run_transcribe(args).await,
-        Command::Run(args) => run_local(args).await,
-        Command::Eval(args) => run_eval(args).await,
-        Command::Perf(args) => run_perf(args).await,
-        Command::Stress(args) => run_stress(args).await,
     }
 }

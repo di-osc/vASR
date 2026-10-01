@@ -262,6 +262,26 @@ pub(crate) fn try_grant_one_kv_block(
     Ok(true)
 }
 
+fn metal_packed_prefill_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn metal_packed_prefill_enabled(thinker: &ThinkerForConditionalGeneration) -> bool {
+    static ENABLED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    ENABLED
+        .get_or_init(|| {
+            std::env::var("VASR_METAL_PACKED_PREFILL")
+                .ok()
+                .map(|value| metal_packed_prefill_flag(Some(&value)))
+        })
+        .unwrap_or_else(|| thinker.metal_auto_packed_prefill())
+}
+
 fn cuda_packed_prefill_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CUDA_PACKED_PREFILL").is_none()
 }
@@ -394,6 +414,7 @@ pub fn paged_batch_decode_slots_at_step(
         .collect::<Result<Vec<_>>>()?;
 
     let active_batch = active_indices.len();
+    crate::profiling::record_batch("decode", active_batch, active_batch, active_batch);
     let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
 
     let prompt_lens_active: Vec<i64> = active_indices
@@ -557,6 +578,7 @@ pub fn paged_batch_decode_slots_at_step_shared(
         })
         .collect::<Result<Vec<_>>>()?;
     let active_batch = active_indices.len();
+    crate::profiling::record_batch("decode", active_batch, active_batch, active_batch);
     let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
     let prompt_lens_active: Vec<i64> = active_indices
         .iter()
@@ -570,15 +592,19 @@ pub fn paged_batch_decode_slots_at_step_shared(
         device,
     )?;
     let next_active = with_model_execution(device, runtime, || {
-        let decode_output = paged_batch_decode_forward_shared(
-            thinker,
-            runtime,
-            &cache,
-            &input_ids_new,
-            &position_ids_new,
-            &input_metadata,
-        )?;
-        next_token_ids_from_decode_output(decode_output, active_batch)
+        let decode_output = crate::profiling::measure("decode_forward", device, || {
+            paged_batch_decode_forward_shared(
+                thinker,
+                runtime,
+                &cache,
+                &input_ids_new,
+                &position_ids_new,
+                &input_metadata,
+            )
+        })?;
+        crate::profiling::measure("decode_argmax", device, || {
+            next_token_ids_from_decode_output(decode_output, active_batch)
+        })
     })?;
     for (slot_idx, &i) in active_indices.iter().enumerate() {
         slots[i].next_id = *next_active
@@ -710,6 +736,7 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
         })
         .collect::<Result<Vec<_>>>()?;
     let active_batch = forward_indices.len();
+    crate::profiling::record_batch("decode", active_batch, active_batch, active_batch);
     let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
     let pos: Vec<i64> = forward_indices
         .iter()
@@ -725,23 +752,34 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
     let position_ids_new = Tensor::from_vec(pos, (active_batch, 1usize), device)?
         .unsqueeze(0)?
         .broadcast_as((3usize, active_batch, 1usize))?;
-    let input_metadata = cache.input_metadata_from_block_tables(
-        &block_tables_active,
-        starts.as_slice(),
-        1,
-        context_lens.as_slice(),
-        device,
-    )?;
+    // This is exclusively a one-token decode step. Reuse the dedicated builder:
+    // prefill cumulative-length tensors are unused by paged decode attention.
+    debug_assert!(
+        starts
+            .iter()
+            .zip(&context_lens)
+            .all(|(start, context)| start + 1 == *context)
+    );
+    let input_metadata = crate::profiling::measure("decode_metadata", device, || {
+        cache
+            .decode_metadata_for_batch_steps(&block_tables_active, &starts, 1, device)?
+            .pop()
+            .ok_or_else(|| candle_core::Error::Msg("missing decode metadata".into()))
+    })?;
     let next_active = with_model_execution(device, runtime, || {
-        let decode_output = paged_batch_decode_forward_shared(
-            thinker,
-            runtime,
-            &cache,
-            &input_ids_new,
-            &position_ids_new,
-            &input_metadata,
-        )?;
-        next_token_ids_from_decode_output(decode_output, active_batch)
+        let decode_output = crate::profiling::measure("decode_forward", device, || {
+            paged_batch_decode_forward_shared(
+                thinker,
+                runtime,
+                &cache,
+                &input_ids_new,
+                &position_ids_new,
+                &input_metadata,
+            )
+        })?;
+        crate::profiling::measure("decode_argmax", device, || {
+            next_token_ids_from_decode_output(decode_output, active_batch)
+        })
     })?;
     for (slot_idx, &i) in forward_indices.iter().enumerate() {
         slots[i].next_id = *next_active
@@ -908,8 +946,20 @@ pub fn paged_batch_prefill(
     let prefill_next_id_chunk_size = prefill_chunked_argmax_size(runtime);
 
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-    let use_packed_cuda_prefill = device.is_cuda() && cuda_packed_prefill_enabled();
-    let (next_ids, prompt_lens_i64) = if use_packed_cuda_prefill {
+    let use_packed_prefill = (device.is_cuda() && cuda_packed_prefill_enabled())
+        || (device.is_metal() && metal_packed_prefill_enabled(thinker));
+    let valid_tokens: usize = prompt_lens_usize.iter().sum();
+    crate::profiling::record_batch(
+        "prefill",
+        batch,
+        valid_tokens,
+        if use_packed_prefill {
+            valid_tokens
+        } else {
+            batch.saturating_mul(seq_len)
+        },
+    );
+    let (next_ids, prompt_lens_i64) = if use_packed_prefill {
         let total_tokens: usize = prompt_lens_usize.iter().sum();
         let mut packed_ids = Vec::with_capacity(total_tokens);
         let mut packed_audio_features: Vec<Tensor> = Vec::new();
@@ -1283,8 +1333,20 @@ fn paged_batch_prefill_with_allocated(
     };
 
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-    let use_packed_cuda_prefill = device.is_cuda() && cuda_packed_prefill_enabled();
-    let (next_ids, prompt_lens_i64) = if use_packed_cuda_prefill {
+    let use_packed_prefill = (device.is_cuda() && cuda_packed_prefill_enabled())
+        || (device.is_metal() && metal_packed_prefill_enabled(thinker));
+    let valid_tokens: usize = prompt_lens_usize.iter().sum();
+    crate::profiling::record_batch(
+        "prefill",
+        batch,
+        valid_tokens,
+        if use_packed_prefill {
+            valid_tokens
+        } else {
+            batch.saturating_mul(seq_len)
+        },
+    );
+    let (next_ids, prompt_lens_i64) = if use_packed_prefill {
         let total_tokens: usize = prompt_lens_usize.iter().sum();
         let mut packed_ids = Vec::with_capacity(total_tokens);
         let mut packed_audio_features: Vec<Tensor> = Vec::new();
@@ -1638,6 +1700,7 @@ pub fn paged_batch_decode_step(
         .collect::<Result<Vec<_>>>()?;
 
     let active_batch = forward_indices.len();
+    crate::profiling::record_batch("decode", active_batch, active_batch, active_batch);
     let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
 
     let prompt_lens_active: Vec<i64> = forward_indices
@@ -1898,6 +1961,17 @@ mod tests {
         DecodeStepOutput, PagedBatchState, decode_step_required_tokens, try_grant_one_kv_block,
     };
     use crate::model::paged_cache_runtime::PagedBlockManager;
+
+    #[test]
+    fn metal_packed_prefill_is_explicitly_opt_in() {
+        assert!(!super::metal_packed_prefill_flag(None));
+        for value in ["", "0", "false", "garbage"] {
+            assert!(!super::metal_packed_prefill_flag(Some(value)));
+        }
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(super::metal_packed_prefill_flag(Some(value)));
+        }
+    }
 
     #[test]
     fn active_indices_skips_finished_rows() {

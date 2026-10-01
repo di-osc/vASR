@@ -1,4 +1,4 @@
-use vasr_data::{AudioChunk, AudioError, Waveform};
+use asr_data::{AudioChunk, AudioError, Waveform};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioChunkList(pub Vec<AudioChunk>);
@@ -131,9 +131,9 @@ impl AudioBytesStream {
     }
 }
 
-/// 把音频块在父时间轴上的区间转成 [`vasr_data::TimeRange`]。
-pub fn chunk_range(chunk: &AudioChunk) -> vasr_data::TimeRange {
-    vasr_data::TimeRange::new(chunk.offset_ms as usize, chunk.end_ms() as usize)
+/// 把音频块在父时间轴上的区间转成 [`asr_data::TimeRange`]。
+pub fn chunk_range(chunk: &AudioChunk) -> asr_data::TimeRange {
+    asr_data::TimeRange::new(chunk.offset_ms as usize, chunk.end_ms() as usize)
 }
 
 fn sample_to_ms(sample: u64, sample_rate: u32) -> u64 {

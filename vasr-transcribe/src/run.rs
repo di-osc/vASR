@@ -2,20 +2,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::dataset::{is_vasr_data_file, read_vasr_audios};
+use crate::dataset::{is_vasr_input, read_vasr_audios};
 use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use vasr_data::AudioSource;
+use asr_data::AudioSource;
 
 #[derive(Debug, Clone, Args)]
 pub struct RunTranscribeArgs {
     #[command(flatten)]
     pub pipeline: TranscribePipelineArgs,
 
-    /// Audio file, directory containing audio files, or vASR MessagePack data file.
+    /// Audio file, directory containing audio files, or vASR dataset directory / `.vasr` data file.
     #[arg(short = 'i', long, value_name = "PATH")]
     pub input: PathBuf,
 
@@ -223,7 +223,7 @@ pub fn collect_audio_inputs(input: &Path, recursive: bool) -> Result<Vec<PathBuf
 }
 
 fn collect_run_inputs(input: &Path, recursive: bool) -> Result<Vec<RunInputItem>> {
-    if input.is_file() && is_vasr_data_file(input) {
+    if is_vasr_input(input) {
         return collect_vasr_inputs(input);
     }
     let files = collect_audio_inputs(input, recursive)?;
@@ -242,7 +242,12 @@ fn collect_vasr_inputs(input: &Path) -> Result<Vec<RunInputItem>> {
     if audios.is_empty() {
         bail!("vASR record list is empty: {}", input.display());
     }
-    let base_dir = input.parent().unwrap_or_else(|| Path::new("."));
+    // 数据集目录本身就是根目录；单个 `.vasr` 文件则与输出并排放在其所在目录。
+    let base_dir = if input.is_dir() {
+        input
+    } else {
+        input.parent().unwrap_or_else(|| Path::new("."))
+    };
     audios
         .into_iter()
         .map(|audio| {
@@ -332,7 +337,7 @@ pub fn resolve_output_json_path(
 mod tests {
     use super::{collect_audio_inputs, collect_run_inputs, resolve_output_json_path};
     use std::path::Path;
-    use vasr_data::{Audio, AudioDb, AudioEncoding, AudioFormat, AudioInfo, AudioSource};
+    use asr_data::{Audio, AudioDb, AudioEncoding, AudioFormat, AudioInfo, AudioSource};
 
     fn test_audio_info() -> AudioInfo {
         AudioInfo {

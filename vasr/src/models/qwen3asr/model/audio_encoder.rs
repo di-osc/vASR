@@ -23,6 +23,105 @@ use vasr_flash_attn::flash_attn_varlen;
 
 const LAYER_NORM_EPS: f64 = 1e-5;
 
+fn conv_forward(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "metal-paged-attn")]
+    if x.device().is_metal() {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("VASR_METAL_CONV_FLATTEN")
+                .ok()
+                .is_some_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+        });
+        let cfg = conv.config();
+        if enabled && cfg.groups == 1 {
+            let output = vasr_paged_attn::metal::conv::conv2d_flattened(
+                x,
+                conv.weight(),
+                cfg.padding,
+                cfg.stride,
+                cfg.dilation,
+            )?;
+            return if let Some(bias) = conv.bias() {
+                output.broadcast_add(&bias.reshape((1, bias.elem_count(), 1, 1))?)
+            } else {
+                Ok(output)
+            };
+        }
+    }
+    conv.forward(x)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConvExecutionPolicy {
+    auto: bool,
+    nhwc_override: Option<bool>,
+    im2col32_override: Option<bool>,
+    bias_gelu_override: Option<bool>,
+}
+
+impl ConvExecutionPolicy {
+    fn from_values(nhwc: Option<&str>, im2col32: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            auto: false,
+            nhwc_override: Self::parse_override(nhwc, "VASR_METAL_CONV_NHWC")?,
+            im2col32_override: Self::parse_override(im2col32, "VASR_METAL_CONV_IM2COL32")?,
+            bias_gelu_override: None,
+        })
+    }
+    fn parse_override(value: Option<&str>, name: &str) -> Result<Option<bool>> {
+        match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None => Ok(None),
+            Some("1" | "true" | "yes" | "on") => Ok(Some(true)),
+            Some("0" | "false" | "no" | "off") => Ok(Some(false)),
+            Some(_) => candle_core::bail!("{name} must be 0 or 1"),
+        }
+    }
+    fn fused_bias_gelu(&self) -> bool {
+        self.resolve().0 && self.bias_gelu_override.unwrap_or(self.auto)
+    }
+    fn resolve(&self) -> (bool, bool) {
+        let nhwc = self.nhwc_override.unwrap_or(self.auto);
+        (nhwc, nhwc && self.im2col32_override.unwrap_or(self.auto))
+    }
+}
+
+fn conv_gelu_forward(conv: &Conv2d, x: &Tensor, policy: &ConvExecutionPolicy) -> Result<Tensor> {
+    let _ = policy;
+    #[cfg(feature = "metal-paged-attn")]
+    if x.device().is_metal() {
+        let (enabled, fast) = policy.resolve();
+        let cfg = conv.config();
+        if enabled && cfg.groups == 1 {
+            let output = vasr_paged_attn::metal::conv::conv2d_nhwc_with_im2col32(
+                x,
+                conv.weight(),
+                cfg.padding,
+                cfg.stride,
+                cfg.dilation,
+                fast,
+            )?;
+            if policy.fused_bias_gelu() {
+                if let Some(bias) = conv.bias() {
+                    return vasr_paged_attn::metal::conv::bias_gelu_nhwc(&output, bias)?
+                        .permute((0, 3, 1, 2));
+                }
+            }
+            let output = if let Some(bias) = conv.bias() {
+                output.broadcast_add(&bias.reshape((1, 1, 1, bias.elem_count()))?)?
+            } else {
+                output
+            };
+            return gelu(&output)?.permute((0, 3, 1, 2));
+        }
+    }
+    gelu(&conv_forward(conv, x)?)
+}
+
 fn maybe_contiguous_for_metal(x: Tensor) -> Result<Tensor> {
     if x.device().is_metal() || x.device().is_cuda() {
         x.contiguous()
@@ -245,8 +344,37 @@ fn round_up_to_multiple(value: usize, multiple: usize) -> Result<usize> {
         .ok_or_else(|| candle_core::Error::Msg("bucket size overflow".to_string()))
 }
 
+// Bound each grouped score tensor to at most eight windows, regardless of
+// how many samples/windows are packed into the encoder batch.
+const AUDIO_ATTN_GROUP_MAX_WINDOWS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioAttentionMode {
+    Reference,
+    ProjectOnce,
+    Grouped,
+}
+
+impl AudioAttentionMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("VASR_QWEN3_ASR_AUDIO_ATTN") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Reference),
+            Ok(value) => match value.as_str() {
+                "reference" => Ok(Self::Reference),
+                "project-once" | "project_once" => Ok(Self::ProjectOnce),
+                "grouped" => Ok(Self::Grouped),
+                _ => candle_core::bail!(
+                    "invalid VASR_QWEN3_ASR_AUDIO_ATTN={value:?}; expected reference, project-once, or grouped"
+                ),
+            },
+            Err(error) => candle_core::bail!("invalid VASR_QWEN3_ASR_AUDIO_ATTN: {error}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AudioAttention {
+    mode: AudioAttentionMode,
     use_flash_attn: bool,
     num_heads: usize,
     head_dim: usize,
@@ -278,6 +406,7 @@ impl AudioAttention {
         let v_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("v_proj"), isq)?;
         let out_proj = isq_linear::linear_b(embed_dim, embed_dim, true, vb.pp("out_proj"), isq)?;
         Ok(Self {
+            mode: AudioAttentionMode::from_env()?,
             use_flash_attn,
             num_heads,
             head_dim,
@@ -319,7 +448,7 @@ impl AudioAttention {
 
         let (q, k, v) = {
             let hidden_states = hidden_states;
-            self.project_qkv(&hidden_states)?
+            crate::profiling::measure("encoder_qkv", &device, || self.project_qkv(&hidden_states))?
         };
         let q = q
             .reshape((seq_len, self.num_heads, self.head_dim))?
@@ -420,6 +549,10 @@ impl AudioAttention {
             candle_core::bail!("invalid cu_seqlens={cu_seqlens:?} for seq_len={seq_len}");
         }
 
+        if self.mode != AudioAttentionMode::Reference {
+            return self.forward_optimized(&q, &k, &v, cu_seqlens, embed_dim);
+        }
+
         let outs = {
             let q = q;
             let k = k;
@@ -448,15 +581,20 @@ impl AudioAttention {
                 let q_seg = maybe_contiguous_for_metal(q_seg)?;
                 let v_seg = maybe_contiguous_for_metal(v_seg)?;
 
-                let attn = {
-                    let k_t = maybe_contiguous_for_metal(k_seg.transpose(2, 3)?)?; // (1, h, d, s)
+                let attn = crate::profiling::measure("encoder_attention", q_seg.device(), || {
+                    let k_t = maybe_contiguous_for_metal(k_seg.transpose(2, 3)?)?;
                     let attn_weights = q_seg.matmul(&k_t)?.affine(self.scaling, 0.0)?;
                     let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                    attn_weights.matmul(&v_seg)? // (1, h, s, d)
-                };
+                    attn_weights.matmul(&v_seg)
+                })?;
                 let attn = attn.squeeze(0)?.transpose(0, 1)?; // (s, h, d)
                 let attn = attn.reshape((len, embed_dim))?.detach();
-                outs.push(self.out_proj.forward(&attn)?.detach());
+                outs.push(
+                    crate::profiling::measure("encoder_out_proj", &device, || {
+                        self.out_proj.forward(&attn)
+                    })?
+                    .detach(),
+                );
             }
             outs
         };
@@ -466,6 +604,86 @@ impl AudioAttention {
         let attn_refs: Vec<&Tensor> = outs.iter().collect();
         let out = Tensor::cat(&attn_refs, 0)?.detach();
         Ok(out)
+    }
+
+    fn attend_batched(&self, q: Tensor, k: Tensor, v: Tensor) -> Result<Tensor> {
+        // Inputs (batch, time, heads, head_dim); no window is padded or merged.
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.transpose(2, 3)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+        let output = crate::profiling::measure("encoder_attention", q.device(), || {
+            let weights = q.matmul(&k)?.affine(self.scaling, 0.0)?;
+            let weights = candle_nn::ops::softmax_last_dim(&weights)?;
+            weights.matmul(&v)
+        })?;
+        output.transpose(1, 2)?.contiguous()
+    }
+
+    fn forward_optimized(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cu: &[usize],
+        embed_dim: usize,
+    ) -> Result<Tensor> {
+        let mut windows = Vec::new();
+        for pair in cu.windows(2) {
+            if pair[1] < pair[0] {
+                candle_core::bail!("cu_seqlens must be non-decreasing: {cu:?}");
+            }
+            let len = pair[1] - pair[0];
+            if len > 0 {
+                windows.push((pair[0], len));
+            }
+        }
+        let mut outputs: Vec<Option<Tensor>> = vec![None; windows.len()];
+        if self.mode == AudioAttentionMode::ProjectOnce {
+            for (index, &(start, len)) in windows.iter().enumerate() {
+                let output = self.attend_batched(
+                    q.narrow(0, start, len)?.unsqueeze(0)?,
+                    k.narrow(0, start, len)?.unsqueeze(0)?,
+                    v.narrow(0, start, len)?.unsqueeze(0)?,
+                )?;
+                outputs[index] = Some(output.reshape((len, embed_dim))?.detach());
+            }
+        } else {
+            let mut groups = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+            for (index, &(_, len)) in windows.iter().enumerate() {
+                groups.entry(len).or_default().push(index);
+            }
+            for (len, indices) in groups {
+                for chunk in indices.chunks(AUDIO_ATTN_GROUP_MAX_WINDOWS) {
+                    let stack = |source: &Tensor| -> Result<Tensor> {
+                        let segments = chunk
+                            .iter()
+                            .map(|&index| source.narrow(0, windows[index].0, len))
+                            .collect::<Result<Vec<_>>>()?;
+                        // Keep the existing on-device BF16 stack workaround.
+                        stack_audio_chunks(&segments)
+                    };
+                    let output = self.attend_batched(stack(q)?, stack(k)?, stack(v)?)?;
+                    for (batch_index, &window_index) in chunk.iter().enumerate() {
+                        outputs[window_index] = Some(
+                            output
+                                .narrow(0, batch_index, 1)?
+                                .reshape((len, embed_dim))?
+                                .detach(),
+                        );
+                    }
+                }
+            }
+        }
+        let outputs = outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    candle_core::Error::Msg("missing grouped attention window".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let joined = Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?;
+        Ok(self.out_proj.forward(&joined)?.detach())
     }
 }
 
@@ -518,7 +736,8 @@ impl AudioEncoderLayer {
             (&residual + &attn)?.detach()
         };
 
-        let x = {
+        let ffn_device = x.device().clone();
+        let x = crate::profiling::measure("encoder_ffn", &ffn_device, || {
             let residual = x;
             let activated = {
                 let normed = self.final_layer_norm.forward(&residual)?.detach();
@@ -537,8 +756,8 @@ impl AudioEncoderLayer {
                 }
             };
             let fc2 = self.fc2.forward(&activated)?.detach();
-            (&residual + &fc2)?.detach()
-        };
+            Ok::<_, candle_core::Error>((&residual + &fc2)?.detach())
+        })?;
 
         let x = if x.dtype() == DType::F16 {
             // Match the official float16 clamp to prevent infs.
@@ -564,6 +783,9 @@ pub struct AudioTower {
     proj1: IsqLinear,
     proj2: IsqLinear,
     use_flash_attn: bool,
+    conv_micro_batch: usize,
+    conv_cross_sample: bool,
+    conv_policy: ConvExecutionPolicy,
 }
 
 struct AudioConvSample {
@@ -574,6 +796,16 @@ struct AudioConvSample {
 }
 
 impl AudioTower {
+    pub(crate) fn set_auto_conv_layout(&mut self, enabled: bool) {
+        self.conv_policy.auto = enabled;
+        let (nhwc, im2col32) = self.conv_policy.resolve();
+        let bias_gelu = self.conv_policy.fused_bias_gelu();
+        if enabled || nhwc {
+            tracing::info!(target: "vasr::execution",
+                "Metal CNN policy | nhwc={nhwc} im2col32={im2col32} bias_gelu={bias_gelu} explicit_overrides=preserved");
+        }
+    }
+
     pub fn load(
         cfg: &AudioEncoderConfig,
         vb: VarBuilder,
@@ -582,6 +814,50 @@ impl AudioTower {
         progress: &Progress,
     ) -> Result<Self> {
         let device = vb.device().clone();
+        let conv_policy = if device.is_metal() {
+            let nhwc = std::env::var("VASR_METAL_CONV_NHWC").ok();
+            let im2col32 = std::env::var("VASR_METAL_CONV_IM2COL32").ok();
+            let bias_gelu = std::env::var("VASR_METAL_CONV_BIAS_GELU").ok();
+            let mut policy =
+                ConvExecutionPolicy::from_values(nhwc.as_deref(), im2col32.as_deref())?;
+            policy.bias_gelu_override = ConvExecutionPolicy::parse_override(
+                bias_gelu.as_deref(),
+                "VASR_METAL_CONV_BIAS_GELU",
+            )?;
+            policy
+        } else {
+            ConvExecutionPolicy::default()
+        };
+        let conv_cross_sample = if device.is_metal() {
+            match std::env::var("VASR_METAL_CONV_CROSS_SAMPLE") {
+                Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => candle_core::bail!("VASR_METAL_CONV_CROSS_SAMPLE must be 0 or 1"),
+                },
+                Err(std::env::VarError::NotPresent) => false,
+                Err(error) => candle_core::bail!("invalid VASR_METAL_CONV_CROSS_SAMPLE: {error}"),
+            }
+        } else {
+            false
+        };
+        let conv_micro_batch = if device.is_metal() {
+            match std::env::var("VASR_METAL_CONV_CHUNKS") {
+                Ok(value) => {
+                    let value = value.parse::<usize>().map_err(|_| {
+                        candle_core::Error::Msg("VASR_METAL_CONV_CHUNKS must be 1..=64".into())
+                    })?;
+                    if !(1..=64).contains(&value) {
+                        candle_core::bail!("VASR_METAL_CONV_CHUNKS must be 1..=64");
+                    }
+                    value
+                }
+                Err(std::env::VarError::NotPresent) => cfg.conv_chunksize.max(1),
+                Err(error) => candle_core::bail!("invalid VASR_METAL_CONV_CHUNKS: {error}"),
+            }
+        } else {
+            cfg.conv_chunksize.max(1)
+        };
 
         let positional_embedding =
             sinusoidal_positional_embedding(cfg.max_source_positions, cfg.d_model, &device)?;
@@ -644,6 +920,9 @@ impl AudioTower {
 
         Ok(Self {
             config: cfg.clone(),
+            conv_micro_batch,
+            conv_cross_sample,
+            conv_policy,
             positional_embedding,
             conv2d1,
             conv2d2,
@@ -732,20 +1011,40 @@ impl AudioTower {
         let mut sample_max_ts: Vec<usize> = Vec::with_capacity(batch);
         let mut total_chunks = 0usize;
 
-        for (sample_idx, &sample_len) in feature_lens.iter().enumerate() {
-            if sample_len == 0 {
-                sample_aftercnn_totals.push(0);
-                sample_max_ts.push(0);
-                continue;
+        if self.conv_cross_sample {
+            let samples = crate::profiling::measure(
+                "encoder_conv_cross_sample",
+                input_features.device(),
+                || self.forward_conv_cross_sample(&input_features, feature_lens, window),
+            )?;
+            for sample in samples {
+                total_chunks = total_chunks.saturating_add(sample.chunks);
+                sample_aftercnn_totals.push(sample.aftercnn_total);
+                sample_max_ts.push(sample.max_t);
+                if sample.aftercnn_total > 0 {
+                    sample_hiddens.push(sample.hidden_states);
+                }
             }
+        } else {
+            for (sample_idx, &sample_len) in feature_lens.iter().enumerate() {
+                if sample_len == 0 {
+                    sample_aftercnn_totals.push(0);
+                    sample_max_ts.push(0);
+                    continue;
+                }
 
-            let input_feature = input_features.narrow(0, sample_idx, 1)?.squeeze(0)?;
-            let input_feature = input_feature.narrow(1, 0, sample_len)?;
-            let sample = self.forward_conv_sample(&input_feature, window)?;
-            total_chunks = total_chunks.saturating_add(sample.chunks);
-            sample_aftercnn_totals.push(sample.aftercnn_total);
-            sample_max_ts.push(sample.max_t);
-            sample_hiddens.push(sample.hidden_states);
+                let input_feature = input_features.narrow(0, sample_idx, 1)?.squeeze(0)?;
+                let input_feature = input_feature.narrow(1, 0, sample_len)?;
+                let sample = crate::profiling::measure(
+                    "encoder_conv_sample",
+                    input_feature.device(),
+                    || self.forward_conv_sample(&input_feature, window),
+                )?;
+                total_chunks = total_chunks.saturating_add(sample.chunks);
+                sample_aftercnn_totals.push(sample.aftercnn_total);
+                sample_max_ts.push(sample.max_t);
+                sample_hiddens.push(sample.hidden_states);
+            }
         }
 
         if sample_hiddens.is_empty() {
@@ -850,6 +1149,145 @@ impl AudioTower {
         Ok(hidden_states.narrow(0, 0, idx_len)?.detach())
     }
 
+    fn forward_conv_layers(&self, x: &Tensor) -> Result<Tensor> {
+        let x = crate::profiling::measure("encoder_conv1", x.device(), || {
+            conv_gelu_forward(&self.conv2d1, x, &self.conv_policy)
+        })?;
+        let x = crate::profiling::measure("encoder_conv2", x.device(), || {
+            conv_gelu_forward(&self.conv2d2, &x, &self.conv_policy)
+        })?;
+        let x = crate::profiling::measure("encoder_conv3", x.device(), || {
+            conv_gelu_forward(&self.conv2d3, &x, &self.conv_policy)
+        })?;
+        Ok(x)
+    }
+
+    fn project_conv_chunks(&self, mut x: Tensor) -> Result<Tensor> {
+        let (b, c, f, t) = x.dims4()?;
+        x = x.transpose(1, 3)?.transpose(2, 3)?.contiguous()?;
+        x = x.reshape((b, t, c * f))?;
+        x = self.conv_out.forward(&x)?;
+
+        let pe = self.positional_embedding.narrow(0, 0, t)?.unsqueeze(0)?;
+        let pe = pe.to_dtype(x.dtype())?;
+        x = x.broadcast_add(&pe)?;
+
+        Ok(x)
+    }
+
+    /// Stream padded chunks in sample order; only this CNN chunk dimension is
+    /// batched across samples. Position ids still restart independently per chunk.
+    fn forward_conv_cross_sample(
+        &self,
+        features: &Tensor,
+        lens: &[usize],
+        window: usize,
+    ) -> Result<Vec<AudioConvSample>> {
+        let (batch, mel, frames) = features.dims3()?;
+        if batch != lens.len()
+            || mel != self.config.num_mel_bins
+            || window == 0
+            || lens.iter().any(|&len| len > frames)
+        {
+            candle_core::bail!("invalid cross-sample CNN input dimensions/lengths/window");
+        }
+        let limit = self.conv_micro_batch.clamp(1, 64);
+        let mut chunks = Vec::with_capacity(limit);
+        let mut metadata = Vec::with_capacity(limit);
+        let mut outputs: Vec<Vec<Tensor>> = vec![Vec::new(); batch];
+        let mut totals = vec![0usize; batch];
+        let mut max_ts = vec![0usize; batch];
+        let mut counts = vec![0usize; batch];
+        for (sample_index, &len) in lens.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let input = features
+                .narrow(0, sample_index, 1)?
+                .squeeze(0)?
+                .narrow(1, 0, len)?
+                .transpose(0, 1)?;
+            for start in (0..len).step_by(window) {
+                let chunk_len = (len - start).min(window);
+                let aftercnn_len = feat_extract_output_length(chunk_len);
+                chunks.push(pad_audio_chunk(
+                    &input.narrow(0, start, chunk_len)?,
+                    0,
+                    0,
+                    window - chunk_len,
+                )?);
+                metadata.push((sample_index, aftercnn_len));
+                totals[sample_index] =
+                    totals[sample_index]
+                        .checked_add(aftercnn_len)
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg("cross-sample aftercnn length overflow".into())
+                        })?;
+                counts[sample_index] += 1;
+                if chunks.len() == limit {
+                    self.flush_conv_chunks(&chunks, &metadata, &mut outputs, &mut max_ts)?;
+                    chunks.clear();
+                    metadata.clear();
+                }
+            }
+            if totals[sample_index] != feat_extract_output_length(len) {
+                candle_core::bail!(
+                    "cross-sample aftercnn length mismatch for sample={sample_index}"
+                );
+            }
+        }
+        if !chunks.is_empty() {
+            self.flush_conv_chunks(&chunks, &metadata, &mut outputs, &mut max_ts)?;
+        }
+        let mut samples = Vec::with_capacity(batch);
+        for (index, parts) in outputs.into_iter().enumerate() {
+            let hidden_states = if parts.is_empty() {
+                Tensor::zeros(
+                    (0usize, self.config.d_model),
+                    features.dtype(),
+                    features.device(),
+                )?
+            } else {
+                Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?.detach()
+            };
+            if hidden_states.dim(0)? != totals[index] {
+                candle_core::bail!("cross-sample output length mismatch for sample={index}");
+            }
+            samples.push(AudioConvSample {
+                hidden_states,
+                aftercnn_total: totals[index],
+                max_t: max_ts[index],
+                chunks: counts[index],
+            });
+        }
+        Ok(samples)
+    }
+
+    fn flush_conv_chunks(
+        &self,
+        chunks: &[Tensor],
+        metadata: &[(usize, usize)],
+        outputs: &mut [Vec<Tensor>],
+        max_ts: &mut [usize],
+    ) -> Result<()> {
+        let packed = stack_audio_chunks(chunks)?.transpose(1, 2)?.unsqueeze(1)?;
+        let x = self.project_conv_chunks(self.forward_conv_layers(&packed)?)?;
+        let (_, max_t, _) = x.dims3()?;
+        for (chunk_index, &(sample_index, valid_t)) in metadata.iter().enumerate() {
+            if valid_t > max_t {
+                candle_core::bail!("cross-sample aftercnn_len={valid_t} exceeds max_t={max_t}");
+            }
+            max_ts[sample_index] = max_t;
+            outputs[sample_index].push(
+                x.narrow(0, chunk_index, 1)?
+                    .squeeze(0)?
+                    .narrow(0, 0, valid_t)?
+                    .detach(),
+            );
+        }
+        Ok(())
+    }
+
     fn forward_conv_sample(
         &self,
         input_feature: &Tensor,
@@ -920,11 +1358,9 @@ impl AudioTower {
             let mut conv_outs: Vec<Tensor> = Vec::new();
             let mut start = 0usize;
             while start < chunk_num {
-                let len = (chunk_num - start).min(self.config.conv_chunksize.max(1));
+                let len = (chunk_num - start).min(self.conv_micro_batch);
                 let x = padded_feature.narrow(0, start, len)?;
-                let x = gelu(&self.conv2d1.forward(&x)?)?;
-                let x = gelu(&self.conv2d2.forward(&x)?)?;
-                let x = gelu(&self.conv2d3.forward(&x)?)?;
+                let x = self.forward_conv_layers(&x)?;
                 conv_outs.push(x.detach());
                 start = start.saturating_add(len);
             }
@@ -943,14 +1379,8 @@ impl AudioTower {
             }
         };
 
-        let (b, c, f, t) = x.dims4()?;
-        x = x.transpose(1, 3)?.transpose(2, 3)?.contiguous()?;
-        x = x.reshape((b, t, c * f))?;
-        x = self.conv_out.forward(&x)?;
-
-        let pe = self.positional_embedding.narrow(0, 0, t)?.unsqueeze(0)?;
-        let pe = pe.to_dtype(x.dtype())?;
-        x = x.broadcast_add(&pe)?;
+        x = self.project_conv_chunks(x)?;
+        let (b, t, _) = x.dims3()?;
 
         let max_t = t;
         let hidden_states = {
@@ -1240,6 +1670,235 @@ mod tests {
             anyhow::bail!("batched forward mismatch: max_abs={max_abs} tolerance={tolerance}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn fused_conv_policy_is_automatic_and_respects_explicit_off() -> anyhow::Result<()> {
+        let mut enabled = super::ConvExecutionPolicy::from_values(Some("1"), None)?;
+        enabled.bias_gelu_override = Some(true);
+        assert!(enabled.fused_bias_gelu());
+        enabled.nhwc_override = Some(false);
+        enabled.auto = true;
+        assert!(!enabled.fused_bias_gelu());
+        let mut automatic = super::ConvExecutionPolicy::from_values(None, None)?;
+        automatic.auto = true;
+        assert!(automatic.fused_bias_gelu());
+        automatic.bias_gelu_override = Some(false);
+        assert!(!automatic.fused_bias_gelu());
+        Ok(())
+    }
+
+    #[test]
+    fn conv_execution_policy_preserves_explicit_reference_override() -> anyhow::Result<()> {
+        let mut policy = super::ConvExecutionPolicy::from_values(None, None)?;
+        assert_eq!(policy.resolve(), (false, false));
+        policy.auto = true;
+        assert_eq!(policy.resolve(), (true, true));
+        let mut disabled = super::ConvExecutionPolicy::from_values(Some("0"), Some("1"))?;
+        disabled.auto = true;
+        assert_eq!(disabled.resolve(), (false, false));
+        let mut layout_only = super::ConvExecutionPolicy::from_values(Some("1"), Some("0"))?;
+        layout_only.auto = true;
+        assert_eq!(layout_only.resolve(), (true, false));
+        assert!(super::ConvExecutionPolicy::from_values(Some("invalid"), None).is_err());
+        Ok(())
+    }
+
+    fn assert_cross_sample_conv_matches_reference(
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        let mut cfg = test_config();
+        cfg.n_window = 50;
+        cfg.n_window_infer = 200;
+        let vb =
+            candle_nn::VarBuilder::from_backend(Box::new(SeededBackend), dtype, device.clone());
+        let mut tower = AudioTower::load(&cfg, vb, false, None, &Progress::disabled())?;
+        // Force multiple microbatches, including a boundary in the middle of a sample.
+        tower.conv_micro_batch = 2;
+        let lens = [0usize, 1, 99, 100, 101, 399, 663, 0];
+        let frames = 663;
+        let values = (0..lens.len() * cfg.num_mel_bins * frames)
+            .map(|i| ((i * 19 % 113) as f32 - 56.0) / 61.0)
+            .collect::<Vec<_>>();
+        let features =
+            candle_core::Tensor::from_vec(values, (lens.len(), cfg.num_mel_bins, frames), device)?;
+        let features = super::cast_input_features_to_weight_dtype(&features, dtype)?;
+        let window = cfg.n_window * 2;
+        let got = tower.forward_conv_cross_sample(&features, &lens, window)?;
+        assert_eq!(got.len(), lens.len());
+        for (index, (&len, got)) in lens.iter().zip(&got).enumerate() {
+            let input = features
+                .narrow(0, index, 1)?
+                .squeeze(0)?
+                .narrow(1, 0, len)?;
+            let reference = tower.forward_conv_sample(&input, window)?;
+            assert_eq!(
+                (got.aftercnn_total, got.max_t, got.chunks),
+                (reference.aftercnn_total, reference.max_t, reference.chunks)
+            );
+            assert_tensor_close(&got.hidden_states, &reference.hidden_states, tolerance)?;
+            if got.hidden_states.elem_count() > 0 {
+                let values = got
+                    .hidden_states
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(values.iter().all(|value| value.is_finite()));
+            }
+        }
+        tower.conv_cross_sample = false;
+        let reference = tower.forward_with_lens(&features, &lens)?;
+        tower.conv_cross_sample = true;
+        let routed = tower.forward_with_lens(&features, &lens)?;
+        let encoder_tolerance = if dtype == candle_core::DType::BF16 {
+            0.1
+        } else {
+            tolerance
+        };
+        assert_tensor_close(&routed, &reference, encoder_tolerance)?;
+        let empty = tower.forward_conv_cross_sample(&features, &[0; 8], window)?;
+        assert!(empty.iter().all(|sample| sample.aftercnn_total == 0
+            && sample.max_t == 0
+            && sample.chunks == 0
+            && sample.hidden_states.dims() == [0, cfg.d_model]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_sample_conv_nonzero_cpu() -> anyhow::Result<()> {
+        assert_cross_sample_conv_matches_reference(
+            &candle_core::Device::Cpu,
+            candle_core::DType::F32,
+            1e-4,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU; run after stopping soak/benchmark server"]
+    fn test_cross_sample_conv_nonzero_metal_f32() -> anyhow::Result<()> {
+        assert_cross_sample_conv_matches_reference(
+            &candle_core::Device::new_metal(0)?,
+            candle_core::DType::F32,
+            1e-3,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU; run after stopping soak/benchmark server"]
+    fn test_cross_sample_conv_nonzero_metal_bf16() -> anyhow::Result<()> {
+        assert_cross_sample_conv_matches_reference(
+            &candle_core::Device::new_metal(0)?,
+            candle_core::DType::BF16,
+            0.025,
+        )
+    }
+
+    fn assert_attention_modes(
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        use super::AudioAttentionMode;
+        let mut cfg = test_config();
+        cfg.encoder_attention_heads = 2;
+        let vb =
+            candle_nn::VarBuilder::from_backend(Box::new(SeededBackend), dtype, device.clone());
+        let mut attention = AudioAttention::load(&cfg, vb, false, None)?;
+        attention.mode = AudioAttentionMode::Reference;
+        // Unequal tails, repeated lengths, empty window, and multiple microbatches.
+        let lengths = [3usize, 1, 3, 2, 0, 3, 3, 3, 3, 3, 3, 3, 3, 2];
+        let mut cu = vec![0];
+        for len in lengths {
+            cu.push(cu.last().copied().unwrap_or(0) + len);
+        }
+        let seq = cu.last().copied().unwrap_or(0);
+        let values: Vec<f32> = (0..seq * cfg.d_model)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 29.0)
+            .collect();
+        let xs =
+            candle_core::Tensor::from_vec(values, (seq, cfg.d_model), device)?.to_dtype(dtype)?;
+        let expected = attention.forward(xs.clone(), &cu)?;
+        for mode in [AudioAttentionMode::ProjectOnce, AudioAttentionMode::Grouped] {
+            attention.mode = mode;
+            let got = attention.forward(xs.clone(), &cu)?;
+            assert_tensor_close(&got, &expected, tolerance)?;
+            let mut isolated = Vec::new();
+            for window in cu.windows(2) {
+                let len = window[1] - window[0];
+                if len > 0 {
+                    isolated.push(attention.forward(xs.narrow(0, window[0], len)?, &[0, len])?);
+                }
+            }
+            let isolated = candle_core::Tensor::cat(&isolated.iter().collect::<Vec<_>>(), 0)?;
+            assert_tensor_close(&got, &isolated, tolerance)?;
+        }
+        Ok(())
+    }
+
+    fn assert_tensor_close(
+        got: &candle_core::Tensor,
+        expected: &candle_core::Tensor,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        assert_eq!(got.dims(), expected.dims());
+        // Empty shapes already establish equality. Candle Metal cannot dispatch
+        // a zero-element cast (linear_split divides by zero while encoding).
+        if got.elem_count() == 0 {
+            return Ok(());
+        }
+        let got = got
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(
+            got.iter().chain(&expected).all(|value| value.is_finite()),
+            "non-finite attention values"
+        );
+        let max_abs = got
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_abs <= tolerance,
+            "attention mismatch: max_abs={max_abs} tolerance={tolerance}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_attention_optimized_modes_preserve_values_and_isolation_cpu() -> anyhow::Result<()> {
+        assert_attention_modes(&candle_core::Device::Cpu, candle_core::DType::F32, 1e-5)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_attention_optimized_modes_preserve_values_and_isolation_metal_f32() -> anyhow::Result<()>
+    {
+        assert_attention_modes(
+            &candle_core::Device::new_metal(0)?,
+            candle_core::DType::F32,
+            1e-3,
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_attention_optimized_modes_preserve_values_and_isolation_metal_bf16()
+    -> anyhow::Result<()> {
+        assert_attention_modes(
+            &candle_core::Device::new_metal(0)?,
+            candle_core::DType::BF16,
+            0.025,
+        )
     }
 
     #[test]
@@ -1543,6 +2202,7 @@ mod tests {
         let out_proj = IsqLinear::new(Linear::new(w, None), None, &device)?;
 
         let attn = AudioAttention {
+            mode: super::AudioAttentionMode::Reference,
             use_flash_attn: false,
             num_heads: 1,
             head_dim: embed_dim,

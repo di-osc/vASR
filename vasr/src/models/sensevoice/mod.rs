@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use asr_data::TimeRange;
 use candle_core::{DType, Device, Tensor};
-use vasr_data::TimeRange;
 
 use crate::{AsrOptions, StreamEvent, StreamingAsrModel, StreamingAsrSession};
 
@@ -182,7 +182,7 @@ impl SenseVoiceSession {
 }
 
 impl StreamingAsrSession for SenseVoiceSession {
-    fn push_chunk(&mut self, chunk: &vasr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
+    fn push_chunk(&mut self, chunk: &asr_data::AudioChunk) -> Result<Vec<StreamEvent>> {
         if self.finished {
             bail!("SenseVoice stream is already finished");
         }

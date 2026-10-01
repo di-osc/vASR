@@ -1,8 +1,8 @@
 use anyhow::Result;
-use vasr_data::{AudioChunk, Timeline, Waveform};
+use asr_data::{AudioChunk, Timeline, Waveform};
 
 use crate::audio::stream::chunk_range;
-use crate::timeline::{ASR_SOURCE, StreamEvent, language_span, transcription_span, waveform_range};
+use crate::timeline::{ASR_SOURCE, StreamEvent, transcription_span, waveform_range};
 use crate::traits::{AsrOptions, OfflineAsrModel, StreamingAsrModel, StreamingAsrSession};
 
 #[cfg(feature = "paged-attn")]
@@ -151,7 +151,7 @@ impl StreamingAsrSession for Qwen3AsrStreamingSession {
             .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR stream is already finished"))?;
         let output = stream.finish()?;
         Ok(vec![StreamEvent::transcription(
-            vasr_data::TimeRange::default(),
+            asr_data::TimeRange::default(),
             output.text,
             Some(output.language),
             ASR_SOURCE,
@@ -195,16 +195,8 @@ pub fn qwen_outputs_to_timelines(
 fn qwen_output_to_timeline(output: AsrTranscription, waveform: &Waveform) -> Result<Timeline> {
     let range = waveform_range(waveform);
     let duration = waveform.duration_ms().round() as usize;
-    let mut spans = Vec::new();
-    if !output.language.is_empty() {
-        spans.push(language_span(range, output.language.clone(), ASR_SOURCE));
-    }
-    spans.push(transcription_span(
-        range,
-        output.text,
-        Some(output.language),
-        ASR_SOURCE,
-    ));
+    let language = (!output.language.is_empty()).then(|| output.language.clone());
+    let spans = [transcription_span(range, output.text, language, ASR_SOURCE)];
     crate::timeline::timeline_from_spans("qwen3_asr_audio", duration, spans)
 }
 

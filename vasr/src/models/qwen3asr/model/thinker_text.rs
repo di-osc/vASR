@@ -427,8 +427,110 @@ fn mask_nonzero_indices_u32(mask: &Tensor, seq_len: usize) -> Result<Vec<u32>> {
     Ok(idxs)
 }
 
+fn metal_dense_projection_fusion_enabled() -> Result<bool> {
+    match std::env::var("VASR_METAL_DENSE_PROJECTION_FUSION") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            _ => candle_core::bail!(
+                "invalid VASR_METAL_DENSE_PROJECTION_FUSION={value:?}; expected 0 or 1"
+            ),
+        },
+        Err(error) => candle_core::bail!("invalid VASR_METAL_DENSE_PROJECTION_FUSION: {error}"),
+    }
+}
+
+/// One dense GEMM for independent projections sharing the same input.
+/// Quantized weights and other devices retain their existing paths.
+#[derive(Debug, Clone)]
+struct MetalDenseProjection {
+    linear: candle_nn::Linear,
+    output_dims: Vec<usize>,
+}
+
+impl MetalDenseProjection {
+    fn new(projections: &[&IsqLinear], enabled: bool) -> Result<Option<Self>> {
+        if !enabled || projections.is_empty() {
+            return Ok(None);
+        }
+        let mut linears = Vec::with_capacity(projections.len());
+        for projection in projections {
+            let IsqLinear::Linear(linear) = projection else {
+                return Ok(None);
+            };
+            linears.push(linear);
+        }
+        let first = linears[0].weight();
+        if !first.device().is_metal() {
+            return Ok(None);
+        }
+        let input_dim = first.dim(1)?;
+        let dtype = first.dtype();
+        let has_bias = linears[0].bias().is_some();
+        let mut weights = Vec::with_capacity(linears.len());
+        let mut biases = Vec::with_capacity(linears.len());
+        let mut output_dims = Vec::with_capacity(linears.len());
+        for linear in linears {
+            let weight = linear.weight();
+            if weight.dim(1)? != input_dim
+                || weight.dtype() != dtype
+                || !weight.device().same_device(first.device())
+                || linear.bias().is_some() != has_bias
+            {
+                return Ok(None);
+            }
+            output_dims.push(weight.dim(0)?);
+            weights.push(weight);
+            if let Some(bias) = linear.bias() {
+                if bias.dtype() != dtype || !bias.device().same_device(first.device()) {
+                    return Ok(None);
+                }
+                biases.push(bias);
+            }
+        }
+        // Metal's BF16 copy kernels do not support every strided cat layout.
+        // Concatenate via F32 on-device only during load; inference stays BF16.
+        let concat = |tensors: &[&Tensor]| -> Result<Tensor> {
+            if dtype == candle_core::DType::BF16 {
+                let tensors = tensors
+                    .iter()
+                    .map(|tensor| tensor.to_dtype(candle_core::DType::F32)?.contiguous())
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&tensors.iter().collect::<Vec<_>>(), 0)?.to_dtype(dtype)
+            } else {
+                Tensor::cat(tensors, 0)
+            }
+        };
+        let weight = concat(&weights)?;
+        let bias = if has_bias {
+            Some(concat(&biases)?)
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            linear: candle_nn::Linear::new(weight, bias),
+            output_dims,
+        }))
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Vec<Tensor>> {
+        let joined = self.linear.forward(&xs.contiguous()?)?;
+        let last_dim = joined.rank() - 1;
+        let mut start = 0;
+        let mut outputs = Vec::with_capacity(self.output_dims.len());
+        for &dim in &self.output_dims {
+            // Preserve the packed layout expected by Q/K normalization and mRoPE.
+            outputs.push(joined.narrow(last_dim, start, dim)?.contiguous()?);
+            start += dim;
+        }
+        Ok(outputs)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ThinkerTextMlp {
+    fused_gate_up: Option<MetalDenseProjection>,
     gate_proj: IsqLinear,
     up_proj: IsqLinear,
     down_proj: IsqLinear,
@@ -436,7 +538,12 @@ struct ThinkerTextMlp {
 }
 
 impl ThinkerTextMlp {
-    fn load(cfg: &TextConfig, vb: VarBuilder, isq: Option<&str>) -> Result<Self> {
+    fn load(
+        cfg: &TextConfig,
+        vb: VarBuilder,
+        isq: Option<&str>,
+        dense_fusion: bool,
+    ) -> Result<Self> {
         let gate_proj = isq_linear::linear_no_bias(
             cfg.hidden_size,
             cfg.intermediate_size,
@@ -455,7 +562,9 @@ impl ThinkerTextMlp {
             vb.pp("down_proj"),
             isq,
         )?;
+        let fused_gate_up = MetalDenseProjection::new(&[&gate_proj, &up_proj], dense_fusion)?;
         Ok(Self {
+            fused_gate_up,
             gate_proj,
             up_proj,
             down_proj,
@@ -473,8 +582,12 @@ impl Module for ThinkerTextMlp {
         {
             return self.down_proj.forward(&hidden);
         }
-        let gate = self.gate_proj.forward(xs)?;
-        let up = self.up_proj.forward(xs)?;
+        let (gate, up) = if let Some(fused) = &self.fused_gate_up {
+            let outputs = fused.forward(xs)?;
+            (outputs[0].clone(), outputs[1].clone())
+        } else {
+            (self.gate_proj.forward(xs)?, self.up_proj.forward(xs)?)
+        };
         let gate = match self.hidden_act.as_str() {
             "silu" | "swish" => candle_nn::ops::silu(&gate)?,
             other => candle_core::bail!("unsupported hidden_act={other:?}"),
@@ -486,6 +599,9 @@ impl Module for ThinkerTextMlp {
 
 #[derive(Debug, Clone)]
 struct ThinkerTextAttention {
+    #[cfg(feature = "paged-attn")]
+    metal_auto_packed_paged: bool,
+    fused_qkv: Option<MetalDenseProjection>,
     use_flash_attn: bool,
     num_attention_heads: usize,
     num_key_value_heads: usize,
@@ -509,6 +625,7 @@ impl ThinkerTextAttention {
         device: &candle_core::Device,
         use_flash_attn: bool,
         isq: Option<&str>,
+        dense_fusion: bool,
     ) -> Result<Self> {
         #[cfg(not(feature = "paged-attn"))]
         let _ = device;
@@ -559,7 +676,11 @@ impl ThinkerTextAttention {
             v_scale: Tensor::new(1f32, device)?,
         });
 
+        let fused_qkv = MetalDenseProjection::new(&[&q_proj, &k_proj, &v_proj], dense_fusion)?;
         Ok(Self {
+            #[cfg(feature = "paged-attn")]
+            metal_auto_packed_paged: false,
+            fused_qkv,
             use_flash_attn,
             num_attention_heads,
             num_key_value_heads,
@@ -588,6 +709,11 @@ impl ThinkerTextAttention {
             )? {
                 return Ok(qkv);
             }
+        }
+
+        if let Some(fused) = &self.fused_qkv {
+            let outputs = fused.forward(hidden_states)?;
+            return Ok((outputs[0].clone(), outputs[1].clone(), outputs[2].clone()));
         }
 
         Ok((
@@ -1088,20 +1214,22 @@ impl ThinkerTextAttention {
                     self.num_attention_heads,
                     self.head_dim,
                 ))?)?;
-                paged_attention(
-                    &q_flat,
-                    Some(&paged_attn.k_scale),
-                    Some(&paged_attn.v_scale),
-                    key_cache,
-                    value_cache,
-                    &input_metadata.block_tables,
-                    &input_metadata.context_lens,
-                    None,
-                    input_metadata.max_context_len,
-                    self.scaling as f32,
-                    1.0,
-                    None,
-                )?
+                crate::profiling::measure("decode_attention", hidden_states.device(), || {
+                    paged_attention(
+                        &q_flat,
+                        Some(&paged_attn.k_scale),
+                        Some(&paged_attn.v_scale),
+                        key_cache,
+                        value_cache,
+                        &input_metadata.block_tables,
+                        &input_metadata.context_lens,
+                        None,
+                        input_metadata.max_context_len,
+                        self.scaling as f32,
+                        1.0,
+                        None,
+                    )
+                })?
             }
             #[cfg(not(any(feature = "cuda-paged-attn", feature = "metal-paged-attn")))]
             {
@@ -1119,6 +1247,11 @@ impl ThinkerTextAttention {
                 {
                     let block_size = key_cache.dim(3)?;
                     if !metal_hybrid_paged_prefill_enabled()
+                        && vasr_paged_attn::supports_metal_varlen_cache_dtype(
+                            q.dtype(),
+                            key_cache.dtype(),
+                            value_cache.dtype(),
+                        )
                         && vasr_paged_attn::supports_metal_varlen_prefill(
                             q.device(),
                             self.head_dim,
@@ -1296,6 +1429,64 @@ impl ThinkerTextAttention {
             );
         }
 
+        #[cfg(feature = "metal-paged-attn")]
+        {
+            static DIRECT_PAGED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+            let direct = DIRECT_PAGED
+                .get_or_init(|| {
+                    std::env::var("VASR_METAL_PACKED_PAGED_ATTN").ok().map(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    })
+                })
+                .unwrap_or(self.metal_auto_packed_paged);
+            if direct
+                && vasr_paged_attn::supports_metal_varlen_cache_dtype(
+                    q.dtype(),
+                    key_cache.dtype(),
+                    value_cache.dtype(),
+                )
+                && q.device().is_metal()
+                && vasr_paged_attn::supports_metal_varlen_prefill(
+                    q.device(),
+                    self.head_dim,
+                    key_cache.dim(3)?,
+                )
+            {
+                let cu_q = input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("packed prefill missing cu_seqlens_q".into())
+                })?;
+                let packed_query = q.transpose(1, 2)?.contiguous()?.reshape((
+                    total_tokens,
+                    self.num_attention_heads,
+                    self.head_dim,
+                ))?;
+                let packed_output =
+                    crate::profiling::measure("prefill_attention", q.device(), || {
+                        vasr_paged_attn::paged_attention_varlen_prefill(
+                            &packed_query,
+                            key_cache,
+                            value_cache,
+                            &input_metadata.block_tables,
+                            &input_metadata.context_lens,
+                            cu_q,
+                            Some(&paged_attn.k_scale),
+                            Some(&paged_attn.v_scale),
+                            self.scaling as f32,
+                            1.0,
+                        )
+                    })?;
+                let output = packed_output.reshape((
+                    1usize,
+                    total_tokens,
+                    self.num_attention_heads * self.head_dim,
+                ))?;
+                return self.o_proj.forward(&output);
+            }
+        }
+
         let cu_kv = input_metadata.cu_seqlens_kv.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("packed prefill missing cu_seqlens_kv".into())
         })?;
@@ -1311,16 +1502,32 @@ impl ThinkerTextAttention {
         let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
         let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
         let q = maybe_contiguous_for_accelerator(q)?;
-        let attn_output = attention::run_attention(
-            &q,
-            &k_4d,
-            &v_4d,
-            &attention::AttentionMask::None,
-            input_metadata.prefill_flash_params(),
-            self.scaling as f32,
-            true,
-            self.num_key_value_groups,
-        )?;
+        let attn_output = if q.device().is_metal() {
+            let kv_lens = input_metadata.kv_lens.as_deref().ok_or_else(|| {
+                candle_core::Error::Msg("packed Metal prefill missing host kv_lens".into())
+            })?;
+            attention::run_packed_prefill_attention(
+                &q,
+                &k_4d,
+                &v_4d,
+                query_lens,
+                kv_lens,
+                self.scaling as f32,
+                true,
+                self.num_key_value_groups,
+            )?
+        } else {
+            attention::run_attention(
+                &q,
+                &k_4d,
+                &v_4d,
+                &attention::AttentionMask::None,
+                input_metadata.prefill_flash_params(),
+                self.scaling as f32,
+                true,
+                self.num_key_value_groups,
+            )?
+        };
         let attn_output = attn_output.transpose(1, 2)?.reshape((
             1usize,
             total_tokens,
@@ -1345,10 +1552,17 @@ impl ThinkerTextDecoderLayer {
         device: &candle_core::Device,
         use_flash_attn: bool,
         isq: Option<&str>,
+        dense_fusion: bool,
     ) -> Result<Self> {
-        let self_attn =
-            ThinkerTextAttention::load(cfg, vb.pp("self_attn"), device, use_flash_attn, isq)?;
-        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"), isq)?;
+        let self_attn = ThinkerTextAttention::load(
+            cfg,
+            vb.pp("self_attn"),
+            device,
+            use_flash_attn,
+            isq,
+            dense_fusion,
+        )?;
+        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"), isq, dense_fusion)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -1493,6 +1707,7 @@ impl ThinkerTextModel {
         isq: Option<&str>,
         progress: &Progress,
     ) -> Result<Self> {
+        let dense_fusion = metal_dense_projection_fusion_enabled()?;
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -1513,6 +1728,7 @@ impl ThinkerTextModel {
                 device,
                 use_flash_attn,
                 isq,
+                dense_fusion,
             )?);
             progress.inc(1);
         }
@@ -1541,6 +1757,13 @@ impl ThinkerTextModel {
 
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub(crate) fn set_auto_packed_paged_prefill(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            layer.self_attn.metal_auto_packed_paged = enabled;
+        }
     }
 
     pub fn num_layers(&self) -> usize {
@@ -1797,6 +2020,143 @@ mod tests {
     use super::load_multimodal_rope;
     #[cfg(feature = "paged-attn")]
     use super::unpack_gathered_kv_for_attention;
+
+    fn dense_fixture(
+        out: usize,
+        input: usize,
+        bias: bool,
+        seed: usize,
+        dtype: candle_core::DType,
+        device: &candle_core::Device,
+    ) -> candle_core::Result<super::IsqLinear> {
+        let values = (0..out * input)
+            .map(|i| (((i * 17 + seed * 23) % 97) as f32 - 48.0) / 193.0)
+            .collect::<Vec<_>>();
+        let weight =
+            candle_core::Tensor::from_vec(values, (out, input), device)?.to_dtype(dtype)?;
+        let bias = if bias {
+            Some(
+                candle_core::Tensor::from_vec(
+                    (0..out)
+                        .map(|i| (i as f32 - 3.0) / 53.0)
+                        .collect::<Vec<_>>(),
+                    out,
+                    device,
+                )?
+                .to_dtype(dtype)?,
+            )
+        } else {
+            None
+        };
+        Ok(super::IsqLinear::Linear(candle_nn::Linear::new(
+            weight, bias,
+        )))
+    }
+
+    #[test]
+    fn test_metal_dense_projection_fusion_leaves_cpu_unchanged() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let gate = dense_fixture(12, 8, false, 1, candle_core::DType::F32, &device)?;
+        let up = dense_fixture(12, 8, false, 2, candle_core::DType::F32, &device)?;
+        assert!(super::MetalDenseProjection::new(&[&gate, &up], true)?.is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn assert_metal_dense_projection_fusion(
+        dtype: candle_core::DType,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        use candle_nn::Module;
+        let device = candle_core::Device::new_metal(0)?;
+        let gate = dense_fixture(12, 8, false, 1, dtype, &device)?;
+        let up = dense_fixture(12, 8, false, 2, dtype, &device)?;
+        let down = dense_fixture(8, 12, false, 3, dtype, &device)?;
+        let reference = super::ThinkerTextMlp {
+            gate_proj: gate.clone(),
+            up_proj: up.clone(),
+            down_proj: down.clone(),
+            hidden_act: "silu".into(),
+            fused_gate_up: None,
+        };
+        let fused = super::ThinkerTextMlp {
+            gate_proj: gate.clone(),
+            up_proj: up.clone(),
+            down_proj: down,
+            hidden_act: "silu".into(),
+            fused_gate_up: super::MetalDenseProjection::new(&[&gate, &up], true)?,
+        };
+        assert!(fused.fused_gate_up.is_some());
+        assert!(super::MetalDenseProjection::new(&[&gate, &up], false)?.is_none());
+        for batch in [1usize, 8, 32] {
+            for seq in [1usize, 5] {
+                let xs = candle_core::Tensor::from_vec(
+                    (0..batch * seq * 8)
+                        .map(|i| ((i * 11 % 83) as f32 - 41.0) / 71.0)
+                        .collect::<Vec<_>>(),
+                    (batch, seq, 8),
+                    &device,
+                )?
+                .to_dtype(dtype)?;
+                assert_dense_close(&fused.forward(&xs)?, &reference.forward(&xs)?, tolerance)?;
+                // Q has more output channels than K/V; exercise bias and no bias.
+                for bias in [false, true] {
+                    let q = dense_fixture(8, 8, bias, 4, dtype, &device)?;
+                    let k = dense_fixture(4, 8, bias, 5, dtype, &device)?;
+                    let v = dense_fixture(4, 8, bias, 6, dtype, &device)?;
+                    let projection = super::MetalDenseProjection::new(&[&q, &k, &v], true)?
+                        .ok_or_else(|| anyhow::anyhow!("missing fused dense QKV"))?;
+                    let got = projection.forward(&xs)?;
+                    for (output, reference) in got.iter().zip([&q, &k, &v]) {
+                        assert_dense_close(output, &reference.forward(&xs)?, tolerance)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn assert_dense_close(
+        got: &candle_core::Tensor,
+        expected: &candle_core::Tensor,
+        tolerance: f32,
+    ) -> anyhow::Result<()> {
+        assert_eq!(got.dims(), expected.dims());
+        let got = got
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = expected
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(got.iter().chain(&expected).all(|x| x.is_finite()));
+        let max_abs = got
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_abs <= tolerance,
+            "dense fusion mismatch max_abs={max_abs}, tolerance={tolerance}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU; run explicitly after stopping benchmark server"]
+    fn test_metal_dense_projection_fusion_f32() -> anyhow::Result<()> {
+        assert_metal_dense_projection_fusion(candle_core::DType::F32, 1e-4)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU; run explicitly after stopping benchmark server"]
+    fn test_metal_dense_projection_fusion_bf16() -> anyhow::Result<()> {
+        assert_metal_dense_projection_fusion(candle_core::DType::BF16, 0.025)
+    }
 
     #[test]
     fn test_rotary_embedding_loads_without_rope_scaling() -> anyhow::Result<()> {

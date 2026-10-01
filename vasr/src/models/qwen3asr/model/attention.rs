@@ -253,6 +253,19 @@ fn run_single_sequence_attention(
         return Ok(out);
     }
 
+    run_eager_attention(q, k, v, mask, softmax_scale, causal, n_kv_groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_eager_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    softmax_scale: f32,
+    causal: bool,
+    n_kv_groups: usize,
+) -> Result<Tensor> {
     let (k, v) = if n_kv_groups > 1 {
         (repeat_kv(k, n_kv_groups)?, repeat_kv(v, n_kv_groups)?)
     } else {
@@ -675,6 +688,119 @@ fn flash_attn_dispatch(
     Ok(None)
 }
 
+/// Attention for physically packed requests, using host lengths to preserve boundaries.
+/// Q and KV offsets advance independently; cached queries are causally right aligned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_packed_prefill_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    query_lens: &[usize],
+    kv_lens: &[usize],
+    softmax_scale: f32,
+    causal: bool,
+    n_kv_groups: usize,
+) -> Result<Tensor> {
+    let (batch, heads, total_q, dim) = q.dims4()?;
+    let (kb, kv_heads, total_k, k_dim) = k.dims4()?;
+    let (vb, v_heads, total_v, v_dim) = v.dims4()?;
+    if batch != 1
+        || kb != 1
+        || vb != 1
+        || dim == 0
+        || dim != k_dim
+        || dim != v_dim
+        || kv_heads == 0
+        || kv_heads != v_heads
+        || kv_heads.checked_mul(n_kv_groups) != Some(heads)
+        || q.dtype() != k.dtype()
+        || q.dtype() != v.dtype()
+        || !q.device().same_device(k.device())
+        || !q.device().same_device(v.device())
+    {
+        candle_core::bail!("invalid packed prefill Q/K/V shapes, GQA groups, dtype or device");
+    }
+    if query_lens.is_empty() || query_lens.len() != kv_lens.len() {
+        candle_core::bail!("packed prefill requires matching nonempty query/KV length lists");
+    }
+    let checked_total = |lengths: &[usize]| -> Result<usize> {
+        lengths.iter().try_fold(0usize, |total, &len| {
+            if len == 0 {
+                candle_core::bail!("packed prefill sequence length must be nonzero");
+            }
+            total
+                .checked_add(len)
+                .ok_or_else(|| candle_core::Error::Msg("packed prefill length overflow".into()))
+        })
+    };
+    let expected_q = checked_total(query_lens)?;
+    let expected_k = checked_total(kv_lens)?;
+    if expected_q != total_q || expected_k != total_k || expected_k != total_v {
+        candle_core::bail!(
+            "packed prefill token count mismatch: query={expected_q}/{total_q} KV={expected_k}/{total_k}/{total_v}"
+        );
+    }
+    let mut outputs = Vec::with_capacity(query_lens.len());
+    let (mut q_offset, mut k_offset) = (0usize, 0usize);
+    for (&q_len, &k_len) in query_lens.iter().zip(kv_lens) {
+        if causal && q_len > k_len {
+            candle_core::bail!(
+                "packed causal prefill query length {q_len} exceeds KV length {k_len}"
+            );
+        }
+        let q_row = q.narrow(2, q_offset, q_len)?.contiguous()?;
+        let k_row = k.narrow(2, k_offset, k_len)?.contiguous()?;
+        let v_row = v.narrow(2, k_offset, k_len)?.contiguous()?;
+        // Candle's short-query Metal vector SDPA accepts neither mask nor causal
+        // flags. Use explicit eager attention there; F32 full SDPA is unsupported.
+        let needs_eager = q.device().is_metal() && (q_len <= 8 || q.dtype() == DType::F32);
+        let (mask, internal_causal) = if causal && (q_len != k_len || needs_eager) {
+            (
+                AttentionMask::Custom(make_causal_mask_cached(
+                    None,
+                    1,
+                    k_len - q_len,
+                    q_len,
+                    q.dtype(),
+                    q.device(),
+                )?),
+                false,
+            )
+        } else {
+            (AttentionMask::None, causal)
+        };
+        let output = if needs_eager {
+            let mask_tensor = match &mask {
+                AttentionMask::None => None,
+                AttentionMask::Custom(mask) => Some(mask),
+            };
+            run_eager_attention(
+                &q_row,
+                &k_row,
+                &v_row,
+                mask_tensor,
+                softmax_scale,
+                internal_causal,
+                n_kv_groups,
+            )?
+        } else {
+            run_attention_noflash(
+                &q_row,
+                &k_row,
+                &v_row,
+                &mask,
+                softmax_scale,
+                internal_causal,
+                n_kv_groups,
+            )?
+        };
+        outputs.push(output);
+        q_offset += q_len;
+        k_offset += k_len;
+    }
+    Tensor::cat(&outputs, 2)
+}
+
 pub fn supports_packed_varlen_sdpa(query: &Tensor) -> bool {
     if std::env::var_os("VASR_DISABLE_PACKED_VARLEN").is_some() {
         return false;
@@ -791,6 +917,11 @@ pub fn accelerated_sdpa(
     }
 
     let (batch, num_heads, q_len, head_dim) = q.dims4()?;
+    // Candle's q_len<=8 vector path ignores both additive masks and causal flags.
+    // Unmasked single-token decode can still use that path.
+    if q_len <= 8 && (mask.is_some() || (causal && q_len > 1)) {
+        return Ok(None);
+    }
     let (kb, _num_kv_heads, k_len, k_head_dim) = k.dims4()?;
     let (vb, _num_v_heads, _v_len, v_head_dim) = v.dims4()?;
     if batch != kb || batch != vb || head_dim != k_head_dim || head_dim != v_head_dim {
@@ -828,6 +959,251 @@ mod tests {
         packed_varlen_attention, repeat_kv,
     };
     use candle_core::{DType, Device, Tensor};
+
+    fn check_packed_prefill_isolation(
+        device: &Device,
+        dtype: DType,
+        query_lens: &[usize],
+        kv_lens: &[usize],
+    ) -> anyhow::Result<()> {
+        let total_q: usize = query_lens.iter().sum();
+        let total_k: usize = kv_lens.iter().sum();
+        let make = |heads, tokens, seed| -> candle_core::Result<Tensor> {
+            let values = (0..heads * tokens * 128)
+                .map(|i| (((i * 17 + seed) % 101) as f32 - 50.0) / 128.0)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (1usize, heads, tokens, 128usize), device)?.to_dtype(dtype)
+        };
+        let q = make(16usize, total_q, 3usize)?;
+        let k = make(8usize, total_k, 17usize)?;
+        let v = make(8usize, total_k, 41usize)?;
+        let output = super::run_packed_prefill_attention(
+            &q,
+            &k,
+            &v,
+            &query_lens,
+            kv_lens,
+            1.0 / 128f32.sqrt(),
+            true,
+            2,
+        )?;
+        let mut references = Vec::new();
+        let (mut q_offset, mut k_offset) = (0, 0);
+        for (&q_len, &k_len) in query_lens.iter().zip(kv_lens) {
+            let q_row = q.narrow(2, q_offset, q_len)?.contiguous()?;
+            let k_row = k.narrow(2, k_offset, k_len)?.contiguous()?;
+            let v_row = v.narrow(2, k_offset, k_len)?.contiguous()?;
+            let mask = make_causal_mask_cached(None, 1, k_len - q_len, q_len, dtype, device)?;
+            references.push(super::run_eager_attention(
+                &q_row,
+                &k_row,
+                &v_row,
+                Some(&mask),
+                1.0 / 128f32.sqrt(),
+                false,
+                2,
+            )?);
+            q_offset += q_len;
+            k_offset += k_len;
+        }
+        let expected = Tensor::cat(&references, 2)?;
+        let actual_values = output
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected_values = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let tolerance = if dtype == DType::BF16 { 0.01 } else { 0.0001 };
+        for (index, (actual, expected)) in actual_values.iter().zip(&expected_values).enumerate() {
+            anyhow::ensure!(
+                (actual - expected).abs() <= tolerance,
+                "isolated mismatch index={index} actual={actual} expected={expected} dtype={dtype:?}"
+            );
+        }
+        // Perturb only the second request's V. Other requests must be unchanged.
+        let changed_v = Tensor::cat(
+            &[
+                v.narrow(2, 0, kv_lens[0])?,
+                v.narrow(2, kv_lens[0], kv_lens[1])?.affine(0.0, 4.0)?,
+                v.narrow(2, kv_lens[0] + kv_lens[1], kv_lens[2])?,
+            ],
+            2,
+        )?;
+        let changed = super::run_packed_prefill_attention(
+            &q,
+            &k,
+            &changed_v,
+            &query_lens,
+            kv_lens,
+            1.0 / 128f32.sqrt(),
+            true,
+            2,
+        )?;
+        for (offset, len) in [
+            (0, query_lens[0]),
+            (query_lens[0] + query_lens[1], query_lens[2]),
+        ] {
+            let before = output
+                .narrow(2, offset, len)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let after = changed
+                .narrow(2, offset, len)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            anyhow::ensure!(
+                before == after,
+                "request isolation changed at offset={offset} dtype={dtype:?}"
+            );
+        }
+        let original_middle = output
+            .narrow(2, query_lens[0], query_lens[1])?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let changed_middle = changed
+            .narrow(2, query_lens[0], query_lens[1])?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        anyhow::ensure!(
+            original_middle
+                .iter()
+                .zip(changed_middle)
+                .any(|(a, b)| (a - b).abs() > 1.0),
+            "perturbation must affect selected request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_packed_prefill_cpu_isolation_and_right_aligned_causal() -> anyhow::Result<()> {
+        check_packed_prefill_isolation(&Device::Cpu, DType::F32, &[3, 7, 2], &[3, 7, 2])?;
+        check_packed_prefill_isolation(&Device::Cpu, DType::F32, &[3, 7, 2], &[5, 10, 4])
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires Metal GPU; run outside concurrent throughput benchmarks"]
+    fn test_packed_prefill_metal_isolation_and_right_aligned_causal() -> anyhow::Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::BF16] {
+            check_packed_prefill_isolation(&device, dtype, &[3, 7, 2], &[3, 7, 2])?;
+            check_packed_prefill_isolation(&device, dtype, &[3, 7, 2], &[5, 10, 4])?;
+            check_packed_prefill_isolation(&device, dtype, &[9, 17, 11], &[9, 17, 11])?;
+            check_packed_prefill_isolation(&device, dtype, &[9, 17, 11], &[13, 21, 14])?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires Metal GPU; run outside concurrent throughput benchmarks"]
+    fn test_nonpacked_metal_short_causal_and_masked_matches_eager() -> anyhow::Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::BF16] {
+            for q_len in [1usize, 2, 7] {
+                let k_len = if q_len == 1 { 7 } else { q_len };
+                let make = |heads, tokens, seed| -> candle_core::Result<Tensor> {
+                    Tensor::from_vec(
+                        (0..heads * tokens * 128)
+                            .map(|i| (((i * 13 + seed) % 113) as f32 - 56.0) / 128.0)
+                            .collect::<Vec<_>>(),
+                        (1usize, heads, tokens, 128usize),
+                        &device,
+                    )?
+                    .to_dtype(dtype)
+                };
+                let q = make(16usize, q_len, 3usize)?;
+                let k = make(8usize, k_len, 17usize)?;
+                let v = make(8usize, k_len, 29usize)?;
+                let mask = if q_len == 1 {
+                    Tensor::from_vec(
+                        vec![
+                            0f32,
+                            f32::MIN,
+                            f32::MIN,
+                            f32::MIN,
+                            f32::MIN,
+                            f32::MIN,
+                            f32::MIN,
+                        ],
+                        (1, 1, 1, 7),
+                        &device,
+                    )?
+                    .to_dtype(dtype)?
+                } else {
+                    make_causal_mask_cached(None, 1, 0, q_len, dtype, &device)?
+                };
+                for causal in [false, true] {
+                    if q_len == 1 && causal {
+                        continue;
+                    }
+                    let expected =
+                        super::run_eager_attention(&q, &k, &v, Some(&mask), 0.08838835, false, 2)?;
+                    let actual = super::run_attention_noflash(
+                        &q,
+                        &k,
+                        &v,
+                        &AttentionMask::Custom(mask.clone()),
+                        0.08838835,
+                        causal,
+                        2,
+                    )?;
+                    let expected = expected
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let actual = actual
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    anyhow::ensure!(
+                        actual == expected,
+                        "nonpacked mask/causal mismatch q_len={q_len} dtype={dtype:?} causal={causal}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_packed_prefill_rejects_invalid_metadata() -> anyhow::Result<()> {
+        let q = Tensor::zeros((1, 16, 12, 128), DType::F32, &Device::Cpu)?;
+        let k = Tensor::zeros((1, 8, 12, 128), DType::F32, &Device::Cpu)?;
+        for (q_lens, k_lens) in [
+            (&[3, 7, 2][..], &[3, 7][..]),
+            (&[3, 7, 1], &[3, 7, 2]),
+            (&[3, 7, 2], &[3, 7, 3]),
+            (&[0, 10, 2], &[3, 7, 2]),
+            (&[3, 7, 2], &[3, 6, 3]),
+        ] {
+            assert!(
+                super::run_packed_prefill_attention(&q, &k, &k, q_lens, k_lens, 1.0, true, 2)
+                    .is_err()
+            );
+        }
+        let bad_v = k.narrow(2, 0, 11)?;
+        assert!(
+            super::run_packed_prefill_attention(
+                &q,
+                &k,
+                &bad_v,
+                &[3, 7, 2],
+                &[3, 7, 2],
+                1.0,
+                true,
+                2
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_repeat_kv_repeats_heads() -> anyhow::Result<()> {

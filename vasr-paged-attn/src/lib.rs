@@ -51,5 +51,6 @@ pub fn reserve_paged_attention_v2_workspace(
 #[cfg(feature = "metal-paged-attn")]
 pub use metal::{
     dense_attention_varlen_prefill, pack_kv_for_varlen_prefill, pack_query_for_varlen_prefill,
-    paged_attention_varlen_prefill, supports_metal_varlen_prefill, unpack_varlen_attn_to_batched,
+    paged_attention_varlen_prefill, supports_metal_varlen_cache_dtype,
+    supports_metal_varlen_prefill, unpack_varlen_attn_to_batched,
 };

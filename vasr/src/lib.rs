@@ -4,6 +4,7 @@ pub mod error;
 pub mod layers;
 pub mod model_builder;
 pub mod models;
+pub mod profiling;
 pub mod timeline;
 pub mod traits;
 pub mod utils;

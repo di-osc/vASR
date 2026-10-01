@@ -19,7 +19,7 @@ use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse, table::render_
 
 #[derive(Debug, Args)]
 pub struct StressArgs {
-    /// Text file with one audio path/URL per line, or a vASR AudioDb (`.vasr`).
+    /// Text file with one audio path/URL per line, or a vASR dataset directory / `.vasr` AudioDb.
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
@@ -792,6 +792,7 @@ mod tests {
         AudioInputDto {
             url: Some(url.to_string()),
             b64_str: None,
+            modelscope: None,
             mono,
             hotword: None,
         }

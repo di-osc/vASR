@@ -689,8 +689,22 @@ fn configure_model_cache_dir(pipeline: &TranscribePipelineArgs) {
 
 fn build_vad_model(vad_args: &VadCliArgs) -> Result<Option<Arc<dyn VadModel>>> {
     let vad_load_start = Instant::now();
-    let vad_device = resolve_vad_device(vad_args.vad_device.as_str())?;
     let vad_model = vad_args.vad_model.trim().to_ascii_lowercase();
+    #[allow(unused_mut)]
+    let mut vad_request = vad_args.vad_device.as_str();
+    #[cfg(feature = "metal")]
+    if vad_request.trim().eq_ignore_ascii_case("auto")
+        && vad_model == "fsmn"
+        && Device::new_metal(0).ok().is_some_and(|device| {
+            vasr::vasr_paged_attn::metal::profile::validated_m4_pro_48gb(&device)
+        })
+    {
+        vad_request = "cpu";
+        tracing::info!(
+            "validated FSMN VAD policy | hardware=M4Pro/48GB device=cpu explicit_override=preserved"
+        );
+    }
+    let vad_device = resolve_vad_device(vad_request)?;
     let vad: Arc<dyn VadModel> = match vad_model.as_str() {
         "fsmn" => {
             let vad = load_fsmn_vad(&vad_device)?;

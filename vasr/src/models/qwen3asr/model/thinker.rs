@@ -120,9 +120,15 @@ pub struct ThinkerForConditionalGeneration {
     text_model: ThinkerTextModel,
     lm_head: IsqLinear,
     audio_token_id: u32,
+    metal_auto_packed_prefill: bool,
 }
 
 impl ThinkerForConditionalGeneration {
+    #[cfg(feature = "paged-attn")]
+    pub(crate) fn metal_auto_packed_prefill(&self) -> bool {
+        self.metal_auto_packed_prefill
+    }
+
     pub fn audio_token_id(&self) -> u32 {
         self.audio_token_id
     }
@@ -176,14 +182,15 @@ impl ThinkerForConditionalGeneration {
             }
             Err(_) => use_flash_attn,
         };
-        let audio_tower = AudioTower::load(
+        let mut audio_tower = AudioTower::load(
             &cfg.audio_config,
             vb.pp("audio_tower"),
             audio_use_flash_attn,
             isq,
             progress,
         )?;
-        let text_model = ThinkerTextModel::load(
+        #[allow(unused_mut)]
+        let mut text_model = ThinkerTextModel::load(
             &cfg.text_config,
             vb.pp("model"),
             device,
@@ -191,6 +198,25 @@ impl ThinkerForConditionalGeneration {
             isq,
             progress,
         )?;
+
+        #[cfg(feature = "metal-paged-attn")]
+        let metal_auto_packed_prefill = validated_packed_profile(
+            cfg,
+            vb.dtype(),
+            isq.is_some(),
+            vasr_paged_attn::metal::profile::validated_m4_pro_48gb(device),
+        );
+        #[cfg(not(feature = "metal-paged-attn"))]
+        let metal_auto_packed_prefill = false;
+        #[cfg(feature = "paged-attn")]
+        text_model.set_auto_packed_paged_prefill(metal_auto_packed_prefill);
+        audio_tower.set_auto_conv_layout(validated_conv_profile(cfg, metal_auto_packed_prefill));
+        if metal_auto_packed_prefill {
+            tracing::info!(
+                target: "vasr::execution",
+                "validated Metal prefill policy | hardware=M4Pro/48GB model=Qwen3-ASR-0.6B dtype=BF16 packed=true direct_paged=true overrides=preserved"
+            );
+        }
 
         let lm_head = if cfg.text_config.tie_word_embeddings {
             if is_forced_aligner {
@@ -216,6 +242,7 @@ impl ThinkerForConditionalGeneration {
             text_model,
             lm_head,
             audio_token_id,
+            metal_auto_packed_prefill,
         })
     }
 
@@ -278,7 +305,11 @@ impl ThinkerForConditionalGeneration {
             inputs_embeds,
             kv_cache,
         )?;
-        Ok(self.lm_head.forward(&hidden_states)?)
+        Ok(crate::profiling::measure(
+            "lm_head",
+            hidden_states.device(),
+            || self.lm_head.forward(&hidden_states),
+        )?)
     }
 
     pub fn forward_decode_one_without_padding(
@@ -292,7 +323,11 @@ impl ThinkerForConditionalGeneration {
             inputs_embeds,
             kv_cache,
         )?;
-        Ok(self.lm_head.forward(&hidden_states)?)
+        Ok(crate::profiling::measure(
+            "lm_head",
+            hidden_states.device(),
+            || self.lm_head.forward(&hidden_states),
+        )?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -312,13 +347,27 @@ impl ThinkerForConditionalGeneration {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let hidden_states = self.text_model.forward_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
+        let hidden_states = crate::profiling::measure(
+            if input_metadata.query_lens.is_some() {
+                "prefill_forward"
+            } else {
+                "text_decode"
+            },
+            inputs_embeds.device(),
+            || {
+                self.text_model.forward_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            },
         )?;
-        Ok(self.lm_head.forward(&hidden_states)?)
+        Ok(crate::profiling::measure(
+            "lm_head",
+            hidden_states.device(),
+            || self.lm_head.forward(&hidden_states),
+        )?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -330,16 +379,30 @@ impl ThinkerForConditionalGeneration {
         input_metadata: &PagedInputMetadata,
         last_token_flat_indices: &[usize],
     ) -> Result<Tensor> {
-        let hidden_states = self.text_model.forward_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
+        let hidden_states = crate::profiling::measure(
+            if input_metadata.query_lens.is_some() {
+                "prefill_forward"
+            } else {
+                "text_decode"
+            },
+            inputs_embeds.device(),
+            || {
+                self.text_model.forward_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            },
         )?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
-        Ok(self.lm_head.forward(&last_hidden)?)
+        Ok(crate::profiling::measure(
+            "lm_head",
+            last_hidden.device(),
+            || self.lm_head.forward(&last_hidden),
+        )?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -355,11 +418,21 @@ impl ThinkerForConditionalGeneration {
         if !self.lm_head.supports_chunked_argmax_next_ids() {
             return Ok(None);
         }
-        let hidden_states = self.text_model.forward_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
+        let hidden_states = crate::profiling::measure(
+            if input_metadata.query_lens.is_some() {
+                "prefill_forward"
+            } else {
+                "text_decode"
+            },
+            inputs_embeds.device(),
+            || {
+                self.text_model.forward_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            },
         )?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
@@ -377,13 +450,20 @@ impl ThinkerForConditionalGeneration {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
-        )?;
-        Ok(self.lm_head.forward(&hidden_states)?)
+        let hidden_states =
+            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+                self.text_model.forward_packed_prefill_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            })?;
+        Ok(crate::profiling::measure(
+            "lm_head",
+            hidden_states.device(),
+            || self.lm_head.forward(&hidden_states),
+        )?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -395,16 +475,23 @@ impl ThinkerForConditionalGeneration {
         input_metadata: &PagedInputMetadata,
         last_token_flat_indices: &[usize],
     ) -> Result<Tensor> {
-        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
-        )?;
+        let hidden_states =
+            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+                self.text_model.forward_packed_prefill_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            })?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
-        Ok(self.lm_head.forward(&last_hidden)?)
+        Ok(crate::profiling::measure(
+            "lm_head",
+            last_hidden.device(),
+            || self.lm_head.forward(&last_hidden),
+        )?)
     }
 
     #[cfg(feature = "paged-attn")]
@@ -420,12 +507,15 @@ impl ThinkerForConditionalGeneration {
         if !self.lm_head.supports_chunked_argmax_next_ids() {
             return Ok(None);
         }
-        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
-            position_ids,
-            inputs_embeds,
-            paged_cache,
-            input_metadata,
-        )?;
+        let hidden_states =
+            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+                self.text_model.forward_packed_prefill_with_paged_cache(
+                    position_ids,
+                    inputs_embeds,
+                    paged_cache,
+                    input_metadata,
+                )
+            })?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
@@ -814,5 +904,106 @@ mod tests {
             }
         }
         Ok(())
+    }
+}
+
+fn validated_conv_profile(cfg: &ThinkerConfig, validated_model: bool) -> bool {
+    validated_model
+        && cfg.audio_config.num_mel_bins == 128
+        && cfg.audio_config.downsample_hidden_size == 480
+        && cfg.audio_config.n_window == 50
+}
+
+fn validated_packed_profile(
+    cfg: &ThinkerConfig,
+    dtype: candle_core::DType,
+    quantized: bool,
+    hardware: bool,
+) -> bool {
+    hardware
+        && dtype == candle_core::DType::BF16
+        && !quantized
+        && matches!(
+            cfg.model_type.as_deref(),
+            Some("qwen3_asr" | "qwen3_asr_thinker")
+        )
+        && cfg.audio_config.encoder_layers == 18
+        && cfg.audio_config.d_model == 896
+        && cfg.audio_config.output_dim == 1024
+        && cfg.text_config.num_hidden_layers == 28
+        && cfg.text_config.hidden_size == 1024
+        && cfg.text_config.num_attention_heads == 16
+        && cfg.text_config.num_key_value_heads == 8
+        && cfg.text_config.head_dim == 128
+}
+
+#[cfg(test)]
+mod packed_policy_tests {
+    use super::*;
+    #[test]
+    fn conv_profile_rejects_unverified_geometry() {
+        let mut cfg = ThinkerConfig::default();
+        cfg.model_type = Some("qwen3_asr".into());
+        cfg.audio_config.n_window = 50;
+        assert!(validated_conv_profile(&cfg, true));
+        assert!(!validated_conv_profile(&cfg, false));
+        cfg.audio_config.downsample_hidden_size = 256;
+        assert!(!validated_conv_profile(&cfg, true));
+        cfg.audio_config.downsample_hidden_size = 480;
+        cfg.audio_config.num_mel_bins = 80;
+        assert!(!validated_conv_profile(&cfg, true));
+    }
+
+    #[test]
+    fn auto_packed_policy_keeps_unvalidated_combinations_on_reference() {
+        let mut cfg = ThinkerConfig::default();
+        cfg.model_type = Some("qwen3_asr".into());
+        cfg.audio_config.encoder_layers = 18;
+        cfg.audio_config.d_model = 896;
+        cfg.audio_config.output_dim = 1024;
+        cfg.text_config.num_hidden_layers = 28;
+        cfg.text_config.hidden_size = 1024;
+        cfg.text_config.num_attention_heads = 16;
+        cfg.text_config.num_key_value_heads = 8;
+        cfg.text_config.head_dim = 128;
+        assert!(validated_packed_profile(
+            &cfg,
+            candle_core::DType::BF16,
+            false,
+            true
+        ));
+        assert!(!validated_packed_profile(
+            &cfg,
+            candle_core::DType::F16,
+            false,
+            true
+        ));
+        assert!(!validated_packed_profile(
+            &cfg,
+            candle_core::DType::BF16,
+            true,
+            true
+        ));
+        assert!(!validated_packed_profile(
+            &cfg,
+            candle_core::DType::BF16,
+            false,
+            false
+        ));
+        cfg.model_type = Some("qwen3_asr_forced_aligner".into());
+        assert!(!validated_packed_profile(
+            &cfg,
+            candle_core::DType::BF16,
+            false,
+            true
+        ));
+        cfg.model_type = Some("qwen3_asr".into());
+        cfg.text_config.num_hidden_layers = 32;
+        assert!(!validated_packed_profile(
+            &cfg,
+            candle_core::DType::BF16,
+            false,
+            true
+        ));
     }
 }

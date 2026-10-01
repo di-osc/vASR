@@ -1,10 +1,21 @@
 use serde::{Deserialize, Serialize};
-use vasr_data::{Annotation, Timeline};
+use asr_data::{TimeRange, Timeline};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelScopeSourceDto {
+    pub repo_id: String,
+    pub file_path: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioInputDto {
     pub url: Option<String>,
     pub b64_str: Option<String>,
+    /// ModelScope 数据集里的单个音频文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modelscope: Option<ModelScopeSourceDto>,
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub mono: Option<bool>,
     pub hotword: Option<String>,
@@ -105,21 +116,28 @@ impl InferenceData {
     ) -> Self {
         let transcript = vasr::prediction_text(timeline);
         let mut sentences = Vec::new();
-        for span in &timeline.prediction {
-            let (text, range) = match &span.annotation {
-                Annotation::Transcription(segment) => (segment.text.clone(), span.range),
-                Annotation::Sentence(segment) => (segment.text.clone(), span.range),
-                _ => continue,
+        for event in &timeline.prediction {
+            let Some(transcription) = event.transcription() else {
+                continue;
             };
-            let duration = range.duration();
-            sentences.push(SentenceResult {
-                text,
-                start_time: range.start_ms as u64,
-                end_time: range.end_ms as u64,
-                duration: duration as u64,
-                channel: channel.to_string(),
-                sentence_index: sentences.len(),
-            });
+            if transcription.sentences.is_empty() {
+                let range = event.range();
+                sentences.push(sentence_result(
+                    transcription.text.clone(),
+                    range,
+                    channel,
+                    sentences.len(),
+                ));
+            } else {
+                for sentence in &transcription.sentences {
+                    sentences.push(sentence_result(
+                        sentence.text.clone(),
+                        sentence.range,
+                        channel,
+                        sentences.len(),
+                    ));
+                }
+            }
         }
         let mut text = TextResult::default();
         match channel {
@@ -138,6 +156,22 @@ impl InferenceData {
             bad_reason: None,
             bad_component: None,
         }
+    }
+}
+
+fn sentence_result(
+    text: String,
+    range: TimeRange,
+    channel: &str,
+    sentence_index: usize,
+) -> SentenceResult {
+    SentenceResult {
+        text,
+        start_time: range.start_ms as u64,
+        end_time: range.end_ms as u64,
+        duration: range.duration() as u64,
+        channel: channel.to_string(),
+        sentence_index,
     }
 }
 

@@ -6,8 +6,8 @@
 
 ### 数据布局
 
-- 当前 checkout 已提供 `datasets/call-100.vasr`（SQLite vASR AudioDb），可直接作为 `perf` 的输入。
-- `perf` 会直接读取 `.vasr` 数据库中的音频 source，不需要先执行旧版 `benchmark` 或 `extract-audio` 子命令。
+- 当前 checkout 已提供 `datasets/call-100.db` 数据集文件，可直接作为 `perf` 的输入。`perf` / `eval` / `stress` / `run` 的 `-i` 接受 `.db` / `.vasr` / `.vasr.msgpack` 数据文件。
+- 数据集音频以 ModelScope 引用（`repo_id` + 仓库内相对路径 + `revision`）存在库里，读取时由 modelhub 下载或命中缓存；不再有“数据集目录 + assets/”布局，也没有旧的 `pack` 子命令。
 
 ### Transcribe
 
@@ -26,5 +26,5 @@ vasr-transcribe serve --model Qwen3-ASR-0.6B
 - 服务起来后再测吞吐。默认请求 `http://127.0.0.1:8867/transcribe`，结果写入 `results/perf_<timestamp>.json`。
 
 ```bash
-vasr-transcribe perf -i datasets/call-100.vasr
+vasr-transcribe perf -i datasets/call-100.db
 ```

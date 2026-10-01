@@ -7,7 +7,7 @@ use std::time::Instant;
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
 use vasr::{AsrOptions, AudioLoader, OfflineAsrModel as AsrModel};
-use vasr_data::AudioSource;
+use asr_data::AudioSource;
 use vasr_vad::{VadModel, VadOptions};
 
 use crate::pipeline::{
@@ -65,6 +65,25 @@ async fn handle_transcribe(
         } else if let Some(b64) = input.b64_str {
             start_stats.base64 += 1;
             AudioSource::Base64(b64)
+        } else if let Some(modelscope) = input.modelscope {
+            start_stats.modelscope += 1;
+            match AudioSource::from_modelscope(
+                modelscope.repo_id,
+                modelscope.file_path,
+                modelscope.revision.as_deref(),
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    data_slots[index] = Some(error_data(
+                        request_metas[index].service_id.clone(),
+                        "loader",
+                        format!("非法的 ModelScope 音频来源: {error}"),
+                        TranscribeItemTiming::default(),
+                        0.0,
+                    ));
+                    continue;
+                }
+            }
         } else {
             start_stats.missing += 1;
             data_slots[index] = Some(error_data(
@@ -84,13 +103,14 @@ async fn handle_transcribe(
     }
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "{} {:<7} {:<5} | items={} src=url:{} base64:{} missing:{} mono=true:{} false:{}",
+        "{} {:<7} {:<5} | items={} src=url:{} base64:{} modelscope:{} missing:{} mono=true:{} false:{}",
         request_id,
         "request",
         "START",
         request_items,
         start_stats.url,
         start_stats.base64,
+        start_stats.modelscope,
         start_stats.missing,
         start_stats.mono_true,
         start_stats.mono_false
@@ -469,6 +489,7 @@ struct RequestStats {
 struct RequestStartStats {
     url: usize,
     base64: usize,
+    modelscope: usize,
     missing: usize,
     mono_true: usize,
     mono_false: usize,

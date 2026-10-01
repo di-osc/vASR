@@ -51,7 +51,7 @@ use vasr::models::qwen3asr::model::paged_cache_runtime::PagedCacheStats;
 use vasr::models::qwen3asr::{
     AudioInput, Qwen3ASR, qwen_outputs_to_timelines, qwen_transcribe_options,
 };
-use vasr_data::{AudioSource, TimeSpan, Timeline, Waveform};
+use asr_data::{AudioEvent, AudioSource, Timeline, Waveform};
 
 use self::vad::VadPreparation;
 #[cfg(feature = "paged-attn")]
@@ -897,7 +897,7 @@ struct AsrSegmentJob {
     timing: TranscribeItemTiming,
     spans: TranscribeItemSpans,
     job_audio_seconds: f64,
-    speech_annotations: Vec<TimeSpan>,
+    speech_annotations: Vec<AudioEvent>,
     segment_index: usize,
     segment_count: usize,
     offset: usize,
@@ -1178,7 +1178,7 @@ fn run_asr_jobs_batch(
     stats: Option<&Arc<Mutex<AsrStageStats>>>,
 ) -> Vec<RoutedTranscribeItemOutcome> {
     let mut outcomes = Vec::with_capacity(jobs.len());
-    let mut raw_jobs: Vec<(AsrJob, Vec<TimeSpan>)> = Vec::new();
+    let mut raw_jobs: Vec<(AsrJob, Vec<AudioEvent>)> = Vec::new();
 
     for mut job in jobs {
         let prepared = std::mem::replace(&mut job.prepared, VadPreparation::Disabled);
@@ -1668,6 +1668,8 @@ fn spawn_component_throughput_reporter(
             last_vad = vad;
             last_asr = asr;
 
+            // Optional probes also track decode steps outside the legacy counters.
+            vasr::profiling::log_snapshot();
             if loader_delta.jobs == 0
                 && loader_delta.failed == 0
                 && vad_delta.jobs == 0
@@ -2021,7 +2023,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use vasr::OfflineAsrModel as AsrModel;
-    use vasr_data::TimeRange;
+    use asr_data::TimeRange;
 
     fn test_transcription_timeline(audio_id: &str, text: &str, source: &str) -> Timeline {
         vasr::timeline_from_spans(

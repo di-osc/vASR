@@ -7,7 +7,7 @@ use crate::{TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
-use vasr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
+use asr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 
 use crate::perf::timestamp_file_name;
 use crate::quality::detect_repeated_pattern;
@@ -15,7 +15,7 @@ use crate::table::render_table;
 
 #[derive(Debug, Args)]
 pub struct EvalArgs {
-    /// vASR SQLite AudioDb.
+    /// vASR dataset directory (`<name>.db` + `assets/`) or a single `.vasr` AudioDb.
     #[arg(short, long, alias = "dataset", value_name = "PATH")]
     input: PathBuf,
 
@@ -311,7 +311,7 @@ fn print_eval_summary_table(summary: &Summary, items: usize) {
     println!("\n{table}\n");
 }
 
-fn record_timeline(record: &Audio, timeline: EvalTimeline) -> Result<&vasr_data::Timeline> {
+fn record_timeline(record: &Audio, timeline: EvalTimeline) -> Result<&asr_data::Timeline> {
     record
         .timeline(timeline.channel())
         .map_err(|err| anyhow!("{err}"))?
@@ -357,7 +357,7 @@ fn build_request(records: &[Audio], mono: bool) -> Result<TranscribeRequest> {
     for record in records {
         let input =
             audio_input_from_source(&record.source, Some(mono), hotword_from_record(record));
-        if input.url.is_none() && input.b64_str.is_none() {
+        if input.url.is_none() && input.b64_str.is_none() && input.modelscope.is_none() {
             bail!("audio {} has no usable source", record.audio_id());
         }
         inputs.push(input);
@@ -409,6 +409,41 @@ async fn request_batch(args: &EvalArgs, request: TranscribeRequest) -> Result<Tr
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("request failed after retries")))
+}
+
+/// Evaluate already-completed concurrent requests with the same normalizer as `eval`.
+/// This performs no additional inference and includes every dataset item.
+pub(crate) fn evaluate_perf_output(
+    records: &[Audio],
+    data: Vec<crate::InferenceData>,
+    wall_seconds: f64,
+    audio_seconds: f64,
+) -> Result<serde_json::Value> {
+    if data.len() != records.len() {
+        bail!("CER requires one response per dataset item");
+    }
+    let response = TranscribeResponse {
+        data,
+        inference_performance: crate::InferencePerformance {
+            batch_wall_seconds: wall_seconds,
+            num_items: records.len(),
+            throughput_items_per_second: records.len() as f64 / wall_seconds,
+            total_audio_duration_seconds: audio_seconds,
+            speedup: audio_seconds / wall_seconds,
+            rtf: wall_seconds / audio_seconds,
+        },
+    };
+    validate_timeline(records, EvalTimeline::Mono)?;
+    let items = extract_items(
+        records,
+        &response,
+        EvalNormalizer::Bench,
+        EvalTimeline::Mono,
+    )?;
+    let summary = summarize(&items, &response)?;
+    Ok(
+        serde_json::json!({"normalizer": "bench", "timeline": "mono", "summary": summary, "items": items}),
+    )
 }
 
 fn extract_items(
@@ -874,6 +909,11 @@ fn url_from_record(record: &Audio) -> String {
     match &record.source {
         AudioSource::Path(path) => path.display().to_string(),
         AudioSource::Url(url) => url.clone(),
+        AudioSource::ModelScope {
+            repo_id,
+            file_path,
+            revision,
+        } => format!("modelscope://{repo_id}/{file_path}@{revision}"),
         AudioSource::Base64(_) | AudioSource::EncodedBytes(_) | AudioSource::PcmS16Le { .. } => {
             String::new()
         }
@@ -947,8 +987,8 @@ mod tests {
         reference_text,
     };
     use crate::InferenceData;
-    use vasr_data::{
-        Annotation, Audio, AudioChannel, AudioEncoding, AudioFormat, AudioInfo, AudioSource,
+    use asr_data::{
+        Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource, Speech,
         Transcription,
     };
 
@@ -970,14 +1010,36 @@ mod tests {
         audio
             .ensure_timeline(channel, Some(duration))
             .expect("timeline")
-            .annotate_span_with(
+            .annotate_with(
                 0,
                 duration,
-                Annotation::Transcription(Transcription::new(text)),
+                AudioEvent::Speech(Speech::new().with_transcription(Transcription::new(text))),
                 true,
                 None,
             )
             .expect("reference");
+    }
+
+    #[test]
+    fn concurrent_perf_quality_reuses_bench_and_rejects_missing_items() {
+        let mut audio = Audio::with_id_from_info(
+            "call-1",
+            AudioSource::from_url("https://example.com/call.wav"),
+            &test_audio_info(1),
+        );
+        add_reference(&mut audio, AudioChannel::Mono, "我要修改商品帖子的价格");
+        let mut output =
+            InferenceData::from_timeline("service", &asr_data::Timeline::new("call-1", 1_000));
+        output.text.mono = "我要修改商品帖子的价格。".into();
+        output.timings.audio = 1.0;
+        let quality =
+            super::evaluate_perf_output(&[audio.clone()], vec![output], 1.0, 1.0).unwrap();
+        assert_eq!(quality["summary"]["cer_weighted"], 0.0);
+        assert_eq!(
+            quality["items"][0]["reference_normalized"],
+            "我要修改商品帖子的价格"
+        );
+        assert!(super::evaluate_perf_output(&[audio], vec![], 1.0, 1.0).is_err());
     }
 
     #[test]
@@ -990,7 +1052,7 @@ mod tests {
         add_reference(&mut audio, AudioChannel::Left, "left reference");
         add_reference(&mut audio, AudioChannel::Right, "right reference");
 
-        let dummy = vasr_data::Timeline::new("call-1", 1_000);
+        let dummy = asr_data::Timeline::new("call-1", 1_000);
         let mut inference = InferenceData::from_timeline("service", &dummy);
         inference.text.mono = "mono hypothesis".to_string();
         inference.text.left = "left hypothesis".to_string();

@@ -2,13 +2,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use vasr_data::{
+use asr_data::{
     Audio, AudioDb, AudioDbError, AudioDbMode, AudioQuery, AudioSource, MAX_QUERY_LIMIT,
 };
 
-use crate::AudioInputDto;
 use crate::legacy_audiodb::read_legacy_audiodb;
+use crate::{AudioInputDto, ModelScopeSourceDto};
 
+/// 判断是否是 vASR 数据文件（`.db` / `.vasr` / `.msgpack`）。
 pub fn is_vasr_data_file(path: &Path) -> bool {
     let file_name = path
         .file_name()
@@ -19,25 +20,36 @@ pub fn is_vasr_data_file(path: &Path) -> bool {
     }
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "vasr" | "msgpack"))
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "db" | "vasr" | "msgpack"))
         .unwrap_or(false)
 }
 
+/// 判断路径是否是 vASR 输入。
+pub fn is_vasr_input(path: &Path) -> bool {
+    is_vasr_data_file(path)
+}
+
+/// 读取 vASR 数据文件里的全部音频文档。
+///
+/// # Errors
+///
+/// 文件打不开、schema 不支持或解码失败时返回错误。
 pub fn read_vasr_audios(input: &Path) -> Result<Vec<Audio>> {
-    match AudioDb::open(input, AudioDbMode::ReadOnly) {
+    let db_path = input;
+    match AudioDb::open(db_path, AudioDbMode::ReadOnly) {
         Ok(db) => db
             .query(&AudioQuery {
                 limit: MAX_QUERY_LIMIT,
                 ..AudioQuery::default()
             })
-            .with_context(|| format!("failed to read vASR AudioDb from {}", input.display())),
+            .with_context(|| format!("failed to read vASR AudioDb from {}", db_path.display())),
         Err(AudioDbError::UnsupportedSchema {
             found: version @ (1 | 2),
             expected: _,
-        }) => read_legacy_audiodb(input, version)
-            .with_context(|| format!("failed to read vASR AudioDb from {}", input.display())),
+        }) => read_legacy_audiodb(db_path, version)
+            .with_context(|| format!("failed to read vASR AudioDb from {}", db_path.display())),
         Err(error) => Err(error)
-            .with_context(|| format!("failed to read vASR AudioDb from {}", input.display())),
+            .with_context(|| format!("failed to read vASR AudioDb from {}", db_path.display())),
     }
 }
 
@@ -50,24 +62,43 @@ pub fn audio_input_from_source(
         AudioSource::Path(path) => AudioInputDto {
             url: Some(path.display().to_string()),
             b64_str: None,
+            modelscope: None,
             mono,
             hotword,
         },
         AudioSource::Url(url) => AudioInputDto {
             url: Some(url.clone()),
             b64_str: None,
+            modelscope: None,
             mono,
             hotword,
         },
         AudioSource::Base64(data) => AudioInputDto {
             url: None,
             b64_str: Some(data.clone()),
+            modelscope: None,
             mono,
             hotword,
         },
         AudioSource::EncodedBytes(bytes) | AudioSource::PcmS16Le { bytes, .. } => AudioInputDto {
             url: None,
             b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            modelscope: None,
+            mono,
+            hotword,
+        },
+        AudioSource::ModelScope {
+            repo_id,
+            file_path,
+            revision,
+        } => AudioInputDto {
+            url: None,
+            b64_str: None,
+            modelscope: Some(ModelScopeSourceDto {
+                repo_id: repo_id.clone(),
+                file_path: file_path.clone(),
+                revision: Some(revision.clone()),
+            }),
             mono,
             hotword,
         },
@@ -75,7 +106,7 @@ pub fn audio_input_from_source(
 }
 
 pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<AudioInputDto>> {
-    if is_vasr_data_file(path) {
+    if is_vasr_input(path) {
         let audios = read_vasr_audios(path)?;
         return Ok(audios
             .iter()
@@ -91,6 +122,7 @@ pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<Audi
         .map(|line| AudioInputDto {
             url: Some(line.to_string()),
             b64_str: None,
+            modelscope: None,
             mono,
             hotword: None,
         })
@@ -99,12 +131,18 @@ pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<Audi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sqlite_database_file_is_a_dataset_input() {
+        let path = std::path::Path::new("datasets/example1.db");
+        assert!(super::is_vasr_data_file(path));
+        assert!(super::is_vasr_input(path));
+    }
     use super::{read_audio_input_dtos, read_vasr_audios};
     use base64::Engine;
     use rusqlite::Connection;
     use serde::Serialize;
     use std::path::PathBuf;
-    use vasr_data::{AudioSource, TimeRange};
+    use asr_data::{AudioSource, TimeRange};
 
     const APPLICATION_ID: i64 = 0x5641_5352;
 
@@ -266,14 +304,15 @@ mod tests {
     }
 
     #[test]
-    fn reads_repo_schema2_dataset_if_present() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datasets/call-100.vasr");
+    fn reads_repo_call_100_dataset_if_present() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datasets/call-100.db");
         if !path.exists() {
             return;
         }
-        let audios = read_vasr_audios(&path).expect("read repo schema 2 dataset");
+        let audios = read_vasr_audios(&path).expect("read repo call-100 dataset");
         assert!(!audios.is_empty());
-        assert!(matches!(audios[0].source, AudioSource::EncodedBytes(_)));
+        // 数据集音频来自 ModelScope 仓库，库里只存仓库身份。
+        assert!(matches!(audios[0].source, AudioSource::ModelScope { .. }));
         let text = audios[0]
             .mono_timeline()
             .expect("mono timeline")

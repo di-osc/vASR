@@ -6,7 +6,7 @@ pub mod loader;
 pub mod normalize;
 pub mod stream;
 
-pub use vasr_data::audio::{
+pub use asr_data::audio::{
     AudioChannel, AudioChunk, AudioEncoding, AudioError, AudioFormat, AudioInfo, AudioSource,
     Waveform, decode,
 };

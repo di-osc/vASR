@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use vasr_data::{AudioSource, Waveform};
+use asr_data::{AudioSource, Waveform};
 
 /// Target ASR/VAD sample rate used by the offline pipeline.
 pub const SAMPLE_RATE_HZ: u32 = 16_000;

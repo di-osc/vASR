@@ -841,9 +841,12 @@ fn apply_prefill_stage_message(
     outputs: &mut Vec<Vec<u32>>,
     prefilled: &mut VecDeque<PrefilledSequence>,
     source_closed: &mut bool,
+    retain_outputs: bool,
     #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
 ) {
-    outputs.resize(outputs.len().max(message.total_rows), Vec::new());
+    if retain_outputs {
+        outputs.resize(outputs.len().max(message.total_rows), Vec::new());
+    }
     prefilled.extend(message.sequences);
     *source_closed = message.source_closed;
     #[cfg(feature = "timing")]
@@ -2410,6 +2413,7 @@ impl AsrBatchScheduler {
                         &mut outputs,
                         &mut prefilled,
                         &mut source_closed,
+                        retain_outputs,
                         #[cfg(feature = "timing")]
                         &mut timings,
                     );
@@ -2515,6 +2519,7 @@ impl AsrBatchScheduler {
                                 &mut outputs,
                                 &mut prefilled,
                                 &mut source_closed,
+                                retain_outputs,
                                 #[cfg(feature = "timing")]
                                 &mut timings,
                             );
@@ -2541,6 +2546,7 @@ impl AsrBatchScheduler {
                                 &mut outputs,
                                 &mut prefilled,
                                 &mut source_closed,
+                                retain_outputs,
                                 #[cfg(feature = "timing")]
                                 &mut timings,
                             );
@@ -2740,6 +2746,39 @@ mod tests {
     use candle_core::{Device, Tensor};
 
     use crate::processor::asr_processor::PreparedInputs;
+
+    #[test]
+    fn streaming_prefill_does_not_retain_historical_output_rows() {
+        use super::{PrefillStageOutput, apply_prefill_stage_message};
+        for retain in [false, true] {
+            let rows = if retain { 5 } else { 1_000_000 };
+            let message = PrefillStageOutput {
+                sequences: Vec::new(),
+                total_rows: rows,
+                source_closed: true,
+                prefill_wave: 0,
+                reason: PrefillBatchReason::WaitingEmpty,
+                #[cfg(feature = "timing")]
+                timings: super::GenerationTimings::default(),
+            };
+            let mut outputs = Vec::new();
+            let mut prefilled = VecDeque::new();
+            let mut closed = false;
+            #[cfg(feature = "timing")]
+            let mut timings = None;
+            apply_prefill_stage_message(
+                message,
+                &mut outputs,
+                &mut prefilled,
+                &mut closed,
+                retain,
+                #[cfg(feature = "timing")]
+                &mut timings,
+            );
+            assert_eq!(outputs.len(), if retain { rows } else { 0 });
+            assert!(closed);
+        }
+    }
 
     #[test]
     fn continuous_batch_defaults_on() {

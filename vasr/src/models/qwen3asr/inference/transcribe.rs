@@ -338,6 +338,14 @@ impl EncodedAsrBatchMetadata {
         self.chunks.len()
     }
 
+    /// Input audio index and duration for each chunk, in producer client order.
+    pub fn chunk_audio_metadata(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.chunks
+            .iter()
+            .zip(&self.chunk_audio_seconds)
+            .map(|(chunk, &seconds)| (chunk.orig_index, seconds))
+    }
+
     fn merge(metas: Vec<Self>) -> Self {
         let audio_len = metas.iter().map(|meta| meta.audio_len).sum();
         let chunk_count = metas.iter().map(|meta| meta.chunks.len()).sum();
@@ -579,14 +587,6 @@ impl StreamingMetadataDecoder {
         chunk_index: usize,
         ids: Vec<u32>,
     ) -> Result<Option<(usize, usize, AsrTranscription)>> {
-        let audio_index = self
-            .merged
-            .chunks
-            .get(chunk_index)
-            .map(|chunk| chunk.orig_index)
-            .ok_or_else(|| {
-                anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
-            })?;
         let is_completed = self.completed_chunks.get(chunk_index).ok_or_else(|| {
             anyhow::anyhow!("dynamic staged ASR completion index out of range: {chunk_index}")
         })?;
@@ -606,12 +606,39 @@ impl StreamingMetadataDecoder {
                 "raw ASR decode"
             );
         }
+        let audio_index = self.merged.chunks[chunk_index].orig_index;
         let forced = self
             .merged
             .forced_langs_norm
             .get(audio_index)
             .and_then(|x| x.as_deref());
         let (lang, text) = parse_asr_output(Some(raw.as_str()), forced);
+        self.accept_decoded_chunk(chunk_index, lang, text)
+    }
+
+    fn accept_decoded_chunk(
+        &mut self,
+        chunk_index: usize,
+        lang: String,
+        text: String,
+    ) -> Result<Option<(usize, usize, AsrTranscription)>> {
+        let audio_index = self
+            .merged
+            .chunks
+            .get(chunk_index)
+            .map(|chunk| chunk.orig_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!("dynamic staged ASR chunk index out of range: {chunk_index}")
+            })?;
+        if *self.completed_chunks.get(chunk_index).ok_or_else(|| {
+            anyhow::anyhow!("dynamic staged ASR completion index out of range: {chunk_index}")
+        })? {
+            bail!("dynamic staged ASR chunk completed more than once: {chunk_index}");
+        }
+        // Tokenization and optional raw-output logging have consumed the only
+        // remaining waveform use. Drop its allocation even if sibling chunks
+        // or earlier requests are still decoding.
+        self.merged.chunks[chunk_index].wav = Vec::new();
         self.completed_chunks[chunk_index] = true;
         self.out_langs[audio_index].push((chunk_index, lang));
         self.out_texts[audio_index].push((chunk_index, text));
@@ -1224,12 +1251,19 @@ fn encode_prepared_audio_features_cpu(
         stack_features(prepared, device)?
     };
     timings.stack_us = duration_to_us(start_stack.elapsed());
+    crate::profiling::record_batch(
+        "encoder_frames",
+        feature_lens.len(),
+        feature_lens.iter().sum(),
+        feature_lens.len() * input_features.dim(2)?,
+    );
     #[cfg(feature = "paged-attn")]
     let (audio_features_cpu, forward_us, d2h_us, audio_tokens) =
         with_metal_model_execution(device, paged_runtime, || {
             let start_forward = std::time::Instant::now();
-            let audio_features =
-                thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+            let audio_features = crate::profiling::measure("encoder_forward", device, || {
+                thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())
+            })?;
             let forward_us = duration_to_us(start_forward.elapsed());
             let audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
             let start_d2h = std::time::Instant::now();
@@ -3107,6 +3141,57 @@ mod batch_grouping_tests {
 #[cfg(all(test, feature = "paged-attn"))]
 mod streaming_metadata_order_tests {
     use super::join_chunk_texts_in_input_order;
+
+    fn metadata(audios: &[usize]) -> super::EncodedAsrBatchMetadata {
+        let chunks = audios
+            .iter()
+            .enumerate()
+            .flat_map(|(audio, &count)| {
+                (0..count).map(move |_| super::ChunkItem {
+                    orig_index: audio,
+                    wav: vec![0.25; 1600],
+                    offset_sec: 0.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        super::EncodedAsrBatchMetadata {
+            audio_len: audios.len(),
+            chunk_audio_seconds: vec![0.1; chunks.len()],
+            chunks,
+            forced_langs_norm: vec![None; audios.len()],
+        }
+    }
+
+    #[test]
+    fn completed_chunks_release_waveforms_and_keep_finish_text_order() -> anyhow::Result<()> {
+        let mut decoder = super::StreamingMetadataDecoder::new(vec![metadata(&[3])], vec![1]);
+        assert!(
+            decoder
+                .accept_decoded_chunk(2, "Chinese".into(), "third".into())?
+                .is_none()
+        );
+        assert_eq!(decoder.merged.chunks[2].wav.capacity(), 0);
+        assert!(!decoder.merged.chunks[0].wav.is_empty());
+        assert!(
+            decoder
+                .accept_decoded_chunk(2, "Chinese".into(), "duplicate".into())
+                .is_err()
+        );
+        decoder.accept_decoded_chunk(0, "Chinese".into(), "first".into())?;
+        let (_, _, output) = decoder
+            .accept_decoded_chunk(1, "Chinese".into(), "second".into())?
+            .expect("all chunks completed");
+        assert_eq!(output.text, "firstsecondthird");
+        assert!(
+            decoder
+                .merged
+                .chunks
+                .iter()
+                .all(|chunk| chunk.wav.capacity() == 0)
+        );
+        assert_eq!(decoder.finish()?[0][0].text, "firstsecondthird");
+        Ok(())
+    }
 
     #[test]
     fn chunk_texts_are_joined_in_audio_order_not_completion_order() {

@@ -16,7 +16,7 @@ use crate::{
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
-    /// Text file with one audio path/URL per line, or a vASR AudioDb (`.vasr`).
+    /// Text file with one audio path/URL per line, or a vASR dataset directory / `.vasr` AudioDb.
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
@@ -39,6 +39,10 @@ pub struct PerfArgs {
     /// Override mono mode for every request item. Omit to let the server decide.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     mono: Option<bool>,
+
+    /// Evaluate concurrent outputs against dataset mono references using the Bench normalizer.
+    #[arg(long, default_value_t = false)]
+    cer: bool,
 
     /// HTTP request retries.
     #[arg(long, default_value_t = 3)]
@@ -128,6 +132,8 @@ struct PerfReport<'a> {
     items: usize,
     summary: PerfSummary,
     requests: Vec<PerfRequestResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +151,18 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     if let Some(limit) = args.limit {
         sources.truncate(limit);
     }
+    let references = if args.cer {
+        if args.mono == Some(false) {
+            bail!("--cer requires mono output");
+        }
+        let mut records = crate::dataset::read_vasr_audios(&args.input)?;
+        if let Some(limit) = args.limit {
+            records.truncate(limit);
+        }
+        Some(records)
+    } else {
+        None
+    };
     let concurrency = resolve_concurrency(args.concurrency);
     let batch_size = args.batch_size;
 
@@ -174,6 +192,26 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     .await
     .with_context(|| format!("perf failed: batch_size={batch_size} concurrency={concurrency}"))?;
     let summary = run.summary.clone();
+    let cer = references.map(|records| {
+        let mut ordered = run.requests.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|request| request.request_index);
+        if ordered
+            .iter()
+            .any(|r| !r.ok || r.data.len() != r.batch_size)
+        {
+            return serde_json::json!({"error": "incomplete responses; CER not accepted"});
+        }
+        let data = ordered.into_iter().flat_map(|r| r.data.clone()).collect();
+        match crate::eval::evaluate_perf_output(
+            &records,
+            data,
+            summary.wall_seconds,
+            summary.audio_seconds,
+        ) {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({"error": error.to_string()}),
+        }
+    });
     println!(
         "perf DONE  | items={} bad={} quality_passed={} failed={} elapsed={:.3}s audio={:.1}s speed={:.1}x quality_speed={:.1}x",
         summary.items,
@@ -201,6 +239,7 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
             items: sources.len(),
             summary,
             requests: run.requests,
+            cer,
         },
     )?;
     println!("[saved] {}", output.display());
@@ -719,24 +758,28 @@ mod tests {
             AudioInputDto {
                 url: Some("https://example.com/a.wav".to_string()),
                 b64_str: Some("AAAA".to_string()),
+                modelscope: None,
                 mono: Some(true),
                 hotword: None,
             },
             AudioInputDto {
                 url: Some("/data/a.wav".to_string()),
                 b64_str: None,
+                modelscope: None,
                 mono: None,
                 hotword: Some("热词".to_string()),
             },
             AudioInputDto {
                 url: None,
                 b64_str: Some("UklGRg==".to_string()),
+                modelscope: None,
                 mono: Some(false),
                 hotword: None,
             },
             AudioInputDto {
                 url: Some("data:audio/wav;base64,UklGRg==".to_string()),
                 b64_str: None,
+                modelscope: None,
                 mono: None,
                 hotword: None,
             },

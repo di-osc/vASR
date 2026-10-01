@@ -4,7 +4,7 @@ use super::{
     format_seconds, format_speed,
 };
 use anyhow::{Result, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -14,7 +14,7 @@ use vasr::models::qwen3asr::{
     Qwen3ASR,
 };
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
-use vasr_data::Waveform;
+use asr_data::Waveform;
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug, Clone, Copy)]
@@ -24,25 +24,51 @@ pub(super) struct SegmentLogItem {
 }
 
 #[cfg(feature = "paged-attn")]
-fn segment_log_items(segments: &[AsrSegmentJob]) -> Vec<SegmentLogItem> {
-    segments
-        .iter()
-        .map(|segment| SegmentLogItem {
-            request_item: segment.request_item,
-            audio_seconds: segment.waveform.duration_seconds(),
+fn segment_log_items(
+    segments: &[AsrSegmentJob],
+    metadata: &EncodedAsrBatchMetadata,
+) -> Vec<SegmentLogItem> {
+    metadata
+        .chunk_audio_metadata()
+        .map(|(audio_index, audio_seconds)| SegmentLogItem {
+            request_item: segments
+                .get(audio_index)
+                .and_then(|segment| segment.request_item),
+            audio_seconds,
         })
         .collect()
 }
 
 #[cfg(feature = "paged-attn")]
+#[derive(Default)]
+struct PrefillLogSegments {
+    items: HashMap<usize, SegmentLogItem>,
+    next_index: usize,
+}
+
+#[cfg(feature = "paged-attn")]
+impl PrefillLogSegments {
+    fn extend(&mut self, segments: Vec<SegmentLogItem>) {
+        for segment in segments {
+            self.items.insert(self.next_index, segment);
+            self.next_index += 1;
+        }
+    }
+
+    fn take(&mut self, client_index: usize) -> Option<SegmentLogItem> {
+        self.items.remove(&client_index)
+    }
+}
+
+#[cfg(feature = "paged-attn")]
 fn log_prefill_batch_done(
-    all_segments: &[SegmentLogItem],
+    all_segments: &mut PrefillLogSegments,
     output: &PrefillStageOutput,
     elapsed_seconds: f64,
 ) {
     let mut segments = Vec::new();
     for sequence in &output.sequences {
-        if let Some(&segment) = all_segments.get(sequence.client_index) {
+        if let Some(segment) = all_segments.take(sequence.client_index) {
             segments.push(segment);
         }
     }
@@ -219,7 +245,7 @@ fn run_global_segment_prefill(
         .ok_or_else(|| anyhow::anyhow!("dynamic staged ASR prefill requires Qwen3ASR"))?;
     let (_inference, waveforms, encoded) = initial.into_parts();
     let (initial_prepared, initial_meta) = qwen3.prepare_encoded_audio_features(encoded)?;
-    let prefill_log_segments = segment_log_items(&segments);
+    let prefill_log_segments = segment_log_items(&segments, &initial_meta);
     decoder_tx
         .send(SegmentPrefillMessage::Prepared {
             producer_id,
@@ -260,7 +286,9 @@ fn run_segment_asr_prefill_dynamic_worker(
     prefill_log_segments: Vec<SegmentLogItem>,
 ) {
     let run = (|| -> Result<()> {
-        let prefill_log_segments = Mutex::new(prefill_log_segments);
+        let mut log_segments = PrefillLogSegments::default();
+        log_segments.extend(prefill_log_segments);
+        let prefill_log_segments = Mutex::new(log_segments);
         let mut source_closed = false;
         let mut poll_prepared = |may_block: bool| -> Result<PreparedAudioBatchPoll> {
             if decode_idle_flush.is_some() && !may_block {
@@ -319,7 +347,7 @@ fn run_segment_asr_prefill_dynamic_worker(
             let done = producer.is_done();
             if wave > 0 {
                 log_prefill_batch_done(
-                    &prefill_log_segments
+                    &mut *prefill_log_segments
                         .lock()
                         .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?,
                     &message,
@@ -361,7 +389,7 @@ fn prepare_coalesced_segment_prefill_batch(
     runtime_handle: &tokio::runtime::Handle,
     decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
-    prefill_log_segments: &Mutex<Vec<SegmentLogItem>>,
+    prefill_log_segments: &Mutex<PrefillLogSegments>,
 ) -> Result<PrefillCoalescedPoll> {
     let mut prepared_batches = Vec::new();
 
@@ -407,7 +435,7 @@ fn prepare_segment_encoded_for_prefill(
     message: SegmentEncoderOutput,
     decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
-    prefill_log_segments: &Mutex<Vec<SegmentLogItem>>,
+    prefill_log_segments: &Mutex<PrefillLogSegments>,
     prepared_batches: &mut Vec<PreparedAudioBatch>,
 ) -> Result<bool> {
     let SegmentEncoderOutput::Encoded(message) = message;
@@ -418,7 +446,7 @@ fn prepare_segment_encoded_for_prefill(
             prefill_log_segments
                 .lock()
                 .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?
-                .extend(segment_log_items(&message.segments));
+                .extend(segment_log_items(&message.segments, &meta));
             if decoder_tx
                 .send(SegmentPrefillMessage::Prepared {
                     producer_id,
@@ -558,5 +586,29 @@ fn try_recv_segment_encoded_message(
             *source_closed = true;
             None
         }
+    }
+}
+
+#[cfg(all(test, feature = "paged-attn"))]
+mod prefill_log_lifecycle_tests {
+    use super::{PrefillLogSegments, SegmentLogItem};
+
+    #[test]
+    fn log_metadata_releases_finished_rows_without_reusing_local_ids() {
+        let mut logs = PrefillLogSegments::default();
+        let item = SegmentLogItem {
+            request_item: None,
+            audio_seconds: 1.0,
+        };
+        logs.extend(vec![item]);
+        for index in 1..=1000 {
+            logs.extend(vec![item]);
+            assert_eq!(logs.take(index).expect("current row").audio_seconds, 1.0);
+            assert_eq!(logs.items.len(), 1);
+            assert!(logs.take(index).is_none());
+        }
+        assert_eq!(logs.next_index, 1001);
+        assert!(logs.take(0).is_some());
+        assert!(logs.items.is_empty());
     }
 }

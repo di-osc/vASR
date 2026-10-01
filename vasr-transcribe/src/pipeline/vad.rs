@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use vasr::{AudioInput, SAMPLE_RATE_HZ, normalize_audio_input};
-use vasr_data::{TimeRange, Waveform};
+use asr_data::{TimeRange, Waveform};
 use vasr_vad::{VadModel, VadOptions, VadSegment};
 
 use super::{
@@ -24,7 +24,7 @@ use super::speech_job_to_segments;
 pub(super) struct VadPrepared {
     /// 语音活动标注，仅在 `paged-attn` 分段解码路径中消费。
     #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
-    pub(super) speech_annotations: Vec<vasr_data::TimeSpan>,
+    pub(super) speech_annotations: Vec<asr_data::AudioEvent>,
     pub(super) segments: Vec<VadSegment>,
     /// 分段音频切片，仅在 `paged-attn` 分段解码路径中消费。
     #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
@@ -93,9 +93,9 @@ fn pad_vad_segments(
 
 #[cfg(feature = "paged-attn")]
 pub(super) fn offset_annotations(
-    annotations: Vec<vasr_data::TimeSpan>,
+    annotations: Vec<asr_data::AudioEvent>,
     offset: usize,
-) -> Vec<vasr_data::TimeSpan> {
+) -> Vec<asr_data::AudioEvent> {
     vasr::offset_spans(annotations, offset)
 }
 

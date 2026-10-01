@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vasr::OfflineAsrModel as AsrModel;
 use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
-use vasr_data::Waveform;
+use asr_data::Waveform;
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]
@@ -51,6 +51,8 @@ pub(super) enum SegmentEncoderOutput {
 }
 
 #[cfg(feature = "paged-attn")]
+// 参数是流水线各阶段的句柄与配置，逐项传递比打包成结构体更直观。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_segment_encoder_worker(
     asr: Arc<dyn AsrModel>,
     asr_options: AsrOptions,

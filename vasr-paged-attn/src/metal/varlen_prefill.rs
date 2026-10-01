@@ -43,6 +43,8 @@ pub fn pack_query_for_varlen_prefill(q: &Tensor, query_lens: &[usize]) -> Result
         let flat = q
             .narrow(0, row, 1)?
             .narrow(2, 0, len)?
+            .transpose(1, 2)?
+            .contiguous()?
             .reshape((len, heads, head_dim))?;
         chunks.push(flat);
     }
@@ -138,7 +140,8 @@ pub fn unpack_varlen_attn_to_batched(
     for &len in query_lens {
         let slice = attn
             .narrow(0, offset, len)?
-            .reshape((1, heads, len, head_dim))?;
+            .reshape((1, len, heads, head_dim))?
+            .transpose(1, 2)?;
         let row_out = if len < seq_len {
             let pad = Tensor::zeros(
                 (1, heads, seq_len - len, head_dim),
@@ -254,6 +257,8 @@ pub fn dense_attention_varlen_prefill(
     )
     .map_err(|e| candle_core::Error::Msg(format!("vasr dense varlen prefill kernel: {e}")))?;
 
+    // Unpacking submits GPU work; release the command encoder guard first.
+    drop(encoder);
     let packed_out = Tensor::from((
         Storage::Metal(MetalStorage::new(
             out_buf,
@@ -264,6 +269,40 @@ pub fn dense_attention_varlen_prefill(
         q_l.shape().clone(),
     ));
     unpack_varlen_attn_to_batched(&packed_out, query_lens, batch, seq_len)
+}
+
+/// Kernel reads dense KV with query's scalar type; FP8 is a separate specialization.
+pub fn supports_metal_varlen_cache_dtype(query: DType, key: DType, value: DType) -> bool {
+    matches!(query, DType::F16 | DType::BF16 | DType::F32)
+        && key == value
+        && (key == query || key == DType::F8E4M3)
+}
+
+fn validate_paged_varlen_layout(q: &Tensor, key: &Tensor, value: &Tensor) -> Result<()> {
+    let (_, _, head_dim) = q.dims3()?;
+    let (_, _, _, _, x) = key.dims5()?;
+    if !q.is_contiguous()
+        || !key.is_contiguous()
+        || !value.is_contiguous()
+        || x != 16 / key.dtype().size_in_bytes()
+        || head_dim % x != 0
+    {
+        candle_core::bail!("unsupported varlen layout");
+    }
+    Ok(())
+}
+
+fn validate_fp8_scale(scale: &Tensor, device: &candle_core::Device) -> Result<()> {
+    let (_storage, layout) = scale.storage_and_layout();
+    if scale.dtype() != DType::F32
+        || scale.elem_count() != 1
+        || !scale.is_contiguous()
+        || layout.start_offset() != 0
+        || !scale.device().same_device(device)
+    {
+        candle_core::bail!("fp8 scale must be a same-device contiguous F32 scalar at offset zero");
+    }
+    Ok(())
 }
 
 fn resolve_fp8_scales(
@@ -296,9 +335,34 @@ pub fn paged_attention_varlen_prefill(
     if !q.device().is_metal() {
         candle_core::bail!("metal varlen prefill requires a Metal device");
     }
+    if !supports_metal_varlen_cache_dtype(q.dtype(), key_cache.dtype(), value_cache.dtype()) {
+        candle_core::bail!(
+            "varlen prefill requires matching dense query/K/V dtypes or two FP8 caches"
+        );
+    }
+    for tensor in [
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+    ] {
+        if !q.device().same_device(tensor.device()) {
+            candle_core::bail!("varlen prefill tensors must share the query device");
+        }
+    }
+    for tensor in [block_tables, context_lens, cu_seqlens_q] {
+        if tensor.dtype() != DType::U32 || !tensor.is_contiguous() {
+            candle_core::bail!("varlen prefill metadata must be contiguous U32 tensors");
+        }
+    }
     let (total_tokens, num_q_heads, head_dim) = q.dims3()?;
     let (num_blocks, num_kv_heads, head_size_kc, block_size, x) = key_cache.dims5()?;
     let (num_blocks_v, num_kv_heads_v, head_size_v, block_size_v) = value_cache.dims4()?;
+    validate_paged_varlen_layout(q, key_cache, value_cache)?;
+    if x == 0 || head_dim % x != 0 || num_kv_heads == 0 || num_q_heads % num_kv_heads != 0 {
+        candle_core::bail!("invalid varlen prefill head/cache geometry");
+    }
     if num_blocks != num_blocks_v
         || num_kv_heads != num_kv_heads_v
         || head_size_v != head_dim
@@ -317,7 +381,11 @@ pub fn paged_attention_varlen_prefill(
         );
     }
 
-    let num_seqs = cu_seqlens_q.dim(0)? - 1;
+    let cu_len = cu_seqlens_q.dim(0)?;
+    if cu_len < 2 || total_tokens == 0 {
+        candle_core::bail!("varlen prefill requires at least one nonempty query sequence");
+    }
+    let num_seqs = cu_len - 1;
     let (num_seqs_bt, max_num_blocks_per_seq) = block_tables.dims2()?;
     if num_seqs_bt != num_seqs || context_lens.dim(0)? != num_seqs {
         candle_core::bail!(
@@ -329,6 +397,10 @@ pub fn paged_attention_varlen_prefill(
     let ty = VarlenPrefillDType::from_candle(q.dtype())
         .map_err(|e| candle_core::Error::Msg(format!("varlen prefill dtype: {e:?}")))?;
     let fp8_scales = resolve_fp8_scales(key_cache, k_scale, v_scale)?;
+    if let Some((k, v)) = &fp8_scales {
+        validate_fp8_scale(k, q.device())?;
+        validate_fp8_scale(v, q.device())?;
+    }
     let quantized_cache = fp8_scales.is_some();
 
     let dev = q.device().as_metal_device()?;
@@ -362,8 +434,14 @@ pub fn paged_attention_varlen_prefill(
         candle_core::bail!("query must be a metal tensor");
     };
 
-    let k_scale_buf = fp8_scales.as_ref().and_then(|(k, _)| metal_buffer(k).ok());
-    let v_scale_buf = fp8_scales.as_ref().and_then(|(_, v)| metal_buffer(v).ok());
+    let k_scale_buf = fp8_scales
+        .as_ref()
+        .map(|(k, _)| metal_buffer(k))
+        .transpose()?;
+    let v_scale_buf = fp8_scales
+        .as_ref()
+        .map(|(_, v)| metal_buffer(v))
+        .transpose()?;
 
     let encoder = dev.command_encoder()?;
     encoder.set_label("vasr-varlen-prefill");
@@ -429,6 +507,68 @@ fn metal_buffer(t: &Tensor) -> Result<candle_metal_kernels::metal::Buffer> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn varlen_layout_rejects_token_gaps_and_wrong_cache_packing() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        let q = Tensor::zeros((2, 2, 64), DType::F32, &Device::Cpu)?;
+        let key = Tensor::zeros((2, 1, 16, 32, 4), DType::F32, &Device::Cpu)?;
+        let value = Tensor::zeros((2, 1, 64, 32), DType::F32, &Device::Cpu)?;
+        assert!(super::validate_paged_varlen_layout(&q, &key, &value).is_ok());
+        let gapped = Tensor::zeros((2, 3, 64), DType::F32, &Device::Cpu)?.narrow(1, 0, 2)?;
+        assert!(super::validate_paged_varlen_layout(&gapped, &key, &value).is_err());
+        let wrong_x = Tensor::zeros((2, 1, 8, 32, 8), DType::F32, &Device::Cpu)?;
+        assert!(super::validate_paged_varlen_layout(&q, &wrong_x, &value).is_err());
+        Ok(())
+    }
+    #[test]
+    fn paged_cache_dtype_eligibility_is_unconditional() {
+        use candle_core::DType;
+        assert!(super::supports_metal_varlen_cache_dtype(
+            DType::BF16,
+            DType::BF16,
+            DType::BF16
+        ));
+        assert!(!super::supports_metal_varlen_cache_dtype(
+            DType::BF16,
+            DType::F16,
+            DType::F16
+        ));
+        assert!(!super::supports_metal_varlen_cache_dtype(
+            DType::BF16,
+            DType::BF16,
+            DType::F16
+        ));
+        assert!(!super::supports_metal_varlen_cache_dtype(
+            DType::BF16,
+            DType::F8E4M3,
+            DType::BF16
+        ));
+        assert!(super::supports_metal_varlen_cache_dtype(
+            DType::BF16,
+            DType::F8E4M3,
+            DType::F8E4M3
+        ));
+        assert!(!super::supports_metal_varlen_cache_dtype(
+            DType::U32,
+            DType::U32,
+            DType::U32
+        ));
+    }
+
+    #[test]
+    fn fp8_scales_reject_wrong_dtype_shape_and_device() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        let scale = Tensor::ones((), DType::F32, &Device::Cpu)?;
+        assert!(super::validate_fp8_scale(&scale, &Device::Cpu).is_ok());
+        assert!(super::validate_fp8_scale(&scale.to_dtype(DType::BF16)?, &Device::Cpu).is_err());
+        assert!(
+            super::validate_fp8_scale(&Tensor::ones(2, DType::F32, &Device::Cpu)?, &Device::Cpu)
+                .is_err()
+        );
+        let offset = Tensor::ones(2, DType::F32, &Device::Cpu)?.narrow(0, 1, 1)?;
+        assert!(super::validate_fp8_scale(&offset, &Device::Cpu).is_err());
+        Ok(())
+    }
     use super::{pack_query_for_varlen_prefill, unpack_varlen_attn_to_batched};
     use candle_core::{Device, Tensor};
 
@@ -444,6 +584,217 @@ mod tests {
         let got0 = restored.narrow(0, 0, 1)?.narrow(2, 0, 3)?;
         let diff = (row0 - got0)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
         assert!(diff.abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_query_preserves_token_head_coordinates() -> anyhow::Result<()> {
+        let q = Tensor::from_vec(
+            (0..2 * 3 * 5 * 2).map(|i| i as f32).collect::<Vec<_>>(),
+            (2, 3, 5, 2),
+            &Device::Cpu,
+        )?;
+        let packed = pack_query_for_varlen_prefill(&q, &[3, 2])?.to_vec3::<f32>()?;
+        let mut t = 0;
+        for (row, len) in [3, 2].into_iter().enumerate() {
+            for token in 0..len {
+                for head in 0..3 {
+                    let index = ((row * 3 + head) * 5 + token) * 2;
+                    assert_eq!(packed[t][head], vec![index as f32, (index + 1) as f32]);
+                }
+                t += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires isolated Metal GPU"]
+    fn varlen_dense_and_paged_match_causal_reference_mixed_lengths() -> anyhow::Result<()> {
+        use super::*;
+        use candle_core::DType;
+        let device = Device::new_metal(0)?;
+        let lens = [3usize, 70, 13];
+        for d in [64, 128] {
+            let (b, h, kv, seq) = (3, 4, 2, 70);
+            for dtype in [DType::F32, DType::BF16] {
+                let tensor = |heads: usize, seed: usize| -> candle_core::Result<Tensor> {
+                    Tensor::from_vec(
+                        (0..b * heads * seq * d)
+                            .map(|i| (((i * seed + 17) % 101) as f32 - 50.) / 100.)
+                            .collect::<Vec<_>>(),
+                        (b, heads, seq, d),
+                        &device,
+                    )?
+                    .to_dtype(dtype)
+                };
+                let q = tensor(h, 7)?;
+                let k = tensor(kv, 11)?;
+                let v = tensor(kv, 13)?;
+                let scale = 1. / (d as f32).sqrt();
+                let dense = dense_attention_varlen_prefill(&q, &k, &v, &lens, scale, 1., 32)?;
+                let cache = crate::PagedKvCache::new_batched(1, kv, d, 32, b, seq, dtype, &device)?;
+                let tables = vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]];
+                let meta = cache.input_metadata_from_query_lens(&tables, &lens, &device)?;
+                let (kc, vc) = cache.key_value_cache(0)?;
+                let (pk, pv) = pack_kv_for_varlen_prefill(&k, &v, &lens)?;
+                crate::reshape_and_cache(
+                    &pk.contiguous()?,
+                    &pv.contiguous()?,
+                    None,
+                    None,
+                    kc,
+                    vc,
+                    &meta.slot_mapping,
+                )?;
+                let pq = pack_query_for_varlen_prefill(&q, &lens)?.contiguous()?;
+                let paged = paged_attention_varlen_prefill(
+                    &pq,
+                    kc,
+                    vc,
+                    &meta.block_tables,
+                    &meta.context_lens,
+                    meta.cu_seqlens_q.as_ref().unwrap(),
+                    None,
+                    None,
+                    scale,
+                    1.,
+                )?;
+                let paged = unpack_varlen_attn_to_batched(&paged, &lens, b, seq)?;
+                for (row, &len) in lens.iter().enumerate() {
+                    let qr = q.narrow(0, row, 1)?.narrow(2, 0, len)?.contiguous()?;
+                    let repeat = |t: &Tensor| -> candle_core::Result<Tensor> {
+                        t.narrow(0, row, 1)?
+                            .narrow(2, 0, len)?
+                            .unsqueeze(2)?
+                            .broadcast_as((1, kv, h / kv, len, d))?
+                            .contiguous()?
+                            .reshape((1, h, len, d))
+                    };
+                    let kr = repeat(&k)?;
+                    let vr = repeat(&v)?;
+                    let mask = Tensor::from_vec(
+                        (0..len * len)
+                            .map(|i| {
+                                if i % len > i / len {
+                                    f32::NEG_INFINITY
+                                } else {
+                                    0.
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        (1, 1, len, len),
+                        &device,
+                    )?
+                    .to_dtype(dtype)?;
+                    let scores = qr
+                        .matmul(&kr.transpose(2, 3)?.contiguous()?)?
+                        .affine(scale as f64, 0.)?
+                        .broadcast_add(&mask)?;
+                    // Equivalent row-wise softmax, avoiding candle-nn dependency.
+                    let max = scores.max_keepdim(3)?;
+                    let exp = scores.broadcast_sub(&max)?.exp()?;
+                    let weights = exp.broadcast_div(&exp.sum_keepdim(3)?)?;
+                    let expected = weights
+                        .matmul(&vr)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    for (kind, actual) in [&dense, &paged].into_iter().enumerate() {
+                        let got = actual
+                            .narrow(0, row, 1)?
+                            .narrow(2, 0, len)?
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        let tol = if dtype == DType::F32 { 1e-4 } else { 0.015 };
+                        for (a, &e) in got.iter().zip(&expected) {
+                            assert!(a.is_finite() && e.is_finite());
+                            assert!(
+                                (a - e).abs() <= tol + tol * e.abs(),
+                                "kind={kind} {dtype:?} row={row} {a} != {e}"
+                            );
+                        }
+                    }
+                }
+                // Unequal Q/KV lengths must align causal positions to the cache tail.
+                let short_lens = [2usize, 7, 1];
+                let mut short_meta =
+                    cache.input_metadata_from_query_lens(&tables, &short_lens, &device)?;
+                short_meta.context_lens = Tensor::from_vec(
+                    lens.iter().map(|&n| n as u32).collect::<Vec<_>>(),
+                    (b,),
+                    &device,
+                )?;
+                let short_q = pack_query_for_varlen_prefill(&q, &short_lens)?.contiguous()?;
+                let short_out = paged_attention_varlen_prefill(
+                    &short_q,
+                    kc,
+                    vc,
+                    &short_meta.block_tables,
+                    &short_meta.context_lens,
+                    short_meta.cu_seqlens_q.as_ref().unwrap(),
+                    None,
+                    None,
+                    scale,
+                    1.,
+                )?;
+                let short_out = unpack_varlen_attn_to_batched(&short_out, &short_lens, b, seq)?;
+                for row in 0..b {
+                    let (ql, kl) = (short_lens[row], lens[row]);
+                    let qr = q.narrow(0, row, 1)?.narrow(2, 0, ql)?.contiguous()?;
+                    let repeat = |t: &Tensor| -> candle_core::Result<Tensor> {
+                        t.narrow(0, row, 1)?
+                            .narrow(2, 0, kl)?
+                            .unsqueeze(2)?
+                            .broadcast_as((1, kv, h / kv, kl, d))?
+                            .contiguous()?
+                            .reshape((1, h, kl, d))
+                    };
+                    let kr = repeat(&k)?;
+                    let vr = repeat(&v)?;
+                    let mask = Tensor::from_vec(
+                        (0..ql * kl)
+                            .map(|i| {
+                                if i % kl > kl - ql + i / kl {
+                                    f32::NEG_INFINITY
+                                } else {
+                                    0.
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        (1, 1, ql, kl),
+                        &device,
+                    )?
+                    .to_dtype(dtype)?;
+                    let scores = qr
+                        .matmul(&kr.transpose(2, 3)?.contiguous()?)?
+                        .affine(scale as f64, 0.)?
+                        .broadcast_add(&mask)?;
+                    let exp = scores.broadcast_sub(&scores.max_keepdim(3)?)?.exp()?;
+                    let expected = exp
+                        .broadcast_div(&exp.sum_keepdim(3)?)?
+                        .matmul(&vr)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let got = short_out
+                        .narrow(0, row, 1)?
+                        .narrow(2, 0, ql)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let tol = if dtype == DType::F32 { 1e-4 } else { 0.015 };
+                    for (a, e) in got.iter().zip(expected) {
+                        assert!(a.is_finite() && e.is_finite());
+                        assert!(
+                            (a - e).abs() <= tol + tol * e.abs(),
+                            "cached {dtype:?} row={row} {a} != {e}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
