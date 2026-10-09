@@ -20,3 +20,13 @@
 - [ ] 30 分钟持续来流、短请求、元数据与 KV 排空
 
 历史 122.6x 仅为参考，尚未构成本次重构的性能验收。
+
+## Metal 公共编译与缓存
+
+pointwise、residual norm、rotary 共用编译选项和缓存；设备、源码、函数、常量和精度均进入 key。保持 Candle 5404348 的现代及旧版 API 选项与环境变量解析规则，未修改 `.metal` 算术。
+
+审查发现 Candle 常量对象的 F32 Eq/Hash 对 NaN 和正负零不一致。公共 key 改用具名类型和浮点位模式，原常量值、类型及重复 setter 顺序保持不变。新增四项回归测试先失败再通过；独立 spec 和质量审查通过。
+
+父任务重新执行默认和关闭 fast-math 的相关 Metal 测试，两组各 19 项通过，含实际非零 F32/F16/BF16 数值、stride/offset/尾部和原生 pipeline 重用。日志 `metal-default-green.log`、`metal-precise-green.log`。旧版系统分支在本机验证配置选择与 setter，不声称已在旧版 macOS 实机验收。
+
+重新计算七个模型文件及 99 个主数据集缓存音频的 SHA256，均与原正确基线一致；归档 `model-manifest.json` 和 `audio-manifest.json`。

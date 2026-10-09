@@ -79,17 +79,9 @@ impl candle_core::CustomOp2 for SiluMul {
         up: &candle_core::MetalStorage,
         up_layout: &candle_core::Layout,
     ) -> Result<(candle_core::MetalStorage, candle_core::Shape)> {
+        use super::compile::{KernelSource, load_pipeline};
         use candle_core::backend::BackendStorage;
-        use candle_metal_kernels::metal::ComputePipeline;
-        use objc2_metal::{
-            MTLCompileOptions, MTLDevice, MTLMathFloatingPointFunctions, MTLMathMode, MTLSize,
-        };
-        use std::{
-            collections::HashMap,
-            sync::{Mutex, OnceLock},
-        };
-        static CACHE: OnceLock<Mutex<HashMap<(u64, &'static str, bool), ComputePipeline>>> =
-            OnceLock::new();
+        use objc2_metal::MTLSize;
         let name = match gate.dtype() {
             DType::F32 => "silu_mul_f32",
             DType::F16 => "silu_mul_f16",
@@ -97,51 +89,7 @@ impl candle_core::CustomOp2 for SiluMul {
             other => candle_core::bail!("SiLU/mul unsupported dtype {other:?}"),
         };
         let device = gate.device();
-        let fast_math = std::env::var("CANDLE_METAL_ENABLE_FAST_MATH")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "t" | "yes" | "y"))
-            .unwrap_or(true);
-        let key = (device.device().as_ref().registryID(), name, fast_math);
-        let pipeline = {
-            let mut cache = CACHE
-                .get_or_init(Mutex::default)
-                .lock()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            if let Some(pipeline) = cache.get(&key) {
-                pipeline.clone()
-            } else {
-                // Match Candle 5404348: otherwise exp() uses different floating-point
-                // functions even with the same arithmetic and intermediate dtype.
-                let options = MTLCompileOptions::new();
-                if objc2::available!(macos = 15, ios = 18) {
-                    options.setMathMode(if fast_math {
-                        MTLMathMode::Fast
-                    } else {
-                        MTLMathMode::Relaxed
-                    });
-                    options.setMathFloatingPointFunctions(if fast_math {
-                        MTLMathFloatingPointFunctions::Fast
-                    } else {
-                        MTLMathFloatingPointFunctions::Precise
-                    });
-                } else {
-                    #[allow(deprecated)]
-                    options.setFastMathEnabled(fast_math);
-                }
-                let library = device
-                    .device()
-                    .new_library_with_source(include_str!("pointwise.metal"), Some(&options))
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let function = library
-                    .get_function(name, None)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let pipeline = device
-                    .device()
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                cache.insert(key, pipeline.clone());
-                pipeline
-            }
-        };
+        let pipeline = load_pipeline(device.device(), KernelSource::Pointwise, name, None)?;
         let count = gate_layout.shape().elem_count();
         let output = device.new_buffer(count, gate.dtype(), "silu-mul")?;
         let guard = device.command_encoder()?;
