@@ -6,7 +6,7 @@ import sys
 import tempfile
 import copy
 from m4_soak import replay_inputs, next_batch
-from audit_soak import check_run_evidence, check_sources, check_metadata_evidence, quality_anomaly, repeated_pattern
+from audit_soak import check_run_evidence, check_sources, check_metadata_evidence, quality_anomaly, repeated_pattern, check_lifecycle_evidence, check_short_text
 
 
 class ReplayInputsTest(unittest.TestCase):
@@ -58,6 +58,30 @@ class SoakAuditTest(unittest.TestCase):
         ]))
         self.assertTrue(result['drained'])
         self.assertEqual(result['peaks']['decoder']['jobs'], 24)
+
+    def test_lifecycle_requires_registry_and_all_permits_drained(self):
+        def line(requests=0, routes=0, requests_available=64, items_available=128, source_available=2048):
+            return (f'metadata_lifetime | stage=registry requests={requests} routes={routes} '
+                    f'request_budget_available={requests_available} request_budget_capacity=64 '
+                    f'item_budget_available={items_available} item_budget_capacity=128 '
+                    f'source_budget_available_bytes={source_available} source_budget_capacity_bytes=2048')
+        for log in ['', line(requests=1), line(routes=1), line(requests_available=63),
+                    line(items_available=127), line(source_available=2047),
+                    line(items_available=129)+'\n'+line()]:
+            with self.subTest(log=log), self.assertRaises(AssertionError):
+                check_lifecycle_evidence(log)
+        result=check_lifecycle_evidence(line(requests=3,routes=20,requests_available=61,items_available=108,source_available=1024)+'\n'+line())
+        self.assertTrue(result['drained'])
+        self.assertEqual(result['samples'],2)
+
+    def test_refactor_short_probe_checks_raw_reference_as_well_as_cer(self):
+        reference='我要修改商品帖子的价格。'
+        check_short_text(reference,reference)
+        for changed in ['我要修改商品帖子的价格', '我要修改商品帖子的价格！', '我要修改帖子价格。']:
+            with self.subTest(text=changed), self.assertRaises(AssertionError):
+                check_short_text(changed,reference)
+        with self.assertRaises(AssertionError):
+            check_short_text('错误标签','错误标签')
 
     def test_unready_service_never_receives_a_benchmark_workload(self):
         # macOS Bash 3.2 does not apply errexit to a bare [[ ... ]] command.

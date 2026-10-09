@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Audit complete same-binary controls and candidates, without excluding samples."""
+"""Audit complete controls and candidates, without excluding samples."""
 import argparse
 import json
 import pathlib
 import statistics
+from decimal import Decimal
 
 
 def ordered_inputs(report):
@@ -48,12 +49,14 @@ def main():
     parser.add_argument('directory', type=pathlib.Path)
     args = parser.parse_args()
     folder = args.directory
+    refactor = (folder / 'experiment.txt').read_text().strip() == 'refactor' if (folder / 'experiment.txt').exists() else False
     first, baseline = checked_report(folder / 'control-r1-perf.json')
     reference_chars = sum(len(item['reference_normalized']) for item in baseline.values())
     reference_edits = sum(edits(item) for item in baseline.values())
     baseline_inputs = ordered_inputs(first)
     rows = []
     service_ids = set()
+    baseline_example = None
     for mode in ['control', 'candidate']:
         for round_number in [1, 2, 3]:
             prefix = folder / f'{mode}-r{round_number}'
@@ -65,6 +68,9 @@ def main():
                 assert report['summary'][field] == first['summary'][field], (prefix, field)
             # Sort by request identity; completion order may legitimately differ.
             inputs = ordered_inputs(report)
+            if refactor:
+                assert report['summary']['concurrency'] == 28 and report['summary']['batch_size'] == 4, (prefix, 'client load must be 28/4')
+                assert all(audio.get('mono') is True for request_inputs in inputs for audio in request_inputs), (prefix, 'mono must be true')
             assert inputs == baseline_inputs, (prefix, 'audio sources or order changed')
             raw_changed = normalized_changed = 0
             for index, item in items.items():
@@ -73,10 +79,27 @@ def main():
                     assert item[field] == control[field], (prefix, index, field)
                 raw_changed += item['hypothesis'] != control['hypothesis']
                 normalized_changed += item['hypothesis_normalized'] != control['hypothesis_normalized']
+            if refactor:
+                assert raw_changed == normalized_changed == 0, (prefix, 'refactor changed transcript')
+                warmup, warmup_items = checked_report(pathlib.Path(f'{prefix}-warmup.json'))
+                assert ordered_inputs(warmup) == baseline_inputs, (prefix, 'warmup input mapping changed')
+                assert warmup['summary']['concurrency'] == 28 and warmup['summary']['batch_size'] == 4, (prefix, 'warmup client load must be 28/4')
+                for index, item in warmup_items.items():
+                    for field in ['audio_id', 'url', 'reference', 'reference_normalized', 'hypothesis', 'hypothesis_normalized']:
+                        assert item[field] == baseline[index][field], (prefix, 'warmup', index, field)
             candidate_edits = sum(edits(item) for item in items.values())
             assert candidate_edits <= reference_edits, (prefix, 'weighted CER increased')
             example = json.loads(pathlib.Path(f'{prefix}-example1.json').read_text())
             assert example['summary']['cer_weighted'] == 0, prefix
+            if refactor:
+                assert example['summary']['quality_passed_items'] == len(example['items']) == 1, prefix
+                item = example['items'][0]
+                assert item['index'] == 0 and item['audio_id'] == 'example1', prefix
+                assert item['reference_normalized'] == item['hypothesis_normalized'] == '我要修改商品帖子的价格', prefix
+                assert not item['is_bad'] and not item['quality_anomaly'], prefix
+                if baseline_example is None:
+                    baseline_example = item['hypothesis']
+                assert item['hypothesis'] == baseline_example, (prefix, 'example1 raw text changed')
             samples = [json.loads(line) for line in pathlib.Path(f'{prefix}-memory.jsonl').read_text().splitlines()]
             rss = [int(sample['rss_kib']) for sample in samples if sample['rss_kib'].isdigit()]
             rows.append({'mode': mode, 'round': round_number,
@@ -93,8 +116,15 @@ def main():
         result[mode] = {'median_x': statistics.median(speeds), 'min_x': min(speeds), 'max_x': max(speeds)}
     result['median_gain_percent'] = (result['candidate']['median_x'] / result['control']['median_x'] - 1) * 100
     result['target_above_100x'] = result['candidate']['median_x'] > 100
+    if refactor:
+        # Compare the reported decimal medians directly; binary percentage arithmetic
+        # can reject exactly 3 percent (for example 194 / 200).
+        within_regression_limit = Decimal(str(result['candidate']['median_x'])) >= Decimal(str(result['control']['median_x'])) * Decimal('0.97')
+        result['refactor_acceptance_passed'] = result['target_above_100x'] and within_regression_limit
     (folder / 'audit.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if refactor:
+        assert result['refactor_acceptance_passed'], 'refactor throughput must stay above 100x and within 3 percent of contemporary baseline'
 
 
 if __name__ == '__main__':

@@ -134,6 +134,39 @@ def check_metadata_evidence(server_log):
             'scope': 'direct live-entry counts at stage transitions; not allocator byte accounting'}
 
 
+def check_short_text(raw, reference):
+    assert normalize(raw) == normalize(reference) == '我要修改商品帖子的价格', 'short reference mismatch'
+    assert raw == reference, 'short raw transcript changed'
+
+
+def check_lifecycle_evidence(server_log):
+    """Direct budget snapshots prove ownership returned after the stream drained."""
+    rows=[]
+    for match in re.finditer(r'metadata_lifetime \| stage=registry ([^\r\n]*)', server_log or ''):
+        values={key:int(value) for key,value in re.findall(r'\b(\w+)=(\d+)\b',match.group(1))}
+        required=['requests','routes']+[f'{budget}_budget_{field}' for budget in ['request','item','source']
+                                       for field in (['available_bytes','capacity_bytes'] if budget=='source' else ['available','capacity'])]
+        assert all(key in values for key in required), 'incomplete lifecycle snapshot'
+        for budget in ['request','item','source']:
+            suffix='_bytes' if budget=='source' else ''
+            capacity=values[f'{budget}_budget_capacity{suffix}']
+            available=values[f'{budget}_budget_available{suffix}']
+            assert capacity>=1 and 0<=available<=capacity, 'invalid budget snapshot'
+        assert values['requests']<=values['request_budget_capacity'], 'request registry exceeds admission bound'
+        assert values['routes']<=2*values['item_budget_capacity'], 'routes exceed item admission bound'
+        rows.append(values)
+    assert rows, 'missing direct lifecycle evidence'
+    last=rows[-1]
+    assert last['requests']==last['routes']==0, 'request registry not drained'
+    for budget in ['request','item','source']:
+        suffix='_bytes' if budget=='source' else ''
+        key=f'{budget}_budget_capacity{suffix}'
+        assert all(row[key]==last[key] for row in rows), 'budget capacity changed during run'
+        assert last[f'{budget}_budget_available{suffix}']==last[key], f'{budget} permits not reclaimed'
+    return {'drained':True,'samples':len(rows),'last':last,
+            'peak_requests':max(row['requests'] for row in rows),'peak_routes':max(row['routes'] for row in rows)}
+
+
 def check_run_evidence(rows, summary, memories, server_log=None):
     """Quality alone cannot certify duration, continuous probes or drained KV."""
     duration = summary['duration_sec']
@@ -203,7 +236,19 @@ def main():
     parser.add_argument('--server-log', help='request KV snapshots including drained completion')
     parser.add_argument('--metadata-policy', choices=['optional', 'require'], default='optional',
                         help='require direct producer, decoder and router lifetime counters')
+    parser.add_argument('--short-baseline', help='formal original-binary example1 eval artifact')
+    parser.add_argument('--refactor', action='store_true', help='require exact transcripts and all admission permits reclaimed')
     args = parser.parse_args()
+    short_reference = None
+    if args.refactor:
+        assert args.short_baseline and args.short_perf, 'refactor requires formal short baseline and replay source'
+        short_baseline = json.loads(pathlib.Path(args.short_baseline).read_text())
+        assert short_baseline['summary']['cer_weighted'] == 0 and len(short_baseline['items']) == 1
+        short_reference = short_baseline['items'][0]['hypothesis']
+        check_short_text(short_reference, short_reference)
+        short_source = json.loads(pathlib.Path(args.short_perf).read_text())
+        assert len(short_source['cer']['items']) == 1
+        check_short_text(short_source['cer']['items'][0]['hypothesis'], short_reference)
     validated = 0
     for path in pathlib.Path(args.validation_dir).glob('*.json'):
         data = json.loads(path.read_text())
@@ -251,6 +296,11 @@ def main():
             short_latencies.append(row['latency_sec'])
             if hypothesis != normalize('我要修改商品帖子的价格'):
                 errors.append('short reference mismatch')
+            if args.refactor:
+                try:
+                    check_short_text(data[0]['text']['mono'], short_reference)
+                except AssertionError as error:
+                    errors.append(str(error))
             continue
         for index, url, response in zip(indices, urls, data):
             hypothesis = normalize(response['text']['mono'])
@@ -283,6 +333,8 @@ def main():
     if args.metadata_policy == 'require' or (server_log and 'metadata_lifetime |' in server_log):
         evidence['metadata_lifetime'] = check_metadata_evidence(server_log)
         evidence['producer_metadata_growth'] = 'direct live-entry counts bounded and drained in this run; allocator bytes not measured'
+    if args.refactor:
+        evidence['request_lifecycle'] = check_lifecycle_evidence(server_log)
     assert bool(args.source_perf) == bool(args.short_perf), 'provide both replay source artifacts'
     if args.source_perf:
         check_sources(rows, json.loads(pathlib.Path(args.source_perf).read_text()),
@@ -296,6 +348,8 @@ def main():
     (folder / 'quality.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k != 'per_item'}, ensure_ascii=False, indent=2))
     assert not errors
+    if args.refactor:
+        assert raw_differences == differences == 0, 'refactor soak transcript differs from baseline'
     assert total_edits/total_chars <= baseline_edits/total_chars + args.cer_tolerance, 'CER exceeds the same-input baseline tolerance'
 
 

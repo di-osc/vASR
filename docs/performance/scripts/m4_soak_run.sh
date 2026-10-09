@@ -9,6 +9,10 @@ baseline=${3:?correct perf --cer baseline required}
 autorelease=${4:-0}
 metadata_policy=${5:-optional}
 execution_mode=${6:-explicit}
+acceptance=${7:-standard}
+short_baseline=${8:-}
+if [[ "$acceptance" == refactor && ! -f "$short_baseline" ]]; then echo "formal example1 baseline required for refactor" >&2; exit 1; fi
+[[ "$acceptance" == standard || "$acceptance" == refactor ]] || { echo "unknown acceptance mode" >&2; exit 1; }
 if [[ "$autorelease" != 0 && "$autorelease" != 1 ]]; then echo "autorelease must be 0 or 1" >&2; exit 1; fi
 if [[ "$metadata_policy" != optional && "$metadata_policy" != require ]]; then echo "unknown metadata policy" >&2; exit 1; fi
 if [[ "$execution_mode" != explicit && "$execution_mode" != automatic ]]; then echo "unknown execution mode" >&2; exit 1; fi
@@ -40,6 +44,7 @@ done < <(python3 -c 'import os;print("\n".join(sorted(k for k in os.environ if k
 unset VASR_METAL_STAGE_PROFILE VASR_METAL_STAGE_SYNC VASR_ISQ VASR_MAX_NUM_SEQS
 unset VASR_DISABLE_MIXED_STEP_DECODE VASR_METAL_GEMM_TRACE CANDLE_METAL_COMPUTE_PER_BUFFER
 unset VASR_METAL_DENSE_PROJECTION_FUSION VASR_METAL_CONV_CROSS_SAMPLE VASR_METAL_CONV_CHUNKS
+if [[ "$acceptance" == refactor ]]; then unset CANDLE_METAL_ENABLE_FAST_MATH; fi
 export VASR_PROFILE=false VASR_LOG=vasr_transcribe=info,vasr::execution=info
 export VASR_METAL_SILU_MUL=0 VASR_METAL_RESIDUAL_RMSNORM=0 VASR_METAL_CONV_NATIVE_CHUNKS=0
 export VASR_METAL_AUTORELEASEPOOL="$autorelease"
@@ -77,5 +82,7 @@ assert s['items']==s['quality_passed_items']==1 and s['failed_requests']==s['bad
 assert d['cer']['summary']['cer_weighted']==0, 'invalid short probe reference'
 PY
 python3 docs/performance/scripts/m4_soak.py --reference-perf "$output/warmup.json" --short-perf "$output/short.json" --output-dir "$output/soak" --server-pid "$server_pid" --duration-sec 1800 --concurrency 28 --batch-size 4 > "$output/progress.log" 2>&1
-python3 docs/performance/scripts/audit_soak.py --baseline "$baseline" --validation-dir "$output" --soak-dir "$output/soak" --source-perf "$output/warmup.json" --short-perf "$output/short.json" --server-log "$output/server.log" --metadata-policy "$metadata_policy" > "$output/audit.log" 2>&1
+audit_options=()
+if [[ "$acceptance" == refactor ]]; then audit_options+=(--refactor --short-baseline "$short_baseline"); fi
+python3 docs/performance/scripts/audit_soak.py "${audit_options[@]}" --baseline "$baseline" --validation-dir "$output" --soak-dir "$output/soak" --source-perf "$output/warmup.json" --short-perf "$output/short.json" --server-log "$output/server.log" --metadata-policy "$metadata_policy" > "$output/audit.log" 2>&1
 cat "$output/audit.log"
