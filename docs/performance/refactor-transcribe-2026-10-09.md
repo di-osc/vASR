@@ -30,3 +30,9 @@ pointwise、residual norm、rotary 共用编译选项和缓存；设备、源码
 父任务重新执行默认和关闭 fast-math 的相关 Metal 测试，两组各 19 项通过，含实际非零 F32/F16/BF16 数值、stride/offset/尾部和原生 pipeline 重用。日志 `metal-default-green.log`、`metal-precise-green.log`。旧版系统分支在本机验证配置选择与 setter，不声称已在旧版 macOS 实机验收。
 
 重新计算七个模型文件及 99 个主数据集缓存音频的 SHA256，均与原正确基线一致；归档 `model-manifest.json` 和 `audio-manifest.json`。
+
+## 具名分段状态与结果组装
+
+将 StreamingMetadataDecoder 从转写编排中拆出，保持原公开导出和构造／方法签名。AudioDecodeProgress 收集文本、语言及完成进度，早期条目返回与最终 finish 共用按全局 chunk 索引排序的组装函数。
+
+四项特征测试在状态替换和模块提取前后均通过：乱序／重复完成、跨批次 push 与结果索引、波形释放、零 chunk 及未完成错误。独立规格、质量审查均通过。日志 metadata-characterization.log、metadata-module-green.log。此阶段没有改动模型计算。
