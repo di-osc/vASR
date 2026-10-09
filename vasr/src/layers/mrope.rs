@@ -13,6 +13,51 @@ pub struct MultimodalRope {
     interleaved: bool,
 }
 
+/// Position data shared by layers within one prefill forward, never across requests.
+/// Query and key projections are still rotated separately for every layer.
+#[derive(Debug, Clone)]
+pub struct PreparedMultimodalRope {
+    cos: Tensor,
+    sin: Tensor,
+    #[cfg(feature = "metal-paged-attn")]
+    packed_metal: bool,
+}
+
+impl PreparedMultimodalRope {
+    #[cfg(feature = "metal-paged-attn")]
+    pub(crate) fn enable_packed_metal(&mut self) {
+        self.packed_metal = true;
+    }
+
+    pub fn forward(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (batch, _, seq, head_dim) = q.dims4()?;
+        let (kv_batch, _, kv_seq, kv_dim) = k.dims4()?;
+        if seq <= 1
+            || (batch, seq, head_dim) != (kv_batch, kv_seq, kv_dim)
+            || self.cos.dims() != [batch, 1, seq, head_dim]
+            || self.sin.dims() != self.cos.dims()
+        {
+            candle_core::bail!(
+                "prepared mRoPE requires matching multi-token q/k and position data"
+            );
+        }
+        #[cfg(feature = "metal-paged-attn")]
+        if self.packed_metal {
+            let q = vasr_paged_attn::metal::rotary::try_packed_rope(q, &self.cos, &self.sin)?;
+            let k = vasr_paged_attn::metal::rotary::try_packed_rope(k, &self.cos, &self.sin)?;
+            if let (Some(q), Some(k)) = (q, k) {
+                return Ok((q, k));
+            }
+        }
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        Ok((
+            apply_rope_full_cache(&q, &self.cos, &self.sin)?,
+            apply_rope_full_cache(&k, &self.cos, &self.sin)?,
+        ))
+    }
+}
+
 impl MultimodalRope {
     pub fn new(
         head_dim: usize,
@@ -46,6 +91,35 @@ impl MultimodalRope {
             self.mrope_section.as_slice(),
             self.interleaved,
         )
+    }
+
+    /// Preserve the original single-token/standard paths. Interleaved prefill
+    /// selects modalities and expands the half-head cache only once per forward.
+    pub fn prepare_prefill_cache(
+        &self,
+        cos: &Tensor,
+        sin: &Tensor,
+        seq_len: usize,
+    ) -> Result<Option<PreparedMultimodalRope>> {
+        if !self.interleaved || seq_len <= 1 {
+            return Ok(None);
+        }
+        if cos.dims() != sin.dims()
+            || cos.dim(2)? != seq_len
+            || cos.dtype() != sin.dtype()
+            || !cos.device().same_device(sin.device())
+        {
+            candle_core::bail!("prepared mRoPE position cache mismatch");
+        }
+        let (cos_half, sin_half) = prepare_interleaved_half_cache(cos, sin, &self.mrope_section)?;
+        let cos = Tensor::cat(&[&cos_half, &cos_half], candle_core::D::Minus1)?.unsqueeze(1)?;
+        let sin = Tensor::cat(&[&sin_half, &sin_half], candle_core::D::Minus1)?.unsqueeze(1)?;
+        Ok(Some(PreparedMultimodalRope {
+            cos,
+            sin,
+            #[cfg(feature = "metal-paged-attn")]
+            packed_metal: false,
+        }))
     }
 
     /// Build cos and sin cache for multimodal positions.
@@ -238,6 +312,19 @@ fn apply_multimodal_rotary_pos_emb_interleaved(
     sin: &Tensor,
     mrope_section: &[usize],
 ) -> Result<(Tensor, Tensor)> {
+    let (cos_half, sin_half) = prepare_interleaved_half_cache(cos, sin, mrope_section)?;
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
+    let q_embed = apply_rope_batched(&q, &cos_half, &sin_half)?;
+    let k_embed = apply_rope_batched(&k, &cos_half, &sin_half)?;
+    Ok((q_embed, k_embed))
+}
+
+fn prepare_interleaved_half_cache(
+    cos: &Tensor,
+    sin: &Tensor,
+    mrope_section: &[usize],
+) -> Result<(Tensor, Tensor)> {
     let (_modalities, _batch, _seq_len, half_dim) = cos.dims4()?;
     let modality_num = mrope_section.len();
 
@@ -301,11 +388,7 @@ fn apply_multimodal_rotary_pos_emb_interleaved(
     let cos_half = cos_half.to_dtype(original_dtype)?.contiguous()?;
     let sin_half = sin_half.to_dtype(original_dtype)?.contiguous()?;
 
-    let q = q.contiguous()?;
-    let k = k.contiguous()?;
-    let q_embed = apply_rope_batched(&q, &cos_half, &sin_half)?;
-    let k_embed = apply_rope_batched(&k, &cos_half, &sin_half)?;
-    Ok((q_embed, k_embed))
+    Ok((cos_half, sin_half))
 }
 
 fn apply_rope_batched(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
@@ -330,7 +413,12 @@ fn apply_rope_batched(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Resul
     let sin = Tensor::cat(&[sin_half, sin_half], candle_core::D::Minus1)?
         .narrow(1, 0, seq_len)?
         .unsqueeze(1)?;
-    (x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?)?.contiguous()
+    apply_rope_full_cache(x, &cos, &sin)
+}
+
+fn apply_rope_full_cache(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    // Keep the dtype rounding at each multiply and add; no arithmetic fusion.
+    (x.broadcast_mul(cos)? + rotate_half(x)?.broadcast_mul(sin)?)?.contiguous()
 }
 
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
@@ -346,7 +434,7 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::MultimodalRope;
+    use super::{DType, Device, MultimodalRope, Result, Tensor};
 
     #[test]
     fn test_multimodal_rope_shapes() -> anyhow::Result<()> {
@@ -404,6 +492,234 @@ mod tests {
             anyhow::bail!("unexpected output dims for interleaved mRoPE");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_prefill_rope_preserves_unequal_modalities_and_offset_inputs() -> anyhow::Result<()>
+    {
+        let device = Device::Cpu;
+        let rope = MultimodalRope::new(128, 4096, 1e6, vec![24, 20, 20], true, &device)?;
+        for (batch, seq) in [(1, 2), (2, 7), (1, 65)] {
+            let make_input = |heads, seed| -> Result<Tensor> {
+                Tensor::from_vec(
+                    (0..batch * (seq + 1) * heads * 128)
+                        .map(|i| ((i * seed % 193) as f32 - 96.) / 151.)
+                        .collect::<Vec<_>>(),
+                    (batch, seq + 1, heads, 128),
+                    &device,
+                )?
+                .narrow(1, 1, seq)?
+                .transpose(1, 2)
+            };
+            let q = make_input(4, 17)?;
+            let k = make_input(2, 13)?;
+            // Temporal, height and width deliberately differ. Audio-only equal
+            // positions would hide an incorrect modality selection.
+            let positions = Tensor::from_vec(
+                (0..3 * batch * seq)
+                    .map(|i| (i / (batch * seq) * 101 + i % (batch * seq) * 3) as i64)
+                    .collect::<Vec<_>>(),
+                (3, batch, seq),
+                &device,
+            )?;
+            let (cos, sin) = rope.build_cache(&q, &positions)?;
+            let prepared = rope.prepare_prefill_cache(&cos, &sin, seq)?.unwrap();
+            // Each layer must still apply the rotation to its own q/k values.
+            for layer in 0..3 {
+                let layer_q = q.affine(1., layer as f64 / 7.)?;
+                let expected = rope.forward(&layer_q, &k, &cos, &sin)?;
+                let got = prepared.forward(&layer_q, &k)?;
+                for (got, expected) in [(&got.0, &expected.0), (&got.1, &expected.1)] {
+                    assert_eq!(got.dims(), expected.dims());
+                    assert_eq!(
+                        got.flatten_all()?.to_vec1::<f32>()?,
+                        expected.flatten_all()?.to_vec1::<f32>()?
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_prefill_rope_keeps_decode_and_standard_reference_paths() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let q = Tensor::zeros((1, 4, 1, 128), DType::F32, &device)?;
+        let positions = Tensor::from_vec(vec![7i64, 101, 203], (3, 1, 1), &device)?;
+        for interleaved in [false, true] {
+            let rope = MultimodalRope::new(128, 4096, 1e6, vec![24, 20, 20], interleaved, &device)?;
+            let (cos, sin) = rope.build_cache(&q, &positions)?;
+            assert!(rope.prepare_prefill_cache(&cos, &sin, 1)?.is_none());
+            if !interleaved {
+                assert!(rope.prepare_prefill_cache(&cos, &sin, 2)?.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn prepared_prefill_rope_matches_metal_reference() -> anyhow::Result<()> {
+        check_prepared_rope_metal(false)
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn packed_prefill_rope_matches_materialized_rounding_and_layout() -> anyhow::Result<()> {
+        check_prepared_rope_metal(true)
+    }
+
+    #[cfg(feature = "metal")]
+    fn check_prepared_rope_metal(packed: bool) -> anyhow::Result<()> {
+        let device = Device::new_metal(0)?;
+        let rope = MultimodalRope::new(128, 4096, 1e6, vec![24, 20, 20], true, &device)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for seq in [2, 65, 641] {
+                let input = |heads, seed| -> Result<Tensor> {
+                    Tensor::from_vec(
+                        (0..(seq + 1) * heads * 128)
+                            .map(|i| ((i * seed % 193) as f32 - 96.) / 151.)
+                            .collect::<Vec<_>>(),
+                        (1, seq + 1, heads, 128),
+                        &device,
+                    )?
+                    .to_dtype(dtype)?
+                    .narrow(1, 1, seq)?
+                    .transpose(1, 2)
+                };
+                let q = input(16, 17)?;
+                let k = input(8, 13)?;
+                let positions = Tensor::from_vec(
+                    (0..3 * seq)
+                        .map(|i| (i / seq * 101 + i % seq * 3) as i64)
+                        .collect::<Vec<_>>(),
+                    (3, 1, seq),
+                    &device,
+                )?;
+                let (cos, sin) = rope.build_cache(&q, &positions)?;
+                #[allow(unused_mut)]
+                let mut prepared = rope.prepare_prefill_cache(&cos, &sin, seq)?.unwrap();
+                #[cfg(feature = "metal-paged-attn")]
+                if packed {
+                    prepared.enable_packed_metal();
+                }
+                let expected = rope.forward(&q, &k, &cos, &sin)?;
+                let got = prepared.forward(&q, &k)?;
+                if packed {
+                    assert!(got.0.transpose(1, 2)?.is_contiguous());
+                    assert!(got.1.transpose(1, 2)?.is_contiguous());
+                }
+                for (got, expected) in [(&got.0, &expected.0), (&got.1, &expected.1)] {
+                    assert_eq!(got.dims(), expected.dims());
+                    let a = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let b = expected
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    assert!(a.iter().chain(&b).all(|value| value.is_finite()));
+                    assert!(
+                        a == b,
+                        "prepared mRoPE changed values: dtype={dtype:?} seq={seq}"
+                    );
+                }
+                assert!(
+                    prepared
+                        .forward(&q.narrow(2, 0, 1)?, &k.narrow(2, 0, 1)?)
+                        .is_err()
+                );
+                eprintln!(
+                    "prepared mRoPE dtype={dtype:?} seq={seq} q_heads=16 kv_heads=8 packed={packed} exact=true"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "exclusive Metal 28-layer mRoPE microbenchmark"]
+    fn diagnose_prepared_prefill_rope() -> anyhow::Result<()> {
+        let device = Device::new_metal(0)?;
+        let rope = MultimodalRope::new(128, 4096, 1e6, vec![24, 20, 20], true, &device)?;
+        for seq in [256, 640, 2000] {
+            let input = |heads, seed| -> Result<Tensor> {
+                Tensor::from_vec(
+                    (0..seq * heads * 128)
+                        .map(|i| ((i * seed % 193) as f32 - 96.) / 151.)
+                        .collect::<Vec<_>>(),
+                    (1, seq, heads, 128),
+                    &device,
+                )?
+                .to_dtype(DType::BF16)?
+                .transpose(1, 2)
+            };
+            let q = input(16, 17)?;
+            let k = input(8, 13)?;
+            let positions = Tensor::from_vec(
+                (0..3 * seq)
+                    .map(|i| (i / seq * 101 + i % seq * 3) as i64)
+                    .collect::<Vec<_>>(),
+                (3, 1, seq),
+                &device,
+            )?;
+            let (cos, sin) = rope.build_cache(&q, &positions)?;
+            let mut times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+            for iteration in 0..60 {
+                for offset in 0..3 {
+                    let mode = if iteration % 2 == 0 {
+                        (iteration + offset) % 3
+                    } else {
+                        (iteration + 3 - offset) % 3
+                    };
+                    device.synchronize()?;
+                    let start = std::time::Instant::now();
+                    // Include the once-per-forward preparation in candidate timing.
+                    let mut prepared = if mode > 0 {
+                        rope.prepare_prefill_cache(&cos, &sin, seq)?
+                    } else {
+                        None
+                    };
+                    if mode == 2 {
+                        prepared.as_mut().unwrap().enable_packed_metal();
+                    }
+                    for _ in 0..28 {
+                        let output = match &prepared {
+                            Some(prepared) => prepared.forward(&q, &k)?,
+                            None => rope.forward(&q, &k, &cos, &sin)?,
+                        };
+                        // Both real consumers need B,S,H,D contiguous storage.
+                        // The fused output is already stored in this order.
+                        std::hint::black_box((
+                            output.0.transpose(1, 2)?.contiguous()?,
+                            output.1.transpose(1, 2)?.contiguous()?,
+                        ));
+                    }
+                    device.synchronize()?;
+                    if iteration >= 12 {
+                        times[mode].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for (mode, samples) in [
+                "per_layer_reference",
+                "per_forward_prepared",
+                "packed_kernel",
+            ]
+            .into_iter()
+            .zip(&mut times)
+            {
+                samples.sort_by(f64::total_cmp);
+                eprintln!(
+                    "rope seq={seq} layers=28 mode={mode} median_us={:.3} min_us={:.3} max_us={:.3}",
+                    (samples[23] + samples[24]) / 2.,
+                    samples[0],
+                    samples[47]
+                );
+            }
+        }
         Ok(())
     }
 

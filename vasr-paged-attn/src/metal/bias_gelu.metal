@@ -34,3 +34,22 @@ template [[host_name("bias_gelu_f16")]] kernel decltype(bias_gelu<half>) bias_ge
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("bias_gelu_bf16")]] kernel decltype(bias_gelu<bfloat>) bias_gelu<bfloat>;
 #endif
+
+// Independent encoder entry: force the same intermediate bias store/load
+// boundary as the materialized reference, including F32 fast-math.
+template <typename T>
+kernel void bias_gelu_last(device const T *input [[buffer(0)]],
+                           device const T *bias [[buffer(1)]],
+                           device T *output [[buffer(2)]],
+                           constant uint *params [[buffer(3)]],
+                           uint i [[thread_position_in_grid]]) {
+    if (i >= params[0]) return;
+    volatile T biased = static_cast<T>(input[i] + bias[i % params[1]]);
+    T x = biased;
+    output[i] = static_cast<T>(x * (1 + audio_erf(x * M_SQRT1_2_F)) / 2);
+}
+template [[host_name("bias_gelu_last_f32")]] kernel decltype(bias_gelu_last<float>) bias_gelu_last<float>;
+template [[host_name("bias_gelu_last_f16")]] kernel decltype(bias_gelu_last<half>) bias_gelu_last<half>;
+#if defined(__HAVE_BFLOAT__)
+template [[host_name("bias_gelu_last_bf16")]] kernel decltype(bias_gelu_last<bfloat>) bias_gelu_last<bfloat>;
+#endif

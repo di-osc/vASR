@@ -1748,6 +1748,15 @@ impl AsrBatchScheduler {
         if result.as_ref().is_ok_and(|(wave, _)| *wave > 0) {
             inputs.compact_completed_prefix()?;
         }
+        static DEBUG_METADATA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DEBUG_METADATA.get_or_init(|| std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()) {
+            tracing::info!(
+                target: "vasr_transcribe::pipeline",
+                "metadata_lifetime | stage=prefill_buffer prepared={} waiting={} audio_tokens={}",
+                inputs.prepared.len(), inputs.waiting.len(),
+                inputs.audio_features.as_ref().map(|features| features.dims()[0]).unwrap_or(0),
+            );
+        }
         result
     }
 
@@ -2398,9 +2407,20 @@ impl AsrBatchScheduler {
         let mut source_closed = false;
         let mut decode_debug = ContinuousDecodeDebug::default();
         let mut async_debug = AsyncContinuousDebug::default();
+        // A global service keeps this loop alive across requests, so waiting
+        // until loop exit would never report lock statistics during a benchmark.
+        let mut lock_wait_reported_at = std::env::var_os("VASR_DEBUG_LOCK_WAIT")
+            .is_some()
+            .then(Instant::now);
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
             loop {
+                if let Some(last) = &mut lock_wait_reported_at {
+                    if last.elapsed() >= Duration::from_secs(5) {
+                        log_model_execution_lock_wait(runtime);
+                        *last = Instant::now();
+                    }
+                }
                 if let Some(on_tick) = on_tick.as_deref_mut() {
                     on_tick()?;
                 }

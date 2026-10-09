@@ -9,6 +9,8 @@ use candle_nn::{Embedding, Module, RmsNorm, VarBuilder, embedding, rms_norm};
 
 use crate::config::TextConfig;
 use crate::layers::MultimodalRope;
+#[cfg(feature = "paged-attn")]
+use crate::layers::mrope::PreparedMultimodalRope;
 use crate::model::attention;
 use crate::model::isq_linear::{self, IsqLinear};
 use crate::model::kv_cache::KVCache;
@@ -441,6 +443,48 @@ fn metal_dense_projection_fusion_enabled() -> Result<bool> {
     }
 }
 
+fn parse_prefill_gate_up_policy(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("0" | "false" | "off") => Ok(false),
+        Some("1" | "true" | "on") => Ok(true),
+        _ => candle_core::bail!("VASR_METAL_PREFILL_GATE_UP must be 0 or 1"),
+    }
+}
+
+fn parse_prepared_mrope_policy(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("0" | "false" | "off") => Ok(false),
+        Some("1" | "true" | "on") => Ok(true),
+        _ => candle_core::bail!("VASR_METAL_PREPARED_MROPE must be 0 or 1"),
+    }
+}
+
+fn parse_packed_rope_policy(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("0" | "false" | "off") => Ok(false),
+        Some("1" | "true" | "on") => Ok(true),
+        _ => candle_core::bail!("VASR_METAL_PREFILL_ROPE_KERNEL must be 0 or 1"),
+    }
+}
+
+fn resolve_rope_defaults(
+    prepared: Option<bool>,
+    packed: Option<bool>,
+    validated: bool,
+) -> (bool, bool) {
+    let packed = packed.unwrap_or(validated);
+    let prepared = prepared.unwrap_or(packed);
+    (prepared, packed && prepared)
+}
+
+fn read_rope_override(name: &str, parse: fn(Option<&str>) -> Result<bool>) -> Result<Option<bool>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(parse(Some(&value))?)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => candle_core::bail!("invalid {name}; expected 0 or 1"),
+    }
+}
+
 /// One dense GEMM for independent projections sharing the same input.
 /// Quantized weights and other devices retain their existing paths.
 #[derive(Debug, Clone)]
@@ -515,22 +559,60 @@ impl MetalDenseProjection {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Vec<Tensor>> {
+        self.forward_views(xs)?
+            .into_iter()
+            .map(|view| view.contiguous())
+            .collect()
+    }
+
+    fn forward_views(&self, xs: &Tensor) -> Result<Vec<Tensor>> {
         let joined = self.linear.forward(&xs.contiguous()?)?;
+        self.split_output(&joined)
+    }
+
+    /// Apply the current prefill GEMM policy before returning strided views.
+    fn forward_prefill_views(&self, xs: &Tensor) -> Result<Vec<Tensor>> {
+        let joined = IsqLinear::Linear(self.linear.clone()).forward(&xs.contiguous()?)?;
+        self.split_output(&joined)
+    }
+
+    fn split_output(&self, joined: &Tensor) -> Result<Vec<Tensor>> {
         let last_dim = joined.rank() - 1;
         let mut start = 0;
         let mut outputs = Vec::with_capacity(self.output_dims.len());
         for &dim in &self.output_dims {
-            // Preserve the packed layout expected by Q/K normalization and mRoPE.
-            outputs.push(joined.narrow(last_dim, start, dim)?.contiguous()?);
+            outputs.push(joined.narrow(last_dim, start, dim)?);
             start += dim;
         }
         Ok(outputs)
+    }
+
+    /// Gate and up keep contiguous slices of the joined allocation, including
+    /// their nonzero offsets. Decode need not retain another copy of each weight.
+    fn shared_linears(&self) -> Result<Vec<IsqLinear>> {
+        let mut start = 0;
+        self.output_dims
+            .iter()
+            .map(|&dim| {
+                let weight = self.linear.weight().narrow(0, start, dim)?;
+                let bias = self
+                    .linear
+                    .bias()
+                    .map(|bias| bias.narrow(0, start, dim))
+                    .transpose()?;
+                start += dim;
+                Ok(IsqLinear::Linear(candle_nn::Linear::new(weight, bias)))
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Clone)]
 struct ThinkerTextMlp {
     fused_gate_up: Option<MetalDenseProjection>,
+    prefill_gate_up: Option<MetalDenseProjection>,
+    prefill_fused_silu_mul: bool,
+    fused_silu_mul: bool,
     gate_proj: IsqLinear,
     up_proj: IsqLinear,
     down_proj: IsqLinear,
@@ -543,14 +625,15 @@ impl ThinkerTextMlp {
         vb: VarBuilder,
         isq: Option<&str>,
         dense_fusion: bool,
+        prefill_gate_up: bool,
     ) -> Result<Self> {
-        let gate_proj = isq_linear::linear_no_bias(
+        let mut gate_proj = isq_linear::linear_no_bias(
             cfg.hidden_size,
             cfg.intermediate_size,
             vb.pp("gate_proj"),
             isq,
         )?;
-        let up_proj = isq_linear::linear_no_bias(
+        let mut up_proj = isq_linear::linear_no_bias(
             cfg.hidden_size,
             cfg.intermediate_size,
             vb.pp("up_proj"),
@@ -563,18 +646,77 @@ impl ThinkerTextMlp {
             isq,
         )?;
         let fused_gate_up = MetalDenseProjection::new(&[&gate_proj, &up_proj], dense_fusion)?;
+        let prefill_gate_up = if prefill_gate_up {
+            match fused_gate_up.clone() {
+                Some(projection) => Some(projection),
+                None => MetalDenseProjection::new(&[&gate_proj, &up_proj], true)?,
+            }
+        } else {
+            None
+        };
+        if let Some(projection) = &prefill_gate_up {
+            let mut shared = projection.shared_linears()?.into_iter();
+            gate_proj = shared
+                .next()
+                .ok_or_else(|| candle_core::Error::Msg("missing shared gate projection".into()))?;
+            up_proj = shared
+                .next()
+                .ok_or_else(|| candle_core::Error::Msg("missing shared up projection".into()))?;
+        }
+        let fused_silu_mul = cfg!(feature = "metal-paged-attn")
+            && vb.device().is_metal()
+            && match std::env::var("VASR_METAL_SILU_MUL") {
+                Err(std::env::VarError::NotPresent) => false,
+                Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "on" => true,
+                    "0" | "false" | "off" => false,
+                    _ => candle_core::bail!("VASR_METAL_SILU_MUL must be 0 or 1"),
+                },
+                Err(error) => candle_core::bail!("invalid VASR_METAL_SILU_MUL: {error}"),
+            };
         Ok(Self {
             fused_gate_up,
+            prefill_gate_up,
+            // An explicit old activation override still takes precedence. The
+            // new path otherwise reads joined views without materializing them.
+            prefill_fused_silu_mul: if std::env::var_os("VASR_METAL_SILU_MUL").is_some() {
+                fused_silu_mul
+            } else {
+                true
+            },
+            fused_silu_mul,
             gate_proj,
             up_proj,
             down_proj,
             hidden_act: cfg.hidden_act.clone(),
         })
     }
+
+    fn prefill_projection(&self) -> Option<&MetalDenseProjection> {
+        if vasr_quant::isq_linear::linear_is_prefill() {
+            self.prefill_gate_up.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 impl Module for ThinkerTextMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal-paged-attn")]
+        if let Some(projection) = self.prefill_projection() {
+            if !matches!(self.hidden_act.as_str(), "silu" | "swish") {
+                candle_core::bail!("unsupported hidden_act={:?}", self.hidden_act);
+            }
+            let views = projection.forward_prefill_views(xs)?;
+            let hidden = if self.prefill_fused_silu_mul {
+                vasr_paged_attn::metal::pointwise::silu_mul(&views[0], &views[1])?
+            } else {
+                candle_nn::ops::silu(&views[0].contiguous()?)?
+                    .broadcast_mul(&views[1].contiguous()?)?
+            };
+            return self.down_proj.forward(&hidden);
+        }
         #[cfg(feature = "cuda")]
         if matches!(self.hidden_act.as_str(), "silu" | "swish")
             && let Some(hidden) =
@@ -583,11 +725,23 @@ impl Module for ThinkerTextMlp {
             return self.down_proj.forward(&hidden);
         }
         let (gate, up) = if let Some(fused) = &self.fused_gate_up {
-            let outputs = fused.forward(xs)?;
+            let outputs = if self.fused_silu_mul {
+                fused.forward_views(xs)?
+            } else {
+                fused.forward(xs)?
+            };
             (outputs[0].clone(), outputs[1].clone())
         } else {
             (self.gate_proj.forward(xs)?, self.up_proj.forward(xs)?)
         };
+        #[cfg(feature = "metal-paged-attn")]
+        if self.fused_silu_mul && xs.device().is_metal() {
+            if !matches!(self.hidden_act.as_str(), "silu" | "swish") {
+                candle_core::bail!("unsupported hidden_act={:?}", self.hidden_act);
+            }
+            let hidden = vasr_paged_attn::metal::pointwise::silu_mul(&gate, &up)?;
+            return self.down_proj.forward(&hidden);
+        }
         let gate = match self.hidden_act.as_str() {
             "silu" | "swish" => candle_nn::ops::silu(&gate)?,
             other => candle_core::bail!("unsupported hidden_act={other:?}"),
@@ -1353,6 +1507,7 @@ impl ThinkerTextAttention {
         &self,
         hidden_states: &Tensor,
         position_embeddings: (&Tensor, &Tensor),
+        prepared_position_embeddings: Option<&PreparedMultimodalRope>,
         input_metadata: &PagedInputMetadata,
         rope_scaling: &MultimodalRope,
         key_cache: &Tensor,
@@ -1396,7 +1551,10 @@ impl ThinkerTextAttention {
         let k = self.k_norm.forward(&k)?;
 
         let (cos, sin) = position_embeddings;
-        let (q, k) = rope_scaling.forward(&q, &k, cos, sin)?;
+        let (q, k) = match prepared_position_embeddings {
+            Some(prepared) => prepared.forward(&q, &k)?,
+            None => rope_scaling.forward(&q, &k, cos, sin)?,
+        };
 
         let k_flat = maybe_contiguous_for_accelerator(k.transpose(1, 2)?.reshape((
             total_tokens,
@@ -1543,6 +1701,7 @@ struct ThinkerTextDecoderLayer {
     mlp: ThinkerTextMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    fused_residual_norm: bool,
 }
 
 impl ThinkerTextDecoderLayer {
@@ -1553,6 +1712,8 @@ impl ThinkerTextDecoderLayer {
         use_flash_attn: bool,
         isq: Option<&str>,
         dense_fusion: bool,
+        fused_residual_norm: bool,
+        prefill_gate_up: bool,
     ) -> Result<Self> {
         let self_attn = ThinkerTextAttention::load(
             cfg,
@@ -1562,7 +1723,7 @@ impl ThinkerTextDecoderLayer {
             isq,
             dense_fusion,
         )?;
-        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"), isq, dense_fusion)?;
+        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"), isq, dense_fusion, prefill_gate_up)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -1575,7 +1736,29 @@ impl ThinkerTextDecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            fused_residual_norm,
         })
+    }
+
+    fn post_attention_norm(
+        &self,
+        residual: &Tensor,
+        attention: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "metal-paged-attn")]
+        if self.fused_residual_norm
+            && let Some(output) = vasr_paged_attn::metal::residual_norm::try_add_rms_norm(
+                residual,
+                attention,
+                self.post_attention_layernorm.weight(),
+                self.post_attention_layernorm.eps() as f32,
+            )?
+        {
+            return Ok(output);
+        }
+        let sum = (residual + attention)?;
+        let normalized = self.post_attention_layernorm.forward(&sum)?;
+        Ok((sum, normalized))
     }
 
     fn forward(
@@ -1595,10 +1778,7 @@ impl ThinkerTextDecoderLayer {
             token_attention_mask,
             rope_scaling,
         )?;
-        let x = (&residual + &x)?;
-
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let (residual, x) = self.post_attention_norm(&residual, &x)?;
         let x = self.mlp.forward(&x)?;
         &residual + &x
     }
@@ -1622,10 +1802,7 @@ impl ThinkerTextDecoderLayer {
             rope_scaling,
             layer_cache,
         )?;
-        let x = (&residual + &x)?;
-
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let (residual, x) = self.post_attention_norm(&residual, &x)?;
         let x = self.mlp.forward(&x)?;
         &residual + &x
     }
@@ -1650,10 +1827,7 @@ impl ThinkerTextDecoderLayer {
             key_cache,
             value_cache,
         )?;
-        let x = (&residual + &x)?;
-
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let (residual, x) = self.post_attention_norm(&residual, &x)?;
         let x = self.mlp.forward(&x)?;
         &residual + &x
     }
@@ -1663,6 +1837,7 @@ impl ThinkerTextDecoderLayer {
         &self,
         hidden_states: &Tensor,
         position_embeddings: (&Tensor, &Tensor),
+        prepared_position_embeddings: Option<&PreparedMultimodalRope>,
         input_metadata: &PagedInputMetadata,
         rope_scaling: &MultimodalRope,
         key_cache: &Tensor,
@@ -1673,15 +1848,13 @@ impl ThinkerTextDecoderLayer {
         let x = self.self_attn.forward_packed_prefill_with_paged_cache(
             &x,
             position_embeddings,
+            prepared_position_embeddings,
             input_metadata,
             rope_scaling,
             key_cache,
             value_cache,
         )?;
-        let x = (&residual + &x)?;
-
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let (residual, x) = self.post_attention_norm(&residual, &x)?;
         let x = self.mlp.forward(&x)?;
         &residual + &x
     }
@@ -1694,6 +1867,12 @@ pub struct ThinkerTextModel {
     layers: Vec<ThinkerTextDecoderLayer>,
     norm: RmsNorm,
     rotary_emb: MultimodalRope,
+    prepared_mrope: bool,
+    packed_prefill_rope: bool,
+    #[cfg(feature = "paged-attn")]
+    prepared_mrope_override: Option<bool>,
+    #[cfg(feature = "paged-attn")]
+    packed_rope_override: Option<bool>,
     hidden_size: usize,
     use_flash_attn: bool,
 }
@@ -1708,6 +1887,38 @@ impl ThinkerTextModel {
         progress: &Progress,
     ) -> Result<Self> {
         let dense_fusion = metal_dense_projection_fusion_enabled()?;
+        // Parse once. The outer model supplies measured hardware/model/dtype
+        // eligibility after loading these layers; explicit disables take priority.
+        let (prepared_mrope_override, packed_rope_override) =
+            if cfg!(feature = "metal-paged-attn") && device.is_metal() {
+                (
+                    read_rope_override("VASR_METAL_PREPARED_MROPE", parse_prepared_mrope_policy)?,
+                    read_rope_override("VASR_METAL_PREFILL_ROPE_KERNEL", parse_packed_rope_policy)?,
+                )
+            } else {
+                (Some(false), Some(false))
+            };
+        let (prepared_mrope, packed_prefill_rope) =
+            resolve_rope_defaults(prepared_mrope_override, packed_rope_override, false);
+        let prefill_gate_up = cfg!(feature = "metal-paged-attn")
+            && device.is_metal()
+            && parse_prefill_gate_up_policy(
+                std::env::var("VASR_METAL_PREFILL_GATE_UP").ok().as_deref(),
+            )?;
+        let fused_residual_norm = cfg!(feature = "metal-paged-attn")
+            && device.is_metal()
+            && match std::env::var("VASR_METAL_RESIDUAL_RMSNORM") {
+                Err(std::env::VarError::NotPresent) => false,
+                Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "on" => true,
+                    "0" | "false" | "off" => false,
+                    _ => candle_core::bail!("VASR_METAL_RESIDUAL_RMSNORM must be 0 or 1"),
+                },
+                Err(error) => candle_core::bail!("invalid VASR_METAL_RESIDUAL_RMSNORM: {error}"),
+            };
+        if device.is_metal() {
+            tracing::info!(target: "vasr::execution", fused_residual_norm, "Metal residual RMSNorm policy");
+        }
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -1729,10 +1940,20 @@ impl ThinkerTextModel {
                 use_flash_attn,
                 isq,
                 dense_fusion,
+                fused_residual_norm,
+                prefill_gate_up,
             )?);
             progress.inc(1);
         }
         progress.finish();
+        if device.is_metal() {
+            let eligible_layers = layers
+                .iter()
+                .filter(|layer| layer.mlp.prefill_gate_up.is_some())
+                .count();
+            tracing::info!(target: "vasr::execution", requested=prefill_gate_up, eligible_layers,
+                "Metal prefill-only gate/up candidate policy");
+        }
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let rotary_emb = load_multimodal_rope(cfg, device)?;
@@ -1742,6 +1963,12 @@ impl ThinkerTextModel {
             layers,
             norm,
             rotary_emb,
+            prepared_mrope,
+            packed_prefill_rope,
+            #[cfg(feature = "paged-attn")]
+            prepared_mrope_override,
+            #[cfg(feature = "paged-attn")]
+            packed_rope_override,
             hidden_size: cfg.hidden_size,
             use_flash_attn,
         })
@@ -1763,6 +1990,17 @@ impl ThinkerTextModel {
     pub(crate) fn set_auto_packed_paged_prefill(&mut self, enabled: bool) {
         for layer in &mut self.layers {
             layer.self_attn.metal_auto_packed_paged = enabled;
+        }
+        (self.prepared_mrope, self.packed_prefill_rope) = resolve_rope_defaults(
+            self.prepared_mrope_override,
+            self.packed_rope_override,
+            enabled,
+        );
+        if self.embed_tokens.embeddings().device().is_metal() {
+            tracing::info!(target: "vasr::execution", override_value=?self.prepared_mrope_override,
+                enabled=self.prepared_mrope, "Metal prefill position preparation policy");
+            tracing::info!(target: "vasr::execution", override_value=?self.packed_rope_override,
+                enabled=self.packed_prefill_rope, "Metal packed prefill RoPE policy");
         }
     }
 
@@ -1935,7 +2173,7 @@ impl ThinkerTextModel {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let (batch, _seq_len, hidden) = inputs_embeds.dims3()?;
+        let (batch, seq_len, hidden) = inputs_embeds.dims3()?;
         if batch != 1 {
             candle_core::bail!("packed prefill expects inputs_embeds batch=1, got {batch}");
         }
@@ -1947,6 +2185,17 @@ impl ThinkerTextModel {
         }
 
         let (cos, sin) = self.rotary_emb.build_cache(inputs_embeds, position_ids)?;
+        let mut prepared = if self.prepared_mrope {
+            self.rotary_emb.prepare_prefill_cache(&cos, &sin, seq_len)?
+        } else {
+            None
+        };
+        #[cfg(feature = "metal-paged-attn")]
+        if self.packed_prefill_rope
+            && let Some(prepared) = &mut prepared
+        {
+            prepared.enable_packed_metal();
+        }
         let position_embeddings = (&cos, &sin);
 
         let mut hidden_states = inputs_embeds.clone();
@@ -1955,6 +2204,7 @@ impl ThinkerTextModel {
             hidden_states = layer.forward_packed_prefill_with_paged_cache(
                 &hidden_states,
                 position_embeddings,
+                prepared.as_ref(),
                 input_metadata,
                 &self.rotary_emb,
                 key_cache,
@@ -2062,6 +2312,181 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn measured_rope_defaults_require_validated_profile_and_keep_overrides() {
+        use super::resolve_rope_defaults as resolve;
+        assert_eq!(resolve(None, None, false), (false, false));
+        assert_eq!(resolve(None, None, true), (true, true));
+        assert_eq!(resolve(Some(false), None, true), (false, false));
+        assert_eq!(resolve(None, Some(false), true), (false, false));
+        assert_eq!(resolve(Some(false), Some(true), true), (false, false));
+        assert_eq!(resolve(Some(true), Some(false), true), (true, false));
+        assert_eq!(resolve(None, Some(true), false), (true, true));
+        assert_eq!(resolve(Some(true), None, false), (true, false));
+    }
+
+    #[test]
+    fn packed_rope_policy_requires_explicit_boolean() -> anyhow::Result<()> {
+        assert!(!super::parse_packed_rope_policy(None)?);
+        assert!(super::parse_packed_rope_policy(Some(" TRUE "))?);
+        assert!(!super::parse_packed_rope_policy(Some("off"))?);
+        assert!(super::parse_packed_rope_policy(Some("invalid")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_mrope_candidate_requires_explicit_opt_in() -> anyhow::Result<()> {
+        assert!(!super::parse_prepared_mrope_policy(None)?);
+        for value in ["0", "false", "off", " FALSE "] {
+            assert!(!super::parse_prepared_mrope_policy(Some(value))?);
+        }
+        for value in ["1", "true", "on", " TRUE "] {
+            assert!(super::parse_prepared_mrope_policy(Some(value))?);
+        }
+        assert!(super::parse_prepared_mrope_policy(Some("invalid")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_gate_up_candidate_requires_explicit_opt_in() -> anyhow::Result<()> {
+        assert!(!super::parse_prefill_gate_up_policy(None)?);
+        for value in ["0", "false", "off"] {
+            assert!(!super::parse_prefill_gate_up_policy(Some(value))?);
+        }
+        for value in ["1", "true", "on"] {
+            assert!(super::parse_prefill_gate_up_policy(Some(value))?);
+        }
+        assert!(super::parse_prefill_gate_up_policy(Some("invalid")).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "exclusive Metal prefill-only MLP numerical comparison"]
+    fn prefill_gate_up_candidate_preserves_decode_and_shared_weights() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        use candle_nn::Module;
+        use vasr_quant::{
+            isq_linear::set_linear_is_prefill,
+            metal_gemm::{GemmTile, set_prefill_tile},
+        };
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let gate = dense_fixture(96, 32, false, 1, dtype, &device)?;
+            let up = dense_fixture(96, 32, false, 2, dtype, &device)?;
+            let down = dense_fixture(32, 96, false, 3, dtype, &device)?;
+            let projection = super::MetalDenseProjection::new(&[&gate, &up], true)?.unwrap();
+            let mut shared = projection.shared_linears()?.into_iter();
+            let shared_gate = shared.next().unwrap();
+            let shared_up = shared.next().unwrap();
+            for (index, linear) in [&shared_gate, &shared_up].into_iter().enumerate() {
+                let super::IsqLinear::Linear(linear) = linear else {
+                    panic!("dense view expected")
+                };
+                assert!(linear.weight().is_contiguous());
+                assert_eq!(linear.weight().dims(), [96, 32]);
+                let (_storage, layout) = linear.weight().storage_and_layout();
+                assert_eq!(layout.start_offset(), index * 96 * 32);
+            }
+            let reference = super::ThinkerTextMlp {
+                fused_gate_up: None,
+                prefill_gate_up: None,
+                prefill_fused_silu_mul: false,
+                fused_silu_mul: false,
+                gate_proj: gate,
+                up_proj: up,
+                down_proj: down.clone(),
+                hidden_act: "silu".into(),
+            };
+            let candidate = super::ThinkerTextMlp {
+                fused_gate_up: None,
+                prefill_gate_up: Some(projection),
+                prefill_fused_silu_mul: true,
+                fused_silu_mul: false,
+                gate_proj: shared_gate,
+                up_proj: shared_up,
+                down_proj: down,
+                hidden_act: "silu".into(),
+            };
+            for rows in [1, 17, 65, 257] {
+                let input = Tensor::from_vec(
+                    (0..(rows + 1) * 32)
+                        .map(|i| ((i * 17 % 193) as f32 - 96.) / 151.)
+                        .collect::<Vec<_>>(),
+                    (1, rows + 1, 32),
+                    &device,
+                )?
+                .to_dtype(dtype)?
+                .narrow(1, 1, rows)?;
+                let _tiles = set_prefill_tile(Some(GemmTile::Adaptive));
+                {
+                    let _decode = set_linear_is_prefill(false);
+                    assert!(candidate.prefill_projection().is_none());
+                    assert_dense_close(
+                        &candidate.forward(&input)?,
+                        &reference.forward(&input)?,
+                        0.,
+                    )?;
+                }
+                let _prefill = set_linear_is_prefill(true);
+                assert!(candidate.prefill_projection().is_some());
+                let tolerance = match dtype {
+                    DType::F32 => 1e-4,
+                    DType::F16 => 0.005,
+                    _ => 0.025,
+                };
+                assert_dense_close(
+                    &candidate.forward(&input)?,
+                    &reference.forward(&input)?,
+                    tolerance,
+                )?;
+                let mut disabled_activation = candidate.clone();
+                disabled_activation.prefill_fused_silu_mul = false;
+                assert_dense_close(
+                    &disabled_activation.forward(&input)?,
+                    &reference.forward(&input)?,
+                    tolerance,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn test_metal_joined_gate_up_views_preserve_values() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        for dtype in [candle_core::DType::F32, candle_core::DType::BF16] {
+            let gate = dense_fixture(12, 8, false, 1, dtype, &device)?;
+            let up = dense_fixture(12, 8, false, 2, dtype, &device)?;
+            let projection = super::MetalDenseProjection::new(&[&gate, &up], true)?.unwrap();
+            for (batch, seq) in [(1usize, 1usize), (32, 1), (3, 17)] {
+                let x = candle_core::Tensor::from_vec(
+                    (0..batch * seq * 8)
+                        .map(|i| ((i * 11 % 83) as f32 - 41.) / 71.)
+                        .collect::<Vec<_>>(),
+                    (batch, seq, 8),
+                    &device,
+                )?
+                .to_dtype(dtype)?;
+                let copied = projection.forward(&x)?;
+                let views = projection.forward_views(&x)?;
+                assert_eq!(views.len(), 2);
+                for (view, copied) in views.iter().zip(&copied) {
+                    if batch * seq > 1 {
+                        assert!(!view.is_contiguous());
+                    }
+                    assert_dense_close(view, copied, 0.)?;
+                }
+                let hidden = vasr_paged_attn::metal::pointwise::silu_mul(&views[0], &views[1])?;
+                let reference = copied[0].silu()?.mul(&copied[1])?;
+                assert_dense_close(&hidden, &reference, 0.)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "metal")]
     fn assert_metal_dense_projection_fusion(
         dtype: candle_core::DType,
@@ -2073,6 +2498,9 @@ mod tests {
         let up = dense_fixture(12, 8, false, 2, dtype, &device)?;
         let down = dense_fixture(8, 12, false, 3, dtype, &device)?;
         let reference = super::ThinkerTextMlp {
+            prefill_gate_up: None,
+            prefill_fused_silu_mul: false,
+            fused_silu_mul: false,
             gate_proj: gate.clone(),
             up_proj: up.clone(),
             down_proj: down.clone(),
@@ -2080,6 +2508,9 @@ mod tests {
             fused_gate_up: None,
         };
         let fused = super::ThinkerTextMlp {
+            prefill_gate_up: None,
+            prefill_fused_silu_mul: false,
+            fused_silu_mul: true,
             gate_proj: gate.clone(),
             up_proj: up.clone(),
             down_proj: down,
@@ -2156,6 +2587,178 @@ mod tests {
     #[ignore = "requires exclusive Metal GPU; run explicitly after stopping benchmark server"]
     fn test_metal_dense_projection_fusion_bf16() -> anyhow::Result<()> {
         assert_metal_dense_projection_fusion(candle_core::DType::BF16, 0.025)
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "exclusive Metal prefill gate/up projection microbenchmark"]
+    fn diagnose_prefill_gate_up_projection() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        use vasr_quant::metal_gemm::{GemmTile, matmul_nt, set_prefill_tile};
+        let device = Device::new_metal(0)?;
+        let gate = dense_fixture(3072, 1024, false, 1, DType::BF16, &device)?;
+        let up = dense_fixture(3072, 1024, false, 2, DType::BF16, &device)?;
+        let joined = super::MetalDenseProjection::new(&[&gate, &up], true)?.unwrap();
+        let _policy = set_prefill_tile(Some(GemmTile::Adaptive));
+        for rows in [65, 256, 640, 1000, 2000] {
+            let input = Tensor::from_vec(
+                (0..rows * 1024)
+                    .map(|i| ((i * 17 % 193) as f32 - 96.) / 151.)
+                    .collect::<Vec<_>>(),
+                (1, rows, 1024),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let run = |index| -> candle_core::Result<Tensor> {
+                match index {
+                    0 => {
+                        let gate = candle_nn::ops::silu(&gate.forward(&input)?)?;
+                        gate.broadcast_mul(&up.forward(&input)?)
+                    }
+                    1 => {
+                        let outputs = joined.forward(&input)?;
+                        candle_nn::ops::silu(&outputs[0])?.broadcast_mul(&outputs[1])
+                    }
+                    2 => {
+                        let views = joined.forward_views(&input)?;
+                        vasr_paged_attn::metal::pointwise::silu_mul(&views[0], &views[1])
+                    }
+                    _ => {
+                        let joined = matmul_nt(&input, joined.linear.weight(), GemmTile::Adaptive)?;
+                        vasr_paged_attn::metal::pointwise::silu_mul(
+                            &joined.narrow(2, 0, 3072)?,
+                            &joined.narrow(2, 3072, 3072)?,
+                        )
+                    }
+                }
+            };
+            let reference = run(0)?;
+            for index in 1..4 {
+                assert_dense_close(&run(index)?, &reference, 0.125)?;
+            }
+            let mut times: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+            for iteration in 0..60 {
+                for offset in 0..4 {
+                    let index = if iteration % 2 == 0 {
+                        (iteration + offset) % 4
+                    } else {
+                        (iteration + 4 - offset) % 4
+                    };
+                    device.synchronize()?;
+                    let start = std::time::Instant::now();
+                    let output = run(index)?;
+                    device.synchronize()?;
+                    std::hint::black_box(output);
+                    if iteration >= 12 {
+                        times[index].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for (mode, times) in [
+                "independent_adaptive",
+                "joined_candle_copy",
+                "joined_candle_views",
+                "joined_adaptive_views",
+            ]
+            .into_iter()
+            .zip(&mut times)
+            {
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "gate_up rows={rows} mode={mode} median_us={:.3} min_us={:.3} max_us={:.3}",
+                    (times[23] + times[24]) / 2.,
+                    times[0],
+                    times[47]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "exclusive Metal Qwen3-ASR-0.6B QKV projection microbenchmark"]
+    fn diagnose_prefill_qkv_projection() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        use vasr_quant::isq_linear::set_linear_is_prefill;
+        use vasr_quant::metal_gemm::{GemmTile, set_prefill_tile};
+        let device = Device::new_metal(0)?;
+        // Actual 0.6B geometry: 16 query heads / 8 KV heads, head_dim=128.
+        // Materialize each joined slice, as project_qkv consumers reshape it.
+        let q = dense_fixture(2048, 1024, false, 4, DType::BF16, &device)?;
+        let k = dense_fixture(1024, 1024, false, 5, DType::BF16, &device)?;
+        let v = dense_fixture(1024, 1024, false, 6, DType::BF16, &device)?;
+        let joined = super::MetalDenseProjection::new(&[&q, &k, &v], true)?.unwrap();
+        let _policy = set_prefill_tile(Some(GemmTile::Adaptive));
+        let _prefill = set_linear_is_prefill(true);
+        for rows in [65, 256, 640, 1000, 2000] {
+            let input = Tensor::from_vec(
+                (0..(rows + 1) * 1024)
+                    .map(|i| ((i * 17 % 193) as f32 - 96.) / 151.)
+                    .collect::<Vec<_>>(),
+                (1, rows + 1, 1024),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?
+            .narrow(1, 1, rows)?;
+            let run = |index| -> candle_core::Result<Vec<Tensor>> {
+                match index {
+                    0 => Ok(vec![
+                        q.forward(&input)?,
+                        k.forward(&input)?,
+                        v.forward(&input)?,
+                    ]),
+                    1 => joined.forward(&input),
+                    _ => joined
+                        .forward_prefill_views(&input)?
+                        .into_iter()
+                        .map(|view| view.contiguous())
+                        .collect(),
+                }
+            };
+            let reference = run(0)?;
+            for index in 1..3 {
+                for (got, expected) in run(index)?.iter().zip(&reference) {
+                    assert!(got.is_contiguous());
+                    assert_dense_close(got, expected, 0.125)?;
+                }
+            }
+            let mut times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+            for iteration in 0..60 {
+                for offset in 0..3 {
+                    let index = if iteration % 2 == 0 {
+                        (iteration + offset) % 3
+                    } else {
+                        (iteration + 3 - offset) % 3
+                    };
+                    device.synchronize()?;
+                    let start = std::time::Instant::now();
+                    let output = run(index)?;
+                    device.synchronize()?;
+                    std::hint::black_box(output);
+                    if iteration >= 12 {
+                        times[index].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for (mode, times) in [
+                "independent_adaptive",
+                "joined_candle_copy",
+                "joined_adaptive_copy",
+            ]
+            .into_iter()
+            .zip(&mut times)
+            {
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "qkv rows={rows} mode={mode} median_us={:.3} min_us={:.3} max_us={:.3}",
+                    (times[23] + times[24]) / 2.,
+                    times[0],
+                    times[47]
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

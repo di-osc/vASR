@@ -26,7 +26,10 @@ enum AudioSourceDedupKey {
     Url(String),
     Base64(String),
     EncodedBytes(Vec<u8>),
-    LocalFileContent { len: u64, hash: u64 },
+    LocalFileContent {
+        len: u64,
+        hash: u64,
+    },
     ModelScope {
         repo_id: String,
         file_path: String,

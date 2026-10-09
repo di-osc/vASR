@@ -1261,9 +1261,12 @@ fn encode_prepared_audio_features_cpu(
     let (audio_features_cpu, forward_us, d2h_us, audio_tokens) =
         with_metal_model_execution(device, paged_runtime, || {
             let start_forward = std::time::Instant::now();
-            let audio_features = crate::profiling::measure("encoder_forward", device, || {
-                thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())
-            })?;
+            let audio_features = crate::profiling::measure_with_autorelease(
+                "encoder_forward",
+                device,
+                thinker.metal_auto_packed_prefill(),
+                || thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice()),
+            )?;
             let forward_us = duration_to_us(start_forward.elapsed());
             let audio_tokens = audio_features.dims2().map(|(n, _)| n).unwrap_or(0);
             let start_d2h = std::time::Instant::now();

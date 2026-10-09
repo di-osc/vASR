@@ -592,16 +592,21 @@ pub fn paged_batch_decode_slots_at_step_shared(
         device,
     )?;
     let next_active = with_model_execution(device, runtime, || {
-        let decode_output = crate::profiling::measure("decode_forward", device, || {
-            paged_batch_decode_forward_shared(
-                thinker,
-                runtime,
-                &cache,
-                &input_ids_new,
-                &position_ids_new,
-                &input_metadata,
-            )
-        })?;
+        let decode_output = crate::profiling::measure_with_autorelease(
+            "decode_forward",
+            device,
+            thinker.metal_auto_packed_prefill(),
+            || {
+                paged_batch_decode_forward_shared(
+                    thinker,
+                    runtime,
+                    &cache,
+                    &input_ids_new,
+                    &position_ids_new,
+                    &input_metadata,
+                )
+            },
+        )?;
         crate::profiling::measure("decode_argmax", device, || {
             next_token_ids_from_decode_output(decode_output, active_batch)
         })
@@ -767,16 +772,21 @@ pub fn paged_batch_decode_slots_mixed_steps_shared(
             .ok_or_else(|| candle_core::Error::Msg("missing decode metadata".into()))
     })?;
     let next_active = with_model_execution(device, runtime, || {
-        let decode_output = crate::profiling::measure("decode_forward", device, || {
-            paged_batch_decode_forward_shared(
-                thinker,
-                runtime,
-                &cache,
-                &input_ids_new,
-                &position_ids_new,
-                &input_metadata,
-            )
-        })?;
+        let decode_output = crate::profiling::measure_with_autorelease(
+            "decode_forward",
+            device,
+            thinker.metal_auto_packed_prefill(),
+            || {
+                paged_batch_decode_forward_shared(
+                    thinker,
+                    runtime,
+                    &cache,
+                    &input_ids_new,
+                    &position_ids_new,
+                    &input_metadata,
+                )
+            },
+        )?;
         crate::profiling::measure("decode_argmax", device, || {
             next_token_ids_from_decode_output(decode_output, active_batch)
         })

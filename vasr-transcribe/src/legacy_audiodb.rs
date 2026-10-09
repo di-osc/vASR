@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OpenFlags};
-use serde::Deserialize;
 use asr_data::{
     Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource,
     MAX_QUERY_LIMIT, Sentence, Speaker, Speech, TimeRange, Token, Transcription,
 };
+use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 
 const APPLICATION_ID: i64 = 0x5641_5352; // "VASR"
 const LEGACY_SCHEMA_V1: i64 = 1;
@@ -300,7 +300,13 @@ fn convert_payload(
                 sentences: vec![sentence],
                 confidence: token.confidence,
             };
-            Some(speech_with_transcription(id, range, source, None, transcription))
+            Some(speech_with_transcription(
+                id,
+                range,
+                source,
+                None,
+                transcription,
+            ))
         }
         LegacyPayload::Transcription(span) => {
             let transcription = legacy_transcription(span, range, annotation.confidence);

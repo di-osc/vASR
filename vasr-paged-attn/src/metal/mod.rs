@@ -11,5 +11,8 @@ pub use varlen_prefill::{
 };
 
 pub mod conv;
+pub mod pointwise;
+pub mod rotary;
+pub mod residual_norm;
 
 pub mod profile;

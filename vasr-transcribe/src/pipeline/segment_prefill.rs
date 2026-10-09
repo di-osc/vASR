@@ -4,6 +4,7 @@ use super::{
     format_seconds, format_speed,
 };
 use anyhow::{Result, bail};
+use asr_data::Waveform;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,7 +15,6 @@ use vasr::models::qwen3asr::{
     Qwen3ASR,
 };
 use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
-use asr_data::Waveform;
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +71,13 @@ fn log_prefill_batch_done(
         if let Some(segment) = all_segments.take(sequence.client_index) {
             segments.push(segment);
         }
+    }
+    static DEBUG_METADATA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG_METADATA.get_or_init(|| std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()) {
+        tracing::info!(
+            target: "vasr_transcribe::pipeline",
+            "metadata_lifetime | stage=prefill_log items={}", all_segments.items.len(),
+        );
     }
     if segments.is_empty() {
         return;

@@ -37,11 +37,14 @@ NVIDIA 机器安装时改用 `--features cuda`。`serve` 未指定模型时默�
 `serve` 默认按所选设备、模型和可用内存估算 KV 容量，再解析出实际执行批量，启动日志会打印最终生效的策略：
 
 ```
-serve 执行策略 | device=metal capacity=355 active_slots=32 decode_rows=32 mixed_step=true prefill_wave=8
-Metal CNN policy | nhwc=true im2col32=true bias_gelu=true explicit_overrides=preserved
+serve 执行策略 | device=metal capacity=159 active_slots=64 decode_rows=64 mixed_step=true prefill_wave=16
+Metal CNN policy | nhwc=true im2col32=true bias_gelu=true native_chunks=false explicit_overrides=preserved
+Metal encoder policy | conv_tile=Some(Narrow) attention=Some(GroupedNative) fc1_bias_gelu=true overrides=preserved
+Metal GEMM policy | decode=Some(Adaptive) max_decode_rows=128 adaptive_split_rows=32 prefill=Some(Adaptive)
+Metal temporary ownership policy | explicit_override=preserved autorelease_scope=true
 ```
 
-上面是本机验收日志示例；`capacity` 随启动时可用内存变化。经过验证的 M4 Pro / 48 GB、`Qwen3-ASR-0.6B`、BF16、未量化组合自动启用 Metal packed prefill、NHWC 卷积布局、3×3 im2col32 和 bias + GELU 融合。CNN 融合保留 bias 相加后的 BF16 舍入与原 GELU 公式。其他硬件、模型或 dtype 保留保守回退，显式配置优先。
+上面是本机默认启动日志示例；`capacity` 和 encoder 音频预算随启动时可用内存变化。经过验证的 M4 Pro / 48 GB、`Qwen3-ASR-0.6B`、BF16、未量化组合自动选择64槽/64行decode、prefill16和encoder16段；安全容量独立估算。自动启用 Metal packed prefill、Adaptive GEMM、同长窗口 attention 合批、NHWC/3×3 im2col32、CNN与encoder FC1的 bias + GELU 融合，以及局部临时所有权回收。融合保留 dtype 舍入与原 GELU 公式。其他硬件、模型或 dtype 保留保守回退，显式配置优先。
 
 日常启动不需要手写并发参数。需要覆盖时可用 CLI 参数（`--max-num-seqs`、`--gpu-memory-utilization`、`--encoder-batch-max-audio-seconds`）或环境变量（`VASR_METAL_MAX_ACTIVE_SEQS`、`VASR_METAL_PAGED_DECODE_BATCH_SIZE`、`VASR_PREFILL_MAX_WAVE`、`VASR_DISABLE_MIXED_STEP_DECODE`）。显式容量超过估算的安全范围，或低于 VAD 最大分段加 padding 的要求时，服务会在启动阶段报错。
 
@@ -62,11 +65,19 @@ datasets/
 
 ## 推理速度
 
-最新验收于 **2026-10-01** 完成。环境为 Apple M4 Pro、48 GB 统一内存、Metal、AC 供电，模型为 `Qwen3-ASR-0.6B`，使用 BF16、未量化。输入为 call-100 的固定音频与参考文本快照：99 条、合计约 5025 秒；固定输入顺序、mono 声道策略和 Bench 规范化。HTTP 并发 14、batch size 1，服务端容量与执行批量自动解析。
+100× 实验于 **2026-10-08** 验收真实自动默认：三轮 **122.54 / 122.61 / 122.65×**，中位 **122.61×**，同期关闭 RoPE 融合的参考中位 100.34×，提升 **22.19%**。使用迁移后的 `call-100.db`，99 条、5025.0118 秒，客户端并发 28/batch 4；完整预热后测量，模型加载另计。六轮正式及六轮预热的原始、Bench 规范化文本与正确基线逐条一致，加权 CER **16.5876%**，example1 零 CER，零失败与质量异常。
+
+主要新改动是 packed prefill 的 RoPE 逐元素计算与 Q/K 布局融合：每次 forward 只准备一次位置数据，并直接写入后续所需布局；保留两个乘积的 dtype 舍入，实际 F32/F16/BF16 与参考逐元素一致。模型权重、BF16、VAD 与解码语义保持原样。已验证的 M4 Pro/48 GB、0.6B、未量化组合自动启用，服务仍自动选择安全容量及 64 活跃槽、encoder16、prefill16；显式禁用优先，其他组合保留回退。量化、wave32、仅 gate/up 融合和仅位置准备复用未显示稳定收益，未纳入默认。
+
+真实自动默认的 **30 分钟持续吞吐为 120.80×**（含短探针及队列排空），1123 次请求零失败，4372 条主转写与基线逐条一致，30 次 example1 探针零 CER。按相同输入重复次数计算的加权 CER 两者均为 16.583913%；KV 3461/3461 全回收，直接计数的请求元数据排空。RSS 五分钟稳态中位先升后降，swap 未增长；短探针最大延迟 46.91 秒，吞吐验收不代表低延迟 SLA。完整优化、精度、负面结果与复现命令见[100× 实验记录](docs/performance/m4-pro-100x-2026-10-07.md)。
+
+### CNN 优化的历史对照
+
+以下为 **2026-10-01 CNN 优化的历史验收**；当前默认结果见下方 100× 实验。环境为 Apple M4 Pro、48 GB 统一内存、Metal、AC 供电，模型为 `Qwen3-ASR-0.6B`，使用 BF16、未量化。输入为 call-100 的固定音频与参考文本快照：99 条、合计约 5025 秒；固定输入顺序、mono 声道策略和 Bench 规范化。HTTP 并发 14、batch size 1，服务端容量与执行批量自动解析。
 
 服务完整预热一轮，再运行三轮正式测试。以下吞吐、RTF 和延迟为各轮统计值的中位数；模型加载和预热时间单独记录，正式吞吐关闭额外 GPU 诊断同步。
 
-| 指标 | 最新默认配置 | 同期对照：关闭 CNN bias + GELU 融合 |
+| 指标 | 当时默认配置 | 同期对照：关闭 CNN bias + GELU 融合 |
 | --- | ---: | ---: |
 | 吞吐（音频秒 / 墙钟秒） | **87.81×** | 82.22× |
 | 三轮吞吐范围 | **87.76–88.55×** | 82.17–82.33× |
@@ -91,9 +102,12 @@ datasets/
 
 ```bash
 vasr-transcribe perf -i datasets/call-100.db \
-  --mono true --concurrency 14 --batch-size 1 --retries 1 --cer
+  --mono true --concurrency 28 --batch-size 4 --retries 1 --cer
 vasr-transcribe eval -i datasets/call-100.db --timeline mono --normalizer bench
 vasr-transcribe eval -i datasets/example1.db --timeline mono --normalizer bench
 ```
 
 `perf --cer` 直接评估并发请求的实际输出。精确重现上述固定快照验收的方法在性能报告及本地归档 `results/m4-pro-cnn-layout-2026-09-30/REPRODUCE.md` 中；归档包含完整响应、冻结二进制、源码校验清单和输入快照，按 `.gitignore` 保留在本地。
+
+
+v17的30分钟持续测试为**80.64×**（含短探针及排空），757次请求全成功、2912条主转写与基线一致、29次短探针零CER，KV和直接计数的请求元数据排空；RSS没有持续上升趋势、swap未增长。这是旧路径的持续成绩，短探针最大延迟69.17秒，本次只证明能够完成。独立FSMN CPU VAD完整三轮计算吞吐1584.90×，音频解码和模型加载另计。配置、每项精度与收益、负面结果及复现命令见[100× 实验记录](docs/performance/m4-pro-100x-2026-10-07.md)。

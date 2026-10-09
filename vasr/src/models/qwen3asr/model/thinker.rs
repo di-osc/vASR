@@ -119,11 +119,23 @@ pub struct ThinkerForConditionalGeneration {
     audio_tower: AudioTower,
     text_model: ThinkerTextModel,
     lm_head: IsqLinear,
+    #[cfg(feature = "metal-paged-attn")]
+    decode_gemm_tile: Option<vasr_quant::metal_gemm::GemmTile>,
+    #[cfg(feature = "metal-paged-attn")]
+    prefill_gemm_tile: Option<vasr_quant::metal_gemm::GemmTile>,
     audio_token_id: u32,
     metal_auto_packed_prefill: bool,
 }
 
 impl ThinkerForConditionalGeneration {
+    #[cfg(feature = "metal-paged-attn")]
+    fn gemm_guard(&self, decode: bool) -> vasr_quant::metal_gemm::GemmGuard {
+        if decode {
+            vasr_quant::metal_gemm::set_tile(self.decode_gemm_tile)
+        } else {
+            vasr_quant::metal_gemm::set_prefill_tile(self.prefill_gemm_tile)
+        }
+    }
     #[cfg(feature = "paged-attn")]
     pub(crate) fn metal_auto_packed_prefill(&self) -> bool {
         self.metal_auto_packed_prefill
@@ -153,6 +165,37 @@ impl ThinkerForConditionalGeneration {
         isq: Option<&str>,
         progress: &Progress,
     ) -> Result<Self> {
+        #[cfg(feature = "metal-paged-attn")]
+        let metal_auto_packed_prefill = validated_packed_profile(
+            cfg,
+            vb.dtype(),
+            isq.is_some(),
+            vasr_paged_attn::metal::profile::validated_m4_pro_48gb(device),
+        );
+        #[cfg(not(feature = "metal-paged-attn"))]
+        let metal_auto_packed_prefill = false;
+        #[cfg(feature = "metal-paged-attn")]
+        let decode_gemm_tile = if device.is_metal() {
+            resolve_gemm_policy(
+                std::env::var("VASR_METAL_DECODE_GEMM_TILE").ok().as_deref(),
+                metal_auto_packed_prefill,
+            )?
+        } else {
+            None
+        };
+        #[cfg(feature = "metal-paged-attn")]
+        let prefill_gemm_tile = if device.is_metal() {
+            resolve_gemm_policy(
+                std::env::var("VASR_METAL_PREFILL_GEMM_TILE")
+                    .ok()
+                    .as_deref(),
+                metal_auto_packed_prefill,
+            )?
+        } else {
+            None
+        };
+        #[cfg(feature = "metal-paged-attn")]
+        tracing::info!(target: "vasr::execution", "Metal GEMM policy | decode={decode_gemm_tile:?} max_decode_rows=128 adaptive_split_rows=32 prefill={prefill_gemm_tile:?}");
         let audio_token_id = cfg
             .audio_token_id
             .context("thinker_config.audio_token_id is required")?;
@@ -199,15 +242,6 @@ impl ThinkerForConditionalGeneration {
             progress,
         )?;
 
-        #[cfg(feature = "metal-paged-attn")]
-        let metal_auto_packed_prefill = validated_packed_profile(
-            cfg,
-            vb.dtype(),
-            isq.is_some(),
-            vasr_paged_attn::metal::profile::validated_m4_pro_48gb(device),
-        );
-        #[cfg(not(feature = "metal-paged-attn"))]
-        let metal_auto_packed_prefill = false;
         #[cfg(feature = "paged-attn")]
         text_model.set_auto_packed_paged_prefill(metal_auto_packed_prefill);
         audio_tower.set_auto_conv_layout(validated_conv_profile(cfg, metal_auto_packed_prefill));
@@ -216,6 +250,10 @@ impl ThinkerForConditionalGeneration {
                 target: "vasr::execution",
                 "validated Metal prefill policy | hardware=M4Pro/48GB model=Qwen3-ASR-0.6B dtype=BF16 packed=true direct_paged=true overrides=preserved"
             );
+        }
+        #[cfg(feature = "metal-paged-attn")]
+        if device.is_metal() {
+            tracing::info!(target: "vasr::execution", autorelease_scope=crate::profiling::autorelease_enabled(metal_auto_packed_prefill), "Metal temporary ownership policy | explicit_override=preserved");
         }
 
         let lm_head = if cfg.text_config.tie_word_embeddings {
@@ -241,6 +279,10 @@ impl ThinkerForConditionalGeneration {
             audio_tower,
             text_model,
             lm_head,
+            #[cfg(feature = "metal-paged-attn")]
+            decode_gemm_tile,
+            #[cfg(feature = "metal-paged-attn")]
+            prefill_gemm_tile,
             audio_token_id,
             metal_auto_packed_prefill,
         })
@@ -299,6 +341,8 @@ impl ThinkerForConditionalGeneration {
         inputs_embeds: &Tensor,
         kv_cache: &mut KVCache,
     ) -> Result<Tensor> {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(inputs_embeds.dim(1)? == 1 && kv_cache.seq_len() > 0);
         let hidden_states = self.text_model.forward_with_kv_cache(
             attention_mask,
             position_ids,
@@ -318,6 +362,8 @@ impl ThinkerForConditionalGeneration {
         inputs_embeds: &Tensor,
         kv_cache: &mut KVCache,
     ) -> Result<Tensor> {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(true);
         let hidden_states = self.text_model.forward_decode_one_without_padding(
             position_ids,
             inputs_embeds,
@@ -347,13 +393,16 @@ impl ThinkerForConditionalGeneration {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let hidden_states = crate::profiling::measure(
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(input_metadata.query_lens.is_none());
+        let hidden_states = crate::profiling::measure_with_autorelease(
             if input_metadata.query_lens.is_some() {
                 "prefill_forward"
             } else {
                 "text_decode"
             },
             inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
             || {
                 self.text_model.forward_with_paged_cache(
                     position_ids,
@@ -379,13 +428,16 @@ impl ThinkerForConditionalGeneration {
         input_metadata: &PagedInputMetadata,
         last_token_flat_indices: &[usize],
     ) -> Result<Tensor> {
-        let hidden_states = crate::profiling::measure(
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(input_metadata.query_lens.is_none());
+        let hidden_states = crate::profiling::measure_with_autorelease(
             if input_metadata.query_lens.is_some() {
                 "prefill_forward"
             } else {
                 "text_decode"
             },
             inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
             || {
                 self.text_model.forward_with_paged_cache(
                     position_ids,
@@ -418,13 +470,16 @@ impl ThinkerForConditionalGeneration {
         if !self.lm_head.supports_chunked_argmax_next_ids() {
             return Ok(None);
         }
-        let hidden_states = crate::profiling::measure(
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(input_metadata.query_lens.is_none());
+        let hidden_states = crate::profiling::measure_with_autorelease(
             if input_metadata.query_lens.is_some() {
                 "prefill_forward"
             } else {
                 "text_decode"
             },
             inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
             || {
                 self.text_model.forward_with_paged_cache(
                     position_ids,
@@ -450,15 +505,21 @@ impl ThinkerForConditionalGeneration {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let hidden_states =
-            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(false);
+        let hidden_states = crate::profiling::measure_with_autorelease(
+            "prefill_forward",
+            inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
+            || {
                 self.text_model.forward_packed_prefill_with_paged_cache(
                     position_ids,
                     inputs_embeds,
                     paged_cache,
                     input_metadata,
                 )
-            })?;
+            },
+        )?;
         Ok(crate::profiling::measure(
             "lm_head",
             hidden_states.device(),
@@ -475,15 +536,21 @@ impl ThinkerForConditionalGeneration {
         input_metadata: &PagedInputMetadata,
         last_token_flat_indices: &[usize],
     ) -> Result<Tensor> {
-        let hidden_states =
-            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(false);
+        let hidden_states = crate::profiling::measure_with_autorelease(
+            "prefill_forward",
+            inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
+            || {
                 self.text_model.forward_packed_prefill_with_paged_cache(
                     position_ids,
                     inputs_embeds,
                     paged_cache,
                     input_metadata,
                 )
-            })?;
+            },
+        )?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
@@ -507,15 +574,21 @@ impl ThinkerForConditionalGeneration {
         if !self.lm_head.supports_chunked_argmax_next_ids() {
             return Ok(None);
         }
-        let hidden_states =
-            crate::profiling::measure("prefill_forward", inputs_embeds.device(), || {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(false);
+        let hidden_states = crate::profiling::measure_with_autorelease(
+            "prefill_forward",
+            inputs_embeds.device(),
+            self.metal_auto_packed_prefill(),
+            || {
                 self.text_model.forward_packed_prefill_with_paged_cache(
                     position_ids,
                     inputs_embeds,
                     paged_cache,
                     input_metadata,
                 )
-            })?;
+            },
+        )?;
         let last_hidden =
             gather_hidden_states_at_flat_indices(&hidden_states, last_token_flat_indices)?;
         drop(hidden_states);
@@ -548,6 +621,8 @@ impl ThinkerForConditionalGeneration {
         audio_features: Option<&Tensor>,
         audio_placeholder_count: usize,
     ) -> Result<Tensor> {
+        #[cfg(feature = "metal-paged-attn")]
+        let _gemm_guard = self.gemm_guard(false);
         let inputs_embeds = self.inputs_embeds_with_audio_features(
             input_ids,
             audio_features,
@@ -907,6 +982,18 @@ mod tests {
     }
 }
 
+#[cfg(feature = "metal-paged-attn")]
+fn resolve_gemm_policy(
+    value: Option<&str>,
+    validated_model: bool,
+) -> Result<Option<vasr_quant::metal_gemm::GemmTile>> {
+    match value {
+        Some(value) => vasr_quant::metal_gemm::GemmTile::parse(value),
+        None => Ok(validated_model.then_some(vasr_quant::metal_gemm::GemmTile::Adaptive)),
+    }
+    .map_err(Into::into)
+}
+
 fn validated_conv_profile(cfg: &ThinkerConfig, validated_model: bool) -> bool {
     validated_model
         && cfg.audio_config.num_mel_bins == 128
@@ -940,6 +1027,20 @@ fn validated_packed_profile(
 #[cfg(test)]
 mod packed_policy_tests {
     use super::*;
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn measured_gemm_policy_preserves_disable_and_unvalidated_fallback() -> Result<()> {
+        use vasr_quant::metal_gemm::GemmTile;
+        assert_eq!(resolve_gemm_policy(None, true)?, Some(GemmTile::Adaptive));
+        assert_eq!(resolve_gemm_policy(Some("0"), true)?, None);
+        assert_eq!(resolve_gemm_policy(None, false)?, None);
+        assert_eq!(
+            resolve_gemm_policy(Some("64x64-simd4"), false)?,
+            Some(GemmTile::Square4)
+        );
+        assert!(resolve_gemm_policy(Some("invalid"), true).is_err());
+        Ok(())
+    }
     #[test]
     fn conv_profile_rejects_unverified_geometry() {
         let mut cfg = ThinkerConfig::default();

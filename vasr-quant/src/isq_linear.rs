@@ -299,7 +299,25 @@ impl LinearX {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Linear(linear) => linear.forward(x),
+            Self::Linear(linear) => {
+                #[cfg(feature = "metal-paged-attn")]
+                if x.device().is_metal()
+                    && x.is_contiguous()
+                    && x.rank() >= 2
+                    && x.dims().last().copied().unwrap_or(0) > 0
+                    && let Some(tile) = crate::metal_gemm::tile_for_linear(
+                        x.elem_count() / x.dims()[x.rank() - 1],
+                        linear_is_prefill(),
+                    )
+                {
+                    let output = crate::metal_gemm::matmul_nt(x, linear.weight(), tile)?;
+                    return match linear.bias() {
+                        Some(bias) => output.broadcast_add(bias),
+                        None => Ok(output),
+                    };
+                }
+                linear.forward(x)
+            }
             Self::QLinear(linear) => linear.forward(x),
         }
     }
@@ -876,6 +894,15 @@ fn should_skip_module(module_path: &str, modules_to_not_convert: &[String]) -> b
 fn module_path_matches_not_convert(module_path: &str, item: &str) -> bool {
     let module_path = module_path.trim_end_matches(".weight");
     let item = item.trim().trim_end_matches(".weight");
+    // An explicit subtree pattern avoids conflating a module suffix (e.g.
+    // q_proj) with all descendants of a tower. Keep legacy exact/suffix matching.
+    if let Some(prefix) = item.strip_suffix(".*") {
+        return !prefix.is_empty()
+            && (module_path == prefix
+                || module_path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.')));
+    }
     !item.is_empty()
         && (module_path == item
             || module_path.ends_with(item)
@@ -895,6 +922,74 @@ fn compatible_dtype(weight: &Tensor, requested: GgmlDType) -> Option<GgmlDType> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_isq_subtree_skip_preserves_module_boundaries() {
+        let pattern = "thinker.audio_tower.*";
+        for module in [
+            "thinker.audio_tower",
+            "thinker.audio_tower.layers.0.self_attn.q_proj",
+            "thinker.audio_tower.layers.17.fc2.weight",
+            "thinker.audio_tower.proj2",
+        ] {
+            assert!(
+                super::module_path_matches_not_convert(module, pattern),
+                "{module}"
+            );
+        }
+        for module in [
+            "thinker.audio_tower2.fc1",
+            "thinker.model.layers.0.mlp.gate_proj",
+            "lm_head",
+            "other.thinker.audio_tower.fc1",
+        ] {
+            assert!(
+                !super::module_path_matches_not_convert(module, pattern),
+                "{module}"
+            );
+        }
+        assert!(super::module_path_matches_not_convert(
+            "thinker.model.layers.0.self_attn.q_proj",
+            "q_proj"
+        ));
+        assert!(!super::module_path_matches_not_convert(
+            "thinker.audio_tower.layers.0.fc1",
+            "audio_tower"
+        ));
+        assert!(!super::module_path_matches_not_convert(
+            "thinker.audio_tower",
+            ".*"
+        ));
+    }
+
+    #[test]
+    fn subtree_skip_keeps_encoder_dense_before_quantization_validation() -> candle_core::Result<()>
+    {
+        let device = candle_core::Device::Cpu;
+        let spec = Some("4;skip=thinker.audio_tower.*,lm_head");
+        let encoder = candle_nn::Linear::new(
+            candle_core::Tensor::ones((4, 896), candle_core::DType::F32, &device)?,
+            None,
+        );
+        let encoder = super::LinearX::new_with_module_path(
+            encoder,
+            spec,
+            &device,
+            "thinker.audio_tower.layers.0.self_attn.q_proj",
+        )?;
+        assert!(matches!(encoder, super::LinearX::Linear(_)));
+        let decoder = candle_nn::Linear::new(
+            candle_core::Tensor::ones((4, 1024), candle_core::DType::F32, &device)?,
+            None,
+        );
+        let decoder = super::LinearX::new_with_module_path(
+            decoder,
+            spec,
+            &device,
+            "thinker.model.layers.0.self_attn.q_proj",
+        )?;
+        assert!(matches!(decoder, super::LinearX::QLinear(_)));
+        Ok(())
+    }
     #[cfg(feature = "cuda")]
     use super::try_fused_q8_silu_gate_up;
     use super::{
@@ -969,7 +1064,12 @@ mod tests {
                 .map(|i| (((i * 17 + i / in_dim * 13) % 127) as f32 - 63.0) / 1024.0)
                 .collect();
             let weight = Tensor::from_vec(weights, (out_dim, in_dim), &Device::Cpu)?;
-            for quant in [GgmlDType::Q8_0, GgmlDType::Q6K, GgmlDType::Q5_0, GgmlDType::Q4_0] {
+            for quant in [
+                GgmlDType::Q8_0,
+                GgmlDType::Q6K,
+                GgmlDType::Q5_0,
+                GgmlDType::Q4_0,
+            ] {
                 let matmul = Arc::new(QMatMul::from_qtensor(QTensor::quantize_onto(
                     &weight, quant, &device,
                 )?)?);

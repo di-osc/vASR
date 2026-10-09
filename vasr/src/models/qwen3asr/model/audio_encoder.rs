@@ -62,6 +62,9 @@ struct ConvExecutionPolicy {
     nhwc_override: Option<bool>,
     im2col32_override: Option<bool>,
     bias_gelu_override: Option<bool>,
+    native_chunks_override: Option<bool>,
+    #[cfg(feature = "metal-paged-attn")]
+    gemm_tile: Option<vasr_quant::metal_gemm::GemmTile>,
 }
 
 impl ConvExecutionPolicy {
@@ -71,6 +74,9 @@ impl ConvExecutionPolicy {
             nhwc_override: Self::parse_override(nhwc, "VASR_METAL_CONV_NHWC")?,
             im2col32_override: Self::parse_override(im2col32, "VASR_METAL_CONV_IM2COL32")?,
             bias_gelu_override: None,
+            native_chunks_override: None,
+            #[cfg(feature = "metal-paged-attn")]
+            gemm_tile: None,
         })
     }
     fn parse_override(value: Option<&str>, name: &str) -> Result<Option<bool>> {
@@ -83,6 +89,9 @@ impl ConvExecutionPolicy {
     }
     fn fused_bias_gelu(&self) -> bool {
         self.resolve().0 && self.bias_gelu_override.unwrap_or(self.auto)
+    }
+    fn native_chunks(&self) -> bool {
+        self.native_chunks_override.unwrap_or(false)
     }
     fn resolve(&self) -> (bool, bool) {
         let nhwc = self.nhwc_override.unwrap_or(self.auto);
@@ -97,13 +106,14 @@ fn conv_gelu_forward(conv: &Conv2d, x: &Tensor, policy: &ConvExecutionPolicy) ->
         let (enabled, fast) = policy.resolve();
         let cfg = conv.config();
         if enabled && cfg.groups == 1 {
-            let output = vasr_paged_attn::metal::conv::conv2d_nhwc_with_im2col32(
+            let output = vasr_paged_attn::metal::conv::conv2d_nhwc_with_gemm_tile(
                 x,
                 conv.weight(),
                 cfg.padding,
                 cfg.stride,
                 cfg.dilation,
                 fast,
+                policy.gemm_tile,
             )?;
             if policy.fused_bias_gelu() {
                 if let Some(bias) = conv.bias() {
@@ -148,8 +158,18 @@ fn cast_input_features_to_weight_dtype(
     input_features.to_dtype(want_dtype)
 }
 
-fn pad_audio_chunk(chunk: &Tensor, dim: usize, left: usize, right: usize) -> Result<Tensor> {
-    if chunk.device().is_metal() && chunk.dtype() == DType::BF16 && (left != 0 || right != 0) {
+fn pad_audio_chunk(
+    chunk: &Tensor,
+    dim: usize,
+    left: usize,
+    right: usize,
+    native: bool,
+) -> Result<Tensor> {
+    if !native
+        && chunk.device().is_metal()
+        && chunk.dtype() == DType::BF16
+        && (left != 0 || right != 0)
+    {
         // Convert to F32 for padding (Metal has full F32 support), then back to BF16.
         return chunk
             .to_dtype(DType::F32)?
@@ -161,12 +181,12 @@ fn pad_audio_chunk(chunk: &Tensor, dim: usize, left: usize, right: usize) -> Res
     chunk.pad_with_zeros(dim, left, right)
 }
 
-fn stack_audio_chunks(chunks: &[Tensor]) -> Result<Tensor> {
+fn stack_audio_chunks(chunks: &[Tensor], native: bool) -> Result<Tensor> {
     let first = chunks
         .first()
         .ok_or_else(|| candle_core::Error::Msg("missing audio chunks".to_string()))?;
 
-    if first.device().is_metal() && first.dtype() == DType::BF16 {
+    if !native && first.device().is_metal() && first.dtype() == DType::BF16 {
         // Convert each chunk to F32 for stacking, stack, then convert back.
         // Keeps all work on-device instead of GPU→CPU→GPU round-trip.
         let f32_chunks: Vec<Tensor> = chunks
@@ -353,6 +373,7 @@ enum AudioAttentionMode {
     Reference,
     ProjectOnce,
     Grouped,
+    GroupedNative,
 }
 
 impl AudioAttentionMode {
@@ -363,8 +384,9 @@ impl AudioAttentionMode {
                 "reference" => Ok(Self::Reference),
                 "project-once" | "project_once" => Ok(Self::ProjectOnce),
                 "grouped" => Ok(Self::Grouped),
+                "grouped-native" => Ok(Self::GroupedNative),
                 _ => candle_core::bail!(
-                    "invalid VASR_QWEN3_ASR_AUDIO_ATTN={value:?}; expected reference, project-once, or grouped"
+                    "invalid VASR_QWEN3_ASR_AUDIO_ATTN={value:?}; expected reference, project-once, grouped, or grouped-native"
                 ),
             },
             Err(error) => candle_core::bail!("invalid VASR_QWEN3_ASR_AUDIO_ATTN: {error}"),
@@ -659,8 +681,12 @@ impl AudioAttention {
                             .iter()
                             .map(|&index| source.narrow(0, windows[index].0, len))
                             .collect::<Result<Vec<_>>>()?;
-                        // Keep the existing on-device BF16 stack workaround.
-                        stack_audio_chunks(&segments)
+                        // Native BF16 copy is characterized against the compatibility
+                        // path on pinned Candle; keep it an independent experiment.
+                        stack_audio_chunks(
+                            &segments,
+                            self.mode == AudioAttentionMode::GroupedNative,
+                        )
                     };
                     let output = self.attend_batched(stack(q)?, stack(k)?, stack(v)?)?;
                     for (batch_index, &window_index) in chunk.iter().enumerate() {
@@ -694,6 +720,8 @@ struct AudioEncoderLayer {
     fc1: IsqLinear,
     fc2: IsqLinear,
     final_layer_norm: LayerNorm,
+    #[cfg(feature = "metal-paged-attn")]
+    fused_fc1_gelu: bool,
 }
 
 impl AudioEncoderLayer {
@@ -717,13 +745,42 @@ impl AudioEncoderLayer {
         )?;
         let fc1 = isq_linear::linear_b(embed_dim, cfg.encoder_ffn_dim, true, vb.pp("fc1"), isq)?;
         let fc2 = isq_linear::linear_b(cfg.encoder_ffn_dim, embed_dim, true, vb.pp("fc2"), isq)?;
+        #[cfg(feature = "metal-paged-attn")]
+        let fused_fc1_gelu = vb.device().is_metal()
+            && ConvExecutionPolicy::parse_override(
+                std::env::var("VASR_METAL_ENCODER_BIAS_GELU")
+                    .ok()
+                    .as_deref(),
+                "VASR_METAL_ENCODER_BIAS_GELU",
+            )?
+            .unwrap_or(false);
         Ok(Self {
             self_attn,
             self_attn_layer_norm,
             fc1,
             fc2,
             final_layer_norm,
+            #[cfg(feature = "metal-paged-attn")]
+            fused_fc1_gelu,
         })
+    }
+
+    fn fc1_gelu(&self, normed: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal-paged-attn")]
+        if self.fused_fc1_gelu && normed.device().is_metal() {
+            if let IsqLinear::Linear(linear) = &self.fc1 {
+                if let Some(bias) = linear.bias() {
+                    // Keep the original dense matmul; the fused operator explicitly
+                    // rounds the bias addition to the input dtype before GELU.
+                    let projected = candle_nn::Linear::new(linear.weight().clone(), None)
+                        .forward(normed)?
+                        .detach();
+                    return vasr_paged_attn::metal::conv::bias_gelu_last_dim(&projected, bias)
+                        .map(|x| x.detach());
+                }
+            }
+        }
+        gelu(&self.fc1.forward(normed)?.detach()).map(|x| x.detach())
     }
 
     fn forward(&self, hidden_states: Tensor, cu_seqlens: &[usize]) -> Result<Tensor> {
@@ -747,12 +804,12 @@ impl AudioEncoderLayer {
                     {
                         activated.detach()
                     } else {
-                        gelu(&self.fc1.forward(&normed)?.detach())?.detach()
+                        self.fc1_gelu(&normed)?
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    gelu(&self.fc1.forward(&normed)?.detach())?.detach()
+                    self.fc1_gelu(&normed)?
                 }
             };
             let fc2 = self.fc2.forward(&activated)?.detach();
@@ -798,12 +855,29 @@ struct AudioConvSample {
 impl AudioTower {
     pub(crate) fn set_auto_conv_layout(&mut self, enabled: bool) {
         self.conv_policy.auto = enabled;
+        #[cfg(feature = "metal-paged-attn")]
+        if enabled {
+            if std::env::var_os("VASR_METAL_CONV_GEMM_TILE").is_none() {
+                self.conv_policy.gemm_tile = Some(vasr_quant::metal_gemm::GemmTile::Narrow);
+            }
+            for layer in &mut self.layers {
+                if std::env::var_os("VASR_QWEN3_ASR_AUDIO_ATTN").is_none() {
+                    layer.self_attn.mode = AudioAttentionMode::GroupedNative;
+                }
+                if std::env::var_os("VASR_METAL_ENCODER_BIAS_GELU").is_none() {
+                    layer.fused_fc1_gelu = true;
+                }
+            }
+        }
         let (nhwc, im2col32) = self.conv_policy.resolve();
         let bias_gelu = self.conv_policy.fused_bias_gelu();
+        let native_chunks = self.conv_policy.native_chunks();
         if enabled || nhwc {
             tracing::info!(target: "vasr::execution",
-                "Metal CNN policy | nhwc={nhwc} im2col32={im2col32} bias_gelu={bias_gelu} explicit_overrides=preserved");
+                "Metal CNN policy | nhwc={nhwc} im2col32={im2col32} bias_gelu={bias_gelu} native_chunks={native_chunks} explicit_overrides=preserved");
         }
+        #[cfg(feature = "metal-paged-attn")]
+        tracing::info!(target: "vasr::execution", "Metal encoder policy | conv_tile={:?} attention={:?} fc1_bias_gelu={} overrides=preserved", self.conv_policy.gemm_tile, self.layers.first().map(|layer| layer.self_attn.mode), self.layers.first().is_some_and(|layer| layer.fused_fc1_gelu));
     }
 
     pub fn load(
@@ -824,6 +898,20 @@ impl AudioTower {
                 bias_gelu.as_deref(),
                 "VASR_METAL_CONV_BIAS_GELU",
             )?;
+            policy.native_chunks_override = ConvExecutionPolicy::parse_override(
+                std::env::var("VASR_METAL_CONV_NATIVE_CHUNKS")
+                    .ok()
+                    .as_deref(),
+                "VASR_METAL_CONV_NATIVE_CHUNKS",
+            )?;
+            #[cfg(feature = "metal-paged-attn")]
+            {
+                policy.gemm_tile = std::env::var("VASR_METAL_CONV_GEMM_TILE")
+                    .ok()
+                    .map(|value| vasr_quant::metal_gemm::GemmTile::parse(&value))
+                    .transpose()?
+                    .flatten();
+            }
             policy
         } else {
             ConvExecutionPolicy::default()
@@ -1215,6 +1303,7 @@ impl AudioTower {
                     0,
                     0,
                     window - chunk_len,
+                    self.conv_policy.native_chunks(),
                 )?);
                 metadata.push((sample_index, aftercnn_len));
                 totals[sample_index] =
@@ -1270,7 +1359,9 @@ impl AudioTower {
         outputs: &mut [Vec<Tensor>],
         max_ts: &mut [usize],
     ) -> Result<()> {
-        let packed = stack_audio_chunks(chunks)?.transpose(1, 2)?.unsqueeze(1)?;
+        let packed = stack_audio_chunks(chunks, self.conv_policy.native_chunks())?
+            .transpose(1, 2)?
+            .unsqueeze(1)?;
         let x = self.project_conv_chunks(self.forward_conv_layers(&packed)?)?;
         let (_, max_t, _) = x.dims3()?;
         for (chunk_index, &(sample_index, valid_t)) in metadata.iter().enumerate() {
@@ -1328,7 +1419,13 @@ impl AudioTower {
             }
             let chunk = input_t.narrow(0, offset, chunk_len)?;
             let pad = window.saturating_sub(chunk_len);
-            padded_chunks.push(pad_audio_chunk(&chunk, 0, 0, pad)?);
+            padded_chunks.push(pad_audio_chunk(
+                &chunk,
+                0,
+                0,
+                pad,
+                self.conv_policy.native_chunks(),
+            )?);
             let aftercnn_len = feat_extract_output_length(chunk_len);
             aftercnn_lens.push(aftercnn_len);
             aftercnn_total = aftercnn_total.saturating_add(aftercnn_len);
@@ -1348,7 +1445,7 @@ impl AudioTower {
 
         let padded_feature = {
             let padded_chunks = padded_chunks;
-            stack_audio_chunks(&padded_chunks)?
+            stack_audio_chunks(&padded_chunks, self.conv_policy.native_chunks())?
                 .transpose(1, 2)?
                 .unsqueeze(1)?
         };
@@ -1546,6 +1643,36 @@ mod tests {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn encoder_fc1_fusion_keeps_dense_projection_values() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        let device = Device::new_metal(0)?;
+        let cfg = test_config();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let vb =
+                candle_nn::VarBuilder::from_backend(Box::new(SeededBackend), dtype, device.clone());
+            let mut layer = super::AudioEncoderLayer::load(&cfg, vb, false, None)?;
+            for rows in [1, 17, 129] {
+                let x = Tensor::from_vec(
+                    (0..rows * cfg.d_model)
+                        .map(|i| ((i * 13 % 193) as f32 - 96.) / 23.)
+                        .collect::<Vec<_>>(),
+                    (rows, cfg.d_model),
+                    &device,
+                )?
+                .to_dtype(dtype)?;
+                layer.fused_fc1_gelu = false;
+                let expected = layer.fc1_gelu(&x)?;
+                layer.fused_fc1_gelu = true;
+                let actual = layer.fc1_gelu(&x)?;
+                assert_tensor_close(&actual, &expected, 0.)?;
+            }
+        }
+        Ok(())
     }
 
     impl candle_nn::var_builder::SimpleBackend for SeededBackend {
@@ -1822,7 +1949,11 @@ mod tests {
         let xs =
             candle_core::Tensor::from_vec(values, (seq, cfg.d_model), device)?.to_dtype(dtype)?;
         let expected = attention.forward(xs.clone(), &cu)?;
-        for mode in [AudioAttentionMode::ProjectOnce, AudioAttentionMode::Grouped] {
+        for mode in [
+            AudioAttentionMode::ProjectOnce,
+            AudioAttentionMode::Grouped,
+            AudioAttentionMode::GroupedNative,
+        ] {
             attention.mode = mode;
             let got = attention.forward(xs.clone(), &cu)?;
             assert_tensor_close(&got, &expected, tolerance)?;
@@ -2116,6 +2247,75 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    #[ignore = "exclusive Metal chunk preparation diagnostic"]
+    fn diagnose_native_bf16_chunk_preparation() -> anyhow::Result<()> {
+        use candle_core::{DType, Device, Tensor};
+        let device = Device::new_metal(0)?;
+        for frames in [5usize, 105, 805, 3005] {
+            let mel = 128;
+            let input = Tensor::from_vec(
+                (0..mel * (frames + 7))
+                    .map(|i| ((i % 193) as f32 - 96.) / 11.)
+                    .collect::<Vec<_>>(),
+                (mel, frames + 7),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?
+            .narrow(1, 7, frames)?
+            .transpose(0, 1)?;
+            let mut reference = Vec::new();
+            let mut native = Vec::new();
+            for start in (0..frames).step_by(100) {
+                let len = (frames - start).min(100);
+                let chunk = input.narrow(0, start, len)?;
+                reference.push(super::pad_audio_chunk(&chunk, 0, 0, 100 - len, false)?);
+                native.push(super::pad_audio_chunk(&chunk, 0, 0, 100 - len, true)?);
+            }
+            let ref_stack = super::stack_audio_chunks(&reference, false)?;
+            let native_stack = super::stack_audio_chunks(&native, true)?;
+            assert_tensor_close(&native_stack, &ref_stack, 0.)?;
+            for phase in ["compat", "native"] {
+                let mut times = Vec::new();
+                for iteration in 0..24 {
+                    device.synchronize()?;
+                    let start_time = std::time::Instant::now();
+                    let chunks = (0..frames)
+                        .step_by(100)
+                        .map(|start| {
+                            let len = (frames - start).min(100);
+                            let chunk = input.narrow(0, start, len)?;
+                            if phase == "compat" {
+                                super::pad_audio_chunk(&chunk, 0, 0, 100 - len, false)
+                            } else {
+                                chunk.pad_with_zeros(0, 0, 100 - len)
+                            }
+                        })
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                    let output = if phase == "compat" {
+                        super::stack_audio_chunks(&chunks, false)?
+                    } else {
+                        Tensor::stack(&chunks.iter().collect::<Vec<_>>(), 0)?
+                    };
+                    device.synchronize()?;
+                    std::hint::black_box(output);
+                    if iteration >= 4 {
+                        times.push(start_time.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "chunk_prep frames={frames} phase={phase} median_us={:.3} min_us={:.3} max_us={:.3}",
+                    (times[9] + times[10]) / 2.,
+                    times[0],
+                    times[19]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
     fn test_metal_bf16_audio_chunk_padding_avoids_strided_copy_kernel() -> anyhow::Result<()> {
         let device = candle_core::Device::new_metal(0)?;
         let mel = 128usize;
@@ -2130,7 +2330,7 @@ mod tests {
 
         let input_t = input.transpose(0, 1)?;
         let chunk = input_t.narrow(0, 1500, 5)?;
-        let padded = super::pad_audio_chunk(&chunk, 0, 0, 95)?;
+        let padded = super::pad_audio_chunk(&chunk, 0, 0, 95, false)?;
 
         assert_eq!(padded.dtype(), candle_core::DType::BF16);
         assert!(padded.device().is_metal());
@@ -2156,9 +2356,9 @@ mod tests {
         for offset in (0..frames).step_by(100) {
             let len = (frames - offset).min(100);
             let chunk = input_t.narrow(0, offset, len)?;
-            chunks.push(super::pad_audio_chunk(&chunk, 0, 0, 100 - len)?);
+            chunks.push(super::pad_audio_chunk(&chunk, 0, 0, 100 - len, false)?);
         }
-        let stacked = super::stack_audio_chunks(&chunks)?;
+        let stacked = super::stack_audio_chunks(&chunks, false)?;
 
         assert_eq!(stacked.dtype(), candle_core::DType::BF16);
         assert!(stacked.device().is_metal());

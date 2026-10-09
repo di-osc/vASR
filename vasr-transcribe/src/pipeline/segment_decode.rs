@@ -9,6 +9,7 @@ use super::{
     prefill_span_from_decode, record_asr_batch_stats,
 };
 use anyhow::{Result, bail};
+use asr_data::{AudioEvent, Timeline, Waveform};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,6 @@ use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
 use vasr::models::qwen3asr::TranscribeTimings;
 use vasr::models::qwen3asr::{Qwen3ASR, StreamingMetadataDecoder, qwen_outputs_to_timelines};
-use asr_data::{AudioEvent, Timeline, Waveform};
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]
@@ -139,6 +139,8 @@ fn run_global_segment_decode_worker(
     let (meta_tx, meta_rx) = std_mpsc::channel();
     let mut stream_batches = StreamBatchRegistry::default();
     let pending_chunks = RefCell::new(BTreeMap::new());
+    let debug_metadata = std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some();
+    let mut last_metadata_snapshot = None;
 
     let forward_thread = std::thread::spawn(move || {
         let mut next_global_chunk = 0usize;
@@ -226,6 +228,15 @@ fn run_global_segment_decode_worker(
                     }
                 }
             }
+            if debug_metadata {
+                tracing::info!(
+                    target: "vasr_transcribe::pipeline",
+                    "metadata_lifetime | stage=producer producers={} ranges={} waiting_chunks={}",
+                    producer_chunk_counts.len(),
+                    producer_chunk_ranges.values().map(Vec::len).sum::<usize>(),
+                    producer_chunk_ranges.values().flatten().map(|range| range.3).sum::<usize>(),
+                );
+            }
         }
     });
 
@@ -258,6 +269,20 @@ fn run_global_segment_decode_worker(
             }
         }
         stream_batches.retire_completed(|batch| batch.decoder.all_chunks_completed());
+        if debug_metadata {
+            let snapshot = (
+                stream_batches.batches.len(),
+                segment_state.jobs.len(),
+                pending_chunks.borrow().len(),
+            );
+            if last_metadata_snapshot.replace(snapshot) != Some(snapshot) {
+                tracing::info!(
+                    target: "vasr_transcribe::pipeline",
+                    "metadata_lifetime | stage=decoder batches={} jobs={} pending_chunks={}",
+                    snapshot.0, snapshot.1, snapshot.2,
+                );
+            }
+        }
         Ok(())
     };
 

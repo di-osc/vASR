@@ -34,10 +34,27 @@ pub(super) struct HardwareProfile {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ModelMemoryProfile {
+    /// Set only after checking the measured hardware, canonical model and dtype.
+    pub validated_metal_100x: bool,
     pub weight_bytes: u64,
     pub kv_bytes_per_token: u64,
     pub encoder_bytes_per_audio_second: u64,
     pub cuda_graph_workspace_bytes: u64,
+}
+
+pub(super) fn validated_metal_100x_profile(
+    model: &str,
+    dtype: candle_core::DType,
+    quantized: bool,
+    hardware: bool,
+) -> bool {
+    hardware
+        && dtype == candle_core::DType::BF16
+        && !quantized
+        && matches!(
+            model.trim().to_ascii_lowercase().as_str(),
+            "qwen3-asr-0.6b" | "qwen/qwen3-asr-0.6b"
+        )
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,7 +115,11 @@ pub(super) fn resolve_tuning(
     // 该问题已由共享 ModelExecutionLock 修复。这里放开到验证过的默认段数，
     // 并用 VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS 继续做 4/8/16/32 的精度扫描。
     let auto_segments = if hardware.backend == Backend::Metal {
-        METAL_AUTO_ENCODER_SEGMENTS
+        if model.validated_metal_100x {
+            16
+        } else {
+            METAL_AUTO_ENCODER_SEGMENTS
+        }
     } else {
         (((memory_after_weights / BYTES_PER_GIB) as usize).saturating_mul(2))
             .clamp(1, MAX_AUTO_ENCODER_SEGMENTS)
@@ -198,10 +219,20 @@ pub(super) fn resolve_tuning(
         0
     };
     // 内存安全容量与执行批量分开：容量用于 KV 规划，执行批量按统一策略收窄。
-    let execution = ExecutionPolicy::resolve_backend(
+    let (auto_slots, auto_wave) = if model.validated_metal_100x {
+        (64, 16)
+    } else {
+        (
+            vasr::models::qwen3asr::inference::execution::METAL_AUTO_MAX_ACTIVE_SLOTS,
+            vasr::models::qwen3asr::inference::execution::METAL_AUTO_MAX_PREFILL_WAVE,
+        )
+    };
+    let execution = ExecutionPolicy::resolve_backend_with_limits(
         hardware.backend == Backend::Metal,
         max_num_seqs,
         overrides.max_num_seqs.is_some(),
+        auto_slots,
+        auto_wave,
     );
     Ok(ResolvedServeTuning {
         max_num_seqs,
@@ -335,6 +366,7 @@ pub(super) fn estimate_model_memory_profile(
         _ => 2.0,
     };
     Some(ModelMemoryProfile {
+        validated_metal_100x: false,
         weight_bytes: (parameters as f64 * bytes_per_parameter) as u64,
         kv_bytes_per_token,
         // At the 32-segment baseline this reserves roughly 2 GiB for a 30-second batch.
@@ -468,6 +500,7 @@ mod tests {
                 cpu_parallelism: 16,
             },
             ModelMemoryProfile {
+                validated_metal_100x: false,
                 weight_bytes: GIB,
                 kv_bytes_per_token: 112 * 1024,
                 encoder_bytes_per_audio_second: 64 * 1024 * 1024,
@@ -671,6 +704,63 @@ mod tests {
             assert!(high.max_num_seqs <= 512);
             assert_eq!(low.reserved_gpu_bytes, 0);
             assert_eq!(high.reserved_gpu_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn measured_metal_profile_resolves_full_policy_and_honors_capacity() {
+        let (mut hardware, mut profile, _) = input(48);
+        hardware.backend = Backend::Metal;
+        profile.validated_metal_100x = true;
+        let tuning = resolve_tuning(
+            Some(hardware),
+            Some(profile),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(tuning.encoder_batch_max_segments, 16);
+        assert_eq!(tuning.execution.active_slots, 64);
+        assert_eq!(tuning.execution.decode_rows, 64);
+        assert_eq!(tuning.execution.prefill_wave, 16);
+        let limited = resolve_tuning(
+            Some(hardware),
+            Some(profile),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides {
+                max_num_seqs: Some(4),
+                encoder_batch_max_segments: Some(7),
+                ..ServeTuningOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(limited.encoder_batch_max_segments, 7);
+        assert_eq!(limited.execution.active_slots, 4);
+        assert_eq!(limited.execution.decode_rows, 4);
+        assert_eq!(limited.execution.prefill_wave, 4);
+    }
+
+    #[test]
+    fn measured_metal_profile_rejects_other_models_dtypes_and_quantization() {
+        use super::validated_metal_100x_profile as eligible;
+        use candle_core::DType;
+        assert!(eligible("Qwen3-ASR-0.6B", DType::BF16, false, true));
+        assert!(eligible("Qwen/Qwen3-ASR-0.6B", DType::BF16, false, true));
+        for (model, dtype, quantized, hardware) in [
+            ("Qwen3-ASR-1.7B", DType::BF16, false, true),
+            ("Other/Qwen3-ASR-0.6B", DType::BF16, false, true),
+            ("/tmp/Qwen3-ASR-0.6B", DType::BF16, false, true),
+            ("Qwen3-ASR-0.6B", DType::F16, false, true),
+            ("Qwen3-ASR-0.6B", DType::BF16, true, true),
+            ("Qwen3-ASR-0.6B", DType::BF16, false, false),
+        ] {
+            assert!(!eligible(model, dtype, quantized, hardware));
         }
     }
 

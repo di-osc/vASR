@@ -69,6 +69,9 @@ struct PerfSavedInput {
     /// 远程 URL 或本地路径。没有可保存的地址时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// ModelScope identity allows replay without persisting audio bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modelscope: Option<crate::ModelScopeSourceDto>,
     /// 请求里显式指定的 mono 模式。
     #[serde(skip_serializing_if = "Option::is_none")]
     mono: Option<bool>,
@@ -704,6 +707,7 @@ fn saved_inputs(inputs: &[AudioInputDto]) -> Vec<PerfSavedInput> {
         .iter()
         .map(|input| PerfSavedInput {
             url: persistable_audio_ref(input.url.as_deref()),
+            modelscope: input.modelscope.clone(),
             mono: input.mono,
             hotword: input.hotword.clone(),
         })
@@ -796,5 +800,24 @@ mod tests {
         assert_eq!(json[1]["hotword"], "热词");
         assert!(json[2].get("url").is_none());
         assert!(json[3].get("url").is_none());
+    }
+
+    #[test]
+    fn saved_inputs_keep_modelscope_identity_for_replay() {
+        let source = crate::ModelScopeSourceDto {
+            repo_id: "owner/dataset".into(),
+            file_path: "nested/audio.wav".into(),
+            revision: Some("immutable-revision".into()),
+        };
+        let input = AudioInputDto {
+            url: None,
+            b64_str: None,
+            modelscope: Some(source.clone()),
+            mono: Some(true),
+            hotword: None,
+        };
+        let json = serde_json::to_value(saved_inputs(&[input])).unwrap();
+        assert_eq!(json[0]["modelscope"], serde_json::to_value(source).unwrap());
+        assert!(json[0].get("b64_str").is_none());
     }
 }

@@ -41,6 +41,18 @@ pub fn conv2d_nhwc_with_im2col32(
     dilation: usize,
     use_fast: bool,
 ) -> Result<Tensor> {
+    conv2d_nhwc_with_gemm_tile(input, weight, padding, stride, dilation, use_fast, None)
+}
+
+pub fn conv2d_nhwc_with_gemm_tile(
+    input: &Tensor,
+    weight: &Tensor,
+    padding: usize,
+    stride: usize,
+    dilation: usize,
+    use_fast: bool,
+    gemm_tile: Option<vasr_quant::metal_gemm::GemmTile>,
+) -> Result<Tensor> {
     let (batch, channels, height, width) = input.dims4()?;
     let (out_channels, kernel_channels, kh, kw) = weight.dims4()?;
     if !input.device().is_metal()
@@ -104,8 +116,14 @@ pub fn conv2d_nhwc_with_im2col32(
             count,
         })?
     };
-    let kernel = weight.contiguous()?.reshape((out_channels, cols))?.t()?;
-    col.matmul(&kernel)?.reshape((batch, oh, ow, out_channels))
+    let kernel = weight.contiguous()?.reshape((out_channels, cols))?;
+    // The input layer has K=9; only the large-K CNN projections were profiled.
+    let output = if let Some(tile) = gemm_tile.filter(|_| cols >= 1024) {
+        vasr_quant::metal_gemm::matmul_nt(&col, &kernel, tile)?
+    } else {
+        col.matmul(&kernel.t()?)?
+    };
+    output.reshape((batch, oh, ow, out_channels))
 }
 
 fn im2col32_params(input: &Tensor) -> Result<([u32; 10], usize, usize)> {
@@ -193,12 +211,53 @@ pub fn bias_gelu_nhwc(input: &Tensor, bias: &Tensor) -> Result<Tensor> {
         bias,
         &BiasGelu {
             channels: channels as u32,
+            store_boundary: false,
+        },
+    )
+}
+
+/// Fuse a last-dimension bias/GELU for dense encoder projections. The
+/// original NHWC entry and its compiled kernel remain unchanged.
+pub fn bias_gelu_last_dim(input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let channels = *input
+        .dims()
+        .last()
+        .ok_or_else(|| candle_core::Error::Msg("bias/GELU requires a last dimension".into()))?;
+    if channels == 0
+        || bias.dims1()? != channels
+        || input.dtype() != bias.dtype()
+        || !input.device().same_device(bias.device())
+    {
+        candle_core::bail!("bias/GELU requires matching nonzero width, dtype and device");
+    }
+    let fast_math = std::env::var("CANDLE_METAL_ENABLE_FAST_MATH")
+        .map(|value| matches!(value.as_str(), "true" | "t" | "yes" | "y" | "1"))
+        .unwrap_or(true);
+    if !input.device().is_metal()
+        || !input.is_contiguous()
+        || !bias.is_contiguous()
+        || input.elem_count() == 0
+        || input.elem_count() > u32::MAX as usize
+        || !fast_math
+        || !matches!(
+            input.dtype(),
+            candle_core::DType::F32 | candle_core::DType::F16 | candle_core::DType::BF16
+        )
+    {
+        return input.broadcast_add(bias)?.gelu_erf();
+    }
+    input.apply_op2_no_bwd(
+        bias,
+        &BiasGelu {
+            channels: channels as u32,
+            store_boundary: true,
         },
     )
 }
 
 struct BiasGelu {
     channels: u32,
+    store_boundary: bool,
 }
 impl candle_core::CustomOp2 for BiasGelu {
     fn name(&self) -> &'static str {
@@ -222,17 +281,22 @@ impl candle_core::CustomOp2 for BiasGelu {
     ) -> Result<(candle_core::MetalStorage, candle_core::Shape)> {
         use candle_core::{DType, backend::BackendStorage};
         use candle_metal_kernels::metal::ComputePipeline;
-        use objc2_metal::{MTLDevice, MTLSize};
+        use objc2_metal::{
+            MTLCompileOptions, MTLDevice, MTLMathFloatingPointFunctions, MTLMathMode, MTLSize,
+        };
         use std::{
             collections::HashMap,
             sync::{Mutex, OnceLock},
         };
         static CACHE: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
             OnceLock::new();
-        let name = match input.dtype() {
-            DType::F32 => "bias_gelu_f32",
-            DType::F16 => "bias_gelu_f16",
-            DType::BF16 => "bias_gelu_bf16",
+        let name = match (input.dtype(), self.store_boundary) {
+            (DType::F32, false) => "bias_gelu_f32",
+            (DType::F16, false) => "bias_gelu_f16",
+            (DType::BF16, false) => "bias_gelu_bf16",
+            (DType::F32, true) => "bias_gelu_last_f32",
+            (DType::F16, true) => "bias_gelu_last_f16",
+            (DType::BF16, true) => "bias_gelu_last_bf16",
             other => candle_core::bail!("bias/GELU unsupported dtype {other:?}"),
         };
         let device = input.device();
@@ -245,9 +309,23 @@ impl candle_core::CustomOp2 for BiasGelu {
             if let Some(p) = cache.get(&key) {
                 p.clone()
             } else {
+                // Keep the established NHWC compiler policy unchanged. The new
+                // last-dimension entry explicitly matches Candle's Fast mode;
+                // precise math was already routed to the materialized fallback.
+                let options = self.store_boundary.then(|| {
+                    let options = MTLCompileOptions::new();
+                    if objc2::available!(macos = 15, ios = 18) {
+                        options.setMathMode(MTLMathMode::Fast);
+                        options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
+                    } else {
+                        #[allow(deprecated)]
+                        options.setFastMathEnabled(true);
+                    }
+                    options
+                });
                 let library = device
                     .device()
-                    .new_library_with_source(include_str!("bias_gelu.metal"), None)
+                    .new_library_with_source(include_str!("bias_gelu.metal"), options.as_deref())
                     .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                 let function = library
                     .get_function(name, None)
@@ -580,6 +658,148 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn tiled_nhwc_conv_preserves_tail_chain() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::BF16] {
+            let mut expected = Tensor::randn(0f32, 0.3, (3, 1, 19, 15), &device)?
+                .to_dtype(dtype)?
+                .narrow(0, 1, 2)?
+                .narrow(2, 1, 17)?
+                .narrow(3, 1, 13)?;
+            let mut actual = expected.clone();
+            for (input, output) in [(1, 480), (480, 480), (480, 480)] {
+                let weight =
+                    Tensor::randn(0f32, 0.03, (output, input, 3, 3), &device)?.to_dtype(dtype)?;
+                expected = conv2d_nhwc_with_im2col32(&expected, &weight, 1, 2, 1, true)?
+                    .gelu_erf()?
+                    .permute((0, 3, 1, 2))?;
+                actual = conv2d_nhwc_with_gemm_tile(
+                    &actual,
+                    &weight,
+                    1,
+                    2,
+                    1,
+                    true,
+                    Some(vasr_quant::metal_gemm::GemmTile::Narrow),
+                )?
+                .gelu_erf()?
+                .permute((0, 3, 1, 2))?;
+                let a = actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let b = expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert_eq!(actual.dims(), expected.dims());
+                let tolerance = if dtype == DType::F32 { 1e-5 } else { 0.01 };
+                assert!(a.iter().zip(&b).all(|(a, b)| a.is_finite()
+                    && b.is_finite()
+                    && (a - b).abs() <= tolerance + tolerance * b.abs()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Metal GPU"]
+    fn last_dim_bias_gelu_matches_materialized_exactly() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (rows, width) in [(1, 13), (17, 896), (257, 3584)] {
+                let x = Tensor::from_vec(
+                    (0..(rows + 1) * width)
+                        .map(|i| ((i * 17 % 1009) as f32 - 504.) / 23.)
+                        .collect::<Vec<_>>(),
+                    (rows + 1, width),
+                    &device,
+                )?
+                .to_dtype(dtype)?
+                .narrow(0, 1, rows)?;
+                let b = Tensor::from_vec(
+                    (0..width + 1)
+                        .map(|i| ((i * 13 % 127) as f32 - 63.) / 51.)
+                        .collect::<Vec<_>>(),
+                    width + 1,
+                    &device,
+                )?
+                .to_dtype(dtype)?
+                .narrow(0, 1, width)?;
+                for x in [
+                    x.clone(),
+                    x.reshape((1, rows, width))?,
+                    x.t()?.contiguous()?.t()?,
+                ] {
+                    let expected = x.broadcast_add(&b)?.gelu_erf()?;
+                    let actual = bias_gelu_last_dim(&x, &b)?;
+                    assert_eq!(actual.dims(), expected.dims());
+                    assert_eq!(
+                        actual
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        expected
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        "must preserve bias rounding and GELU at {dtype:?}/{rows}/{width}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn last_dim_bias_gelu_cpu_fallback_and_validation() -> Result<()> {
+        let input = Tensor::from_vec(vec![-4f32, -1., 0., 1., 2., 5.], (2, 3), &Device::Cpu)?;
+        let bias = Tensor::from_vec(vec![0.125f32, -0.5, 1.], 3, &Device::Cpu)?;
+        let expected = input.broadcast_add(&bias)?.gelu_erf()?;
+        let actual = bias_gelu_last_dim(&input, &bias)?;
+        assert_eq!(actual.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+        assert!(bias_gelu_last_dim(&input, &bias.narrow(0, 0, 2)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "synchronized Metal microbenchmark; requires exclusive GPU"]
+    fn diagnose_encoder_bias_gelu() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        for rows in [128, 1000, 3000] {
+            let x = Tensor::randn(0f32, 1., (rows, 3584), &device)?.to_dtype(DType::BF16)?;
+            let bias = Tensor::randn(0f32, 0.1, 3584, &device)?.to_dtype(DType::BF16)?;
+            let mut samples = [Vec::new(), Vec::new()];
+            // Alternate order so clock and thermal drift affect both variants.
+            for iteration in 0..48 {
+                for phase in [iteration % 2, 1 - iteration % 2] {
+                    device.synchronize()?;
+                    let start = std::time::Instant::now();
+                    let output = if phase == 0 {
+                        x.broadcast_add(&bias)?.gelu_erf()?
+                    } else {
+                        bias_gelu_last_dim(&x, &bias)?
+                    };
+                    device.synchronize()?;
+                    std::hint::black_box(output);
+                    if iteration >= 8 {
+                        samples[phase].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for (phase, mut times) in samples.into_iter().enumerate() {
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "encoder_bias_gelu rows={rows} phase={phase} median_us={:.3}",
+                    (times[19] + times[20]) / 2.
+                );
             }
         }
         Ok(())

@@ -7,19 +7,18 @@
 
 use candle_core::Device;
 
-/// Metal 自动模式下默认的活跃槽位上限。
+/// 未验证 Metal 组合的保守活跃槽位上限。
 ///
-/// 该值是容量扫描（8 / 16 / 32 / 64 槽，见
-/// `docs/performance/m4-pro-qwen3-asr-2026-09-30.md`）选出的最优候选：
-/// 32 槽 / 32 行 / mixed-step / prefill wave 8 / encoder 8 段，实测约 2.0× 基线吞吐，
-/// 且 64 槽反而更慢。显式指定 `--max-num-seqs` 或 `VASR_METAL_MAX_ACTIVE_SEQS`
-/// 可以覆盖它，以便继续做容量扫描。
+/// 2026-09-30 的算子与批量扫描选出 32 槽、wave 8、encoder 8：
+/// `docs/performance/m4-pro-qwen3-asr-2026-09-30.md`。2026-10-08 已验证的
+/// M4 Pro / 48 GB、Qwen3-ASR-0.6B、BF16 组合由服务传入 64 槽和 wave 16；
+/// 通用入口继续使用此回退。显式执行参数优先，始终受安全容量约束。
 pub const METAL_AUTO_MAX_ACTIVE_SLOTS: usize = 32;
 
-/// Metal 自动模式下单次 prefill wave 的默认上限。
+/// 未验证 Metal 组合的单次 prefill wave 上限。
 ///
 /// 容量和 prefill wave 是独立限制：即使 KV block 允许更多序列，也不让单次
-/// prefill 一次执行过多行。实测把 wave 提到与容量相同并不提升吞吐。
+/// prefill 一次执行过多行。已验证组合的 wave 16 也独立于安全容量。
 pub const METAL_AUTO_MAX_PREFILL_WAVE: usize = 8;
 
 /// 一次服务启动解析出的统一执行策略。
@@ -55,6 +54,24 @@ impl ExecutionPolicy {
     /// 与 [`Self::resolve`] 相同，但直接使用后端判断，方便启动阶段在拿到
     /// `Device` 之前（或只有后端枚举时）解析策略。
     pub fn resolve_backend(is_metal: bool, capacity: usize, explicit_capacity: bool) -> Self {
+        Self::resolve_backend_with_limits(
+            is_metal,
+            capacity,
+            explicit_capacity,
+            METAL_AUTO_MAX_ACTIVE_SLOTS,
+            METAL_AUTO_MAX_PREFILL_WAVE,
+        )
+    }
+
+    /// Resolve a measured automatic batch policy without changing safe KV capacity
+    /// or overriding explicit execution settings. Other backends ignore these limits.
+    pub fn resolve_backend_with_limits(
+        is_metal: bool,
+        capacity: usize,
+        explicit_capacity: bool,
+        auto_slots: usize,
+        auto_prefill_wave: usize,
+    ) -> Self {
         let capacity = capacity.max(1);
         if !is_metal {
             return Self {
@@ -69,7 +86,7 @@ impl ExecutionPolicy {
         let auto_capacity = if explicit_capacity {
             capacity
         } else {
-            capacity.min(METAL_AUTO_MAX_ACTIVE_SLOTS)
+            capacity.min(auto_slots.max(1))
         };
         // 环境变量仍然最高优先级，但不会突破本次解析出的安全容量。
         let active_slots = env_usize("VASR_METAL_MAX_ACTIVE_SEQS")
@@ -79,7 +96,7 @@ impl ExecutionPolicy {
             .unwrap_or(active_slots)
             .clamp(1, active_slots);
         let prefill_wave = env_usize("VASR_PREFILL_MAX_WAVE")
-            .unwrap_or(auto_capacity.min(METAL_AUTO_MAX_PREFILL_WAVE))
+            .unwrap_or(auto_capacity.min(auto_prefill_wave.max(1)))
             .clamp(1, active_slots);
         Self {
             active_slots,

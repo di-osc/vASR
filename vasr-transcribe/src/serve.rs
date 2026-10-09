@@ -412,7 +412,8 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             None
         }
     };
-    let model_profile = crate::serve_tuning::estimate_model_memory_profile(
+    #[allow(unused_mut)]
+    let mut model_profile = crate::serve_tuning::estimate_model_memory_profile(
         &args.pipeline.model.model,
         args.pipeline.model.isq.as_deref(),
         if device.is_cuda() {
@@ -423,6 +424,15 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             crate::serve_tuning::Backend::Cpu
         },
     );
+    #[cfg(feature = "metal")]
+    if let Some(profile) = model_profile.as_mut() {
+        profile.validated_metal_100x = crate::serve_tuning::validated_metal_100x_profile(
+            &args.pipeline.model.model,
+            auto_dtype(&device)?,
+            args.pipeline.model.isq.is_some(),
+            vasr::vasr_paged_attn::metal::profile::validated_m4_pro_48gb(&device),
+        );
+    }
     if model_profile.is_none() {
         tracing::warn!(target: "vasr_transcribe::serve", "model memory profile unavailable for {:?}; using baseline fallback values", args.pipeline.model.model);
     }
@@ -906,6 +916,18 @@ fn log_model_loaded(
             ],
         )
     );
+
+    if let Some((encoder, text, other)) = stats.quantized_layer_counts
+        && encoder + text + other > 0
+    {
+        tracing::info!(
+            target: "vasr_transcribe::serve",
+            encoder_layers = encoder,
+            text_layers = text,
+            other_layers = other,
+            "ISQ effective quantized layer counts"
+        );
+    }
 
     let mut gpu_fields = Vec::new();
     // 没有 CUDA 显存快照时不写 used/total/free。

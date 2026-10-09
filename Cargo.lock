@@ -4803,10 +4803,12 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-metal-kernels",
+ "candle-nn",
  "cudaforge",
  "dispatch2",
  "float8",
  "half",
+ "objc2",
  "objc2-metal",
  "thiserror 2.0.20",
  "tracing",
@@ -4821,8 +4823,10 @@ dependencies = [
  "bindgen_cuda",
  "candle-core",
  "candle-kernels",
+ "candle-metal-kernels",
  "candle-nn",
  "half",
+ "objc2-metal",
  "tracing",
 ]
 

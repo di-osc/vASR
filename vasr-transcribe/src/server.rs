@@ -4,10 +4,10 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use asr_data::AudioSource;
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router, routing::post};
 use vasr::{AsrOptions, AudioLoader, OfflineAsrModel as AsrModel};
-use asr_data::AudioSource;
 use vasr_vad::{VadModel, VadOptions};
 
 use crate::pipeline::{
@@ -239,13 +239,20 @@ async fn handle_transcribe(
     maybe_trim_cuda_after_request(&request_id, &service);
     #[cfg(not(feature = "cuda-graph"))]
     service.active_requests.fetch_sub(1, Ordering::AcqRel);
-    log_request_memory_debug(
-        &request_id,
-        &service.pipeline.memory_snapshot(),
-        q8_fast_path_start,
-        #[cfg(feature = "cuda-graph")]
-        service.baseline_cuda_used_bytes,
-    );
+    if let Some(snapshot) = collect_request_memory_debug(request_memory_debug_enabled(), {
+        let pipeline = Arc::clone(&service.pipeline);
+        move || pipeline.memory_snapshot()
+    })
+    .await
+    {
+        log_request_memory_debug(
+            &request_id,
+            &snapshot,
+            q8_fast_path_start,
+            #[cfg(feature = "cuda-graph")]
+            service.baseline_cuda_used_bytes,
+        );
+    }
     Json(TranscribeResponse {
         data,
         inference_performance: performance,
@@ -263,6 +270,24 @@ fn maybe_trim_cuda_after_request(request_id: &str, service: &TranscribeService) 
 fn request_memory_debug_enabled() -> bool {
     std::env::var_os("VASR_DEBUG_CUDA_MEM").is_some()
         || std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()
+}
+
+async fn collect_request_memory_debug(
+    enabled: bool,
+    collect: impl FnOnce() -> PipelineMemorySnapshot + Send + 'static,
+) -> Option<PipelineMemorySnapshot> {
+    if !enabled {
+        return None;
+    }
+    // A cache snapshot can wait for an in-flight GPU forward. Optional
+    // diagnostics must never block a Tokio worker that feeds the pipeline.
+    match tokio::task::spawn_blocking(collect).await {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::warn!(target: "vasr_transcribe::serve", "request memory diagnostics unavailable: {error}");
+            None
+        }
+    }
 }
 
 fn log_request_memory_debug(
@@ -842,6 +867,25 @@ pub fn build_transcribe_service_from_parts(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn disabled_memory_debug_does_not_collect_or_wait_for_cache() {
+        let result = super::collect_request_memory_debug(false, || {
+            panic!("disabled diagnostics must not acquire cache locks")
+        })
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enabled_memory_debug_collects_off_the_async_worker() {
+        let caller = std::thread::current().id();
+        let result = super::collect_request_memory_debug(true, move || {
+            assert_ne!(std::thread::current().id(), caller);
+            super::PipelineMemorySnapshot::default()
+        })
+        .await;
+        assert!(result.is_some());
+    }
     use std::time::Instant;
 
     use super::{StageSpan, active_spans_seconds, clean_call_boundary_noise, merge_channel_data};

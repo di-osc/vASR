@@ -1,6 +1,10 @@
 //! In-situ quantization (ISQ) and decode matmul fast paths for VASR.
 
 pub mod isq_linear;
+#[cfg(feature = "metal-paged-attn")]
+pub mod metal_gemm;
+#[cfg(all(test, feature = "metal-paged-attn"))]
+mod metal_mpp;
 #[cfg(feature = "cuda")]
 mod q8_mmvq;
 #[cfg(feature = "cuda")]
