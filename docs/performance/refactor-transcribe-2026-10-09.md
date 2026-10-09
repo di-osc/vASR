@@ -36,3 +36,15 @@ pointwise、residual norm、rotary 共用编译选项和缓存；设备、源码
 将 StreamingMetadataDecoder 从转写编排中拆出，保持原公开导出和构造／方法签名。AudioDecodeProgress 收集文本、语言及完成进度，早期条目返回与最终 finish 共用按全局 chunk 索引排序的组装函数。
 
 四项特征测试在状态替换和模块提取前后均通过：乱序／重复完成、跨批次 push 与结果索引、波形释放、零 chunk 及未完成错误。独立规格、质量审查均通过。日志 metadata-characterization.log、metadata-module-green.log。此阶段没有改动模型计算。
+
+## CNN 编译缓存迁移与精度模式对照
+
+将既有 CNN bias/GELU 与 im2col32 的编译、缓存迁入公共辅助代码。保持原生默认编译选项 `None` 与显式 Fast 的区别；缓存键纳入这一区别。所有 dispatch、dtype、布局、offset、尾部及 Metal 源码不变。规格和独立质量审查通过。
+
+默认浮点设置下，相关 28 项测试通过。关闭 fast-math 后，完整扫描发现 `nhwc_bias_gelu_matches_materialized_reference` 的 F32 精确相等断言失败；在原版 `82b4951` 相同配置下也失败。两版实际输出和参考输出分别具有完全相同的 SHA256，见 `precise-conv-comparison.json`。既有 NHWC kernel 使用原生默认浮点设置，而参考路径服从 Candle 精确设置；本轮不改变计算设置以消除这个原有差异。排除这一项后，扩展 Metal 测试 36 项通过；模型侧精确模式 90 项通过。不得将本轮结果表述为所有精确模式测试通过。
+
+## 正式对照与持续来流脚本
+
+新增 refactor 模式，对冻结的两个二进制交替运行三轮，均采用自动默认策略、并发 28、batch 4、mono=true，预热完整数据集。正式模式清除额外浮点覆盖和内部实验覆盖。审计同时检查原始文本、Bench 文本、条目映射、CER、预热、示例标签以及中位吞吐门槛；精确 3% 边界使用十进制比较。
+
+持续来流验收新增基线示例原始文本对照、每个短请求文本对照，以及登记、路由、请求／条目／来源预算的容量与最终回收检查。脚本回归 21 项通过（正式 10、持续来流 11），bash 语法检查通过。真实六轮及 30 分钟测试尚未执行；此阶段只交付可复现的验收入口。

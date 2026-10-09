@@ -13,6 +13,8 @@ pub(super) enum KernelSource {
     Pointwise,
     ResidualNorm,
     Rotary,
+    BiasGelu,
+    Im2Col32,
 }
 
 impl KernelSource {
@@ -22,12 +24,15 @@ impl KernelSource {
             Self::Pointwise => include_str!("pointwise.metal"),
             Self::ResidualNorm => include_str!("residual_norm.metal"),
             Self::Rotary => include_str!("rotary.metal"),
+            Self::BiasGelu => include_str!("bias_gelu.metal"),
+            Self::Im2Col32 => include_str!("im2col32.metal"),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum MathOptions {
+    MetalDefault,
     Modern {
         mode: MTLMathMode,
         functions: MTLMathFloatingPointFunctions,
@@ -57,11 +62,15 @@ impl MathOptions {
         }
     }
 
-    fn to_mtl(self) -> Retained<MTLCompileOptions> {
+    fn to_mtl(self) -> Option<Retained<MTLCompileOptions>> {
+        if self == Self::MetalDefault {
+            return None;
+        }
         // Match Candle 5404348 exactly, including the floating-point functions
         // used by exp() and the legacy API on older operating systems.
         let options = MTLCompileOptions::new();
         match self {
+            Self::MetalDefault => unreachable!("handled above"),
             Self::Modern { mode, functions } => {
                 options.setMathMode(mode);
                 options.setMathFloatingPointFunctions(functions);
@@ -71,7 +80,7 @@ impl MathOptions {
                 options.setFastMathEnabled(fast_math);
             }
         }
-        options
+        Some(options)
     }
 }
 
@@ -142,11 +151,36 @@ pub(super) fn load_pipeline(
     function: &'static str,
     constants: Option<Vec<(usize, Value)>>,
 ) -> candle_core::Result<ComputePipeline> {
-    let value = std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").ok();
-    let math = MathOptions::for_os(
-        fast_math_from_env(value.as_deref()),
-        objc2::available!(macos = 15, ios = 18),
-    );
+    load_pipeline_with_policy(device, source, function, constants, CompilePolicy::Candle)
+}
+
+/// Retain each existing kernel's exact compiler settings; None is not replaced
+/// with an explicit Fast option even when today's Metal defaults are fast.
+#[derive(Clone, Copy)]
+pub(super) enum CompilePolicy {
+    Candle,
+    MetalDefault,
+    Fast,
+}
+
+pub(super) fn load_pipeline_with_policy(
+    device: &Device,
+    source: KernelSource,
+    function: &'static str,
+    constants: Option<Vec<(usize, Value)>>,
+    policy: CompilePolicy,
+) -> candle_core::Result<ComputePipeline> {
+    let math = match policy {
+        CompilePolicy::MetalDefault => MathOptions::MetalDefault,
+        CompilePolicy::Fast => MathOptions::for_os(true, objc2::available!(macos = 15, ios = 18)),
+        CompilePolicy::Candle => {
+            let value = std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").ok();
+            MathOptions::for_os(
+                fast_math_from_env(value.as_deref()),
+                objc2::available!(macos = 15, ios = 18),
+            )
+        }
+    };
     load_pipeline_with_options(device, source, function, constants, math)
 }
 
@@ -174,7 +208,7 @@ fn load_pipeline_with_options(
     }
     let options = math.to_mtl();
     let library = device
-        .new_library_with_source(source.source(), Some(&options))
+        .new_library_with_source(source.source(), options.as_deref())
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
     // Only the cache key is transformed. Pass the original types, float bits
     // and setter ordering to Candle/Metal unchanged.
@@ -193,6 +227,27 @@ fn load_pipeline_with_options(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn metal_default_and_explicit_fast_options_have_distinct_cache_identity() {
+        assert!(MathOptions::MetalDefault.to_mtl().is_none());
+        for modern in [false, true] {
+            let fast = MathOptions::for_os(true, modern);
+            if !modern || objc2::available!(macos = 15, ios = 18) {
+                assert!(fast.to_mtl().is_some());
+            }
+            assert_ne!(
+                PipelineKey::new(7, KernelSource::BiasGelu, "same", None, fast),
+                PipelineKey::new(
+                    7,
+                    KernelSource::BiasGelu,
+                    "same",
+                    None,
+                    MathOptions::MetalDefault
+                )
+            );
+        }
+    }
 
     #[test]
     fn environment_values_keep_candle_fast_math_semantics() {
@@ -239,7 +294,7 @@ mod tests {
             return;
         }
         for fast_math in [false, true] {
-            let options = MathOptions::for_os(fast_math, true).to_mtl();
+            let options = MathOptions::for_os(fast_math, true).to_mtl().unwrap();
             assert_eq!(
                 options.mathMode(),
                 if fast_math {
@@ -262,7 +317,7 @@ mod tests {
     #[test]
     fn legacy_mtl_options_apply_fast_math_setting() {
         for fast_math in [false, true] {
-            let options = MathOptions::Legacy { fast_math }.to_mtl();
+            let options = MathOptions::Legacy { fast_math }.to_mtl().unwrap();
             #[allow(deprecated)]
             let actual = options.fastMathEnabled();
             assert_eq!(actual, fast_math);
