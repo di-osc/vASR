@@ -11,7 +11,7 @@ use asr_data::AudioSource;
 use super::{
     DeduplicatedTranscribeInputs, PendingGlobalRequest, PipelineRequestId, RequestItemRef,
     RequestStageProgress, TranscribeInput, TranscribeItemOutcome, deduplicate_transcribe_inputs,
-    global_pipeline_failure_outcomes,
+    global_pipeline_failure_outcomes, RequestRegistry,
 };
 
 pub(super) struct GlobalTranscribeRequest {
@@ -62,6 +62,7 @@ pub(super) fn spawn_global_submit_worker(
                 let _ = response_tx.send(Vec::new());
                 continue;
             }
+            let expected = unique_inputs.iter().map(|input| (input.index, "mono")).collect();
             let mut load_jobs = Vec::with_capacity(unique_count);
             let mut internal_indices = Vec::with_capacity(unique_count);
             for input in unique_inputs {
@@ -93,6 +94,7 @@ pub(super) fn spawn_global_submit_worker(
                         log_id,
                         failure_indices,
                         remaining: unique_count,
+                        expected,
                         duplicate_indices,
                         internal_indices,
                         outcomes: Vec::with_capacity(unique_count),
@@ -115,10 +117,14 @@ pub(super) fn spawn_global_submit_worker(
                 for job in &load_jobs {
                     routes.insert(job.internal_index, job.request_item);
                 }
+            } else {
+                RequestRegistry::new(pending_requests.clone(), job_routes.clone()).fail_all("request route lock poisoned");
+                return;
             }
             for job in load_jobs {
                 if load_job_tx.send(job).is_err() {
-                    break;
+                    RequestRegistry::new(pending_requests.clone(), job_routes.clone()).fail_request(request_id, "global loader channel closed");
+                    return;
                 }
             }
         }

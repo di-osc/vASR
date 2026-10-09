@@ -87,6 +87,7 @@ async fn global_channels_register_all_routes_before_first_send_and_progress() {
             log_id: "test".into(),
             failure_indices: vec![3],
             remaining: 1,
+            expected: [(3, "mono")].into(),
             duplicate_indices: Vec::new(),
             internal_indices: vec![10],
             outcomes: Vec::new(),

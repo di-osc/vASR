@@ -407,6 +407,8 @@ async fn send_global_loaded_result(
                     && let Some(request) = pending.get_mut(&request_item.request_id)
                 {
                     request.remaining += jobs.len() - 1;
+                    request.expected.remove(&(request_item.item_index, "mono"));
+                    request.expected.extend(jobs.iter().map(|job| (request_item.item_index, job.channel)));
                     request
                         .internal_indices
                         .extend(jobs.iter().skip(1).map(|job| job.index));

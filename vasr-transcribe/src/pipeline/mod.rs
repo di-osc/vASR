@@ -4,6 +4,7 @@ mod dedup;
 mod load;
 mod memory;
 mod result_router;
+mod registry;
 #[cfg(feature = "paged-attn")]
 mod segment_decode;
 #[cfg(feature = "paged-attn")]
@@ -18,6 +19,7 @@ use self::dedup::*;
 use self::load::*;
 use self::memory::*;
 use self::result_router::*;
+use self::registry::*;
 #[cfg(feature = "paged-attn")]
 use self::segment_decode::*;
 #[cfg(feature = "paged-attn")]
@@ -603,6 +605,7 @@ struct PendingGlobalRequest {
     #[cfg_attr(not(feature = "paged-attn"), allow(dead_code))]
     failure_indices: Vec<usize>,
     remaining: usize,
+    expected: std::collections::HashSet<(usize, &'static str)>,
     duplicate_indices: Vec<(usize, usize)>,
     internal_indices: Vec<usize>,
     outcomes: Vec<TranscribeItemOutcome>,
@@ -2616,6 +2619,7 @@ mod tests {
             log_id: "test".to_string(),
             failure_indices: vec![0],
             remaining: 1,
+            expected: [(0, "mono")].into(),
             duplicate_indices: Vec::new(),
             internal_indices: Vec::new(),
             outcomes: Vec::new(),
@@ -2662,3 +2666,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

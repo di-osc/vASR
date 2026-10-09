@@ -5,7 +5,7 @@ use super::{
     AsrOptions, AsrSegmentJob, AsrStageStats, PendingGlobalRequest, PipelineRequestId,
     RequestItemRef, RoutedTranscribeItemOutcome, StageSpan, TranscribeItemOutcome,
     TranscribeItemSpans, TranscribeItemTiming, allocated_batch_seconds, allocation_scale,
-    global_pipeline_failure_outcomes, merge_optional_span, outcome_from_result,
+    merge_optional_span, outcome_from_result,
     prefill_span_from_decode, record_asr_batch_stats,
 };
 use anyhow::{Result, bail};
@@ -115,10 +115,7 @@ fn fail_pending_requests(
             return;
         }
     };
-    for request in requests {
-        let outcomes = global_pipeline_failure_outcomes(request.failure_indices, error);
-        let _ = request.response_tx.send(outcomes);
-    }
+    for request in requests { request.fail(error); }
 }
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
