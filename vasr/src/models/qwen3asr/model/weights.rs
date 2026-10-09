@@ -37,6 +37,10 @@ impl Default for LoadOptions {
     }
 }
 
+pub(crate) fn load_config_from_pretrained(model_id_or_path: &str) -> Result<AsrConfig> {
+    load_config_json(&resolve_model_dir(model_id_or_path)?)
+}
+
 pub(crate) fn load_model_from_pretrained(
     model_id_or_path: &str,
     device: &Device,
@@ -653,6 +657,26 @@ mod tests {
         if got != want {
             anyhow::bail!("unexpected weights paths: got={got:?} want={want:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pretrained_config_reads_actual_geometry_without_loading_weights() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen3_asr_config_only")?;
+        write_minimal_local_model(&dir, true, false)?;
+        // A nonempty placeholder is valid cache inventory, but cannot be loaded
+        // as tensor weights. Configuration probing must not create a model.
+        let mut json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
+        json["thinker_config"]["text_config"]["hidden_size"] = serde_json::json!(777);
+        fs::write(dir.join("config.json"), json.to_string())?;
+        let config = crate::models::qwen3asr::Qwen3ASR::pretrained_config(dir.to_str().unwrap())?;
+        assert_eq!(config.thinker_config.text_config.hidden_size, 777);
+        fs::write(dir.join("config.json"), "{not-json")?;
+        assert!(
+            crate::models::qwen3asr::Qwen3ASR::pretrained_config(dir.to_str().unwrap()).is_err()
+        );
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

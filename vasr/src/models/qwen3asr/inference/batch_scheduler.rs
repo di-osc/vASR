@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
 
-use crate::inference::execution::ExecutionPolicy;
+use crate::inference::execution::{
+    ExecutionOverrides, ExecutionPolicy, METAL_AUTO_MAX_ACTIVE_SLOTS, METAL_AUTO_MAX_PREFILL_WAVE,
+};
 #[cfg(feature = "timing")]
 use crate::model::generation::GenerationTimings;
 use crate::model::paged_batch_engine::{
@@ -43,8 +45,8 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
     }
 }
 
-fn log_cuda_mem_debug(device: &Device, label: &str) {
-    if std::env::var_os("VASR_DEBUG_CUDA_MEM").is_none() {
+fn log_cuda_mem_debug(device: &Device, label: &str, enabled: bool) {
+    if !enabled {
         return;
     }
     let _ = label;
@@ -87,8 +89,8 @@ fn log_cuda_mem_debug(device: &Device, label: &str) {
 /// Metal 上 encoder、prefill、decode 共用一个 forward 锁，这个日志让性能报告能直接
 /// 看到锁等待是否成为瓶颈，而不必从各阶段耗时反推。默认仅在 `VASR_DEBUG_LOCK_WAIT`
 /// 开启时输出，避免日常启动刷屏。
-fn log_model_execution_lock_wait(runtime: &SharedPagedCacheRuntime) {
-    if std::env::var_os("VASR_DEBUG_LOCK_WAIT").is_none() {
+fn log_model_execution_lock_wait(runtime: &SharedPagedCacheRuntime, enabled: bool) {
+    if !enabled {
         return;
     }
     let Ok(guard) = runtime.lock() else {
@@ -108,6 +110,30 @@ fn log_model_execution_lock_wait(runtime: &SharedPagedCacheRuntime) {
 }
 
 #[derive(Debug, Clone)]
+struct SchedulerEnvironment {
+    execution: ExecutionOverrides,
+    async_prefill_capacity: usize,
+    length_schedule: bool,
+    debug_cuda_mem: bool,
+    debug_lock_wait: bool,
+    debug_request_mem: bool,
+    debug_decode_steps: bool,
+}
+impl SchedulerEnvironment {
+    fn capture() -> Self {
+        Self {
+            execution: ExecutionOverrides::capture(),
+            async_prefill_capacity: async_prefill_channel_capacity(),
+            length_schedule: std::env::var_os("VASR_DISABLE_LENGTH_SCHEDULE").is_none(),
+            debug_cuda_mem: std::env::var_os("VASR_DEBUG_CUDA_MEM").is_some(),
+            debug_lock_wait: std::env::var_os("VASR_DEBUG_LOCK_WAIT").is_some(),
+            debug_request_mem: std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some(),
+            debug_decode_steps: std::env::var_os("VASR_DEBUG_CONTINUOUS_DECODE_STEPS").is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
     /// Per-sequence output cap used by continuous decode; mirrors the public ASR default.
@@ -118,18 +144,21 @@ pub struct AsrBatchSchedulerConfig {
     pub generated_tokens_per_sec: f64,
     /// 启动时解析一次的统一执行策略。`None` 时按设备与容量自行推导。
     execution: Option<ExecutionPolicy>,
+    environment: SchedulerEnvironment,
 }
 
 impl Default for AsrBatchSchedulerConfig {
     fn default() -> Self {
+        let environment = SchedulerEnvironment::capture();
         Self {
             max_num_seqs: 8,
             max_new_tokens: 256,
             explicit_decode_max_seqs: None,
-            prefill_max_wave: prefill_max_wave_from_env(),
+            prefill_max_wave: environment.execution.prefill_wave,
             continuous_batch: continuous_batch_enabled(),
             generated_tokens_per_sec: crate::models::qwen3asr::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
             execution: None,
+            environment,
         }
     }
 }
@@ -168,9 +197,15 @@ impl AsrBatchSchedulerConfig {
         let capacity = self.continuous_max_num_seqs(runtime).max(1);
         let explicit_capacity =
             self.explicit_decode_max_seqs.is_some() || runtime_decode_max_seqs(runtime).is_some();
-        let policy = self
-            .execution
-            .unwrap_or_else(|| ExecutionPolicy::resolve(device, capacity, explicit_capacity));
+        let policy = self.execution.unwrap_or_else(|| {
+            self.environment.execution.resolve_backend(
+                device.is_metal(),
+                capacity,
+                explicit_capacity,
+                METAL_AUTO_MAX_ACTIVE_SLOTS,
+                METAL_AUTO_MAX_PREFILL_WAVE,
+            )
+        });
         policy.clamped_to(capacity)
     }
 
@@ -196,13 +231,6 @@ impl AsrBatchSchedulerConfig {
     ) -> usize {
         self.effective_execution(runtime, device).active_slots
     }
-}
-
-fn prefill_max_wave_from_env() -> Option<usize> {
-    std::env::var("VASR_PREFILL_MAX_WAVE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
 }
 
 fn async_prefill_channel_capacity() -> usize {
@@ -256,9 +284,16 @@ struct ContinuousDecodeDebug {
     max_active_slots: usize,
     one_slot_calls: usize,
     two_or_less_slot_calls: usize,
+    debug_steps: bool,
 }
 
 impl ContinuousDecodeDebug {
+    fn with_debug(debug_steps: bool) -> Self {
+        Self {
+            debug_steps,
+            ..Self::default()
+        }
+    }
     fn record_active(&mut self, step: usize, active_slots: usize) {
         self.total_decode_calls = self.total_decode_calls.saturating_add(1);
         self.total_active_slots = self.total_active_slots.saturating_add(active_slots);
@@ -274,7 +309,7 @@ impl ContinuousDecodeDebug {
             self.tail_active_slots.pop_front();
         }
 
-        if std::env::var_os("VASR_DEBUG_CONTINUOUS_DECODE_STEPS").is_some() {
+        if self.debug_steps {
             tracing::debug!(
                 target: "vasr_transcribe::pipeline",
                 "continuous decode | step={step} active_slots={active_slots}",
@@ -750,8 +785,9 @@ fn prepared_token_capacity(
 /// 空闲工位出现时，领预测生成长度最长的那条。关闭长度规划时仍按到达顺序。
 fn pop_scheduled_prefilled(
     prefilled: &mut VecDeque<PrefilledSequence>,
+    length_schedule: bool,
 ) -> Option<PrefilledSequence> {
-    if !length_schedule_enabled()
+    if !length_schedule
         || prefilled.len() <= 1
         || prefilled.iter().all(|seq| seq.predicted_generated == 0)
     {
@@ -763,10 +799,6 @@ fn pop_scheduled_prefilled(
         .max_by_key(|(_, seq)| (seq.predicted_generated, usize::MAX - seq.client_index))
         .map(|(index, _)| index)?;
     prefilled.remove(index)
-}
-
-fn length_schedule_enabled() -> bool {
-    std::env::var_os("VASR_DISABLE_LENGTH_SCHEDULE").is_none()
 }
 
 /// 两个工位的子集和划分。返回两侧作业下标，使长度和尽量接近总长的一半。
@@ -809,6 +841,7 @@ fn partition_two_slots(lengths: &[usize]) -> (Vec<usize>, Vec<usize>) {
 }
 
 fn attach_prefilled_to_running(
+    length_schedule: bool,
     prefilled: &mut VecDeque<PrefilledSequence>,
     running: &mut [Option<RunningSlot>],
     #[cfg(feature = "timing")] timings: &mut Option<&mut GenerationTimings>,
@@ -818,7 +851,7 @@ fn attach_prefilled_to_running(
         if slot.is_some() {
             continue;
         }
-        let Some(prefilled) = pop_scheduled_prefilled(prefilled) else {
+        let Some(prefilled) = pop_scheduled_prefilled(prefilled, length_schedule) else {
             break;
         };
         #[cfg(feature = "timing")]
@@ -1519,7 +1552,11 @@ impl AsrBatchScheduler {
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
         let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-        log_cuda_mem_debug(device, "prefill_done");
+        log_cuda_mem_debug(
+            device,
+            "prefill_done",
+            self.config.environment.debug_cuda_mem,
+        );
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
             t.prefill_us = t.prefill_us.saturating_add(elapsed);
@@ -1662,7 +1699,11 @@ impl AsrBatchScheduler {
         let elapsed = duration_to_us(start_prefill.elapsed());
         #[cfg(feature = "timing")]
         let prefill_tokens = state.prompt_lens_usize.iter().copied().sum::<usize>();
-        log_cuda_mem_debug(device, "prefill_done");
+        log_cuda_mem_debug(
+            device,
+            "prefill_done",
+            self.config.environment.debug_cuda_mem,
+        );
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_deref_mut() {
             t.prefill_us = t.prefill_us.saturating_add(elapsed);
@@ -1748,8 +1789,7 @@ impl AsrBatchScheduler {
         if result.as_ref().is_ok_and(|(wave, _)| *wave > 0) {
             inputs.compact_completed_prefix()?;
         }
-        static DEBUG_METADATA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DEBUG_METADATA.get_or_init(|| std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()) {
+        if self.config.environment.debug_request_mem {
             tracing::info!(
                 target: "vasr_transcribe::pipeline",
                 "metadata_lifetime | stage=prefill_buffer prepared={} waiting={} audio_tokens={}",
@@ -1844,7 +1884,8 @@ impl AsrBatchScheduler {
         }
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
-            let mut decode_debug = ContinuousDecodeDebug::default();
+            let mut decode_debug =
+                ContinuousDecodeDebug::with_debug(self.config.environment.debug_decode_steps);
             loop {
                 decode_debug.record_finished(running.as_slice());
                 if free_finished_and_grant_kv(
@@ -1864,6 +1905,7 @@ impl AsrBatchScheduler {
                     )?;
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -1942,6 +1984,7 @@ impl AsrBatchScheduler {
                     )?;
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -1967,6 +2010,7 @@ impl AsrBatchScheduler {
                 )?;
                 if prefill_wave > 0 {
                     attach_prefilled_to_running(
+                        self.config.environment.length_schedule,
                         &mut prefilled,
                         running.as_mut_slice(),
                         #[cfg(feature = "timing")]
@@ -1999,7 +2043,11 @@ impl AsrBatchScheduler {
             }
 
             decode_debug.log_summary(max_slots);
-            log_cuda_mem_debug(device, "decode_done");
+            log_cuda_mem_debug(
+                device,
+                "decode_done",
+                self.config.environment.debug_cuda_mem,
+            );
             Ok(outputs)
         })();
 
@@ -2041,7 +2089,8 @@ impl AsrBatchScheduler {
         outputs.resize(prefill_inputs.len(), Vec::new());
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
-            let mut decode_debug = ContinuousDecodeDebug::default();
+            let mut decode_debug =
+                ContinuousDecodeDebug::with_debug(self.config.environment.debug_decode_steps);
             loop {
                 {
                     let mut runtime_guard = runtime
@@ -2066,6 +2115,7 @@ impl AsrBatchScheduler {
                     }
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -2119,6 +2169,7 @@ impl AsrBatchScheduler {
                     }
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -2149,6 +2200,7 @@ impl AsrBatchScheduler {
 
                 if prefill_wave > 0 {
                     attach_prefilled_to_running(
+                        self.config.environment.length_schedule,
                         &mut prefilled,
                         running.as_mut_slice(),
                         #[cfg(feature = "timing")]
@@ -2230,8 +2282,9 @@ impl AsrBatchScheduler {
             self.config.execution_max_num_seqs(&runtime_guard, device)
         };
         let max_slots = max_num_seqs.max(1);
-        let (message_tx, message_rx) =
-            mpsc::sync_channel::<Result<PrefillStageOutput>>(async_prefill_channel_capacity());
+        let (message_tx, message_rx) = mpsc::sync_channel::<Result<PrefillStageOutput>>(
+            self.config.environment.async_prefill_capacity,
+        );
         let shared_request_ids = Arc::new(AtomicUsize::new(self.next_request_id));
         tracing::debug!(
             target: "vasr_transcribe::pipeline",
@@ -2405,19 +2458,21 @@ impl AsrBatchScheduler {
         let mut running: Vec<Option<RunningSlot>> = (0..max_slots.max(1)).map(|_| None).collect();
         let mut outputs: Vec<Vec<u32>> = Vec::new();
         let mut source_closed = false;
-        let mut decode_debug = ContinuousDecodeDebug::default();
+        let mut decode_debug =
+            ContinuousDecodeDebug::with_debug(self.config.environment.debug_decode_steps);
         let mut async_debug = AsyncContinuousDebug::default();
         // A global service keeps this loop alive across requests, so waiting
         // until loop exit would never report lock statistics during a benchmark.
-        let mut lock_wait_reported_at = std::env::var_os("VASR_DEBUG_LOCK_WAIT")
-            .is_some()
-            .then(Instant::now);
+        let mut lock_wait_reported_at = self.config.environment.debug_lock_wait.then(Instant::now);
 
         let result = (|| -> Result<Vec<Vec<u32>>> {
             loop {
                 if let Some(last) = &mut lock_wait_reported_at {
                     if last.elapsed() >= Duration::from_secs(5) {
-                        log_model_execution_lock_wait(runtime);
+                        log_model_execution_lock_wait(
+                            runtime,
+                            self.config.environment.debug_lock_wait,
+                        );
                         *last = Instant::now();
                     }
                 }
@@ -2466,6 +2521,7 @@ impl AsrBatchScheduler {
                     }
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -2520,6 +2576,7 @@ impl AsrBatchScheduler {
                     }
                 }
                 attach_prefilled_to_running(
+                    self.config.environment.length_schedule,
                     &mut prefilled,
                     running.as_mut_slice(),
                     #[cfg(feature = "timing")]
@@ -2586,9 +2643,13 @@ impl AsrBatchScheduler {
             }
 
             decode_debug.log_summary(max_slots);
-            log_cuda_mem_debug(device, "decode_done");
+            log_cuda_mem_debug(
+                device,
+                "decode_done",
+                self.config.environment.debug_cuda_mem,
+            );
             async_debug.log_summary();
-            log_model_execution_lock_wait(runtime);
+            log_model_execution_lock_wait(runtime, self.config.environment.debug_lock_wait);
             Ok(std::mem::take(&mut outputs))
         })();
 

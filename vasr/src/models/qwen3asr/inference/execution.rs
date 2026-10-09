@@ -72,39 +72,13 @@ impl ExecutionPolicy {
         auto_slots: usize,
         auto_prefill_wave: usize,
     ) -> Self {
-        let capacity = capacity.max(1);
-        if !is_metal {
-            return Self {
-                active_slots: capacity,
-                decode_rows: capacity,
-                // 非 Metal 默认允许 mixed-step，只有显式禁用才关闭。
-                mixed_step: !env_flag("VASR_DISABLE_MIXED_STEP_DECODE"),
-                prefill_wave: capacity,
-            };
-        }
-
-        let auto_capacity = if explicit_capacity {
-            capacity
-        } else {
-            capacity.min(auto_slots.max(1))
-        };
-        // 环境变量仍然最高优先级，但不会突破本次解析出的安全容量。
-        let active_slots = env_usize("VASR_METAL_MAX_ACTIVE_SEQS")
-            .unwrap_or(auto_capacity)
-            .clamp(1, capacity);
-        let decode_rows = env_usize("VASR_METAL_PAGED_DECODE_BATCH_SIZE")
-            .unwrap_or(active_slots)
-            .clamp(1, active_slots);
-        let prefill_wave = env_usize("VASR_PREFILL_MAX_WAVE")
-            .unwrap_or(auto_capacity.min(auto_prefill_wave.max(1)))
-            .clamp(1, active_slots);
-        Self {
-            active_slots,
-            decode_rows,
-            // Metal 现在默认开启 mixed-step；显式禁用优先。
-            mixed_step: !env_flag("VASR_DISABLE_MIXED_STEP_DECODE"),
-            prefill_wave,
-        }
+        ExecutionOverrides::capture().resolve_backend(
+            is_metal,
+            capacity,
+            explicit_capacity,
+            auto_slots,
+            auto_prefill_wave,
+        )
     }
 
     /// 把策略约束到给定的活跃槽位数以内，保证不越过内存安全容量。
@@ -135,10 +109,78 @@ impl ExecutionPolicy {
     }
 }
 
+/// Captured once by a scheduler config, so fallback execution never re-reads
+/// environment variables during prefill or decode. Public policy literals stay compatible.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutionOverrides {
+    active_slots: Option<usize>,
+    decode_rows: Option<usize>,
+    pub(crate) prefill_wave: Option<usize>,
+    mixed_step: bool,
+}
+impl ExecutionOverrides {
+    pub(crate) fn capture() -> Self {
+        Self {
+            active_slots: env_usize("VASR_METAL_MAX_ACTIVE_SEQS"),
+            decode_rows: env_usize("VASR_METAL_PAGED_DECODE_BATCH_SIZE"),
+            prefill_wave: env_usize("VASR_PREFILL_MAX_WAVE"),
+            mixed_step: !env_flag("VASR_DISABLE_MIXED_STEP_DECODE"),
+        }
+    }
+    pub(crate) fn resolve_backend(
+        self,
+        is_metal: bool,
+        capacity: usize,
+        explicit_capacity: bool,
+        auto_slots: usize,
+        auto_prefill_wave: usize,
+    ) -> ExecutionPolicy {
+        let capacity = capacity.max(1);
+        if !is_metal {
+            return ExecutionPolicy {
+                active_slots: capacity,
+                decode_rows: capacity,
+                // 非 Metal 默认允许 mixed-step，只有显式禁用才关闭。
+                mixed_step: self.mixed_step,
+                prefill_wave: capacity,
+            };
+        }
+
+        let auto_capacity = if explicit_capacity {
+            capacity
+        } else {
+            capacity.min(auto_slots.max(1))
+        };
+        // 环境变量仍然最高优先级，但不会突破本次解析出的安全容量。
+        let active_slots = self
+            .active_slots
+            .unwrap_or(auto_capacity)
+            .clamp(1, capacity);
+        let decode_rows = self
+            .decode_rows
+            .unwrap_or(active_slots)
+            .clamp(1, active_slots);
+        let prefill_wave = self
+            .prefill_wave
+            .unwrap_or(auto_capacity.min(auto_prefill_wave.max(1)))
+            .clamp(1, active_slots);
+        ExecutionPolicy {
+            active_slots,
+            decode_rows,
+            // Metal 现在默认开启 mixed-step；显式禁用优先。
+            mixed_step: self.mixed_step,
+            prefill_wave,
+        }
+    }
+}
+
 /// 读取一个正整数环境变量，非正数或解析失败时返回 `None`。
 fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
+    parse_positive_usize(std::env::var(name).ok().as_deref())
+}
+
+fn parse_positive_usize(value: Option<&str>) -> Option<usize> {
+    value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
 }
@@ -151,6 +193,62 @@ fn env_flag(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ExecutionPolicy, METAL_AUTO_MAX_ACTIVE_SLOTS, METAL_AUTO_MAX_PREFILL_WAVE};
+
+    #[test]
+    fn captured_execution_overrides_preserve_priority_and_independent_defaults() {
+        use super::ExecutionOverrides;
+        let first = ExecutionOverrides {
+            active_slots: Some(128),
+            decode_rows: Some(96),
+            prefill_wave: Some(32),
+            mixed_step: false,
+        };
+        let resolved = first.resolve_backend(true, 64, false, 32, 8);
+        assert_eq!(
+            resolved,
+            ExecutionPolicy {
+                active_slots: 64,
+                decode_rows: 64,
+                prefill_wave: 32,
+                mixed_step: false
+            }
+        );
+        let other = ExecutionOverrides {
+            active_slots: None,
+            decode_rows: None,
+            prefill_wave: None,
+            mixed_step: true,
+        };
+        assert_eq!(
+            other.resolve_backend(true, 128, false, 64, 16),
+            ExecutionPolicy {
+                active_slots: 64,
+                decode_rows: 64,
+                prefill_wave: 16,
+                mixed_step: true
+            }
+        );
+        assert_eq!(
+            first.resolve_backend(false, 4, false, 32, 8),
+            ExecutionPolicy {
+                active_slots: 4,
+                decode_rows: 4,
+                prefill_wave: 4,
+                mixed_step: false
+            }
+        );
+        assert_eq!(first.resolve_backend(true, 1, false, 32, 8).active_slots, 1);
+    }
+
+    #[test]
+    fn legacy_execution_integer_parser_ignores_invalid_and_zero_without_trimming() {
+        use super::parse_positive_usize;
+        assert_eq!(parse_positive_usize(None), None);
+        for value in ["0", "false", "invalid", "-1", " 64 ", ""] {
+            assert_eq!(parse_positive_usize(Some(value)), None);
+        }
+        assert_eq!(parse_positive_usize(Some("64")), Some(64));
+    }
 
     fn cpu() -> candle_core::Device {
         candle_core::Device::Cpu

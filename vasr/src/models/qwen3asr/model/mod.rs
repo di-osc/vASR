@@ -8,6 +8,7 @@ pub(crate) mod cuda_mem_debug;
 pub mod generation;
 pub mod kv_cache;
 pub mod name_map;
+pub mod operator_policy;
 #[cfg(feature = "paged-attn")]
 pub mod paged_batch_engine;
 pub mod thinker;
