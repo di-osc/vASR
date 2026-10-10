@@ -52,7 +52,7 @@ Metal temporary ownership policy | explicit_override=preserved autorelease_scope
 
 ## 数据集
 
-数据集现在是单个 SQLite 文件 `datasets/<name>.db`。音频不再拆到 `assets/`，而是以 ModelScope 数据集引用（`repo_id` + 仓库内相对路径 + `revision`）存进库里，读取时由 modelhub 下载或命中缓存：
+数据集现在是单个 SQLite 文件 `datasets/<name>.db`。call 系列音频以 ModelScope 数据集引用（`repo_id` + 仓库内相对路径 + `revision`）存进库里，读取时由 modelhub 下载或命中缓存；内置短样本 `example1.db` 保留对 `assets/example1.mp3` 的本地引用：
 
 ```text
 datasets/
@@ -64,6 +64,10 @@ datasets/
 `perf`、`eval`、`stress`、`run` 的 `-i` 接受 `.db` / `.vasr` / `.vasr.msgpack` 数据文件。旧的“拆成数据集目录”的 `pack` 子命令已经移除。
 
 ## 推理速度
+
+2026-10-10 的隔离重构分支 `codex/refactor-transcribe` 完成同期六轮对照：原版 `82b4951` 三轮 **122.66 / 122.89 / 123.16×**，重构版三轮 **123.52 / 118.18 / 123.30×**，中位分别 **122.89× / 123.30×**。两版使用真实自动默认策略，99 条输入的原始、Bench 规范化文本在正式及预热轮全部一致，加权 CER **16.5876%**，example1 零 CER，零失败。此轮重构保持模型、BF16、VAD 和浮点计算，主要改进 worker 监督、入口背压、取消清理、实例配置及模块职责；30 分钟持续吞吐 **123.18×**，1123 次请求零失败，4372 条主转写逐条一致，30 次短探针零 CER；登记、路由、许可与 KV 全部排空，RSS 稳态无持续增长，swap 未增长。短探针最大延迟 48.02 秒。详见[重构记录](docs/performance/refactor-transcribe-2026-10-09.md)。
+
+### 100× 优化的历史验收
 
 100× 实验于 **2026-10-08** 验收真实自动默认：三轮 **122.54 / 122.61 / 122.65×**，中位 **122.61×**，同期关闭 RoPE 融合的参考中位 100.34×，提升 **22.19%**。使用迁移后的 `call-100.db`，99 条、5025.0118 秒，客户端并发 28/batch 4；完整预热后测量，模型加载另计。六轮正式及六轮预热的原始、Bench 规范化文本与正确基线逐条一致，加权 CER **16.5876%**，example1 零 CER，零失败与质量异常。
 
