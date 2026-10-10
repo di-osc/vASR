@@ -56,3 +56,25 @@ pointwise、residual norm、rotary 共用编译选项和缓存；设备、源码
 模型和服务共用实际模型结构的资格判断；仅规范名称不足以启用已验证策略。新增 config-only 入口读取 checkpoint 配置，不额外加载模型权重或 GPU。公开导出保留。拆分 text 策略、投影／MLP、attention、测试及 audio 策略、attention、测试，数学函数保持。
 
 相关规格与质量审查通过。模型普通 CPU 测试 117 项通过；模型侧默认浮点专项 45 项、关闭 fast-math 后扩展 90 项通过。实际 GPU 测试涵盖非零权重 encoder F32/BF16 混批、尾窗、窗口隔离、投影融合、stride 与 offset；保留参考路径和实验开关。本机不声称完成 CUDA 运行验证。
+
+## 请求生命周期、入口预算与取消
+
+请求登记器按稳定请求／条目／声道管理结果，重复完成仅计一次；统一失败出口保留完成项并补齐失败项、撤销路由、唤醒等待者。监督器保存 stage 的 abort handle 并监视 join，包括嵌套 encoder、prefill、decode；异常退出、panic、意外通道关闭转为 fatal，正常 stop 使用明确停止状态。
+
+HTTP middleware 在 JSON 请求体读取前申请请求许可及编码来源预算，超载等待；活跃请求用 guard 自动释放。进入加载前按唯一条目逐条申请许可，大批次不会一次占满许可后等待自身释放。每条目的许可沿加载、VAD、encoder 和已提交 GPU 任务传递；取消跳过尚未开始的工作，已进入 GPU 的工作完成后回收，迟到结果不会进入其他请求。管理锁不跨通道等待或 GPU forward。
+
+请求上限为最终 active_slots，唯一待处理条目上限为安全容量两倍；编码来源预算按可用内存 1/16 推导并限制在 512 MiB–2 GiB，纳入内存安全估算。HTTP 无 Content-Length 时预留 512 MiB 请求体上限。现有 PCM／segment 预算保留。内部来源超出总预算时按原条目索引报告失败，避免不可满足的 semaphore 等待；HTTP 超载不返回 429。
+
+审查额外捕获三项实际缺陷并先 RED 后 GREEN：最后一个 VAD 子任务失败而上游保持打开时必须立即失败；stop 与 submit 注册竞态必须在排空前关闭 gate；立体声加载完成后、发表结果前取消不能产生无归属的右声道 ID。额外 ID 分配与完整声道登记在同一 pending 锁内完成，16 次重复取消的退役范围由 16 降为 1。完整 CLI Metal 回归 129 lib + 3 bin 通过；真实模型加载集成测试按既有标记保留待正式验收。日志 `lifecycle-review-red.log`、`lifecycle-stereo-red.log`、`lifecycle-final.log`。
+
+拆分流水线统计／日志及测试模块；32 个统计函数体保持。ProducerChunkRange 用具名字段替换跨 producer 范围元组，集中索引换算和剩余计数检查，补充越界、乱序及重复回收测试。
+
+## 混批取消、结果顺序与公开入口兼容
+
+排队的编码批次进入初始及追加 prefill 前按存活请求筛选。用同一 mask 保序筛选 segments、waveforms、inference targets、encoder CPU 特征行、chunk 和语言元数据；全部存活直接保持原对象，全部取消则不提交 prefill。特征 token 行数按原 mask 非零长度计算并校验总行数。prefill 的 debug 存在性与 coalesce wait 在 worker 构造时捕获，不再使用进程级 OnceLock 或逐轮读取。
+
+独立 RED 测试复现非原始分组顺序时 prepared 行与 metadata 不一致，修复仅将现有 CPU 行按原 chunk 顺序重排，默认顺序保持原路径。非零特征／混长短／交错分组测试 6 项通过；真实 prefill worker 的旧 any-live 语义会保留取消条目，先 RED 后 GREEN。
+
+质量审查发现公开 start() 把 decode_max_seqs=0 的自动语义缩为单槽，以及不同来源使用相同 caller index 时请求无法结束。两项新回归先失败再通过。公开包装在有重复 caller index 时使用输入位置作为内部身份，并在成功／失败统一出口还原调用方索引；HTTP 已使用唯一输入位置，路径不变。零容量恢复原调度默认 8，显式执行槽数受容量约束。5 项回归涵盖不同来源、重复来源、立体声、失败及取消许可回收。
+
+最终完整 CLI 测试 139 lib + 3 bin 通过，包含本地监听和 Metal 设备探测，模型加载集成测试仍按标记待正式验收。普通 CPU 模型 121 项通过，CPU CLI 构建检查通过（保留条件编译下的 unused/dead-code 警告）；日志 `cli-final-complete.log`、`cpu-model-complete.log`、`cpu-check-complete.log`、`public-compat-red.log`、`public-compat-complete.log`。本轮协作审查受使用额度中断，最终新增兼容包装由父任务复核并执行测试，不声称全范围最后版本均完成独立双重审查。

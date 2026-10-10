@@ -1,13 +1,14 @@
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+use super::{PendingGlobalRequest, PipelineRequestId};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{
-    PendingGlobalRequest, PipelineRequestId, RequestItemRef, RoutedTranscribeItemOutcome,
-    TranscribeItemOutcome,
-};
+use super::{RequestItemRef, RoutedTranscribeItemOutcome, TranscribeItemOutcome};
 
 pub(super) fn route_outcome(
     request_item: Option<RequestItemRef>,
@@ -19,18 +20,28 @@ pub(super) fn route_outcome(
     }
 }
 
+#[cfg(test)]
 pub(super) fn spawn_global_result_router(
-    mut asr_to_result_rx: mpsc::Receiver<RoutedTranscribeItemOutcome>,
+    asr_to_result_rx: mpsc::Receiver<RoutedTranscribeItemOutcome>,
     pending_requests: Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>,
     job_routes: Arc<Mutex<HashMap<usize, RequestItemRef>>>,
-) -> JoinHandle<()> {
+) -> JoinHandle<anyhow::Result<()>> {
+    spawn_result_router_with_registry(
+        asr_to_result_rx,
+        super::RequestRegistry::new(pending_requests, job_routes),
+    )
+}
+
+pub(super) fn spawn_result_router_with_registry(
+    mut asr_to_result_rx: mpsc::Receiver<RoutedTranscribeItemOutcome>,
+    registry: super::RequestRegistry,
+) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(async move {
         let debug_metadata = std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some();
-        let registry = super::RequestRegistry::new(pending_requests, job_routes);
         while let Some(routed) = asr_to_result_rx.recv().await {
             if let Err(error) = registry.finish(routed) {
                 registry.fail_all(&format!("result routing failed: {error}"));
-                return;
+                return Err(error);
             }
             if debug_metadata {
                 let requests = registry.pending.lock().ok().map(|pending| pending.len());
@@ -42,5 +53,6 @@ pub(super) fn spawn_global_result_router(
             }
         }
         registry.fail_all("global result channel closed");
+        Err(anyhow::anyhow!("global result channel closed"))
     })
 }

@@ -5,14 +5,18 @@ use std::sync::{
 use std::time::Instant;
 
 use asr_data::AudioSource;
-use axum::extract::DefaultBodyLimit;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::post};
 use vasr::{AsrOptions, AudioLoader, OfflineAsrModel as AsrModel};
 use vasr_vad::{VadModel, VadOptions};
 
 use crate::pipeline::{
-    GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions, StageSpan,
-    TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
+    GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions,
+    SourceReservation, StageSpan, TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
 };
 use crate::protocol::{
     InferenceData, InferencePerformance, SentenceResult, TextResult, TimingBreakdown,
@@ -33,17 +37,91 @@ pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
     Router::new()
         .route("/transcribe", post(handle_transcribe))
         .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn_with_state(
+            service.clone(),
+            admit_transcribe,
+        ))
         .with_state(service)
+}
+
+#[derive(Clone)]
+struct AdmittedRequest {
+    request_id: String,
+    source_memory: Arc<SourceReservation>,
+}
+struct ActiveRequestGuard {
+    service: Arc<TranscribeService>,
+    request_id: String,
+}
+impl ActiveRequestGuard {
+    fn new(service: Arc<TranscribeService>, request_id: String) -> Self {
+        service.active_requests.fetch_add(1, Ordering::AcqRel);
+        Self {
+            service,
+            request_id,
+        }
+    }
+}
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        let active_after = self.service.active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+        #[cfg(feature = "cuda-graph")]
+        {
+            let service = self.service.clone();
+            let request_id = self.request_id.clone();
+            // CUDA workspace trimming may wait for a forward. Keep it off the
+            // async worker on both response completion and cancellation.
+            tokio::task::spawn_blocking(move || {
+                maybe_trim_cuda_after_request(&request_id, &service, active_after)
+            });
+        }
+        #[cfg(not(feature = "cuda-graph"))]
+        let _ = (active_after, &self.request_id);
+    }
+}
+async fn admit_transcribe(
+    State(service): State<Arc<TranscribeService>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let _request_permit = match service.pipeline.admit_request().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    // Acquire before Json/body extraction. Requests without a length reserve
+    // the body limit up front; neither waiting case materializes base64.
+    let bytes = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(TRANSCRIBE_BODY_LIMIT_BYTES)
+        .min(TRANSCRIBE_BODY_LIMIT_BYTES);
+    let source_memory = match service.pipeline.reserve_source(bytes).await {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let request_id = short_request_id();
+    let _active = ActiveRequestGuard::new(service, request_id.clone());
+    request.extensions_mut().insert(AdmittedRequest {
+        request_id,
+        source_memory,
+    });
+    next.run(request).await
 }
 
 async fn handle_transcribe(
     axum::extract::State(service): axum::extract::State<Arc<TranscribeService>>,
+    axum::extract::Extension(admission): axum::extract::Extension<AdmittedRequest>,
     Json(request): Json<TranscribeRequest>,
 ) -> Json<TranscribeResponse> {
     let start = Instant::now();
-    let request_id = short_request_id();
+    let request_id = admission.request_id;
     let q8_fast_path_start = vasr::models::qwen3asr::model::q8_fast_path_stats();
-    service.active_requests.fetch_add(1, Ordering::AcqRel);
     let request_items = request.inputs.len();
     let mut inputs = Vec::new();
     let mut data_slots = vec![None; request_items];
@@ -120,7 +198,7 @@ async fn handle_transcribe(
     // 设备执行安全，不再用全局请求锁把请求串行化，也不再拆成单条请求。
     let outcomes = service
         .pipeline
-        .run_with_log_id(request_id.clone(), inputs)
+        .run_admitted(request_id.clone(), inputs, admission.source_memory)
         .await;
     let mut total_audio_duration_seconds = 0.0;
     let mut component_timing = TranscribeItemTiming::default();
@@ -235,10 +313,6 @@ async fn handle_transcribe(
         performance.total_audio_duration_seconds / active.max(f64::EPSILON),
         performance.total_audio_duration_seconds / performance.batch_wall_seconds.max(f64::EPSILON)
     );
-    #[cfg(feature = "cuda-graph")]
-    maybe_trim_cuda_after_request(&request_id, &service);
-    #[cfg(not(feature = "cuda-graph"))]
-    service.active_requests.fetch_sub(1, Ordering::AcqRel);
     if let Some(snapshot) = collect_request_memory_debug(request_memory_debug_enabled(), {
         let pipeline = Arc::clone(&service.pipeline);
         move || pipeline.memory_snapshot()
@@ -260,8 +334,11 @@ async fn handle_transcribe(
 }
 
 #[cfg(feature = "cuda-graph")]
-fn maybe_trim_cuda_after_request(request_id: &str, service: &TranscribeService) {
-    let active_after = service.active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+fn maybe_trim_cuda_after_request(
+    request_id: &str,
+    service: &TranscribeService,
+    active_after: usize,
+) {
     if let Some(trim) = service.pipeline.trim_cuda_mempool() {
         log_request_trim_debug(request_id, active_after, trim);
     }
@@ -1024,5 +1101,101 @@ mod tests {
             channel: "mono".to_string(),
             sentence_index: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::future::IntoFuture;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    struct EmptyAsr;
+    impl AsrModel for EmptyAsr {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn transcribe(
+            &self,
+            audio: &[asr_data::Waveform],
+            _: &AsrOptions,
+        ) -> anyhow::Result<Vec<asr_data::Timeline>> {
+            Ok(audio
+                .iter()
+                .map(|_| asr_data::Timeline::new("test", 0))
+                .collect())
+        }
+    }
+    fn service() -> Arc<TranscribeService> {
+        build_transcribe_service(Arc::new(GlobalAsyncTranscribePipeline::start_with_limits(
+            AudioLoader,
+            None,
+            Arc::new(EmptyAsr),
+            AsrOptions::default(),
+            VadOptions::default(),
+            PipelineWorkerOptions::default(),
+            crate::pipeline::PipelineLimits {
+                active_slots: 1,
+                safe_capacity: 1,
+                source_bytes: 1024,
+            },
+        )))
+    }
+    #[tokio::test]
+    async fn active_counter_guard_cleans_up_on_cancel_and_error() {
+        let service = service();
+        let guard = ActiveRequestGuard::new(service.clone(), "test".into());
+        assert_eq!(service.active_requests.load(Ordering::Acquire), 1);
+        drop(guard);
+        assert_eq!(service.active_requests.load(Ordering::Acquire), 0);
+    }
+    #[tokio::test]
+    async fn request_admission_precedes_json_body_extraction_and_disconnect_wakes_waiter() {
+        let service = service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(axum::serve(listener, transcribe_router(service.clone())).into_future());
+        let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        first.write_all(b"POST /transcribe HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 512\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.active_requests.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let mut second = Box::pin(
+            client
+                .post(format!("http://{addr}/transcribe"))
+                .json(&serde_json::json!({"inputs": []}))
+                .send(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut second)
+                .await
+                .is_err(),
+            "a second handler parsed/answered while the first admitted body was still unread"
+        );
+        assert_eq!(service.active_requests.load(Ordering::Acquire), 1);
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(service.active_requests.load(Ordering::Acquire), 0);
+        // Invalid JSON also releases both admission and the RAII counter.
+        let invalid = client
+            .post(format!("http://{addr}/transcribe"))
+            .header("Content-Type", "application/json")
+            .body("invalid")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(service.active_requests.load(Ordering::Acquire), 0);
+        server.abort();
     }
 }

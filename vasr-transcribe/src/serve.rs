@@ -426,11 +426,18 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     );
     #[cfg(feature = "metal")]
     if let Some(profile) = model_profile.as_mut() {
+        // Inspect the same checkpoint configuration the loader will use before
+        // selecting batches or allocating KV; a canonical name alone is insufficient.
+        let config = vasr::models::qwen3asr::Qwen3ASR::pretrained_config(
+            vasr::models::qwen3asr::resolve_qwen3_asr_model_id(&args.pipeline.model.model),
+        )?;
+        let geometry = vasr::models::qwen3asr::ModelGeometry::from_config(&config.thinker_config);
         profile.validated_metal_100x = crate::serve_tuning::validated_metal_100x_profile(
             &args.pipeline.model.model,
             auto_dtype(&device)?,
             args.pipeline.model.isq.is_some(),
             vasr::vasr_paged_attn::metal::profile::validated_m4_pro_48gb(&device),
+            &geometry,
         );
     }
     if model_profile.is_none() {
@@ -484,7 +491,7 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
         // CUDA：paged cache 知道权重加载后的实际容量，交给运行时（CUDA graph）决定。
         asr_options.decode_max_seqs = 0;
     }
-    let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start(
+    let pipeline = Arc::new(GlobalAsyncTranscribePipeline::start_with_limits(
         AudioLoader,
         vad_model,
         load_asr_model_for_pipeline_on_device(
@@ -498,15 +505,20 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
         asr_options,
         vad_options_from_pipeline(&pipeline),
         worker_options_from_pipeline(&pipeline),
+        crate::pipeline::PipelineLimits {
+            active_slots: tuning.execution.active_slots.max(1),
+            safe_capacity: tuning.max_num_seqs.max(1),
+            source_bytes: tuning.source_memory_bytes,
+        },
     ));
     let fatal_errors = pipeline.subscribe_fatal_errors();
-    let transcribe_service = build_transcribe_service(pipeline);
+    let transcribe_service = build_transcribe_service(pipeline.clone());
 
     let app = Router::new()
         .route("/health", get(health))
         .merge(crate::server::transcribe_router(transcribe_service));
     let addr = bind_addr(&args.host, args.port)?;
-    serve_app(app, addr, fatal_errors).await
+    serve_app_with_pipeline(app, addr, fatal_errors, Some(pipeline)).await
 }
 
 fn validate_serve_pipeline(pipeline: &ServePipelineArgs) -> Result<()> {
@@ -1127,10 +1139,19 @@ fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(format!("{host}:{port}").parse()?)
 }
 
+#[cfg(test)]
 async fn serve_app(
     app: Router,
     addr: SocketAddr,
+    fatal_errors: tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()> {
+    serve_app_with_pipeline(app, addr, fatal_errors, None).await
+}
+async fn serve_app_with_pipeline(
+    app: Router,
+    addr: SocketAddr,
     mut fatal_errors: tokio::sync::watch::Receiver<Option<String>>,
+    pipeline: Option<Arc<GlobalAsyncTranscribePipeline>>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
@@ -1149,10 +1170,12 @@ async fn serve_app(
 
     tokio::select! {
         result = server.as_mut() => {
+            if let Some(pipeline) = &pipeline { pipeline.shutdown(); }
             result?;
             Ok(())
         }
         _ = tokio::signal::ctrl_c() => {
+            if let Some(pipeline) = &pipeline { pipeline.shutdown(); }
             let _ = shutdown_tx.send(());
             server.as_mut().await?;
             Ok(())

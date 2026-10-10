@@ -18,6 +18,22 @@ use vasr::{AsrOptions, OfflineAsrModel as AsrModel};
 
 #[cfg(feature = "paged-attn")]
 #[derive(Debug, Clone, Copy)]
+struct SegmentPrefillPolicy {
+    debug_metadata: bool,
+    coalesce_wait: std::time::Duration,
+}
+#[cfg(feature = "paged-attn")]
+impl SegmentPrefillPolicy {
+    fn capture() -> Self {
+        Self {
+            debug_metadata: std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some(),
+            coalesce_wait: asr_prefill_coalesce_wait(),
+        }
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct SegmentLogItem {
     request_item: Option<RequestItemRef>,
     audio_seconds: f64,
@@ -65,6 +81,7 @@ fn log_prefill_batch_done(
     all_segments: &mut PrefillLogSegments,
     output: &PrefillStageOutput,
     elapsed_seconds: f64,
+    debug_metadata: bool,
 ) {
     let mut segments = Vec::new();
     for sequence in &output.sequences {
@@ -72,8 +89,7 @@ fn log_prefill_batch_done(
             segments.push(segment);
         }
     }
-    static DEBUG_METADATA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DEBUG_METADATA.get_or_init(|| std::env::var_os("VASR_DEBUG_REQUEST_MEM").is_some()) {
+    if debug_metadata {
         tracing::info!(
             target: "vasr_transcribe::pipeline",
             "metadata_lifetime | stage=prefill_log items={}", all_segments.items.len(),
@@ -139,7 +155,9 @@ pub(super) fn spawn_segment_prefill_worker(
     encoded_rx: mpsc::UnboundedReceiver<SegmentEncoderOutput>,
     prefilled_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
     decode_idle_flush: Option<std::time::Duration>,
-) -> JoinHandle<()> {
+    pending_requests: Option<super::PendingRequests>,
+) -> JoinHandle<Result<()>> {
+    let policy = SegmentPrefillPolicy::capture();
     tokio::spawn(async move {
         let encoded_rx = Arc::new(tokio::sync::Mutex::new(encoded_rx));
         let mut next_producer_id = 0usize;
@@ -150,6 +168,9 @@ pub(super) fn spawn_segment_prefill_worker(
             };
             let Some(first) = first else {
                 break;
+            };
+            let Some(first) = retain_live_encoded_message(first, &pending_requests)? else {
+                continue;
             };
             let SegmentEncoderOutput::Encoded(first) = first;
             let SegmentEncodedMessage {
@@ -175,45 +196,41 @@ pub(super) fn spawn_segment_prefill_worker(
                     continue;
                 }
             };
-            let result = tokio::task::spawn_blocking({
-                let producer_id = next_producer_id;
-                next_producer_id = next_producer_id.saturating_add(1);
-                let asr = Arc::clone(&asr);
-                let asr_options = asr_options.clone();
-                let encoded_rx = Arc::clone(&encoded_rx);
-                let prefilled_tx = prefilled_tx.clone();
-                let runtime_handle = tokio::runtime::Handle::current();
-                move || {
-                    run_global_segment_prefill(
-                        asr,
-                        segments,
-                        stage_start,
-                        initial,
-                        encoded_rx,
-                        runtime_handle,
-                        &asr_options,
-                        decode_idle_flush,
-                        prefilled_tx,
-                        producer_id,
-                    )
-                }
-            })
-            .await
-            .unwrap_or_else(|error| {
-                Err(anyhow::anyhow!(
-                    "ASR dynamic prefill worker join error: {error}"
-                ))
-            });
-            if let Err(error) = result {
-                tracing::warn!(
-                    target: "vasr_transcribe::pipeline",
-                    "ASR dynamic prefill failed: {error}"
-                );
-            }
+            let result = super::blocking_result(
+                tokio::task::spawn_blocking({
+                    let producer_id = next_producer_id;
+                    next_producer_id = next_producer_id.saturating_add(1);
+                    let asr = Arc::clone(&asr);
+                    let asr_options = asr_options.clone();
+                    let encoded_rx = Arc::clone(&encoded_rx);
+                    let prefilled_tx = prefilled_tx.clone();
+                    let runtime_handle = tokio::runtime::Handle::current();
+                    let pending_requests = pending_requests.clone();
+                    move || {
+                        run_global_segment_prefill(
+                            asr,
+                            segments,
+                            stage_start,
+                            initial,
+                            encoded_rx,
+                            runtime_handle,
+                            &asr_options,
+                            decode_idle_flush,
+                            prefilled_tx,
+                            producer_id,
+                            pending_requests,
+                            policy,
+                        )
+                    }
+                })
+                .await,
+            )?;
+            result?;
             if decode_idle_flush.is_none() {
                 break;
             }
         }
+        Ok(())
     })
 }
 #[cfg(feature = "paged-attn")]
@@ -245,7 +262,22 @@ fn run_global_segment_prefill(
     decode_idle_flush: Option<std::time::Duration>,
     decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
+    pending_requests: Option<super::PendingRequests>,
+    policy: SegmentPrefillPolicy,
 ) -> Result<()> {
+    let message = SegmentEncoderOutput::Encoded(SegmentEncodedMessage {
+        segments,
+        stage_start,
+        encoder_timing: Default::default(),
+        batch: Ok(initial),
+    });
+    let Some(SegmentEncoderOutput::Encoded(message)) =
+        retain_live_encoded_message(message, &pending_requests)?
+    else {
+        return Ok(());
+    };
+    let segments = message.segments;
+    let initial = message.batch?;
     let qwen3 = asr
         .as_any()
         .downcast_ref::<Qwen3ASR>()
@@ -276,8 +308,9 @@ fn run_global_segment_prefill(
         decoder_tx,
         producer_id,
         prefill_log_segments,
-    );
-    Ok(())
+        pending_requests,
+        policy,
+    )
 }
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
@@ -291,7 +324,9 @@ fn run_segment_asr_prefill_dynamic_worker(
     decoder_tx: mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
     prefill_log_segments: Vec<SegmentLogItem>,
-) {
+    pending_requests: Option<super::PendingRequests>,
+    policy: SegmentPrefillPolicy,
+) -> Result<()> {
     let run = (|| -> Result<()> {
         let mut log_segments = PrefillLogSegments::default();
         log_segments.extend(prefill_log_segments);
@@ -327,6 +362,8 @@ fn run_segment_asr_prefill_dynamic_worker(
                     &decoder_tx,
                     producer_id,
                     &prefill_log_segments,
+                    &pending_requests,
+                    policy.coalesce_wait,
                 )? {
                     PrefillCoalescedPoll::Ready(coalesced) => {
                         PreparedAudioBatchPoll::Ready(coalesced.prepared)
@@ -359,6 +396,7 @@ fn run_segment_asr_prefill_dynamic_worker(
                         .map_err(|_| anyhow::anyhow!("prefill log segments lock poisoned"))?,
                     &message,
                     elapsed_seconds,
+                    policy.debug_metadata,
                 );
             }
             if wave > 0
@@ -369,7 +407,7 @@ fn run_segment_asr_prefill_dynamic_worker(
                     })
                     .is_err()
             {
-                return Ok(());
+                anyhow::bail!("ASR decoder channel closed");
             }
             if done {
                 break;
@@ -380,12 +418,7 @@ fn run_segment_asr_prefill_dynamic_worker(
         }
         Ok(())
     })();
-    if let Err(error) = run {
-        let _ = decoder_tx.send(SegmentPrefillMessage::Prefill {
-            producer_id,
-            result: Err(error),
-        });
-    }
+    run
 }
 
 #[cfg(feature = "paged-attn")]
@@ -397,24 +430,28 @@ fn prepare_coalesced_segment_prefill_batch(
     decoder_tx: &mpsc::UnboundedSender<SegmentPrefillMessage>,
     producer_id: usize,
     prefill_log_segments: &Mutex<PrefillLogSegments>,
+    pending_requests: &Option<super::PendingRequests>,
+    coalesce_wait: std::time::Duration,
 ) -> Result<PrefillCoalescedPoll> {
     let mut prepared_batches = Vec::new();
 
     let mut current = Some(first);
-    let deadline = std::time::Instant::now() + asr_prefill_coalesce_wait();
+    let deadline = std::time::Instant::now() + coalesce_wait;
     loop {
         let Some(message) = current.take() else {
             break;
         };
-        if !prepare_segment_encoded_for_prefill(
-            qwen3,
-            message,
-            decoder_tx,
-            producer_id,
-            prefill_log_segments,
-            &mut prepared_batches,
-        )? {
-            return Ok(PrefillCoalescedPoll::Closed);
+        if let Some(message) = retain_live_encoded_message(message, pending_requests)? {
+            if !prepare_segment_encoded_for_prefill(
+                qwen3,
+                message,
+                decoder_tx,
+                producer_id,
+                prefill_log_segments,
+                &mut prepared_batches,
+            )? {
+                return Ok(PrefillCoalescedPoll::Closed);
+            }
         }
 
         if std::time::Instant::now() >= deadline {
@@ -619,3 +656,47 @@ mod prefill_log_lifecycle_tests {
         assert!(logs.items.is_empty());
     }
 }
+
+#[cfg(feature = "paged-attn")]
+fn retain_live_encoded_message(
+    message: SegmentEncoderOutput,
+    pending: &Option<super::PendingRequests>,
+) -> Result<Option<SegmentEncoderOutput>> {
+    retain_encoded_message(message, |segment| {
+        super::request_is_live(pending, segment.request_item)
+    })
+}
+
+#[cfg(feature = "paged-attn")]
+fn retain_encoded_message(
+    message: SegmentEncoderOutput,
+    mut is_live: impl FnMut(&AsrSegmentJob) -> bool,
+) -> Result<Option<SegmentEncoderOutput>> {
+    let SegmentEncoderOutput::Encoded(mut message) = message;
+    let keep = message
+        .segments
+        .iter()
+        .map(&mut is_live)
+        .collect::<Vec<_>>();
+    if !keep.iter().any(|&keep| keep) {
+        return Ok(None);
+    }
+    if keep.iter().all(|&keep| keep) {
+        return Ok(Some(SegmentEncoderOutput::Encoded(message)));
+    }
+    message.batch = match message.batch {
+        Ok(batch) => Ok(batch.retain_audios(&keep)?),
+        Err(error) => Err(error),
+    };
+    message.segments = message
+        .segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(segment, keep)| keep.then_some(segment))
+        .collect();
+    Ok(Some(SegmentEncoderOutput::Encoded(message)))
+}
+
+#[cfg(all(test, feature = "paged-attn"))]
+#[path = "segment_prefill_filter_tests.rs"]
+mod filter_tests;

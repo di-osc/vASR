@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
+use asr_data::{TimeRange, Waveform};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use vasr::{AudioInput, SAMPLE_RATE_HZ, normalize_audio_input};
-use asr_data::{TimeRange, Waveform};
 use vasr_vad::{VadModel, VadOptions, VadSegment};
 
 use super::{
@@ -121,46 +121,64 @@ pub(super) fn spawn_vad_worker(
     vad_to_asr_queue_memory: LoadedQueueMemoryBudget,
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     stats: Arc<Mutex<VadStageStats>>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let wall_start = Instant::now();
         let max_in_flight = max_in_flight.max(1);
         let mut tasks = JoinSet::new();
         let mut free_workers = (0..max_in_flight).rev().collect::<Vec<_>>();
-        while let Some(message) = loader_to_vad_rx.recv().await {
-            match message {
-                Ok(job) => {
-                    if tasks.len() >= max_in_flight
-                        && let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await
-                    {
+        loop {
+            tokio::select! {
+                message = loader_to_vad_rx.recv(), if tasks.len() < max_in_flight => {
+                    match message {
+                        Some(Ok(job)) => {
+                            if !super::request_is_live(&pending_requests, job.request_item) {
+                                continue;
+                            }
+                            let worker_id = free_workers.pop().unwrap_or(tasks.len());
+                            spawn_vad_task(
+                                &mut tasks,
+                                vad.clone(),
+                                vad_options.clone(),
+                                vad_to_asr_tx.clone(),
+                                vad_to_asr_queue_memory.clone(),
+                                pending_requests.clone(),
+                                job,
+                                worker_id,
+                            );
+                        }
+                        Some(Err(outcome)) => {
+                            let mut send_wait_seconds = 0.0;
+                            send_vad_to_asr_timed(
+                                &vad_to_asr_tx,
+                                &vad_to_asr_queue_memory,
+                                Err(outcome),
+                                &mut send_wait_seconds,
+                            ).await?;
+                        }
+                        None => break,
+                    }
+                }
+                worker_id = send_next_vad_task(&mut tasks, &stats), if !tasks.is_empty() => {
+                    if let Some(worker_id) = worker_id.map_err(|outcome| {
+                        outcome.result.err().unwrap_or_else(|| anyhow::anyhow!("VAD task failed"))
+                    })? {
                         free_workers.push(worker_id);
                     }
-                    let worker_id = free_workers.pop().unwrap_or(tasks.len());
-                    spawn_vad_task(
-                        &mut tasks,
-                        vad.clone(),
-                        vad_options.clone(),
-                        vad_to_asr_tx.clone(),
-                        vad_to_asr_queue_memory.clone(),
-                        pending_requests.clone(),
-                        job,
-                        worker_id,
-                    );
-                }
-                Err(outcome) => {
-                    let mut send_wait_seconds = 0.0;
-                    let _ = send_vad_to_asr_timed(
-                        &vad_to_asr_tx,
-                        &vad_to_asr_queue_memory,
-                        Err(outcome),
-                        &mut send_wait_seconds,
-                    )
-                    .await;
                 }
             }
         }
         while !tasks.is_empty() {
-            if let Ok(Some(worker_id)) = send_next_vad_task(&mut tasks, &stats).await {
+            if let Some(worker_id) =
+                send_next_vad_task(&mut tasks, &stats)
+                    .await
+                    .map_err(|outcome| {
+                        outcome
+                            .result
+                            .err()
+                            .unwrap_or_else(|| anyhow::anyhow!("VAD task failed"))
+                    })?
+            {
                 free_workers.push(worker_id);
             }
         }
@@ -168,6 +186,7 @@ pub(super) fn spawn_vad_worker(
             stats.wall_seconds = wall_start.elapsed().as_secs_f64();
             log_vad_summary(&stats);
         }
+        Ok(())
     })
 }
 
@@ -183,6 +202,12 @@ fn spawn_vad_task(
     worker_id: usize,
 ) {
     tasks.spawn(async move {
+        if !super::request_is_live(&pending_requests, job.request_item) {
+            return Ok(VadTaskStats {
+                worker_id,
+                ..Default::default()
+            });
+        }
         let stage_start = Instant::now();
         let request_item = job.request_item;
         let mut timing = job.timing;
@@ -194,24 +219,34 @@ fn spawn_vad_task(
         let vad_queue_span = spans
             .loader
             .and_then(|loader| StageSpan::try_new(loader.end, stage_start));
-        let prepared = tokio::task::spawn_blocking({
-            let vad = vad.clone();
-            let waveform = job.waveform.clone();
-            let vad_options = vad_options.clone();
-            move || prepare_vad_stage(vad.as_deref(), &waveform, &vad_options)
-        })
-        .await;
+        let prepared = super::blocking_result(
+            tokio::task::spawn_blocking({
+                let vad = vad.clone();
+                let waveform = job.waveform.clone();
+                let vad_options = vad_options.clone();
+                move || prepare_vad_stage(vad.as_deref(), &waveform, &vad_options)
+            })
+            .await,
+        )
+        .expect("VAD blocking task must finish");
+        if !super::request_is_live(&pending_requests, request_item) {
+            return Ok(VadTaskStats {
+                worker_id,
+                ..Default::default()
+            });
+        }
         let compute_seconds = stage_start.elapsed().as_secs_f64();
         let vad_span = StageSpan::new(stage_start, Instant::now());
         spans.vad = Some(vad_span);
         timing.vad_seconds += compute_seconds;
         let mut send_wait_seconds = 0.0;
 
-        match prepared {
+        match Ok::<_, tokio::task::JoinError>(prepared) {
             Ok(Ok(prepared)) => {
                 let (segments, speech_seconds) = vad_preparation_stats(&prepared);
                 let no_speech = matches!(prepared, VadPreparation::NoSpeech);
                 let asr_job = AsrJob {
+                    _item_permit: job._item_permit,
                     index: job_index,
                     request_item,
                     channel: job.channel,

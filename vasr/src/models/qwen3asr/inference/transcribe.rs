@@ -289,11 +289,41 @@ fn rebatch_prepared_inputs(
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EncodedPreparedGroup {
     chunk_indices: Vec<usize>,
     prepared: Vec<PreparedInputs>,
     audio_features_cpu: Tensor,
+}
+
+impl EncodedPreparedGroup {
+    fn audio_token_lengths(&self) -> Result<Vec<usize>> {
+        if self.chunk_indices.len() != self.prepared.len() {
+            bail!("encoded group prepared/chunk length mismatch");
+        }
+        let (rows, _) = self.audio_features_cpu.dims2()?;
+        let lengths = self
+            .prepared
+            .iter()
+            .map(|row| {
+                let frames = row
+                    .feature_attention_mask
+                    .iter()
+                    .filter(|&&value| value != 0)
+                    .count();
+                crate::processor::feat_lengths::feat_extract_output_length(frames)
+            })
+            .collect::<Vec<_>>();
+        let expected = lengths.iter().try_fold(0usize, |total, &length| {
+            total
+                .checked_add(length)
+                .ok_or_else(|| anyhow::anyhow!("encoded feature token count overflow"))
+        })?;
+        if expected != rows {
+            bail!("encoded group feature token rows mismatch: expected={expected}, got={rows}");
+        }
+        Ok(lengths)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -511,6 +541,126 @@ pub fn decode_ids_with_metadata(
 }
 
 impl EncodedAsrBatch {
+    /// Keep the requested input audios and remap chunk metadata to their new indices.
+    /// Encoder work is not repeated: retained CPU feature rows are sliced from the
+    /// existing tensors. Identity selection returns the original batch unchanged.
+    pub fn select_audios(self, indices: &[usize]) -> Result<Self> {
+        let mut audio_map = vec![None; self.audio_len];
+        for (new_index, &old_index) in indices.iter().enumerate() {
+            let destination = audio_map
+                .get_mut(old_index)
+                .ok_or_else(|| anyhow::anyhow!("encoded audio index out of range: {old_index}"))?;
+            if destination.replace(new_index).is_some() {
+                bail!("encoded audio selected more than once: {old_index}");
+            }
+        }
+        if indices.iter().copied().eq(0..self.audio_len) {
+            return Ok(self);
+        }
+        if self.forced_langs_norm.len() != self.audio_len
+            || self.chunk_audio_seconds.len() != self.chunks.len()
+        {
+            bail!("encoded audio metadata lengths do not match the batch");
+        }
+        let forced_langs_norm = indices
+            .iter()
+            .map(|&index| self.forced_langs_norm[index].clone())
+            .collect();
+        let mut chunk_map = vec![None; self.chunks.len()];
+        let mut chunks = Vec::new();
+        let mut chunk_audio_seconds = Vec::new();
+        for (old_index, (mut chunk, seconds)) in self
+            .chunks
+            .into_iter()
+            .zip(self.chunk_audio_seconds)
+            .enumerate()
+        {
+            let selected = audio_map.get(chunk.orig_index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "encoded chunk audio index out of range: {}",
+                    chunk.orig_index
+                )
+            })?;
+            if let Some(new_audio_index) = *selected {
+                chunk_map[old_index] = Some(chunks.len());
+                chunk.orig_index = new_audio_index;
+                chunks.push(chunk);
+                chunk_audio_seconds.push(seconds);
+            }
+        }
+        let mut groups = Vec::new();
+        if !indices.is_empty() {
+            for group in self.groups {
+                let lengths = group.audio_token_lengths()?;
+                let original_len = group.prepared.len();
+                let mut offset = 0;
+                let mut prepared = Vec::new();
+                let mut chunk_indices = Vec::new();
+                let mut features = Vec::new();
+                for ((old_chunk_index, row), tokens) in group
+                    .chunk_indices
+                    .into_iter()
+                    .zip(group.prepared)
+                    .zip(lengths)
+                {
+                    let selected = chunk_map.get(old_chunk_index).ok_or_else(|| {
+                        anyhow::anyhow!("encoded group chunk index out of range: {old_chunk_index}")
+                    })?;
+                    if let Some(new_chunk_index) = *selected {
+                        chunk_indices.push(new_chunk_index);
+                        prepared.push(row);
+                        features.push(group.audio_features_cpu.narrow(0, offset, tokens)?);
+                    }
+                    offset += tokens;
+                }
+                if prepared.is_empty() {
+                    continue;
+                }
+                let audio_features_cpu = if prepared.len() == original_len {
+                    group.audio_features_cpu
+                } else if features.len() == 1 {
+                    features.pop().expect("one retained row")
+                } else {
+                    Tensor::cat(features.as_slice(), 0)?
+                };
+                groups.push(EncodedPreparedGroup {
+                    chunk_indices,
+                    prepared,
+                    audio_features_cpu,
+                });
+            }
+        }
+        Ok(Self {
+            audio_len: indices.len(),
+            chunks,
+            chunk_audio_seconds,
+            forced_langs_norm,
+            groups,
+            timings: self.timings,
+        })
+    }
+
+    /// Keep input audios in their original order using one mask for the whole batch.
+    pub fn retain_audios(self, keep: &[bool]) -> Result<Self> {
+        if keep.len() != self.audio_len {
+            bail!(
+                "encoded audio retention mask length mismatch: expected={}, got={}",
+                self.audio_len,
+                keep.len()
+            );
+        }
+        if keep.iter().all(|&keep| keep) {
+            return Ok(self);
+        }
+        self.select_audios(
+            &keep
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &keep)| keep.then_some(index))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.audio_len
     }
@@ -586,6 +736,59 @@ impl EncodedAsrBatch {
         chunk_audio_seconds: &[f64],
         chunks: &[ChunkItem],
     ) -> Result<PreparedAudioBatch> {
+        // The scheduler assigns client indices in prepared-row order. Normalize
+        // length-bucketed groups to chunk order so metadata and per-audio chunk
+        // concatenation stay aligned. The normal sequential path is untouched.
+        let groups = if groups
+            .iter()
+            .flat_map(|group| group.chunk_indices.iter().copied())
+            .eq(0..chunks.len())
+        {
+            groups
+        } else {
+            let mut ordered = (0..chunks.len())
+                .map(|_| None)
+                .collect::<Vec<Option<(PreparedInputs, Tensor)>>>();
+            for group in groups {
+                let lengths = group.audio_token_lengths()?;
+                let mut offset = 0;
+                for ((index, prepared), tokens) in group
+                    .chunk_indices
+                    .into_iter()
+                    .zip(group.prepared)
+                    .zip(lengths)
+                {
+                    let destination = ordered.get_mut(index).ok_or_else(|| {
+                        anyhow::anyhow!("encoded group chunk index out of range: {index}")
+                    })?;
+                    if destination
+                        .replace((
+                            prepared,
+                            group.audio_features_cpu.narrow(0, offset, tokens)?,
+                        ))
+                        .is_some()
+                    {
+                        bail!("encoded chunk prepared more than once: {index}");
+                    }
+                    offset += tokens;
+                }
+            }
+            let mut prepared = Vec::with_capacity(ordered.len());
+            let mut features = Vec::with_capacity(ordered.len());
+            for (index, row) in ordered.into_iter().enumerate() {
+                let (input, feature) = row.ok_or_else(|| {
+                    anyhow::anyhow!("encoded chunk missing prepared row: {index}")
+                })?;
+                prepared.push(input);
+                features.push(feature);
+            }
+            let audio_features_cpu = Tensor::cat(features.as_slice(), 0)?;
+            vec![EncodedPreparedGroup {
+                chunk_indices: (0..chunks.len()).collect(),
+                prepared,
+                audio_features_cpu,
+            }]
+        };
         let mut prepared = Vec::new();
         let mut audio_seconds = Vec::new();
         let mut speech_rate_ratios = Vec::new();
@@ -647,42 +850,11 @@ impl EncodedAsrBatch {
 
     #[cfg(feature = "paged-attn")]
     pub fn to_prepared_audio_batch(&self) -> Result<PreparedAudioBatch> {
-        let mut prepared = Vec::new();
-        let mut audio_seconds = Vec::new();
-        let mut speech_rate_ratios = Vec::new();
-        let mut audio_feature_parts = Vec::new();
-        for group in &self.groups {
-            for &chunk_idx in &group.chunk_indices {
-                audio_seconds.push(*self.chunk_audio_seconds.get(chunk_idx).ok_or_else(|| {
-                    anyhow::anyhow!("missing chunk audio seconds for chunk {chunk_idx}")
-                })?);
-                let chunk = self
-                    .chunks
-                    .get(chunk_idx)
-                    .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
-                speech_rate_ratios.push(super::speech_rate::speech_rate_ratio(
-                    chunk.wav.as_slice(),
-                    SAMPLE_RATE_HZ,
-                ));
-            }
-            prepared.extend(group.prepared.clone());
-            audio_feature_parts.push(group.audio_features_cpu.clone());
-        }
-        let audio_features = if audio_feature_parts.is_empty() {
-            Tensor::zeros((0usize, 0usize), candle_core::DType::F32, &Device::Cpu)?
-        } else if audio_feature_parts.len() == 1 {
-            audio_feature_parts
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("missing staged audio features"))?
-        } else {
-            Tensor::cat(audio_feature_parts.as_slice(), 0)?
-        };
-        Ok(PreparedAudioBatch {
-            prepared,
-            audio_features,
-            audio_seconds,
-            speech_rate_ratios,
-        })
+        Self::groups_into_prepared_audio_batch(
+            self.groups.clone(),
+            &self.chunk_audio_seconds,
+            &self.chunks,
+        )
     }
 }
 
@@ -2917,3 +3089,7 @@ mod batch_grouping_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "encoded_selection_tests.rs"]
+mod encoded_selection_tests;

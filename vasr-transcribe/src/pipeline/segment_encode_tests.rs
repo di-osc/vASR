@@ -6,6 +6,7 @@ use std::time::Duration;
 fn request(job_index: usize, offset: usize, stage_start: Instant) -> SegmentEncodeRequest {
     SegmentEncodeRequest {
         segment: AsrSegmentJob {
+            _item_permit: None,
             job_index,
             request_item: None,
             channel: "mono",
@@ -166,4 +167,38 @@ async fn idle_open_source_flushes_first_segment() {
     .unwrap();
     assert_eq!(batch.reason, "wait_timeout");
     assert_eq!(batch.segments.len(), 1);
+}
+
+#[test]
+fn retained_waveforms_and_inference_targets_share_the_mask_and_original_order() -> Result<()> {
+    let inference = SegmentAsrInference {
+        targets: vec![(9, 2, 8), (4, 1, 3), (9, 0, 1)],
+        segment_audio_seconds: 99.,
+        active_job_count: 2,
+    };
+    let waveforms = vec![
+        Waveform::new(vec![2.; 16], 16_000),
+        Waveform::new(vec![1.; 32], 16_000),
+        Waveform::new(vec![3.; 48], 16_000),
+    ];
+    let first = waveforms[0].samples.as_ptr();
+    let last = waveforms[2].samples.as_ptr();
+    let (inference, waveforms) = inference.retain_waveforms(waveforms, &[true, false, true])?;
+    assert_eq!(inference.targets, [(9, 2, 8), (9, 0, 1)]);
+    assert_eq!(inference.active_job_count, 1);
+    assert_eq!(inference.segment_audio_seconds, 0.004);
+    assert_eq!(waveforms[0].samples, vec![2.; 16]);
+    assert_eq!(waveforms[1].samples, vec![3.; 48]);
+    assert_eq!(waveforms[0].samples.as_ptr(), first);
+    assert_eq!(waveforms[1].samples.as_ptr(), last);
+    let targets_ptr = inference.targets.as_ptr();
+    let waveform_ptr = waveforms.as_ptr();
+    let (inference, waveforms) = inference.retain_waveforms(waveforms, &[true, true])?;
+    assert_eq!(inference.targets.as_ptr(), targets_ptr);
+    assert_eq!(waveforms.as_ptr(), waveform_ptr);
+    let (inference, waveforms) = inference.retain_waveforms(waveforms, &[false, false])?;
+    assert!(inference.targets.is_empty() && waveforms.is_empty());
+    assert_eq!(inference.active_job_count, 0);
+    assert_eq!(inference.segment_audio_seconds, 0.);
+    Ok(())
 }
