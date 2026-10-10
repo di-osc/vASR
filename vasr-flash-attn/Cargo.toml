@@ -6,7 +6,7 @@ license.workspace = true
 description = "Minimal FlashAttention kernels for vASR Qwen3-ASR"
 
 [dependencies]
-candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-core = { workspace = true }
 half = "2.5.0"
 
 [build-dependencies]

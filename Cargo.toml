@@ -12,11 +12,10 @@ resolver = "3"
 
 [workspace.dependencies]
 asr-data = { version = "0.2.0", default-features = false, features = ["db", "metrics", "modelscope"] }
-
-[patch."https://github.com/huggingface/candle.git"]
-candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
-candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
-candle-kernels = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-kernels = "0.11.0"
+candle-metal-kernels = "0.11.0"
 
 [workspace.package]
 version = "0.1.0"
