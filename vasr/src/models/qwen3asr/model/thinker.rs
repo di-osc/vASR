@@ -11,6 +11,9 @@ use crate::config::asr_config::ThinkerConfig;
 use crate::model::audio_encoder::AudioTower;
 use crate::model::isq_linear::IsqLinear;
 use crate::model::kv_cache::KVCache;
+use crate::model::operator_policy::ModelOperatorPolicy;
+#[cfg(test)]
+use crate::model::operator_policy::{ModelGeometry, ValidatedMetalProfile};
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
 use crate::model::thinker_text::ThinkerTextModel;
@@ -165,35 +168,12 @@ impl ThinkerForConditionalGeneration {
         isq: Option<&str>,
         progress: &Progress,
     ) -> Result<Self> {
+        let policy = ModelOperatorPolicy::capture(cfg, &vb, device, use_flash_attn, isq.is_some())?;
+        let metal_auto_packed_prefill = policy.profile.packed_prefill;
         #[cfg(feature = "metal-paged-attn")]
-        let metal_auto_packed_prefill = validated_packed_profile(
-            cfg,
-            vb.dtype(),
-            isq.is_some(),
-            vasr_paged_attn::metal::profile::validated_m4_pro_48gb(device),
-        );
-        #[cfg(not(feature = "metal-paged-attn"))]
-        let metal_auto_packed_prefill = false;
+        let decode_gemm_tile = policy.decode_gemm_tile;
         #[cfg(feature = "metal-paged-attn")]
-        let decode_gemm_tile = if device.is_metal() {
-            resolve_gemm_policy(
-                std::env::var("VASR_METAL_DECODE_GEMM_TILE").ok().as_deref(),
-                metal_auto_packed_prefill,
-            )?
-        } else {
-            None
-        };
-        #[cfg(feature = "metal-paged-attn")]
-        let prefill_gemm_tile = if device.is_metal() {
-            resolve_gemm_policy(
-                std::env::var("VASR_METAL_PREFILL_GEMM_TILE")
-                    .ok()
-                    .as_deref(),
-                metal_auto_packed_prefill,
-            )?
-        } else {
-            None
-        };
+        let prefill_gemm_tile = policy.prefill_gemm_tile;
         #[cfg(feature = "metal-paged-attn")]
         tracing::info!(target: "vasr::execution", "Metal GEMM policy | decode={decode_gemm_tile:?} max_decode_rows=128 adaptive_split_rows=32 prefill={prefill_gemm_tile:?}");
         let audio_token_id = cfg
@@ -212,39 +192,24 @@ impl ThinkerForConditionalGeneration {
             cfg.text_config.vocab_size
         };
 
-        let audio_use_flash_attn = match std::env::var("VASR_QWEN3_ASR_AUDIO_FLASH_ATTN").as_deref()
-        {
-            Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF") => false,
-            Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("on") | Ok("ON") => use_flash_attn,
-            Ok(other) => {
-                tracing::warn!(
-                    target: "vasr::models::qwen3asr",
-                    "ignoring invalid VASR_QWEN3_ASR_AUDIO_FLASH_ATTN={other:?}; expected 0/1"
-                );
-                use_flash_attn
-            }
-            Err(_) => use_flash_attn,
-        };
-        let mut audio_tower = AudioTower::load(
+        let audio_tower = AudioTower::load_with_policy(
             &cfg.audio_config,
             vb.pp("audio_tower"),
-            audio_use_flash_attn,
+            policy.audio_flash,
             isq,
             progress,
+            &policy.audio,
         )?;
-        #[allow(unused_mut)]
-        let mut text_model = ThinkerTextModel::load(
+        let text_model = ThinkerTextModel::load_with_policy(
             &cfg.text_config,
             vb.pp("model"),
             device,
             use_flash_attn,
             isq,
             progress,
+            &policy.text,
         )?;
 
-        #[cfg(feature = "paged-attn")]
-        text_model.set_auto_packed_paged_prefill(metal_auto_packed_prefill);
-        audio_tower.set_auto_conv_layout(validated_conv_profile(cfg, metal_auto_packed_prefill));
         if metal_auto_packed_prefill {
             tracing::info!(
                 target: "vasr::execution",
@@ -982,7 +947,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "metal-paged-attn")]
+#[cfg(all(test, feature = "metal-paged-attn"))]
 fn resolve_gemm_policy(
     value: Option<&str>,
     validated_model: bool,
@@ -994,6 +959,7 @@ fn resolve_gemm_policy(
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn validated_conv_profile(cfg: &ThinkerConfig, validated_model: bool) -> bool {
     validated_model
         && cfg.audio_config.num_mel_bins == 128
@@ -1001,27 +967,15 @@ fn validated_conv_profile(cfg: &ThinkerConfig, validated_model: bool) -> bool {
         && cfg.audio_config.n_window == 50
 }
 
+#[cfg(test)]
 fn validated_packed_profile(
     cfg: &ThinkerConfig,
-    dtype: candle_core::DType,
+    dtype: DType,
     quantized: bool,
     hardware: bool,
 ) -> bool {
-    hardware
-        && dtype == candle_core::DType::BF16
-        && !quantized
-        && matches!(
-            cfg.model_type.as_deref(),
-            Some("qwen3_asr" | "qwen3_asr_thinker")
-        )
-        && cfg.audio_config.encoder_layers == 18
-        && cfg.audio_config.d_model == 896
-        && cfg.audio_config.output_dim == 1024
-        && cfg.text_config.num_hidden_layers == 28
-        && cfg.text_config.hidden_size == 1024
-        && cfg.text_config.num_attention_heads == 16
-        && cfg.text_config.num_key_value_heads == 8
-        && cfg.text_config.head_dim == 128
+    ValidatedMetalProfile::resolve(&ModelGeometry::from_config(cfg), dtype, quantized, hardware)
+        .packed_prefill
 }
 
 #[cfg(test)]

@@ -47,14 +47,15 @@ pub(super) fn validated_metal_100x_profile(
     dtype: candle_core::DType,
     quantized: bool,
     hardware: bool,
+    geometry: &vasr::models::qwen3asr::ModelGeometry,
 ) -> bool {
-    hardware
-        && dtype == candle_core::DType::BF16
-        && !quantized
-        && matches!(
-            model.trim().to_ascii_lowercase().as_str(),
-            "qwen3-asr-0.6b" | "qwen/qwen3-asr-0.6b"
-        )
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "qwen3-asr-0.6b" | "qwen/qwen3-asr-0.6b"
+    ) && vasr::models::qwen3asr::ValidatedMetalProfile::resolve(
+        geometry, dtype, quantized, hardware,
+    )
+    .conv_layout
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,6 +73,7 @@ pub(super) struct ResolvedServeTuning {
     pub encoder_batch_max_audio_seconds: f64,
     pub encoder_batch_max_segments: usize,
     pub reserved_gpu_bytes: usize,
+    pub source_memory_bytes: usize,
     pub used_fallback: bool,
     /// 启动时解析一次的统一执行策略，随模型与 runtime 传递。
     pub execution: ExecutionPolicy,
@@ -158,9 +160,12 @@ pub(super) fn resolve_tuning(
     } else {
         0
     };
+    let source_memory_bytes =
+        crate::pipeline::source_memory_budget(Some(hardware.available_memory_bytes));
     let reserved_bytes = safety_margin_bytes
         .saturating_add(encoder_workspace_bytes)
-        .saturating_add(graph_workspace_bytes);
+        .saturating_add(graph_workspace_bytes)
+        .saturating_add(source_memory_bytes as u64);
     let mut kv_budget_bytes = memory_after_weights.saturating_sub(reserved_bytes);
     let utilization =
         overrides
@@ -240,6 +245,7 @@ pub(super) fn resolve_tuning(
         encoder_batch_max_audio_seconds: audio_seconds,
         encoder_batch_max_segments: segments,
         reserved_gpu_bytes,
+        source_memory_bytes,
         used_fallback: false,
         execution,
     })
@@ -307,6 +313,7 @@ fn fallback_tuning(
         encoder_batch_max_audio_seconds: audio_seconds,
         encoder_batch_max_segments: segments,
         reserved_gpu_bytes: 0,
+        source_memory_bytes: crate::pipeline::source_memory_budget(None),
         used_fallback: true,
         execution: ExecutionPolicy::resolve_backend(
             is_metal,
@@ -746,12 +753,63 @@ mod tests {
         assert_eq!(limited.execution.prefill_wave, 4);
     }
 
+    fn measured_geometry() -> vasr::models::qwen3asr::ModelGeometry {
+        vasr::models::qwen3asr::ModelGeometry {
+            model_type: Some("qwen3_asr_thinker".into()),
+            audio_layers: 18,
+            audio_hidden: 896,
+            audio_output: 1024,
+            text_layers: 28,
+            text_hidden: 1024,
+            attention_heads: 16,
+            kv_heads: 8,
+            head_dim: 128,
+            mel_bins: 128,
+            downsample_hidden: 480,
+            audio_window: 50,
+        }
+    }
+
+    #[test]
+    fn canonical_name_does_not_qualify_a_different_checkpoint_geometry() {
+        let mut geometry = measured_geometry();
+        geometry.text_hidden = 777;
+        assert!(!super::validated_metal_100x_profile(
+            "Qwen3-ASR-0.6B",
+            candle_core::DType::BF16,
+            false,
+            true,
+            &geometry
+        ));
+        geometry = measured_geometry();
+        geometry.audio_window = 100;
+        assert!(!super::validated_metal_100x_profile(
+            "Qwen3-ASR-0.6B",
+            candle_core::DType::BF16,
+            false,
+            true,
+            &geometry
+        ));
+    }
+
     #[test]
     fn measured_metal_profile_rejects_other_models_dtypes_and_quantization() {
         use super::validated_metal_100x_profile as eligible;
         use candle_core::DType;
-        assert!(eligible("Qwen3-ASR-0.6B", DType::BF16, false, true));
-        assert!(eligible("Qwen/Qwen3-ASR-0.6B", DType::BF16, false, true));
+        assert!(eligible(
+            "Qwen3-ASR-0.6B",
+            DType::BF16,
+            false,
+            true,
+            &measured_geometry()
+        ));
+        assert!(eligible(
+            "Qwen/Qwen3-ASR-0.6B",
+            DType::BF16,
+            false,
+            true,
+            &measured_geometry()
+        ));
         for (model, dtype, quantized, hardware) in [
             ("Qwen3-ASR-1.7B", DType::BF16, false, true),
             ("Other/Qwen3-ASR-0.6B", DType::BF16, false, true),
@@ -760,7 +818,13 @@ mod tests {
             ("Qwen3-ASR-0.6B", DType::BF16, true, true),
             ("Qwen3-ASR-0.6B", DType::BF16, false, false),
         ] {
-            assert!(!eligible(model, dtype, quantized, hardware));
+            assert!(!eligible(
+                model,
+                dtype,
+                quantized,
+                hardware,
+                &measured_geometry()
+            ));
         }
     }
 

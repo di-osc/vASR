@@ -2,20 +2,18 @@ use super::segment_encode::SegmentAsrInference;
 use super::segment_prefill::{SegmentPrefillMessage, SegmentPreparedEvent};
 use super::vad::offset_annotations;
 use super::{
-    AsrOptions, AsrSegmentJob, AsrStageStats, PendingGlobalRequest, PipelineRequestId,
-    RequestItemRef, RoutedTranscribeItemOutcome, StageSpan, TranscribeItemOutcome,
-    TranscribeItemSpans, TranscribeItemTiming, allocated_batch_seconds, allocation_scale,
-    global_pipeline_failure_outcomes, merge_optional_span, outcome_from_result,
+    AsrOptions, AsrSegmentJob, AsrStageStats, RequestItemRef, RoutedTranscribeItemOutcome,
+    StageSpan, TranscribeItemOutcome, TranscribeItemSpans, TranscribeItemTiming,
+    allocated_batch_seconds, allocation_scale, merge_optional_span, outcome_from_result,
     prefill_span_from_decode, record_asr_batch_stats,
 };
 use anyhow::{Result, bail};
 use asr_data::{AudioEvent, Timeline, Waveform};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Instant;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vasr::OfflineAsrModel as AsrModel;
 #[cfg(feature = "timing")]
@@ -44,6 +42,38 @@ pub(super) struct SegmentAsrState {
     pub(super) jobs: HashMap<usize, SegmentJobState>,
 }
 
+/// One producer-local interval and its global decoder interval.
+#[derive(Debug)]
+struct ProducerChunkRange {
+    local_start: usize,
+    global_start: usize,
+    len: usize,
+    remaining: usize,
+}
+impl ProducerChunkRange {
+    fn new(local_start: usize, global_start: usize, len: usize) -> Self {
+        Self {
+            local_start,
+            global_start,
+            len,
+            remaining: len,
+        }
+    }
+    fn contains(&self, local: usize) -> bool {
+        local >= self.local_start && local < self.local_start.saturating_add(self.len)
+    }
+    fn take_global_index(&mut self, local: usize) -> Result<usize> {
+        if !self.contains(local) {
+            bail!("producer chunk index out of range: {local}");
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("prefill metadata range emitted too many sequences"))?;
+        Ok(self.global_start.saturating_add(local - self.local_start))
+    }
+}
+
 type SegmentDecoderReceiver = mpsc::UnboundedReceiver<SegmentPrefillMessage>;
 
 #[cfg(feature = "paged-attn")]
@@ -54,18 +84,12 @@ pub(super) fn spawn_segment_decoder_worker(
     decoder_rx: SegmentDecoderReceiver,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
-    pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-    failed: Option<Arc<AtomicBool>>,
-    fatal_error_tx: Option<watch::Sender<Option<String>>>,
-) -> JoinHandle<()> {
+    pending_requests: Option<super::PendingRequests>,
+) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
-        let result = tokio::task::spawn_blocking({
-            let asr = Arc::clone(&asr);
-            let asr_options = asr_options.clone();
-            let stats = Arc::clone(&stats);
-            let asr_to_result_tx = asr_to_result_tx.clone();
-            move || {
+        super::blocking_result(
+            tokio::task::spawn_blocking(move || {
                 run_global_segment_decode_worker(
                     asr.as_ref(),
                     asr_options,
@@ -73,53 +97,14 @@ pub(super) fn spawn_segment_decoder_worker(
                     &mut segment_state,
                     asr_to_result_tx,
                     stats,
+                    pending_requests,
                 )
-            }
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR global decoder join error: {error}")));
-        if let Err(error) = result {
-            let error = format!("ASR global decoder failed: {error:#}");
-            tracing::error!(
-                target: "vasr_transcribe::pipeline",
-                "{error}"
-            );
-            if let Some(failed) = failed {
-                failed.store(true, Ordering::Release);
-            }
-            fail_pending_requests(&pending_requests, &error);
-            if let Some(fatal_error_tx) = fatal_error_tx {
-                fatal_error_tx.send_replace(Some(error));
-            }
-        }
+            })
+            .await,
+        )?
     })
 }
 
-#[cfg(feature = "paged-attn")]
-fn fail_pending_requests(
-    pending_requests: &Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
-    error: &str,
-) {
-    let Some(pending_requests) = pending_requests else {
-        return;
-    };
-    let requests = match pending_requests.lock() {
-        Ok(mut pending) => std::mem::take(&mut *pending)
-            .into_values()
-            .collect::<Vec<_>>(),
-        Err(_) => {
-            tracing::error!(
-                target: "vasr_transcribe::pipeline",
-                "failed to notify pending requests after decoder failure: pending request lock poisoned"
-            );
-            return;
-        }
-    };
-    for request in requests {
-        let outcomes = global_pipeline_failure_outcomes(request.failure_indices, error);
-        let _ = request.response_tx.send(outcomes);
-    }
-}
 #[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
 fn run_global_segment_decode_worker(
@@ -129,6 +114,7 @@ fn run_global_segment_decode_worker(
     segment_state: &mut SegmentAsrState,
     asr_to_result_tx: mpsc::Sender<RoutedTranscribeItemOutcome>,
     stats: Arc<Mutex<AsrStageStats>>,
+    pending_requests: Option<super::PendingRequests>,
 ) -> Result<()> {
     let qwen3 = asr
         .as_any()
@@ -144,8 +130,7 @@ fn run_global_segment_decode_worker(
 
     let forward_thread = std::thread::spawn(move || {
         let mut next_global_chunk = 0usize;
-        let mut producer_chunk_ranges: HashMap<usize, Vec<(usize, usize, usize, usize)>> =
-            HashMap::new();
+        let mut producer_chunk_ranges: HashMap<usize, Vec<ProducerChunkRange>> = HashMap::new();
         let mut producer_chunk_counts: HashMap<usize, usize> = HashMap::new();
         while let Some(message) = decoder_rx.blocking_recv() {
             match message {
@@ -164,23 +149,15 @@ fn run_global_segment_decode_worker(
                         if let Some(ranges) = ranges {
                             for seq in &mut output.sequences {
                                 let local = seq.client_index;
-                                let Some((local_start, global_start, _len, remaining)) =
-                                    ranges.iter_mut().find(|(local_start, _, len, _)| {
-                                        local >= *local_start
-                                            && local < local_start.saturating_add(*len)
-                                    })
+                                let Some(range) = ranges.iter_mut().find(|range| range.contains(local))
                                 else {
                                     return Err(anyhow::anyhow!(
                                         "dynamic staged ASR producer chunk index out of range: producer={producer_id} local_chunk={local}"
                                     ));
                                 };
-                                seq.client_index =
-                                    global_start.saturating_add(local - *local_start);
-                                *remaining = remaining.checked_sub(1).ok_or_else(|| {
-                                    anyhow::anyhow!("prefill metadata range emitted too many sequences")
-                                })?;
+                                seq.client_index = range.take_global_index(local)?;
                             }
-                            ranges.retain(|(_, _, _, remaining)| *remaining > 0);
+                            ranges.retain(|range| range.remaining > 0);
                         }
                         output.total_rows = next_global_chunk;
                         Ok(output)
@@ -200,12 +177,9 @@ fn run_global_segment_decode_worker(
                     if let Ok(SegmentPreparedEvent::Prepared(prepared)) = &result {
                         let chunk_count = prepared.meta.chunk_len();
                         let local_start = producer_chunk_counts.entry(producer_id).or_default();
-                        producer_chunk_ranges.entry(producer_id).or_default().push((
-                            *local_start,
-                            next_global_chunk,
-                            chunk_count,
-                            chunk_count,
-                        ));
+                        producer_chunk_ranges.entry(producer_id).or_default().push(
+                            ProducerChunkRange::new(*local_start, next_global_chunk, chunk_count),
+                        );
                         *local_start = local_start.saturating_add(chunk_count);
                         next_global_chunk = next_global_chunk.saturating_add(chunk_count);
                     }
@@ -234,7 +208,7 @@ fn run_global_segment_decode_worker(
                     "metadata_lifetime | stage=producer producers={} ranges={} waiting_chunks={}",
                     producer_chunk_counts.len(),
                     producer_chunk_ranges.values().map(Vec::len).sum::<usize>(),
-                    producer_chunk_ranges.values().flatten().map(|range| range.3).sum::<usize>(),
+                    producer_chunk_ranges.values().flatten().map(|range| range.remaining).sum::<usize>(),
                 );
             }
         }
@@ -268,6 +242,9 @@ fn run_global_segment_decode_worker(
                 bail!("ASR result router closed");
             }
         }
+        segment_state
+            .jobs
+            .retain(|_, job| super::request_is_live(&pending_requests, job.request_item));
         stream_batches.retire_completed(|batch| batch.decoder.all_chunks_completed());
         if debug_metadata {
             let snapshot = (
@@ -298,11 +275,13 @@ fn run_global_segment_decode_worker(
     );
     // 显式结束 `on_tick` 的可变借用以释放对回调上下文的借用；闭包不实现 `Drop`，用 `let _` 移动即可。
     let _ = on_tick;
-    if let Err(error) = decode_result {
-        let _ = forward_thread.join();
-        return Err(error);
+    // On error the forwarding thread may be waiting on an open upstream
+    // channel. Return first so supervision closes upstream; joining here
+    // would prevent the fatal notification that wakes the service.
+    decode_result?;
+    if let Err(panic) = forward_thread.join() {
+        std::panic::resume_unwind(panic);
     }
-    let _ = forward_thread.join();
     drain_global_decoder_meta(
         &meta_rx,
         &mut stream_batches,
@@ -882,6 +861,25 @@ mod stream_batch_lifecycle_tests {
         assert_eq!(batches.get_mut(global + 1)?.1, 1);
         assert!(batches.get_mut(global - 1).is_err());
         assert!(batches.get_mut(global + 2).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    #[test]
+    fn producer_ranges_preserve_offsets_and_retire_at_exact_completion() -> Result<()> {
+        let mut range = ProducerChunkRange::new(5, 20, 2);
+        assert!(!range.contains(4) && !range.contains(7));
+        assert!(range.take_global_index(4).is_err());
+        assert_eq!(range.remaining, 2);
+        assert_eq!(range.take_global_index(6)?, 21);
+        assert_eq!(range.take_global_index(5)?, 20);
+        assert_eq!(range.remaining, 0);
+        assert!(range.take_global_index(5).is_err());
+        let empty = ProducerChunkRange::new(7, 30, 0);
+        assert!(!empty.contains(7));
         Ok(())
     }
 }

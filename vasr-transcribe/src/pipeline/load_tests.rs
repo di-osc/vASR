@@ -1,7 +1,7 @@
 use super::*;
+use asr_data::Waveform;
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
-use asr_data::Waveform;
 
 fn budget() -> LoadedQueueMemoryBudget {
     LoadedQueueMemoryBudget {
@@ -16,6 +16,7 @@ fn jobs(request_item: Option<RequestItemRef>) -> Vec<LoadedJob> {
         .into_iter()
         .enumerate()
         .map(|(index, channel)| LoadedJob {
+            _item_permit: None,
             index: 10 + index,
             request_item,
             channel,
@@ -84,9 +85,10 @@ async fn global_channels_register_all_routes_before_first_send_and_progress() {
     let pending = Arc::new(Mutex::new(HashMap::from([(
         item.request_id,
         PendingGlobalRequest {
+            item_routes: HashMap::new(),
             log_id: "test".into(),
-            failure_indices: vec![3],
             remaining: 1,
+            expected: [(3, "mono")].into(),
             duplicate_indices: Vec::new(),
             internal_indices: vec![10],
             outcomes: Vec::new(),
@@ -99,6 +101,7 @@ async fn global_channels_register_all_routes_before_first_send_and_progress() {
         },
     )])));
     let routes = Arc::new(Mutex::new(HashMap::from([(10, item)])));
+    let next_job_id = AtomicU64::new(11);
     tokio::time::timeout(Duration::from_secs(1), async {
         let send = send_global_loaded_result(
             Ok((Ok(jobs(Some(item))), task_stats())),
@@ -106,6 +109,7 @@ async fn global_channels_register_all_routes_before_first_send_and_progress() {
             &tx,
             &pending,
             &routes,
+            &next_job_id,
             &stats,
         );
         let consume = async {
@@ -158,6 +162,7 @@ async fn forward(
             tx,
             &Arc::new(Mutex::new(HashMap::new())),
             &Arc::new(Mutex::new(HashMap::new())),
+            &AtomicU64::new(11),
             &stats,
         )
         .await
@@ -223,4 +228,92 @@ async fn forwarding_preserves_loader_outcomes_without_acquiring_memory() {
         );
         assert!(rx.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn repeated_stereo_cancellation_before_publication_keeps_retired_ranges_bounded() {
+    let registry = super::super::registry::RequestRegistry::new(Arc::default(), Arc::default());
+    let next_job_id = Arc::new(AtomicU64::new(1));
+    let memory = budget();
+    let stats = Arc::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    for id in 1..=16 {
+        let internal_index = next_job_id.fetch_add(1, Ordering::Relaxed) as usize;
+        let item = RequestItemRef {
+            request_id: PipelineRequestId(id),
+            item_index: 4,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        registry.pending.lock().unwrap().insert(
+            item.request_id,
+            PendingGlobalRequest {
+                item_routes: [((4, "mono"), internal_index)].into(),
+                log_id: format!("stereo-cancel-{id}"),
+                remaining: 1,
+                expected: [(4, "mono")].into(),
+                duplicate_indices: Vec::new(),
+                internal_indices: vec![internal_index],
+                outcomes: Vec::new(),
+                stages: super::super::stages::RequestStageProgress {
+                    load_remaining: 1,
+                    vad_remaining: 1,
+                    ..Default::default()
+                },
+                response_tx,
+            },
+        );
+        registry.routes.lock().unwrap().insert(internal_index, item);
+        let mut tasks = JoinSet::new();
+        spawn_global_loader_task(
+            &mut tasks,
+            AudioLoader,
+            GlobalLoadJob {
+                internal_index,
+                request_item: item,
+                source: asr_data::AudioSource::from_pcm_s16le(vec![0; 640], 16_000, 2),
+                mono: false,
+                _item_permit: None,
+                _source_memory: None,
+            },
+            0,
+        );
+        let result = tasks.join_next().await.unwrap();
+        assert_eq!(
+            result.as_ref().unwrap().0.as_ref().unwrap().len(),
+            2,
+            "fixture must finish the real stereo loader task"
+        );
+        // Cancel after loading but before the outer loader publishes channels.
+        // The extra channel must still belong to this request if it has an ID.
+        registry.cancel(item.request_id);
+        assert!(response_rx.await.is_err());
+        send_global_loaded_result(
+            result,
+            &memory,
+            &tx,
+            &registry.pending,
+            &registry.routes,
+            &next_job_id,
+            &stats,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "canceled stereo channels were published"
+        );
+    }
+    assert_eq!(
+        registry.retired_range_count(),
+        1,
+        "canceled stereo extra IDs leave permanent retirement holes"
+    );
+    assert_eq!(
+        next_job_id.load(Ordering::Acquire),
+        17,
+        "unpublished canceled channels must not consume extra work IDs"
+    );
+    assert!(registry.pending.lock().unwrap().is_empty());
+    assert!(registry.routes.lock().unwrap().is_empty());
+    assert_eq!(memory.semaphore.available_permits(), 1);
 }

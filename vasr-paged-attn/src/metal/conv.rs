@@ -279,17 +279,9 @@ impl candle_core::CustomOp2 for BiasGelu {
         bias: &candle_core::MetalStorage,
         bias_layout: &candle_core::Layout,
     ) -> Result<(candle_core::MetalStorage, candle_core::Shape)> {
+        use super::compile::{CompilePolicy, KernelSource, load_pipeline_with_policy};
         use candle_core::{DType, backend::BackendStorage};
-        use candle_metal_kernels::metal::ComputePipeline;
-        use objc2_metal::{
-            MTLCompileOptions, MTLDevice, MTLMathFloatingPointFunctions, MTLMathMode, MTLSize,
-        };
-        use std::{
-            collections::HashMap,
-            sync::{Mutex, OnceLock},
-        };
-        static CACHE: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
-            OnceLock::new();
+        use objc2_metal::MTLSize;
         let name = match (input.dtype(), self.store_boundary) {
             (DType::F32, false) => "bias_gelu_f32",
             (DType::F16, false) => "bias_gelu_f16",
@@ -300,44 +292,17 @@ impl candle_core::CustomOp2 for BiasGelu {
             other => candle_core::bail!("bias/GELU unsupported dtype {other:?}"),
         };
         let device = input.device();
-        let key = (device.device().as_ref().registryID(), name);
-        let pipeline = {
-            let mut cache = CACHE
-                .get_or_init(Mutex::default)
-                .lock()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            if let Some(p) = cache.get(&key) {
-                p.clone()
+        let pipeline = load_pipeline_with_policy(
+            device.device(),
+            KernelSource::BiasGelu,
+            name,
+            None,
+            if self.store_boundary {
+                CompilePolicy::Fast
             } else {
-                // Keep the established NHWC compiler policy unchanged. The new
-                // last-dimension entry explicitly matches Candle's Fast mode;
-                // precise math was already routed to the materialized fallback.
-                let options = self.store_boundary.then(|| {
-                    let options = MTLCompileOptions::new();
-                    if objc2::available!(macos = 15, ios = 18) {
-                        options.setMathMode(MTLMathMode::Fast);
-                        options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
-                    } else {
-                        #[allow(deprecated)]
-                        options.setFastMathEnabled(true);
-                    }
-                    options
-                });
-                let library = device
-                    .device()
-                    .new_library_with_source(include_str!("bias_gelu.metal"), options.as_deref())
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let function = library
-                    .get_function(name, None)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let pipeline = device
-                    .device()
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                cache.insert(key, pipeline.clone());
-                pipeline
-            }
-        };
+                CompilePolicy::MetalDefault
+            },
+        )?;
         let count = layout.shape().elem_count();
         let output = device.new_buffer(count, input.dtype(), "audio-bias-gelu")?;
         let guard = device.command_encoder()?;
@@ -402,45 +367,22 @@ impl candle_core::CustomOp1 for Im2Col32 {
         input: &candle_core::MetalStorage,
         layout: &candle_core::Layout,
     ) -> Result<(candle_core::MetalStorage, candle_core::Shape)> {
+        use super::compile::{CompilePolicy, KernelSource, load_pipeline_with_policy};
         use candle_core::{DType, backend::BackendStorage};
-        use candle_metal_kernels::metal::ComputePipeline;
-        use objc2_metal::{MTLDevice, MTLSize};
-        use std::{
-            collections::HashMap,
-            sync::{Mutex, OnceLock},
-        };
-        static CACHE: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
-            OnceLock::new();
+        use objc2_metal::MTLSize;
         let name = match input.dtype() {
             DType::F32 => "im2col32_f32",
             DType::F16 | DType::BF16 => "im2col32_16",
             other => candle_core::bail!("im2col32 unsupported dtype {other:?}"),
         };
         let device = input.device();
-        let key = (device.device().as_ref().registryID(), name);
-        let pipeline = {
-            let mut cache = CACHE
-                .get_or_init(Mutex::default)
-                .lock()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            if let Some(p) = cache.get(&key) {
-                p.clone()
-            } else {
-                let library = device
-                    .device()
-                    .new_library_with_source(include_str!("im2col32.metal"), None)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let function = library
-                    .get_function(name, None)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                let pipeline = device
-                    .device()
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                cache.insert(key, pipeline.clone());
-                pipeline
-            }
-        };
+        let pipeline = load_pipeline_with_policy(
+            device.device(),
+            KernelSource::Im2Col32,
+            name,
+            None,
+            CompilePolicy::MetalDefault,
+        )?;
         let count = self.rows * self.cols;
         let output = device.new_buffer(count, input.dtype(), "audio-im2col32")?;
         let command_guard = device.command_encoder()?;

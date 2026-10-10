@@ -3,6 +3,7 @@ pub mod capabilities;
 pub mod config;
 pub mod inference;
 pub mod model;
+pub use model::operator_policy::{ModelGeometry, ValidatedMetalProfile};
 pub mod processor;
 
 pub use crate::audio;
@@ -68,6 +69,12 @@ pub struct Qwen3ASR {
 pub type Qwen3Asr = Qwen3ASR;
 
 impl Qwen3ASR {
+    /// Resolve and inspect checkpoint configuration before allocating weights or KV.
+    /// Uses the same cache and local-directory validation as `from_pretrained`.
+    pub fn pretrained_config(model_id_or_path: &str) -> Result<config::AsrConfig> {
+        model::weights::load_config_from_pretrained(model_id_or_path)
+    }
+
     /// Canonical language names supported by the official Qwen3-ASR stack.
     pub fn supported_languages(&self) -> &'static [&'static str] {
         inference::utils::SUPPORTED_LANGUAGES

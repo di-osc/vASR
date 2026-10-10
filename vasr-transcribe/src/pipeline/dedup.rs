@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -15,25 +16,25 @@ pub(super) struct DeduplicatedTranscribeInputs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TranscribeInputDedupKey {
-    source: AudioSourceDedupKey,
+struct TranscribeInputDedupKey<'a> {
+    source: AudioSourceDedupKey<'a>,
     mono: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum AudioSourceDedupKey {
-    Path(PathBuf),
-    Url(String),
-    Base64(String),
-    EncodedBytes(Vec<u8>),
+enum AudioSourceDedupKey<'a> {
+    Path(&'a Path),
+    Url(&'a str),
+    Base64(&'a str),
+    EncodedBytes(Cow<'a, [u8]>),
     LocalFileContent {
         len: u64,
         hash: u64,
     },
     ModelScope {
-        repo_id: String,
-        file_path: String,
-        revision: String,
+        repo_id: &'a str,
+        file_path: &'a str,
+        revision: &'a str,
     },
 }
 
@@ -41,10 +42,10 @@ pub(super) fn deduplicate_transcribe_inputs(
     inputs: Vec<TranscribeInput>,
 ) -> DeduplicatedTranscribeInputs {
     let mut seen = HashMap::with_capacity(inputs.len());
-    let mut unique_inputs = Vec::with_capacity(inputs.len());
+    let mut unique_positions = Vec::with_capacity(inputs.len());
     let mut duplicate_indices = Vec::new();
 
-    for input in inputs {
+    for (position, input) in inputs.iter().enumerate() {
         if let Some(source_key) = audio_source_dedup_key(&input.source) {
             let key = TranscribeInputDedupKey {
                 source: source_key,
@@ -56,40 +57,55 @@ pub(super) fn deduplicate_transcribe_inputs(
             }
             seen.insert(key, input.index);
         }
-        unique_inputs.push(input);
+        unique_positions.push(position);
     }
 
+    drop(seen);
+    let mut positions = unique_positions.into_iter().peekable();
+    let unique_inputs = inputs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, input)| {
+            if positions.peek() == Some(&position) {
+                positions.next();
+                Some(input)
+            } else {
+                None
+            }
+        })
+        .collect();
     DeduplicatedTranscribeInputs {
         unique_inputs,
         duplicate_indices,
     }
 }
 
-fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey> {
+fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey<'_>> {
     match source {
-        AudioSource::Path(path) => Some(
-            local_file_content_key(path).unwrap_or_else(|| AudioSourceDedupKey::Path(path.clone())),
-        ),
+        AudioSource::Path(path) => {
+            Some(local_file_content_key(path).unwrap_or_else(|| AudioSourceDedupKey::Path(path)))
+        }
         AudioSource::Url(url) => {
             if let Some(path) = local_path_from_url(url) {
                 return Some(
-                    local_file_content_key(&path)
-                        .unwrap_or_else(|| AudioSourceDedupKey::Url(url.clone())),
+                    local_file_content_key(&path).unwrap_or_else(|| AudioSourceDedupKey::Url(url)),
                 );
             }
-            Some(AudioSourceDedupKey::Url(url.clone()))
+            Some(AudioSourceDedupKey::Url(url))
         }
-        AudioSource::Base64(encoded) => Some(AudioSourceDedupKey::Base64(encoded.clone())),
+        AudioSource::Base64(encoded) => Some(AudioSourceDedupKey::Base64(encoded)),
         AudioSource::ModelScope {
             repo_id,
             file_path,
             revision,
         } => Some(AudioSourceDedupKey::ModelScope {
-            repo_id: repo_id.clone(),
-            file_path: file_path.clone(),
-            revision: revision.clone(),
+            repo_id,
+            file_path,
+            revision,
         }),
-        AudioSource::EncodedBytes(bytes) => Some(AudioSourceDedupKey::EncodedBytes(bytes.clone())),
+        AudioSource::EncodedBytes(bytes) => {
+            Some(AudioSourceDedupKey::EncodedBytes(Cow::Borrowed(bytes)))
+        }
         AudioSource::PcmS16Le {
             bytes,
             sample_rate,
@@ -98,17 +114,17 @@ fn audio_source_dedup_key(source: &AudioSource) -> Option<AudioSourceDedupKey> {
             let mut key = sample_rate.to_le_bytes().to_vec();
             key.extend_from_slice(&channels.to_le_bytes());
             key.extend_from_slice(bytes);
-            Some(AudioSourceDedupKey::EncodedBytes(key))
+            Some(AudioSourceDedupKey::EncodedBytes(Cow::Owned(key)))
         }
     }
 }
 
-fn local_file_content_key(path: &Path) -> Option<AudioSourceDedupKey> {
+fn local_file_content_key(path: &Path) -> Option<AudioSourceDedupKey<'static>> {
     let bytes = fs::read(path).ok()?;
     Some(bytes_content_key(&bytes))
 }
 
-fn bytes_content_key(bytes: &[u8]) -> AudioSourceDedupKey {
+fn bytes_content_key(bytes: &[u8]) -> AudioSourceDedupKey<'static> {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     AudioSourceDedupKey::LocalFileContent {

@@ -1,12 +1,18 @@
 #!/bin/bash
-# Same-binary alternating controls, with a complete warmup after each restart.
+# Alternating same-binary controls or two-binary refactor controls, with a complete warmup after each restart.
 # All outputs remain available for per-item CER and source-identity auditing.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 binary=${1:?frozen binary path required}
 output=${2:?new output directory required}
 experiment=${3:-throughput}
-[[ "$experiment" == throughput || "$experiment" == autorelease || "$experiment" == automatic || "$experiment" == prefill-gate-up || "$experiment" == prefill-wave || "$experiment" == prefill-rope || "$experiment" == prefill-rope-kernel || "$experiment" == rope-automatic ]] || { echo "unknown experiment" >&2; exit 1; }
+[[ "$experiment" == throughput || "$experiment" == autorelease || "$experiment" == automatic || "$experiment" == prefill-gate-up || "$experiment" == prefill-wave || "$experiment" == prefill-rope || "$experiment" == prefill-rope-kernel || "$experiment" == rope-automatic || "$experiment" == refactor ]] || { echo "unknown experiment" >&2; exit 1; }
+baseline_binary=
+if [[ "$experiment" == refactor ]]; then
+    baseline_binary=${4:?baseline binary required for refactor}
+    [[ -x "$baseline_binary" && -x "$binary" ]] || { echo "both frozen binaries must be executable" >&2; exit 1; }
+    baseline_binary=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$baseline_binary")
+fi
 [[ ! -e "$output" ]] || { echo "output directory already exists" >&2; exit 1; }
 mkdir -p "$output"
 binary=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$binary")
@@ -26,6 +32,7 @@ trap 'cleanup; if [[ -n "$awake_pid" ]]; then kill "$awake_pid" 2>/dev/null || t
 caffeinate -d -i -u -t 3600 &
 awake_pid=$!
 pmset -g batt > "$output/power.txt"
+if [[ -n "$baseline_binary" ]]; then shasum -a 256 "$baseline_binary" > "$output/baseline-sha256.txt"; fi
 shasum -a 256 "$binary" datasets/call-100.db datasets/example1.db > "$output/sha256.txt"
 # Avoid inherited experimental options; explicit controls also work if these
 # optimizations later become defaults. Existing validated CNN/packed paths stay on.
@@ -37,6 +44,10 @@ unset VASR_DEVICE VASR_METAL_ASR_DTYPE VASR_GPU_MEMORY_UTILIZATION
 unset VASR_METAL_CONV_NHWC VASR_METAL_CONV_IM2COL32 VASR_METAL_CONV_BIAS_GELU
 unset VASR_METAL_PACKED_PREFILL VASR_METAL_PACKED_PAGED_ATTN
 unset VASR_DEBUG_REQUEST_MEM VASR_DEBUG_CUDA_MEM VASR_DEBUG_LOCK_WAIT
+if [[ "$experiment" == refactor ]]; then
+    unset CANDLE_METAL_ENABLE_FAST_MATH
+    printf '%s\n' 'CANDLE_METAL_ENABLE_FAST_MATH=unset (Candle default)' > "$output/floating-point.txt"
+fi
 export VASR_PROFILE=false
 unset VASR_DISABLE_MIXED_STEP_DECODE VASR_METAL_GEMM_TRACE
 unset VASR_METAL_PREFILL_GATE_UP
@@ -52,6 +63,8 @@ for round in 1 2 3; do
     if [[ "$round" == 2 ]]; then modes=(candidate control); fi
     for mode in "${modes[@]}"; do
         prefix="$output/$mode-r$round"
+        run_binary=$binary
+        if [[ "$experiment" == refactor && "$mode" == control ]]; then run_binary=$baseline_binary; fi
         if [[ "$experiment" == autorelease ]]; then
             # Isolate ownership scopes: all kernels, batches and safety estimates
             # are otherwise identical in the two groups.
@@ -60,7 +73,7 @@ for round in 1 2 3; do
             export VASR_METAL_MAX_ACTIVE_SEQS=64 VASR_METAL_PAGED_DECODE_BATCH_SIZE=64
             export VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS=16 VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS=120 VASR_PREFILL_MAX_WAVE=16
             if [[ "$mode" == control ]]; then export VASR_METAL_AUTORELEASEPOOL=0; else export VASR_METAL_AUTORELEASEPOOL=1; fi
-        elif [[ "$experiment" == prefill-gate-up || "$experiment" == prefill-wave || "$experiment" == prefill-rope || "$experiment" == prefill-rope-kernel || "$experiment" == rope-automatic ]] || [[ "$experiment" == automatic && "$mode" == candidate ]]; then
+        elif [[ "$experiment" == prefill-gate-up || "$experiment" == prefill-wave || "$experiment" == prefill-rope || "$experiment" == prefill-rope-kernel || "$experiment" == rope-automatic || "$experiment" == refactor ]] || [[ "$experiment" == automatic && "$mode" == candidate ]]; then
             # Exercise the actual startup defaults. No capacity, batching or
             # operator knob is supplied to this group.
             unset VASR_QWEN3_ASR_AUDIO_ATTN VASR_METAL_CONV_GEMM_TILE
@@ -107,7 +120,7 @@ import socket
 with socket.socket() as server:
     server.bind(('0.0.0.0', 8868))
 PYPORT
-        "$binary" serve --model Qwen3-ASR-0.6B --port 8868 > "$prefix-server.log" 2>&1 &
+        "$run_binary" serve --model Qwen3-ASR-0.6B --port 8868 > "$prefix-server.log" 2>&1 &
         server_pid=$!
         ready=0
         for attempt in {1..90}; do
@@ -129,14 +142,14 @@ PY
             done
         ) > "$prefix-memory.jsonl" &
         monitor_pid=$!
-        "$binary" perf -i datasets/call-100.db --server http://127.0.0.1:8868/transcribe --mono true --concurrency 28 --batch-size 4 --retries 1 --cer -o "$prefix-warmup.json" > "$prefix-warmup.log" 2>&1
+        "$run_binary" perf -i datasets/call-100.db --server http://127.0.0.1:8868/transcribe --mono true --concurrency 28 --batch-size 4 --retries 1 --cer -o "$prefix-warmup.json" > "$prefix-warmup.log" 2>&1
         python3 - "$prefix-warmup.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]));s=d['summary']
 assert s['items']==s['quality_passed_items']==99 and s['failed_requests']==s['bad_items']==0, 'invalid warmup'
 assert d['cer']['summary']['quality_passed_items']==99
 PY
-        "$binary" perf -i datasets/call-100.db --server http://127.0.0.1:8868/transcribe --mono true --concurrency 28 --batch-size 4 --retries 1 --cer -o "$prefix-perf.json" > "$prefix-perf.log" 2>&1
+        "$run_binary" perf -i datasets/call-100.db --server http://127.0.0.1:8868/transcribe --mono true --concurrency 28 --batch-size 4 --retries 1 --cer -o "$prefix-perf.json" > "$prefix-perf.log" 2>&1
         python3 - "$prefix-perf.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]));s=d['summary']
@@ -145,7 +158,7 @@ c=d['cer']['summary']
 assert c['quality_passed_items']==99
 print(sys.argv[1],s['quality_audio_seconds_per_second'],c['cer_weighted'],flush=True)
 PY
-        "$binary" eval -i datasets/example1.db --server http://127.0.0.1:8868/transcribe --retries 1 -o "$prefix-example1.json" > "$prefix-example1.log" 2>&1
+        "$run_binary" eval -i datasets/example1.db --server http://127.0.0.1:8868/transcribe --retries 1 -o "$prefix-example1.json" > "$prefix-example1.log" 2>&1
         python3 - "$prefix-example1.json" <<'PY'
 import json,sys
 assert json.load(open(sys.argv[1]))['summary']['cer_weighted']==0

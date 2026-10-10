@@ -5,6 +5,7 @@ use super::{
     record_request_encode_stages,
 };
 use anyhow::Result;
+use asr_data::Waveform;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,7 +13,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vasr::OfflineAsrModel as AsrModel;
 use vasr::models::qwen3asr::{AudioFeatureEncodeTimings, EncodedAsrBatch, Qwen3ASR};
-use asr_data::Waveform;
 
 #[derive(Debug)]
 #[cfg(feature = "paged-attn")]
@@ -62,7 +62,7 @@ pub(super) fn spawn_segment_encoder_worker(
     pending_requests: Option<Arc<Mutex<HashMap<PipelineRequestId, PendingGlobalRequest>>>>,
     max_segments: usize,
     max_audio_seconds: f64,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let mut pending = None;
         loop {
@@ -73,7 +73,7 @@ pub(super) fn spawn_segment_encoder_worker(
                     None => break,
                 },
             };
-            let request = collect_encoder_segment_batch(
+            let mut request = collect_encoder_segment_batch(
                 first,
                 &mut request_rx,
                 &mut pending,
@@ -81,6 +81,12 @@ pub(super) fn spawn_segment_encoder_worker(
                 max_audio_seconds,
             )
             .await;
+            request
+                .segments
+                .retain(|segment| super::request_is_live(&pending_requests, segment.request_item));
+            if request.segments.is_empty() {
+                continue;
+            }
             let encode_start = Instant::now();
             let segments_for_result = request.segments.clone();
             let segment_audio_seconds = segments_for_result
@@ -97,16 +103,15 @@ pub(super) fn spawn_segment_encoder_worker(
                     "ASR encoder segment duration {seconds:.3}s exceeds --encoder-batch-max-audio-seconds={max_audio_seconds:.3}; reduce --vad-max-segment-sec or raise the encoder batch duration"
                 ))
             } else {
-                tokio::task::spawn_blocking({
-                    let asr = Arc::clone(&asr);
-                    let asr_options = asr_options.clone();
-                    let segments = request.segments;
-                    move || run_segment_asr_encode(asr.as_ref(), &segments, &asr_options)
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    Err(anyhow::anyhow!("ASR audio encoder join error: {error}"))
-                })
+                super::blocking_result(
+                    tokio::task::spawn_blocking({
+                        let asr = Arc::clone(&asr);
+                        let asr_options = asr_options.clone();
+                        let segments = request.segments;
+                        move || run_segment_asr_encode(asr.as_ref(), &segments, &asr_options)
+                    })
+                    .await,
+                )?
             };
             let encode_wall_seconds = encode_start.elapsed().as_secs_f64();
             let encode_span = StageSpan::new(encode_start, Instant::now());
@@ -173,9 +178,10 @@ pub(super) fn spawn_segment_encoder_worker(
                 .send(SegmentEncoderOutput::Encoded(message))
                 .is_err()
             {
-                break;
+                anyhow::bail!("prefill channel closed");
             }
         }
+        Ok(())
     })
 }
 #[cfg(feature = "paged-attn")]
@@ -245,16 +251,14 @@ async fn collect_encoder_segment_batch(
 pub(super) fn send_segment_encode_request(
     asr_to_encoder_tx: &mpsc::UnboundedSender<SegmentEncodeMessage>,
     request: SegmentEncodeRequest,
-) {
+) -> Result<()> {
     if asr_to_encoder_tx
         .send(SegmentEncodeMessage::Segment(request))
         .is_err()
     {
-        tracing::warn!(
-            target: "vasr_transcribe::pipeline",
-            "ASR audio feature encoder closed"
-        );
+        anyhow::bail!("ASR audio feature encoder closed");
     }
+    Ok(())
 }
 #[derive(Debug, Clone)]
 #[cfg(feature = "paged-attn")]
@@ -262,6 +266,47 @@ pub(super) struct SegmentAsrInference {
     pub(super) targets: Vec<(usize, usize, usize)>,
     pub(super) segment_audio_seconds: f64,
     pub(super) active_job_count: usize,
+}
+
+#[cfg(feature = "paged-attn")]
+impl SegmentAsrInference {
+    fn retain_waveforms(
+        self,
+        waveforms: Vec<Waveform>,
+        keep: &[bool],
+    ) -> Result<(Self, Vec<Waveform>)> {
+        if keep.len() != waveforms.len() || keep.len() != self.targets.len() {
+            anyhow::bail!("segment waveform retention lengths do not match");
+        }
+        if keep.iter().all(|&keep| keep) {
+            return Ok((self, waveforms));
+        }
+        let targets = self
+            .targets
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(target, &keep)| keep.then_some(target))
+            .collect::<Vec<_>>();
+        let waveforms = waveforms
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(waveform, &keep)| keep.then_some(waveform))
+            .collect::<Vec<_>>();
+        let segment_audio_seconds = waveforms.iter().map(Waveform::duration_seconds).sum();
+        let active_job_count = targets
+            .iter()
+            .map(|target| target.0)
+            .collect::<HashSet<_>>()
+            .len();
+        Ok((
+            Self {
+                targets,
+                segment_audio_seconds,
+                active_job_count,
+            },
+            waveforms,
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -275,6 +320,26 @@ pub(super) struct SegmentEncodedAsrBatch {
 
 #[cfg(feature = "paged-attn")]
 impl SegmentEncodedAsrBatch {
+    pub(super) fn retain_audios(self, keep: &[bool]) -> Result<Self> {
+        if keep.len() != self.waveforms.len()
+            || keep.len() != self.inference.targets.len()
+            || keep.len() != self.encoded.audio_len()
+        {
+            anyhow::bail!("segment encoded retention lengths do not match");
+        }
+        if keep.iter().all(|&keep| keep) {
+            return Ok(self);
+        }
+        let encoded = self.encoded.retain_audios(keep)?;
+        let (inference, waveforms) = self.inference.retain_waveforms(self.waveforms, keep)?;
+        Ok(Self {
+            inference,
+            waveforms,
+            encoded,
+            timings: self.timings,
+        })
+    }
+
     pub(super) fn into_parts(self) -> (SegmentAsrInference, Vec<Waveform>, EncodedAsrBatch) {
         (self.inference, self.waveforms, self.encoded)
     }

@@ -1,3 +1,4 @@
+mod compile;
 pub mod kernels;
 pub(crate) mod paged;
 pub mod varlen_prefill;
@@ -12,7 +13,7 @@ pub use varlen_prefill::{
 
 pub mod conv;
 pub mod pointwise;
-pub mod rotary;
 pub mod residual_norm;
+pub mod rotary;
 
 pub mod profile;
