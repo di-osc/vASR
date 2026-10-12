@@ -166,10 +166,10 @@ segment 完成:
 
 request 完成:
   Global Result Router 等该 request 下所有 item 完成
-  再按原始输入顺序返回 HTTP JSON response
+  再按原始输入顺序返回 HTTP JSONL，每行是一个 asr-data Audio 文档
 ```
 
-这意味着内部 pipeline 已经是全局流式 decode：所有请求共享同一个 decode scheduler，chunk/segment 完成即聚合、完成即路由。HTTP `/transcribe` 仍是一次请求一次 JSON 响应，不是 SSE/WebSocket 流式 API。后续如果要做对外流式服务，可以复用 `RoutedTranscribeItemOutcome` 这一层事件。
+这意味着内部 pipeline 已经是全局流式 decode：所有请求共享同一个 decode scheduler，chunk/segment 完成即聚合、完成即路由。HTTP `/transcribe` 在整批处理完成后返回 JSONL，每行本身是一个 `asr-data::Audio` 文档，转写结果写入对应声道的 prediction timeline；这不是 SSE/WebSocket 流式 API。后续如果要做对外流式服务，可以复用 `RoutedTranscribeItemOutcome` 这一层事件。
 
 ## Segment Batch 形成规则
 
@@ -249,14 +249,17 @@ JSON body 上限是 512 MiB。
 请求字段说明：
 
 ```text
-inputs      音频输入数组。响应 data 会保持与 inputs 相同的 item 顺序。
+inputs      音频输入数组。返回的 Audio JSONL 行保持与 inputs 相同的 item 顺序。
+id          可选，输出 Audio 的 id；缺省时由服务生成。
+info        可选，已探测的 asr_data::AudioInfo，可避免服务重复探测音频。
 url         可选，音频 URL。
 b64_str     可选，base64 编码后的音频 bytes。
+modelscope  可选，ModelScope repo_id、仓库内 file_path 和 revision。
 mono        可选 bool。缺省为 false。
 hotword     可选文本。当前 API 接收该字段，但服务 pipeline 尚未将它接入 ASR options。
 ```
 
-每个 input 必须提供 `url` 或 `b64_str` 之一。如果两个字段同时存在，优先使用 `url`。如果两个字段都缺失，该 item 会作为 loader 错误写入响应，不会让整个 HTTP 请求失败。
+每个 input 必须提供 `url`、`b64_str` 或 `modelscope` 之一。如果提供多个来源，按 `url`、`b64_str`、`modelscope` 的顺序选择。缺少或无法读取音频来源时，服务仍为该 input 返回一个 Audio，并在其 `metadata["vasr-transcribe-error"]` 中记录 `component` 和 `reason`；这仍是 `asr_data::Audio` 的 metadata map，不包含旧响应 envelope 字段。
 
 `mono` 控制通道处理：
 
@@ -265,95 +268,20 @@ mono=true   下混为一个 mono 通道。
 mono=false  尽量保留 stereo；当源音频超过一个通道时，分别处理 left/right。
 ```
 
-响应示例：
+响应为 JSONL，Content-Type 是 `application/x-ndjson`。每行是一个 `asr_data::Audio`，不会再包装 `data`、`inference_performance`，也不会输出 `spentDetails`、`spentSeconds` 等旧协议字段。示例：
 
-```json
-{
-  "data": [
-    {
-      "serviceId": "transcribe-<uuid>",
-      "spentSeconds": 1.234,
-      "spentDetails": {
-        "loader": 0.1,
-        "detector": 0.2,
-        "recognizer": 0.9,
-        "sentencizer": 0.0
-      },
-      "timings": {
-        "total": 1.234,
-        "loader": 0.1,
-        "pipeline": 1.134,
-        "audio": 12.3
-      },
-      "text": {
-        "mono": "",
-        "left": "左声道文本",
-        "right": "右声道文本"
-      },
-      "sentences": [
-        {
-          "text": "左声道文本",
-          "startTime": 0,
-          "endTime": 1230,
-          "duration": 1230,
-          "channel": "left",
-          "sentenceIndex": 0
-        }
-      ],
-      "is_bad": false,
-      "bad_reason": null,
-      "bad_component": null
-    }
-  ],
-  "inference_performance": {
-    "batch_wall_seconds": 1.234,
-    "num_items": 1,
-    "throughput_items_per_second": 0.81,
-    "total_audio_duration_seconds": 12.3,
-    "speedup": 9.97,
-    "rtf": 0.1003
-  }
-}
+```jsonl
+{"id":"audio-1","source":{"Path":"/data/audio.wav"},"info":{"sample_rate":16000,"channels":1,"frame_count":192000,"source_format":{"encoding":"Wav","sample_rate":16000,"channels":1}},"timelines":{"Mono":{"id":"tl-1","audio_id":"audio-1","duration":12000,"reference":[],"prediction":[{"Speech":{"id":"evt-1","range":{"start_ms":0,"end_ms":12000},"source":"vasr-transcribe","confidence":null,"language":null,"speaker":null,"transcription":{"text":"识别文本","sentences":[],"confidence":null}}}]}}}
 ```
 
-响应字段说明：
+转写失败时仍返回 Audio 行，错误信息使用 Audio 自带的可扩展 metadata map：
 
 ```text
-data                         每个请求 input 对应一个结果。
-serviceId                    当前服务进程生成的服务 id。
-spentSeconds                 单个 item 的处理耗时，单位秒。
-spentDetails.loader          加载/解码耗时，单位秒。
-spentDetails.detector        VAD 耗时，单位秒。
-spentDetails.recognizer      ASR 耗时，单位秒。
-spentDetails.sentencizer     预留字段，当前通常为 0。
-timings.total                单个 item 的总耗时，单位秒。
-timings.loader               loader 耗时，单位秒。
-timings.pipeline             非 loader pipeline 耗时，单位秒。
-timings.audio                处理的音频时长，单位秒。
-text.mono                    mono 输出文本。
-text.left/text.right         stereo left/right 通道输出文本。
-sentences[].startTime        句子开始时间，单位毫秒。
-sentences[].endTime          句子结束时间，单位毫秒。
-sentences[].duration         句子时长，单位毫秒。
-sentences[].channel          mono、left 或 right。
-sentences[].sentenceIndex    通道合并并排序后的句子序号。
-is_bad                       该 item 是否失败。
-bad_reason                   is_bad=true 时的错误详情。
-bad_component                is_bad=true 时的失败组件：loader、vad 或 recognizer。
+metadata.vasr-transcribe-error.component  失败组件，例如 loader、vad、recognizer。
+metadata.vasr-transcribe-error.reason     错误详情。
 ```
 
-`inference_performance` 描述整个 HTTP 请求：
-
-```text
-batch_wall_seconds           从请求进入服务到响应组装完成的 wall-clock 秒数。
-num_items                    响应 item 数。
-throughput_items_per_second  num_items / batch_wall_seconds。
-total_audio_duration_seconds 成功处理的输出通道音频总时长。
-speedup                      total_audio_duration_seconds / batch_wall_seconds。
-rtf                          batch_wall_seconds / total_audio_duration_seconds。
-```
-
-handler 通常返回 HTTP 200，并通过 `data[].is_bad` 表达 item 级错误。JSON 解析、body 超限等错误会在进入 transcribe handler 之前由 Axum 处理。
+服务性能数据只写入服务日志；客户端需要请求耗时和吞吐统计时自行测量。JSON 解析、body 超限等请求级错误由 Axum 以 HTTP 错误响应处理。
 
 ## AudioSource 映射
 

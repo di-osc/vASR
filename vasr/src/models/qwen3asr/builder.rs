@@ -11,13 +11,9 @@ use crate::model_builder::{
 
 use super::{LoadOptions, Qwen3Asr};
 
-#[cfg(feature = "paged-attn")]
 const KV_BLOCK_SIZE: usize = 32;
-#[cfg(feature = "paged-attn")]
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
-#[cfg(feature = "paged-attn")]
 const ASR_FEATURE_HOP_LENGTH: usize = 160;
-#[cfg(feature = "paged-attn")]
 const KV_BASE_SEGMENT_SEC: f32 = 1.0;
 
 pub struct Qwen3AsrBuilder;
@@ -308,16 +304,115 @@ fn estimate_kv_cache_sizing(
     })
 }
 
-#[cfg(feature = "paged-attn")]
+/// KV cache work estimate for an entire offline input set, using the same
+/// tokenizer and block sizing logic as the model builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCacheWorkEstimate {
+    pub total_blocks: usize,
+    pub blocks_per_sequence: usize,
+    pub block_size: usize,
+}
+
+/// Estimate the aggregate KV cache work for audio durations before building
+/// the model. The returned total represents the full corpus; callers must cap
+/// the resident sequence count to the available device budget.
+pub fn estimate_kv_cache_work(
+    model_id: &str,
+    language: Option<&str>,
+    durations_seconds: impl IntoIterator<Item = f64>,
+    max_segment_seconds: f32,
+    max_hotword_tokens: usize,
+    peak_ratio: f32,
+) -> Result<KvCacheWorkEstimate> {
+    if !max_segment_seconds.is_finite() || max_segment_seconds <= 0.0 {
+        anyhow::bail!("maximum VAD segment duration must be finite and greater than zero");
+    }
+    if !peak_ratio.is_finite() || !(0.0..=1.0).contains(&peak_ratio) {
+        anyhow::bail!("KV peak ratio must be finite and between 0.0 and 1.0");
+    }
+
+    let tokenizer = super::processor::tokenizer::Tokenizer::from_pretrained(model_id)?;
+    let fixed_prompt = super::processor::chat_template::build_prompt("", language);
+    let audio_pad_id = tokenizer.token_to_id(super::processor::chat_template::AUDIO_PAD)?;
+    let prompt_tokens = tokenizer.encode(&fixed_prompt)?;
+    let fixed_prompt_tokens = prompt_tokens
+        .iter()
+        .filter(|&&id| id != audio_pad_id)
+        .count();
+    let base = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        max_hotword_tokens,
+        KV_BASE_SEGMENT_SEC,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+    )?;
+    let peak = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        max_hotword_tokens,
+        max_segment_seconds,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+    )?;
+    let max_segment_seconds_f64 = f64::from(max_segment_seconds);
+    let full_segment_extra_blocks = peak.blocks_per_seq.saturating_sub(base.blocks_per_seq);
+    let mut base_blocks = 0usize;
+    let mut peak_extra_blocks = 0usize;
+
+    for duration_seconds in durations_seconds {
+        if !duration_seconds.is_finite() || duration_seconds < 0.0 {
+            anyhow::bail!("audio duration must be finite and non-negative");
+        }
+        let full_segments = (duration_seconds / max_segment_seconds_f64).floor();
+        if full_segments > usize::MAX as f64 {
+            base_blocks = usize::MAX;
+            peak_extra_blocks = usize::MAX;
+            break;
+        }
+        let full_segments = full_segments as usize;
+        base_blocks = base_blocks.saturating_add(full_segments.saturating_mul(base.blocks_per_seq));
+        peak_extra_blocks = peak_extra_blocks
+            .saturating_add(full_segments.saturating_mul(full_segment_extra_blocks));
+
+        let remainder = duration_seconds - full_segments as f64 * max_segment_seconds_f64;
+        if remainder > f64::EPSILON {
+            let partial = kv_tokens_for_segment(
+                fixed_prompt_tokens,
+                max_hotword_tokens,
+                remainder.min(max_segment_seconds_f64) as f32,
+                super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+            )?;
+            base_blocks = base_blocks.saturating_add(base.blocks_per_seq);
+            peak_extra_blocks = peak_extra_blocks
+                .saturating_add(partial.blocks_per_seq.saturating_sub(base.blocks_per_seq));
+        }
+    }
+
+    let peak_extra_blocks = ((peak_extra_blocks as f64) * f64::from(peak_ratio))
+        .ceil()
+        .min(usize::MAX as f64) as usize;
+    let total_blocks = base_blocks.saturating_add(peak_extra_blocks);
+    let blocks_per_sequence = base.blocks_per_seq.saturating_add(
+        ((full_segment_extra_blocks as f64) * f64::from(peak_ratio))
+            .ceil()
+            .min(usize::MAX as f64) as usize,
+    );
+
+    Ok(KvCacheWorkEstimate {
+        total_blocks,
+        blocks_per_sequence,
+        block_size: KV_BLOCK_SIZE,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KvSegmentTokens {
+    #[cfg(feature = "paged-attn")]
     audio_prompt_tokens: usize,
+    #[cfg(feature = "paged-attn")]
     decode_tokens: usize,
+    #[cfg(feature = "paged-attn")]
     tokens_per_seq: usize,
     blocks_per_seq: usize,
 }
 
-#[cfg(feature = "paged-attn")]
 fn kv_tokens_for_segment(
     fixed_prompt_tokens: usize,
     max_hotword_tokens: usize,
@@ -332,21 +427,22 @@ fn kv_tokens_for_segment(
         .and_then(|n| n.checked_add(decode_tokens))
         .ok_or_else(|| anyhow::anyhow!("KV cache token estimate overflow"))?;
     Ok(KvSegmentTokens {
+        #[cfg(feature = "paged-attn")]
         audio_prompt_tokens,
+        #[cfg(feature = "paged-attn")]
         decode_tokens,
+        #[cfg(feature = "paged-attn")]
         tokens_per_seq,
         blocks_per_seq: tokens_per_seq.div_ceil(KV_BLOCK_SIZE),
     })
 }
 
-#[cfg(feature = "paged-attn")]
 fn max_audio_prompt_tokens(max_segment_sec: f32) -> usize {
     let samples = (f64::from(max_segment_sec) * ASR_SAMPLE_RATE_HZ).ceil() as usize;
     let frames = samples.div_ceil(ASR_FEATURE_HOP_LENGTH);
     super::processor::feat_lengths::feat_extract_output_length(frames)
 }
 
-#[cfg(feature = "paged-attn")]
 fn generated_token_budget(max_segment_sec: f32, tokens_per_sec: f64, min_tokens: usize) -> usize {
     let estimated = if max_segment_sec.is_finite() && max_segment_sec > 0.0 {
         (f64::from(max_segment_sec) * tokens_per_sec).ceil() as usize

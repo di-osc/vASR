@@ -623,6 +623,14 @@ pub fn build_async_transcribe_pipeline(
     pipeline: &TranscribePipelineArgs,
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
+    build_async_transcribe_pipeline_with_reservation(pipeline, language, 0)
+}
+
+pub(crate) fn build_async_transcribe_pipeline_with_reservation(
+    pipeline: &TranscribePipelineArgs,
+    language: Option<String>,
+    gpu_memory_reserved_bytes: usize,
+) -> Result<AsyncTranscribePipeline> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
     log_transcribe_start();
@@ -634,11 +642,12 @@ pub fn build_async_transcribe_pipeline(
         "configured",
         "configured",
     );
-    let asr = load_asr_model_for_pipeline(
+    let asr = load_asr_model_for_pipeline_with_reservation(
         pipeline,
         language.as_deref(),
         cuda_graph_max_batch(&pipeline.model),
         false,
+        gpu_memory_reserved_bytes,
     )?;
     Ok(AsyncTranscribePipeline::new(
         AudioLoader,
@@ -1035,6 +1044,26 @@ fn load_asr_model_for_pipeline(
     cuda_graph_max_batch: Option<usize>,
     scheduled: bool,
 ) -> Result<Arc<dyn AsrModel>> {
+    load_asr_model_for_pipeline_with_reservation(
+        pipeline,
+        language,
+        cuda_graph_max_batch,
+        scheduled,
+        0,
+    )
+}
+
+fn load_asr_model_for_pipeline_with_reservation(
+    pipeline: &TranscribePipelineArgs,
+    #[cfg_attr(not(feature = "paged-attn"), allow(unused_variables))] language: Option<&str>,
+    #[cfg_attr(
+        not(all(feature = "cuda-graph", feature = "paged-attn")),
+        allow(unused_variables)
+    )]
+    cuda_graph_max_batch: Option<usize>,
+    scheduled: bool,
+    gpu_memory_reserved_bytes: usize,
+) -> Result<Arc<dyn AsrModel>> {
     let args = &pipeline.model;
     let device = resolve_device(&args.device)?;
     load_asr_model_for_pipeline_on_device(
@@ -1043,7 +1072,7 @@ fn load_asr_model_for_pipeline(
         cuda_graph_max_batch,
         scheduled,
         device,
-        0,
+        gpu_memory_reserved_bytes,
     )
 }
 

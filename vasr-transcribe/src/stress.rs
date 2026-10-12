@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 
 use crate::dataset::read_audio_input_dtos;
 use crate::perf::timestamp_file_name;
-use crate::{AudioInputDto, TranscribeRequest, TranscribeResponse, table::render_table};
+use crate::{AudioInputDto, TranscribeRequest, table::render_table};
 
 #[derive(Debug, Args)]
 pub struct StressArgs {
@@ -411,8 +411,12 @@ async fn run_one_request(
         let started = Instant::now();
         match client.post(server).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
+                let body = response.text().await;
                 let latency_seconds = started.elapsed().as_secs_f64();
-                match response.json::<TranscribeResponse>().await {
+                match body.map_err(|error| error.to_string()).and_then(|body| {
+                    crate::protocol::parse_transcribe_jsonl(&body, latency_seconds)
+                        .map_err(|error| error.to_string())
+                }) {
                     Ok(response) => {
                         let bad_items = response.data.iter().filter(|item| item.is_bad).count();
                         let error_text = response
@@ -438,7 +442,7 @@ async fn run_one_request(
                             },
                         };
                     }
-                    Err(error) => last_error = Some(format!("decode response JSON: {error}")),
+                    Err(error) => last_error = Some(format!("decode response JSONL: {error}")),
                 }
             }
             Ok(response) => {
@@ -790,6 +794,8 @@ mod tests {
 
     fn sample_input(url: &str, mono: Option<bool>) -> AudioInputDto {
         AudioInputDto {
+            id: None,
+            info: None,
             url: Some(url.to_string()),
             b64_str: None,
             modelscope: None,

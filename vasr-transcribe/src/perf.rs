@@ -10,9 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::dataset::read_audio_input_dtos;
 use crate::quality::detect_repeated_pattern;
-use crate::{
-    AudioInputDto, InferenceData, TranscribeRequest, TranscribeResponse, table::render_table,
-};
+use crate::{AudioInputDto, InferenceData, TranscribeRequest, table::render_table};
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
@@ -66,6 +64,10 @@ pub struct PerfArgs {
 /// 只保留可再次定位音频的地址和请求参数。base64、`data:` URI 等原始音频载荷不进入该结构。
 #[derive(Debug, Clone, Serialize)]
 struct PerfSavedInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    info: Option<asr_data::AudioInfo>,
     /// 远程 URL 或本地路径。没有可保存的地址时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
@@ -359,11 +361,13 @@ async fn run_one_request(
         let start = Instant::now();
         match client.post(&server).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
-                let latency_seconds = start.elapsed().as_secs_f64();
-                let response = response
-                    .json::<TranscribeResponse>()
+                let body = response
+                    .text()
                     .await
-                    .context("failed to decode transcribe response JSON")?;
+                    .context("failed to read transcribe JSONL response")?;
+                let latency_seconds = start.elapsed().as_secs_f64();
+                let response = crate::protocol::parse_transcribe_jsonl(&body, latency_seconds)
+                    .context("failed to decode transcribe response JSONL")?;
                 let data_count = response.data.len();
                 let mapping_complete = data_count == batch_size;
                 let mut quality_anomalies = Vec::new();
@@ -706,6 +710,8 @@ fn saved_inputs(inputs: &[AudioInputDto]) -> Vec<PerfSavedInput> {
     inputs
         .iter()
         .map(|input| PerfSavedInput {
+            id: input.id.clone(),
+            info: input.info.clone(),
             url: persistable_audio_ref(input.url.as_deref()),
             modelscope: input.modelscope.clone(),
             mono: input.mono,
@@ -760,6 +766,8 @@ mod tests {
     fn saved_inputs_keep_audio_refs_and_drop_payloads() {
         let inputs = vec![
             AudioInputDto {
+                id: None,
+                info: None,
                 url: Some("https://example.com/a.wav".to_string()),
                 b64_str: Some("AAAA".to_string()),
                 modelscope: None,
@@ -767,6 +775,8 @@ mod tests {
                 hotword: None,
             },
             AudioInputDto {
+                id: None,
+                info: None,
                 url: Some("/data/a.wav".to_string()),
                 b64_str: None,
                 modelscope: None,
@@ -774,6 +784,8 @@ mod tests {
                 hotword: Some("热词".to_string()),
             },
             AudioInputDto {
+                id: None,
+                info: None,
                 url: None,
                 b64_str: Some("UklGRg==".to_string()),
                 modelscope: None,
@@ -781,6 +793,8 @@ mod tests {
                 hotword: None,
             },
             AudioInputDto {
+                id: None,
+                info: None,
                 url: Some("data:audio/wav;base64,UklGRg==".to_string()),
                 b64_str: None,
                 modelscope: None,
@@ -810,6 +824,8 @@ mod tests {
             revision: Some("immutable-revision".into()),
         };
         let input = AudioInputDto {
+            id: None,
+            info: None,
             url: None,
             b64_str: None,
             modelscope: Some(source.clone()),

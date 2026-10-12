@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dataset::{audio_input_from_source, read_vasr_audios};
 use crate::{TranscribeRequest, TranscribeResponse};
 use anyhow::{Context, Result, anyhow, bail};
+use asr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
-use asr_data::{Audio, AudioChannel, AudioSource, CerStats, normalize_for_cer};
 
 use crate::perf::timestamp_file_name;
 use crate::quality::detect_repeated_pattern;
@@ -355,8 +355,10 @@ fn validate_timeline(records: &[Audio], timeline: EvalTimeline) -> Result<()> {
 fn build_request(records: &[Audio], mono: bool) -> Result<TranscribeRequest> {
     let mut inputs = Vec::with_capacity(records.len());
     for record in records {
-        let input =
+        let mut input =
             audio_input_from_source(&record.source, Some(mono), hotword_from_record(record));
+        input.id = Some(record.id.clone());
+        input.info = Some(record.info.clone());
         if input.url.is_none() && input.b64_str.is_none() && input.modelscope.is_none() {
             bail!("audio {} has no usable source", record.audio_id());
         }
@@ -374,6 +376,7 @@ async fn request_batch(args: &EvalArgs, request: TranscribeRequest) -> Result<Tr
 
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..args.retries {
+        let started = Instant::now();
         let response = client.post(&args.server).json(&request).send().await;
         match response {
             Ok(response) => {
@@ -391,10 +394,15 @@ async fn request_batch(args: &EvalArgs, request: TranscribeRequest) -> Result<Tr
                         truncate_for_error(&body)
                     ));
                 } else {
-                    let parsed = response
-                        .json::<TranscribeResponse>()
+                    let body = response
+                        .text()
                         .await
-                        .context("failed to decode transcribe response JSON")?;
+                        .context("failed to read transcribe JSONL response")?;
+                    let parsed = crate::protocol::parse_transcribe_jsonl(
+                        &body,
+                        started.elapsed().as_secs_f64(),
+                    )
+                    .context("failed to decode transcribe response JSONL")?;
                     return Ok(parsed);
                 }
             }
@@ -988,8 +996,8 @@ mod tests {
     };
     use crate::InferenceData;
     use asr_data::{
-        Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource, Speech,
-        Transcription,
+        Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource,
+        Speech, Transcription,
     };
 
     fn test_audio_info(channels: u16) -> AudioInfo {

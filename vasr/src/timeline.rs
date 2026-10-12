@@ -136,6 +136,9 @@ pub fn extend_predictions(
             source.as_deref(),
         )?;
     }
+    timeline
+        .prediction
+        .sort_by_key(|event| (event.range().start_ms, event.range().end_ms));
     Ok(())
 }
 

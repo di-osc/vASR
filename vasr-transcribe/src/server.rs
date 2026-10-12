@@ -4,7 +4,10 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use asr_data::AudioSource;
+use asr_data::{
+    Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource, Sentence,
+    Speech, Timeline, Transcription,
+};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Request, StatusCode};
@@ -20,7 +23,7 @@ use crate::pipeline::{
 };
 use crate::protocol::{
     InferenceData, InferencePerformance, SentenceResult, TextResult, TimingBreakdown,
-    TranscribeRequest, TranscribeResponse,
+    TranscribeRequest,
 };
 
 const TRANSCRIBE_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
@@ -118,31 +121,36 @@ async fn handle_transcribe(
     axum::extract::State(service): axum::extract::State<Arc<TranscribeService>>,
     axum::extract::Extension(admission): axum::extract::Extension<AdmittedRequest>,
     Json(request): Json<TranscribeRequest>,
-) -> Json<TranscribeResponse> {
+) -> Response {
     let start = Instant::now();
     let request_id = admission.request_id;
     let q8_fast_path_start = vasr::models::qwen3asr::model::q8_fast_path_stats();
     let request_items = request.inputs.len();
     let mut inputs = Vec::new();
     let mut data_slots = vec![None; request_items];
-    let mut request_metas = vec![RequestMeta::default(); request_items];
+    let mut request_metas = (0..request_items)
+        .map(|_| RequestMeta::default())
+        .collect::<Vec<_>>();
     let mut request_stats = RequestStats::default();
     let mut start_stats = RequestStartStats::default();
 
     for (index, input) in request.inputs.into_iter().enumerate() {
-        request_metas[index].service_id = service.service_id.clone();
+        let service_id = service.service_id.clone();
+        let audio_id = input
+            .id
+            .unwrap_or_else(|| format!("{}-{index}", request_id));
         let mono = input.mono.unwrap_or(false);
         if mono {
             start_stats.mono_true += 1;
         } else {
             start_stats.mono_false += 1;
         }
-        let source = if let Some(url) = input.url {
+        let (source, source_error) = if let Some(url) = input.url {
             start_stats.url += 1;
-            AudioSource::Url(url)
+            (AudioSource::Url(url), None)
         } else if let Some(b64) = input.b64_str {
             start_stats.base64 += 1;
-            AudioSource::Base64(b64)
+            (AudioSource::Base64(b64), None)
         } else if let Some(modelscope) = input.modelscope {
             start_stats.modelscope += 1;
             match AudioSource::from_modelscope(
@@ -150,29 +158,54 @@ async fn handle_transcribe(
                 modelscope.file_path,
                 modelscope.revision.as_deref(),
             ) {
-                Ok(source) => source,
-                Err(error) => {
-                    data_slots[index] = Some(error_data(
-                        request_metas[index].service_id.clone(),
-                        "loader",
-                        format!("非法的 ModelScope 音频来源: {error}"),
-                        TranscribeItemTiming::default(),
-                        0.0,
-                    ));
-                    continue;
-                }
+                Ok(source) => (source, None),
+                Err(error) => (
+                    AudioSource::from_encoded_bytes(Vec::new()),
+                    Some(format!("非法的 ModelScope 音频来源: {error}")),
+                ),
             }
         } else {
             start_stats.missing += 1;
+            (
+                AudioSource::from_encoded_bytes(Vec::new()),
+                Some("必须提供 url、b64_str 或 modelscope 音频来源".to_string()),
+            )
+        };
+
+        let info = match input.info.filter(valid_audio_info) {
+            Some(info) => info,
+            None if source_error.is_some() => fallback_audio_info(),
+            None => match source.aprobe().await {
+                Ok(info) => info,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "vasr_transcribe::serve",
+                        audio_id,
+                        error = %error,
+                        "could not probe audio metadata; using fallback AudioInfo"
+                    );
+                    fallback_audio_info()
+                }
+            },
+        };
+        let mut audio = Audio::with_id_from_info(audio_id, source.clone(), &info);
+        crate::protocol::clear_legacy_transcribe_metadata(&mut audio);
+        if let Some(error) = source_error.as_ref() {
             data_slots[index] = Some(error_data(
-                request_metas[index].service_id.clone(),
+                service_id.clone(),
                 "loader",
-                "必须提供 url 或 b64_str 之一".to_string(),
+                error.clone(),
                 TranscribeItemTiming::default(),
                 0.0,
             ));
-            continue;
+        }
+        request_metas[index] = RequestMeta {
+            service_id,
+            audio: Some(audio),
         };
+        if source_error.is_some() {
+            continue;
+        }
         inputs.push(TranscribeInput {
             index,
             source,
@@ -327,10 +360,192 @@ async fn handle_transcribe(
             service.baseline_cuda_used_bytes,
         );
     }
-    Json(TranscribeResponse {
-        data,
-        inference_performance: performance,
-    })
+    let records = data.iter().zip(request_metas).map(|(inference, meta)| {
+        let mut audio = meta.audio.unwrap_or_else(|| {
+            Audio::with_id_from_info(
+                "audio-unknown",
+                AudioSource::from_encoded_bytes(Vec::new()),
+                &fallback_audio_info(),
+            )
+        });
+        repair_fallback_audio_info(&mut audio, inference);
+        attach_inference_timelines(&mut audio, inference);
+        if inference.is_bad {
+            crate::protocol::mark_transcription_failed(
+                &mut audio,
+                inference.bad_component.as_deref().unwrap_or("transcriber"),
+                inference
+                    .bad_reason
+                    .as_deref()
+                    .unwrap_or("transcription failed"),
+            );
+        }
+        crate::protocol::clear_legacy_transcribe_metadata(&mut audio);
+        audio
+    });
+    audio_jsonl_response(records)
+}
+
+fn fallback_audio_info() -> AudioInfo {
+    AudioInfo {
+        sample_rate: 1_000,
+        channels: 1,
+        frame_count: 0,
+        source_format: AudioFormat {
+            encoding: AudioEncoding::Unknown,
+            sample_rate: 1_000,
+            channels: 1,
+        },
+    }
+}
+
+fn valid_audio_info(info: &AudioInfo) -> bool {
+    info.sample_rate > 0
+        && info.channels > 0
+        && info.source_format.sample_rate > 0
+        && info.source_format.channels > 0
+}
+
+fn repair_fallback_audio_info(audio: &mut Audio, inference: &InferenceData) {
+    if audio.info.frame_count != 0 || inference.timings.audio <= 0.0 {
+        return;
+    }
+    let stereo = !inference.text.left.is_empty() || !inference.text.right.is_empty();
+    let channels = if stereo { 2 } else { 1 };
+    let inferred_end_ms = inference
+        .sentences
+        .iter()
+        .map(|sentence| sentence.end_time)
+        .max()
+        .unwrap_or_default();
+    let duration_seconds =
+        (inference.timings.audio / f64::from(channels)).max(inferred_end_ms as f64 / 1_000.0);
+    audio.info.channels = channels;
+    audio.info.source_format.channels = channels;
+    audio.info.frame_count = (duration_seconds * f64::from(audio.info.sample_rate)).ceil() as u64;
+    let duration_ms = audio.info.timeline_duration_ms();
+    let existing_channels = audio.timelines().keys().copied().collect::<Vec<_>>();
+    for channel in existing_channels {
+        if let Ok(Some(timeline)) = audio.timeline_mut(channel) {
+            timeline.duration = duration_ms;
+        }
+    }
+    if stereo && inference.text.mono.is_empty() {
+        let _ = audio.remove_timeline(AudioChannel::Mono);
+    }
+}
+
+fn attach_inference_timelines(audio: &mut Audio, inference: &InferenceData) {
+    let duration = audio.info.timeline_duration_ms();
+    for (channel_name, channel) in [
+        ("mono", AudioChannel::Mono),
+        ("left", AudioChannel::Left),
+        ("right", AudioChannel::Right),
+    ] {
+        let has_text = match channel_name {
+            "left" => !inference.text.left.is_empty(),
+            "right" => !inference.text.right.is_empty(),
+            _ => !inference.text.mono.is_empty(),
+        };
+        let transcript = match channel_name {
+            "left" => &inference.text.left,
+            "right" => &inference.text.right,
+            _ => &inference.text.mono,
+        };
+        let sentences = inference
+            .sentences
+            .iter()
+            .filter(|sentence| sentence.channel == channel_name)
+            .collect::<Vec<_>>();
+        if !has_text && sentences.is_empty() {
+            continue;
+        }
+
+        let mut timeline = Timeline::new(audio.id.clone(), duration);
+        let mut annotation_failed = false;
+        for item in &sentences {
+            let start = item.start_time as usize;
+            let end = item.end_time as usize;
+            if end <= start {
+                continue;
+            }
+            let sentence = Sentence::new(item.text.clone(), start, end);
+            let transcription =
+                Transcription::new(item.text.clone()).with_sentences(vec![sentence]);
+            let speech = Speech::new().with_transcription(transcription);
+            if let Err(error) = timeline.annotate_with(
+                start,
+                end,
+                AudioEvent::from(speech),
+                false,
+                Some("vasr-transcribe"),
+            ) {
+                tracing::warn!(
+                    target: "vasr_transcribe::serve",
+                    audio_id = %audio.id,
+                    channel = channel_name,
+                    error = %error,
+                    "could not attach sentence spans to Audio timeline; falling back to full transcript"
+                );
+                timeline.prediction.clear();
+                annotation_failed = true;
+                break;
+            }
+        }
+        if has_text && (sentences.is_empty() || annotation_failed || timeline.prediction.is_empty())
+        {
+            let speech = Speech::new().with_transcription(Transcription::new(transcript.clone()));
+            if let Err(error) = timeline.annotate_with(
+                0,
+                duration,
+                AudioEvent::from(speech),
+                false,
+                Some("vasr-transcribe"),
+            ) {
+                tracing::warn!(
+                    target: "vasr_transcribe::serve",
+                    audio_id = %audio.id,
+                    channel = channel_name,
+                    error = %error,
+                    "could not attach full transcript to Audio timeline"
+                );
+            }
+        }
+        match audio.ensure_timeline(channel, None) {
+            Ok(slot) => *slot = timeline,
+            Err(error) => tracing::warn!(
+                target: "vasr_transcribe::serve",
+                audio_id = %audio.id,
+                channel = channel_name,
+                error = %error,
+                "could not create Audio timeline for transcription"
+            ),
+        }
+    }
+}
+
+fn audio_jsonl_response(records: impl IntoIterator<Item = Audio>) -> Response {
+    let mut body = Vec::new();
+    for record in records {
+        if let Err(error) = serde_json::to_writer(&mut body, &record) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to encode Audio JSONL response: {error}"),
+            )
+                .into_response();
+        }
+        body.push(b'\n');
+    }
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from(body))
+        .unwrap_or_else(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build Audio JSONL response: {error}"),
+            )
+                .into_response()
+        })
 }
 
 #[cfg(feature = "cuda-graph")]
@@ -597,9 +812,10 @@ struct RequestStartStats {
     mono_false: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct RequestMeta {
     service_id: String,
+    audio: Option<Audio>,
 }
 
 fn short_request_id() -> String {

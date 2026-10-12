@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use asr_data::{
     Audio, AudioDb, AudioDbError, AudioDbMode, AudioQuery, AudioSource, MAX_QUERY_LIMIT,
 };
+use base64::Engine;
 
 use crate::legacy_audiodb::read_legacy_audiodb;
 use crate::{AudioInputDto, ModelScopeSourceDto};
@@ -60,6 +60,8 @@ pub fn audio_input_from_source(
 ) -> AudioInputDto {
     match source {
         AudioSource::Path(path) => AudioInputDto {
+            id: None,
+            info: None,
             url: Some(path.display().to_string()),
             b64_str: None,
             modelscope: None,
@@ -67,6 +69,8 @@ pub fn audio_input_from_source(
             hotword,
         },
         AudioSource::Url(url) => AudioInputDto {
+            id: None,
+            info: None,
             url: Some(url.clone()),
             b64_str: None,
             modelscope: None,
@@ -74,6 +78,8 @@ pub fn audio_input_from_source(
             hotword,
         },
         AudioSource::Base64(data) => AudioInputDto {
+            id: None,
+            info: None,
             url: None,
             b64_str: Some(data.clone()),
             modelscope: None,
@@ -81,6 +87,8 @@ pub fn audio_input_from_source(
             hotword,
         },
         AudioSource::EncodedBytes(bytes) | AudioSource::PcmS16Le { bytes, .. } => AudioInputDto {
+            id: None,
+            info: None,
             url: None,
             b64_str: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
             modelscope: None,
@@ -92,6 +100,8 @@ pub fn audio_input_from_source(
             file_path,
             revision,
         } => AudioInputDto {
+            id: None,
+            info: None,
             url: None,
             b64_str: None,
             modelscope: Some(ModelScopeSourceDto {
@@ -105,12 +115,19 @@ pub fn audio_input_from_source(
     }
 }
 
+pub fn audio_input_from_audio(audio: &Audio, mono: Option<bool>) -> AudioInputDto {
+    let mut input = audio_input_from_source(&audio.source, mono, None);
+    input.id = Some(audio.id.clone());
+    input.info = Some(audio.info.clone());
+    input
+}
+
 pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<AudioInputDto>> {
     if is_vasr_input(path) {
         let audios = read_vasr_audios(path)?;
         return Ok(audios
             .iter()
-            .map(|audio| audio_input_from_source(&audio.source, mono, None))
+            .map(|audio| audio_input_from_audio(audio, mono))
             .collect());
     }
     let text = std::fs::read_to_string(path)
@@ -119,7 +136,10 @@ pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<Audi
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| AudioInputDto {
+        .enumerate()
+        .map(|(index, line)| AudioInputDto {
+            id: Some(Audio::id_for_index(index)),
+            info: None,
             url: Some(line.to_string()),
             b64_str: None,
             modelscope: None,
@@ -138,11 +158,11 @@ mod tests {
         assert!(super::is_vasr_input(path));
     }
     use super::{read_audio_input_dtos, read_vasr_audios};
+    use asr_data::{AudioSource, TimeRange};
     use base64::Engine;
     use rusqlite::Connection;
     use serde::Serialize;
     use std::path::PathBuf;
-    use asr_data::{AudioSource, TimeRange};
 
     const APPLICATION_ID: i64 = 0x5641_5352;
 
