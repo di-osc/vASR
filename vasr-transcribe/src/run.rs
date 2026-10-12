@@ -86,7 +86,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         .map(|bytes_per_token| estimated_kv_tokens.saturating_mul(bytes_per_token));
     tracing::info!(
         target: "vasr_transcribe::run",
-        "run capacity plan | inputs={} audio={:.1}s estimated_kv={}tok estimated_kv_bytes={} estimated_sequences={} safe_capacity={} max_num_seqs={} encoder_batch_segments={} encoder_batch_audio_seconds={:.1}s fallback={}",
+        "start | inputs={} audio={:.1}s kv={}tok/{} sequences={}/{} max_num_seqs={} encoder={}seg/{:.1}s fallback={}",
         items.len(),
         total_input_audio_seconds,
         estimated_kv_tokens,
@@ -125,13 +125,6 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
             mono: true,
         })
         .collect::<Vec<_>>();
-
-    tracing::info!(
-        target: "vasr_transcribe::run",
-        "run | inputs={} input={}",
-        items.len(),
-        args.input.display(),
-    );
 
     let batch_start = Instant::now();
     let outcomes = pipeline.run(inputs).await;

@@ -484,10 +484,10 @@ impl AudioTower {
         let bias_gelu = conv_policy.fused_bias_gelu();
         let native_chunks = conv_policy.native_chunks();
         if conv_policy.auto || nhwc {
-            tracing::info!(target: "vasr::execution", "Metal CNN policy | nhwc={nhwc} im2col32={im2col32} bias_gelu={bias_gelu} native_chunks={native_chunks} explicit_overrides=preserved");
+            tracing::debug!(target: "vasr::execution", "Metal CNN policy | nhwc={nhwc} im2col32={im2col32} bias_gelu={bias_gelu} native_chunks={native_chunks} explicit_overrides=preserved");
         }
         #[cfg(feature = "metal-paged-attn")]
-        tracing::info!(target: "vasr::execution", "Metal encoder policy | conv_tile={:?} attention={:?} fc1_bias_gelu={} overrides=preserved", conv_policy.gemm_tile, policy.attention, policy.fused_fc1_gelu);
+        tracing::debug!(target: "vasr::execution", "Metal encoder policy | conv_tile={:?} attention={:?} fc1_bias_gelu={} overrides=preserved", conv_policy.gemm_tile, policy.attention, policy.fused_fc1_gelu);
 
         let positional_embedding =
             sinusoidal_positional_embedding(cfg.max_source_positions, cfg.d_model, &device)?;

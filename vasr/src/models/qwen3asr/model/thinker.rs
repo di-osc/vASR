@@ -175,7 +175,7 @@ impl ThinkerForConditionalGeneration {
         #[cfg(feature = "metal-paged-attn")]
         let prefill_gemm_tile = policy.prefill_gemm_tile;
         #[cfg(feature = "metal-paged-attn")]
-        tracing::info!(target: "vasr::execution", "Metal GEMM policy | decode={decode_gemm_tile:?} max_decode_rows=128 adaptive_split_rows=32 prefill={prefill_gemm_tile:?}");
+        tracing::debug!(target: "vasr::execution", "Metal GEMM policy | decode={decode_gemm_tile:?} max_decode_rows=128 adaptive_split_rows=32 prefill={prefill_gemm_tile:?}");
         let audio_token_id = cfg
             .audio_token_id
             .context("thinker_config.audio_token_id is required")?;
@@ -211,14 +211,14 @@ impl ThinkerForConditionalGeneration {
         )?;
 
         if metal_auto_packed_prefill {
-            tracing::info!(
+            tracing::debug!(
                 target: "vasr::execution",
                 "validated Metal prefill policy | hardware=M4Pro/48GB model=Qwen3-ASR-0.6B dtype=BF16 packed=true direct_paged=true overrides=preserved"
             );
         }
         #[cfg(feature = "metal-paged-attn")]
         if device.is_metal() {
-            tracing::info!(target: "vasr::execution", autorelease_scope=crate::profiling::autorelease_enabled(metal_auto_packed_prefill), "Metal temporary ownership policy | explicit_override=preserved");
+            tracing::debug!(target: "vasr::execution", autorelease_scope=crate::profiling::autorelease_enabled(metal_auto_packed_prefill), "Metal temporary ownership policy | explicit_override=preserved");
         }
 
         let lm_head = if cfg.text_config.tie_word_embeddings {

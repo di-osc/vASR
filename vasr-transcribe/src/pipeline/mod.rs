@@ -369,13 +369,12 @@ impl AsyncTranscribePipeline {
         let vad_parallelism = worker_options.vad_workers;
         let loaded_queue_memory = loaded_queue_memory_budget();
         let vad_to_asr_queue_memory = loaded_queue_memory_budget();
-        tracing::info!(
+        // 队列与 worker 属于流水线内部细节，正常启动日志不再打印。
+        tracing::debug!(
             target: "vasr_transcribe::pipeline",
-            "pipeline config | loader_workers={} vad_workers={} encoder_batch_segments={} encoder_batch_audio_seconds={:.1} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
+            "pipeline config | loader_workers={} vad_workers={} loaded_queue_mem={:.1}GiB segment_queue_mem={:.1}GiB encoder_request_queue=unbounded feature_queue=unbounded",
             loader_parallelism,
             vad_parallelism,
-            worker_options.encoder_batch_max_segments,
-            worker_options.encoder_batch_max_audio_seconds,
             permits_to_gib(loaded_queue_memory.capacity_permits),
             permits_to_gib(vad_to_asr_queue_memory.capacity_permits)
         );

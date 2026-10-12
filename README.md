@@ -34,17 +34,35 @@ vasr-transcribe serve --model Qwen3-ASR-0.6B
 
 NVIDIA 机器安装时改用 `--features cuda`。`serve` 未指定模型时默认也是 `Qwen3-ASR-0.6B`，监听 `0.0.0.0:8867`。
 
-`serve` 默认按所选设备、模型和可用内存估算 KV 容量，再解析出实际执行批量，启动日志会打印最终生效的策略：
+`serve` 默认按所选设备、模型和可用内存估算 KV 容量，再解析出实际执行批量。启动日志默认只打印几行摘要：VAD、容量解析、生效策略，以及合并成一行的 ASR 与显存。
 
 ```
-serve 执行策略 | device=metal capacity=159 active_slots=64 decode_rows=64 mixed_step=true prefill_wave=16
-Metal CNN policy | nhwc=true im2col32=true bias_gelu=true native_chunks=false explicit_overrides=preserved
-Metal encoder policy | conv_tile=Some(Narrow) attention=Some(GroupedNative) fc1_bias_gelu=true overrides=preserved
+vad | model=fsmn load=0.029 device=cpu
+transcribe tuning | probe=hardware max_num_seqs=177(auto) gpu_memory_budget_fraction=0.800(auto) encoder_batch_max_audio_seconds=120.0(auto) encoder_batch_max_segments=16 workers=load:2/vad:2
+serve 执行策略 | device=metal capacity=177 active_slots=64 decode_rows=64 mixed_step=true prefill_wave=16
+asr | model=Qwen3-ASR-0.6B load=1.077 device=metal dtype=bf16 | gpu | params=1.75GiB kv=5.90GiB
+server ready | http://0.0.0.0:8867 endpoints=health,transcribe
+```
+
+逐组件的 Metal 策略明细、流水线队列配置和各阶段 DEBUG 统计默认都不打印，避免掩盖容量与结果。需要把它们写进性能归档时加 `--verbose`，或显式设置 `VASR_LOG=vasr_transcribe=info,vasr::execution=debug`：
+
+```
 Metal GEMM policy | decode=Some(Adaptive) max_decode_rows=128 adaptive_split_rows=32 prefill=Some(Adaptive)
+Metal CNN policy | nhwc=true im2col32=true bias_gelu=true native_chunks=false explicit_overrides=preserved
+Metal encoder policy | conv_tile=Some(Narrow) attention=GroupedNative fc1_bias_gelu=true overrides=preserved
 Metal temporary ownership policy | explicit_override=preserved autorelease_scope=true
 ```
 
-上面是本机默认启动日志示例；`capacity` 和 encoder 音频预算随启动时可用内存变化。经过验证的 M4 Pro / 48 GB、`Qwen3-ASR-0.6B`、BF16、未量化组合自动选择64槽/64行decode、prefill16和encoder16段；安全容量独立估算。自动启用 Metal packed prefill、Adaptive GEMM、同长窗口 attention 合批、NHWC/3×3 im2col32、CNN与encoder FC1的 bias + GELU 融合，以及局部临时所有权回收。融合保留 dtype 舍入与原 GELU 公式。其他硬件、模型或 dtype 保留保守回退，显式配置优先。
+`run` 同样精简，一次转写只有 `start`、`vad`、`asr | ... | gpu | ...` 和结束行：
+
+```
+start | inputs=3 audio=78.9s kv=1280tok/0.14GiB sequences=4/232 max_num_seqs=4 encoder=1seg/30.0s fallback=false
+vad | model=fsmn load=0.014 device=cpu
+asr | model=Qwen/Qwen3-ASR-0.6B load=0.981 device=metal dtype=bf16 | gpu | params=1.75GiB kv=0.13GiB
+run done | inputs=3 failed=0 audio=78.9s wall=16.4s speed=4.8x rtf=0.2080 output=assets-transcriptions.jsonl
+```
+
+上面是本机启动日志示例；`capacity` 和 encoder 音频预算随启动时可用内存变化。经过验证的 M4 Pro / 48 GB、`Qwen3-ASR-0.6B`、BF16、未量化组合自动选择64槽/64行decode、prefill16和encoder16段；安全容量独立估算。自动启用 Metal packed prefill、Adaptive GEMM、同长窗口 attention 合批、NHWC/3×3 im2col32、CNN与encoder FC1的 bias + GELU 融合，以及局部临时所有权回收。融合保留 dtype 舍入与原 GELU 公式。其他硬件、模型或 dtype 保留保守回退，显式配置优先。
 
 日常启动不需要手写并发参数。需要覆盖时可用 CLI 参数（`--max-num-seqs`、`--gpu-memory-utilization`、`--encoder-batch-max-audio-seconds`）或环境变量（`VASR_METAL_MAX_ACTIVE_SEQS`、`VASR_METAL_PAGED_DECODE_BATCH_SIZE`、`VASR_PREFILL_MAX_WAVE`、`VASR_DISABLE_MIXED_STEP_DECODE`）。显式容量超过估算的安全范围，或低于 VAD 最大分段加 padding 的要求时，服务会在启动阶段报错。
 

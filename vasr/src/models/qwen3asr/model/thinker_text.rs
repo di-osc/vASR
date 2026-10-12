@@ -281,13 +281,13 @@ impl ThinkerTextModel {
         policy: &TextOperatorPolicy,
     ) -> Result<Self> {
         if device.is_metal() {
-            tracing::info!(target: "vasr::execution", fused_residual_norm=policy.fused_residual_norm, "Metal residual RMSNorm policy");
+            tracing::debug!(target: "vasr::execution", fused_residual_norm=policy.fused_residual_norm, "Metal residual RMSNorm policy");
         }
         #[cfg(feature = "paged-attn")]
         if device.is_metal() {
-            tracing::info!(target: "vasr::execution", override_value=?policy.prepared_override,
+            tracing::debug!(target: "vasr::execution", override_value=?policy.prepared_override,
                 enabled=policy.prepared_mrope, "Metal prefill position preparation policy");
-            tracing::info!(target: "vasr::execution", override_value=?policy.packed_rope_override,
+            tracing::debug!(target: "vasr::execution", override_value=?policy.packed_rope_override,
                 enabled=policy.packed_prefill_rope, "Metal packed prefill RoPE policy");
         }
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
@@ -320,7 +320,7 @@ impl ThinkerTextModel {
                 .iter()
                 .filter(|layer| layer.mlp.prefill_gate_up.is_some())
                 .count();
-            tracing::info!(target: "vasr::execution", requested=policy.prefill_gate_up, eligible_layers,
+            tracing::debug!(target: "vasr::execution", requested=policy.prefill_gate_up, eligible_layers,
                 "Metal prefill-only gate/up candidate policy");
         }
 

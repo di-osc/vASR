@@ -49,6 +49,10 @@ if [[ "$experiment" == refactor ]]; then
     printf '%s\n' 'CANDLE_METAL_ENABLE_FAST_MATH=unset (Candle default)' > "$output/floating-point.txt"
 fi
 export VASR_PROFILE=false
+# The per-component execution policy lines are DEBUG and no longer part of the
+# default log filter. Keep them in the archived server log explicitly; this sets
+# log verbosity only, not any capacity/batching override the run must exercise.
+export VASR_LOG=vasr_transcribe=info,vasr::execution=debug
 unset VASR_DISABLE_MIXED_STEP_DECODE VASR_METAL_GEMM_TRACE
 unset VASR_METAL_PREFILL_GATE_UP
 unset VASR_METAL_PREPARED_MROPE

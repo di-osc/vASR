@@ -726,7 +726,8 @@ pub(super) fn log_pipeline(
             );
         }
     }
-    tracing::info!(
+    // 批次汇总与各子命令自己的结束行重复，降到 DEBUG。
+    tracing::debug!(
         target: "vasr_transcribe::pipeline",
         "pipeline | batch={} | returned={} | audio={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3} | bad={}",
         job_count,

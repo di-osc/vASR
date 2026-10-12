@@ -16,7 +16,7 @@ use vasr_transcribe::{
     about = "vASR offline transcribe CLI"
 )]
 struct Cli {
-    /// Show loader, VAD, ASR, and other component runtime logs.
+    /// Show loader, VAD, ASR, per-stage logs, and the resolved execution policy.
     #[arg(long, short, global = true)]
     verbose: bool,
 

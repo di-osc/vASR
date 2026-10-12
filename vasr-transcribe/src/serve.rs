@@ -381,13 +381,21 @@ pub struct ServePipelineArgs {
 /// Backward-compatible alias for the HTTP serve entry point.
 pub type TranscribeArgs = ServeTranscribeArgs;
 
-pub fn init_logging(verbose: bool) {
-    let default = if verbose {
-        "warn,vasr_transcribe=debug,vasr::models::qwen3asr=debug,vasr::execution=info"
+/// 默认日志过滤器。
+///
+/// `vasr::execution` 的逐组件策略明细是 DEBUG，只在 `--verbose` 下打开；汇总行
+/// `{name} 执行策略 | ...` 保持 INFO，继续作为性能归档的配置记录。需要在不加
+/// `--verbose` 时保留明细，显式设置 `VASR_LOG=...,vasr::execution=debug`。
+pub fn default_log_filter(verbose: bool) -> &'static str {
+    if verbose {
+        "warn,vasr_transcribe=debug,vasr::models::qwen3asr=debug,vasr::execution=debug"
     } else {
-        // 默认就打印启动时解析出的统一执行策略，便于性能报告复现配置。
         "warn,vasr_transcribe=info,vasr::execution=info"
-    };
+    }
+}
+
+pub fn init_logging(verbose: bool) {
+    let default = default_log_filter(verbose);
     let filter = std::env::var("VASR_LOG").unwrap_or_else(|_| default.to_string());
 
     tracing_subscriber::fmt()
@@ -401,7 +409,6 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_serve_pipeline(&args.pipeline)?;
     vasr::set_cache_dir(args.pipeline.model.cache_dir.clone());
-    log_transcribe_start();
     let vad_args = internal_vad_args(&args.pipeline.vad)?;
     let vad_model = build_vad_model(&vad_args)?;
     let device = resolve_device(&args.pipeline.model.device)?;
@@ -623,18 +630,6 @@ pub fn build_async_transcribe_pipeline(
     pipeline: &TranscribePipelineArgs,
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
-    build_async_transcribe_pipeline_with_reservation(pipeline, language, 0)
-}
-
-pub(crate) fn build_async_transcribe_pipeline_with_reservation(
-    pipeline: &TranscribePipelineArgs,
-    language: Option<String>,
-    gpu_memory_reserved_bytes: usize,
-) -> Result<AsyncTranscribePipeline> {
-    validate_pipeline(pipeline)?;
-    configure_model_cache_dir(pipeline);
-    log_transcribe_start();
-    let vad = build_vad_model(&pipeline.vad)?;
     log_transcribe_tuning(
         pipeline,
         "not-run",
@@ -642,6 +637,20 @@ pub(crate) fn build_async_transcribe_pipeline_with_reservation(
         "configured",
         "configured",
     );
+    build_async_transcribe_pipeline_with_reservation(pipeline, language, 0)
+}
+
+/// 供一次性 `run` 使用的构建入口。
+///
+/// 容量已经由 `run` 自己的 `start` 摘要行报告，因此这里不再重复打印 tuning 行。
+pub(crate) fn build_async_transcribe_pipeline_with_reservation(
+    pipeline: &TranscribePipelineArgs,
+    language: Option<String>,
+    gpu_memory_reserved_bytes: usize,
+) -> Result<AsyncTranscribePipeline> {
+    validate_pipeline(pipeline)?;
+    configure_model_cache_dir(pipeline);
+    let vad = build_vad_model(&pipeline.vad)?;
     let asr = load_asr_model_for_pipeline_with_reservation(
         pipeline,
         language.as_deref(),
@@ -665,7 +674,6 @@ pub fn build_global_transcribe_pipeline(
 ) -> Result<Arc<GlobalAsyncTranscribePipeline>> {
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
-    log_transcribe_start();
     let vad = build_vad_model(&pipeline.vad)?;
     log_transcribe_tuning(
         pipeline,
@@ -731,7 +739,7 @@ fn build_vad_model(vad_args: &VadCliArgs) -> Result<Option<Arc<dyn VadModel>>> {
         })
     {
         vad_request = "cpu";
-        tracing::info!(
+        tracing::debug!(
             "validated FSMN VAD policy | hardware=M4Pro/48GB device=cpu explicit_override=preserved"
         );
     }
@@ -833,11 +841,6 @@ fn bytes_to_gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// 在加载 VAD 和 ASR 之前打印统一的推理启动日志。
-fn log_transcribe_start() {
-    tracing::info!(target: "vasr_transcribe::serve", "starting transcription");
-}
-
 fn format_transcribe_tuning_log(
     pipeline: &TranscribePipelineArgs,
     probe: &str,
@@ -917,25 +920,22 @@ fn dtype_label(dtype: DType) -> &'static str {
 
 /// 打印 ASR 加载结果和显存占用。
 ///
-/// 显存行只保留整卡占用、参数、KV 和 CUDA graph。paged attention workspace 不写入启动日志。
+/// ASR 与显存合并成一行启动摘要。显存只保留整卡占用、参数、KV 和 CUDA graph；
+/// paged attention workspace 不写入启动日志。
 fn log_model_loaded(
     model: &str,
     dtype: DType,
     stats: &vasr::OfflineAsrBuildStats,
     device: &Device,
 ) {
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "{}",
-        startup_log_line(
-            "asr",
-            &[
-                ("model", model.to_string()),
-                ("load", format_load_seconds(stats.build_seconds)),
-                ("device", device_label(device).to_string()),
-                ("dtype", dtype_label(dtype).to_string()),
-            ],
-        )
+    let asr_line = startup_log_line(
+        "asr",
+        &[
+            ("model", model.to_string()),
+            ("load", format_load_seconds(stats.build_seconds)),
+            ("device", device_label(device).to_string()),
+            ("dtype", dtype_label(dtype).to_string()),
+        ],
     );
 
     if let Some((encoder, text, other)) = stats.quantized_layer_counts
@@ -975,7 +975,8 @@ fn log_model_loaded(
     }
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "{}",
+        "{} | {}",
+        asr_line,
         startup_log_line("gpu", &gpu_fields)
     );
 }
@@ -1659,6 +1660,25 @@ mod tests {
         assert_eq!(
             configured,
             "transcribe tuning | probe=not-run max_num_seqs=107(configured) gpu_memory_budget_fraction=1.000(configured) encoder_batch_max_audio_seconds=66.0(configured) encoder_batch_max_segments=20 workers=load:2/vad:2"
+        );
+    }
+
+    #[test]
+    fn execution_policy_detail_requires_verbose() {
+        let default = default_log_filter(false);
+        assert!(
+            default.contains("vasr::execution=info"),
+            "default filter must keep the resolved-policy summary line: {default}"
+        );
+        assert!(
+            !default.contains("vasr::execution=debug"),
+            "default filter must not enable per-component policy detail: {default}"
+        );
+
+        let verbose = default_log_filter(true);
+        assert!(
+            verbose.contains("vasr::execution=debug"),
+            "verbose filter must enable the per-component policy detail: {verbose}"
         );
     }
 
