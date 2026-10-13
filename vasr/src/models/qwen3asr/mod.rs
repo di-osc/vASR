@@ -75,6 +75,15 @@ impl Qwen3ASR {
         model::weights::load_config_from_pretrained(model_id_or_path)
     }
 
+    /// Inspect tensor shapes without allocating device weights. For ISQ this is
+    /// a conservative dense-weight budget, rather than assuming every tensor is quantized.
+    pub fn pretrained_parameter_bytes(
+        model_id_or_path: &str,
+        dtype: candle_core::DType,
+    ) -> Result<usize> {
+        model::weights::pretrained_parameter_bytes(model_id_or_path, dtype)
+    }
+
     /// Canonical language names supported by the official Qwen3-ASR stack.
     pub fn supported_languages(&self) -> &'static [&'static str] {
         inference::utils::SUPPORTED_LANGUAGES

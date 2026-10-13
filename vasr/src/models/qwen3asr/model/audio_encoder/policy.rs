@@ -79,6 +79,7 @@ impl AudioOperatorPolicy {
         env: &OperatorEnvironment,
         cfg: &AudioEncoderConfig,
         is_metal: bool,
+        is_cuda: bool,
         validated: bool,
     ) -> Result<Self> {
         let mut conv = ConvExecutionPolicy::default();
@@ -112,29 +113,33 @@ impl AudioOperatorPolicy {
                 }
             }
         }
-        let cross_sample = is_metal
-            && match env.var("VASR_METAL_CONV_CROSS_SAMPLE") {
-                Ok(value) => ConvExecutionPolicy::parse_override(
-                    Some(value),
-                    "VASR_METAL_CONV_CROSS_SAMPLE",
-                )?
-                .unwrap_or(false),
+        let (cross_name, chunks_name) = if is_cuda {
+            ("VASR_CUDA_CONV_CROSS_SAMPLE", "VASR_CUDA_CONV_CHUNKS")
+        } else {
+            ("VASR_METAL_CONV_CROSS_SAMPLE", "VASR_METAL_CONV_CHUNKS")
+        };
+        let cross_sample = (is_metal || is_cuda)
+            && match env.var(cross_name) {
+                Ok(value) => {
+                    ConvExecutionPolicy::parse_override(Some(value), cross_name)?.unwrap_or(false)
+                }
                 Err(std::env::VarError::NotPresent) => false,
-                Err(error) => candle_core::bail!("invalid VASR_METAL_CONV_CROSS_SAMPLE: {error}"),
+                Err(error) => candle_core::bail!("invalid {cross_name}: {error}"),
             };
-        let micro_batch = if is_metal {
-            match env.var("VASR_METAL_CONV_CHUNKS") {
+        let max_chunks = if is_cuda { 256 } else { 64 };
+        let micro_batch = if is_metal || is_cuda {
+            match env.var(chunks_name) {
                 Ok(value) => {
                     let value = value.parse::<usize>().map_err(|_| {
-                        candle_core::Error::Msg("VASR_METAL_CONV_CHUNKS must be 1..=64".into())
+                        candle_core::Error::Msg(format!("{chunks_name} must be 1..={max_chunks}"))
                     })?;
-                    if !(1..=64).contains(&value) {
-                        candle_core::bail!("VASR_METAL_CONV_CHUNKS must be 1..=64");
+                    if !(1..=max_chunks).contains(&value) {
+                        candle_core::bail!("{chunks_name} must be 1..={max_chunks}");
                     }
                     value
                 }
                 Err(std::env::VarError::NotPresent) => cfg.conv_chunksize.max(1),
-                Err(error) => candle_core::bail!("invalid VASR_METAL_CONV_CHUNKS: {error}"),
+                Err(error) => candle_core::bail!("invalid {chunks_name}: {error}"),
             }
         } else {
             cfg.conv_chunksize.max(1)
@@ -207,7 +212,7 @@ mod tests {
     fn audio_snapshots_preserve_ranges_presence_and_instance_independence() -> Result<()> {
         let cfg = AudioEncoderConfig::default();
         let first =
-            AudioOperatorPolicy::resolve(&OperatorEnvironment::default(), &cfg, true, true)?;
+            AudioOperatorPolicy::resolve(&OperatorEnvironment::default(), &cfg, true, false, true)?;
         assert_eq!(first.conv.resolve(), (true, true));
         let off = OperatorEnvironment::from_values(&[
             ("VASR_METAL_CONV_NHWC", "false".into()),
@@ -215,7 +220,7 @@ mod tests {
             ("VASR_DEBUG_AUDIO_ENCODER_LAYERS", "false".into()),
             ("VASR_QWEN3_ASR_AUDIO_SEQ_BUCKET", "16".into()),
         ]);
-        let off = AudioOperatorPolicy::resolve(&off, &cfg, true, true)?;
+        let off = AudioOperatorPolicy::resolve(&off, &cfg, true, false, true)?;
         assert_eq!(off.conv.resolve(), (false, false));
         assert!(!off.cross_sample);
         assert!(off.debug_layers);
@@ -223,16 +228,37 @@ mod tests {
         assert_eq!(first.conv.resolve(), (true, true));
         for value in ["0", "65", "invalid", " 8 "] {
             let env = OperatorEnvironment::from_values(&[("VASR_METAL_CONV_CHUNKS", value.into())]);
-            assert!(AudioOperatorPolicy::resolve(&env, &cfg, true, false).is_err());
-            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, false).is_ok());
+            assert!(AudioOperatorPolicy::resolve(&env, &cfg, true, false, false).is_err());
+            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, false, false).is_ok());
         }
         for value in ["REFERENCE", "invalid"] {
             let env =
                 OperatorEnvironment::from_values(&[("VASR_QWEN3_ASR_AUDIO_ATTN", value.into())]);
-            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, false).is_err());
+            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, false, false).is_err());
         }
         Ok(())
     }
+    #[test]
+    fn cuda_conv_overrides_are_backend_scoped_and_bounded() -> Result<()> {
+        let cfg = AudioEncoderConfig::default();
+        let env = OperatorEnvironment::from_values(&[
+            ("VASR_CUDA_CONV_CROSS_SAMPLE", "true".into()),
+            ("VASR_CUDA_CONV_CHUNKS", "32".into()),
+        ]);
+        let cuda = AudioOperatorPolicy::resolve(&env, &cfg, false, true, false)?;
+        assert!(cuda.cross_sample);
+        assert_eq!(cuda.micro_batch, 32);
+        let cpu = AudioOperatorPolicy::resolve(&env, &cfg, false, false, false)?;
+        assert!(!cpu.cross_sample);
+        assert_eq!(cpu.micro_batch, cfg.conv_chunksize);
+        for value in ["0", "257", "invalid"] {
+            let env = OperatorEnvironment::from_values(&[("VASR_CUDA_CONV_CHUNKS", value.into())]);
+            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, true, false).is_err());
+            assert!(AudioOperatorPolicy::resolve(&env, &cfg, false, false, false).is_ok());
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_unicode_conv_override_keeps_legacy_fallback_while_required_values_error() -> Result<()> {
@@ -241,14 +267,14 @@ mod tests {
         let cfg = AudioEncoderConfig::default();
         let conv = OperatorEnvironment::from_values(&[("VASR_METAL_CONV_NHWC", invalid.clone())]);
         assert_eq!(
-            AudioOperatorPolicy::resolve(&conv, &cfg, true, true)?
+            AudioOperatorPolicy::resolve(&conv, &cfg, true, false, true)?
                 .conv
                 .resolve(),
             (true, true)
         );
         let required =
             OperatorEnvironment::from_values(&[("VASR_METAL_CONV_CROSS_SAMPLE", invalid)]);
-        assert!(AudioOperatorPolicy::resolve(&required, &cfg, true, false).is_err());
+        assert!(AudioOperatorPolicy::resolve(&required, &cfg, true, false, false).is_err());
         Ok(())
     }
 }

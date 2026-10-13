@@ -34,6 +34,7 @@ uuid = "1"
 default = ["timing"]
 accelerate = ["vasr/accelerate"]
 cuda = ["cuda-vad", "vasr/cuda", "vasr/cuda-graph", "vasr/flash-attn", "vasr/cuda-quant", "timing", "paged-attn", "cuda-graph"]
+cudnn = ["cuda", "vasr/cudnn"]
 cuda-graph = []
 cuda-vad = ["vasr-vad/cuda"]
 metal = ["vasr/metal-paged-attn", "timing", "paged-attn"]

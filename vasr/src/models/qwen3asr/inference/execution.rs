@@ -7,6 +7,24 @@
 
 use candle_core::Device;
 
+/// Optional CUDA forward serialization for controlled throughput experiments.
+/// Metal always uses the shared model gate for correctness.
+pub(crate) fn model_execution_gate_enabled(device: &Device) -> bool {
+    static CUDA_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    device.is_metal()
+        || (device.is_cuda()
+            && *CUDA_SERIAL.get_or_init(|| {
+                std::env::var("VASR_CUDA_SERIAL_FORWARD")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "on"
+                        )
+                    })
+            }))
+}
+
 /// 未验证 Metal 组合的保守活跃槽位上限。
 ///
 /// 2026-09-30 的算子与批量扫描选出 32 槽、wave 8、encoder 8：

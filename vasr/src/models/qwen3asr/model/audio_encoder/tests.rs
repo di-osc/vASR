@@ -301,6 +301,17 @@ fn test_cross_sample_conv_nonzero_metal_bf16() -> anyhow::Result<()> {
     )
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an idle CUDA GPU"]
+fn test_cross_sample_conv_nonzero_cuda_bf16() -> anyhow::Result<()> {
+    assert_cross_sample_conv_matches_reference(
+        &candle_core::Device::new_cuda(0)?,
+        candle_core::DType::BF16,
+        0.025,
+    )
+}
+
 fn assert_attention_modes(
     device: &candle_core::Device,
     dtype: candle_core::DType,

@@ -170,15 +170,22 @@ fn with_model_execution<T>(
     runtime: &SharedPagedCacheRuntime,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if device.is_metal() {
+    if crate::models::qwen3asr::inference::execution::model_execution_gate_enabled(device) {
         let execution_lock = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?
             .model_execution_lock();
         let _execution_guard = execution_lock
             .lock()
-            .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))?;
-        return operation();
+            .map_err(|_| anyhow::anyhow!("model execution lock poisoned"))?;
+        let result = operation();
+        if device.is_cuda() {
+            let sync = device.synchronize();
+            if result.is_ok() {
+                sync?;
+            }
+        }
+        return result;
     }
     operation()
 }

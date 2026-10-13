@@ -206,8 +206,8 @@ fn blocks_for_byte_budget(byte_budget: usize, bytes_per_block: usize) -> Result<
     if bytes_per_block == 0 {
         candle_core::bail!("paged block byte size must be non-zero");
     }
-    let usable_blocks = byte_budget / bytes_per_block;
-    let num_blocks = usable_blocks.saturating_add(1);
+    // Block zero is physically allocated too; it must fit inside the budget.
+    let num_blocks = byte_budget / bytes_per_block;
     if num_blocks <= 1 {
         candle_core::bail!(
             "paged KV byte budget {byte_budget} is too small for one block ({bytes_per_block} bytes)"
@@ -217,67 +217,23 @@ fn blocks_for_byte_budget(byte_budget: usize, bytes_per_block: usize) -> Result<
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_memory_mib(gpu_id: usize) -> Result<(u64, u64)> {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
-
-    let child = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-            "-i",
-            &gpu_id.to_string(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            candle_core::Error::Msg(format!(
-                "failed to launch nvidia-smi for GPU memory query: {err}"
-            ))
-        })?;
-    let stdout = child
-        .stdout
-        .ok_or_else(|| candle_core::Error::Msg("nvidia-smi produced no stdout".into()))?;
-    let mut lines = BufReader::new(stdout).lines();
-    let line = lines
-        .next()
-        .transpose()
-        .map_err(|err| candle_core::Error::Msg(format!("failed to read nvidia-smi output: {err}")))?
-        .ok_or_else(|| candle_core::Error::Msg("nvidia-smi returned no GPU memory stats".into()))?;
-    let mut parts = line.split(',').map(str::trim);
-    let total_mib = parts
-        .next()
-        .ok_or_else(|| candle_core::Error::Msg("nvidia-smi missing memory.total".into()))?
-        .parse::<u64>()
-        .map_err(|err| {
-            candle_core::Error::Msg(format!("invalid nvidia-smi memory.total {line:?}: {err}"))
-        })?;
-    let used_mib = parts
-        .next()
-        .ok_or_else(|| candle_core::Error::Msg("nvidia-smi missing memory.used".into()))?
-        .parse::<u64>()
-        .map_err(|err| {
-            candle_core::Error::Msg(format!("invalid nvidia-smi memory.used {line:?}: {err}"))
-        })?;
-    Ok((total_mib, used_mib))
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_kv_byte_budget(gpu_id: usize, fraction: f32, reserved_bytes: usize) -> Result<usize> {
-    let (total_mib, used_mib) = cuda_memory_mib(gpu_id)?;
-    let target_mib = ((total_mib as f64) * f64::from(fraction)).floor() as u64;
-    let reserved_mib = reserved_bytes.div_ceil(1024 * 1024) as u64;
-    let budget_mib = target_mib.saturating_sub(used_mib.saturating_add(reserved_mib));
-    if budget_mib == 0 {
+fn cuda_kv_byte_budget(device: &Device, fraction: f32, reserved_bytes: usize) -> Result<usize> {
+    // Match the CUDA driver byte counters used by startup planning.
+    let cuda = device.as_cuda_device()?;
+    let (free, total) = cuda
+        .cuda_stream()
+        .context()
+        .mem_get_info()
+        .map_err(candle_core::Error::wrap)?;
+    let used = total.saturating_sub(free);
+    let target = (total as f64 * f64::from(fraction)).floor() as usize;
+    let budget = target.saturating_sub(used).saturating_sub(reserved_bytes);
+    if budget == 0 {
         candle_core::bail!(
-            "GPU KV budget exhausted: total_mib={total_mib} used_mib={used_mib} reserved_mib={reserved_mib} fraction={fraction}"
+            "GPU KV budget exhausted: total_bytes={total} used_bytes={used} reserved_bytes={reserved_bytes} fraction={fraction}"
         );
     }
-    usize::try_from(budget_mib)
-        .map_err(|_| candle_core::Error::Msg("GPU KV budget MiB overflow".into()))?
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| candle_core::Error::Msg("GPU KV budget byte overflow".into()))
+    Ok(budget)
 }
 
 fn resolve_num_blocks(
@@ -322,12 +278,7 @@ fn resolve_num_blocks(
                 if !(fraction > 0.0 && fraction <= 1.0) {
                     candle_core::bail!("GPU memory fraction must be in (0.0, 1.0]; got {fraction}");
                 }
-                let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
-                    candle_core::bail!(
-                        "GpuMemoryFraction paged cache sizing requires a CUDA device"
-                    );
-                };
-                let byte_budget = cuda_kv_byte_budget(gpu_id, fraction, reserved_bytes)?;
+                let byte_budget = cuda_kv_byte_budget(device, fraction, reserved_bytes)?;
                 let bytes_per_block =
                     bytes_per_paged_block(num_layers, num_kv_heads, head_dim, block_size, dtype)?;
                 blocks_for_byte_budget(byte_budget, bytes_per_block)
@@ -1114,7 +1065,12 @@ mod tests {
     fn blocks_for_byte_budget_reserves_null_block() -> anyhow::Result<()> {
         let bytes_per_block = bytes_per_paged_block(28, 8, 128, 32, DType::BF16)?;
         let num_blocks = blocks_for_byte_budget(bytes_per_block * 10, bytes_per_block)?;
-        assert_eq!(num_blocks, 11);
+        assert_eq!(num_blocks, 10);
+        assert!(blocks_for_byte_budget(bytes_per_block, bytes_per_block).is_err());
+        assert_eq!(
+            blocks_for_byte_budget(bytes_per_block * 10 + bytes_per_block / 2, bytes_per_block)?,
+            10
+        );
         Ok(())
     }
 

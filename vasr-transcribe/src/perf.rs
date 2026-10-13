@@ -248,7 +248,14 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
         summary.audio_seconds_per_second,
         summary.quality_audio_seconds_per_second,
     );
-    print_perf_summary_table(&summary);
+    print_perf_summary_table(&summary, cer.as_ref());
+    if let Some(error) = cer
+        .as_ref()
+        .and_then(|report| report.get("error"))
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("perf CER  | failed: {error}");
+    }
 
     let timestamp = timestamp_file_name();
     let output = args
@@ -670,7 +677,14 @@ fn progress_bar(total: usize) -> ProgressBar {
     progress
 }
 
-fn print_perf_summary_table(summary: &PerfSummary) {
+fn print_perf_summary_table(summary: &PerfSummary, cer: Option<&serde_json::Value>) {
+    let cer_summary = cer.and_then(|report| report.get("summary"));
+    let cer_percent = |key: &str| {
+        cer_summary
+            .and_then(|summary| summary[key].as_f64())
+            .map(|value| format!("{:.4}%", value * 100.0))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
     let table = render_table(
         ["metric", "value"],
         [
@@ -679,6 +693,20 @@ fn print_perf_summary_table(summary: &PerfSummary) {
             vec![
                 "quality passed".to_string(),
                 summary.quality_passed_items.to_string(),
+            ],
+            vec!["weighted CER".to_string(), cer_percent("cer_weighted")],
+            vec!["average CER".to_string(), cer_percent("cer_average")],
+            vec![
+                "CER labeled".to_string(),
+                cer_summary
+                    .and_then(|summary| {
+                        Some(format!(
+                            "{}/{}",
+                            summary["labeled_items"].as_u64()?,
+                            summary["total_items"].as_u64()?
+                        ))
+                    })
+                    .unwrap_or_else(|| "n/a".to_string()),
             ],
             vec!["requests".to_string(), summary.requests.to_string()],
             vec![

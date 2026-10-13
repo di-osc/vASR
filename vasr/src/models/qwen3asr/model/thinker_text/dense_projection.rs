@@ -89,6 +89,7 @@ impl MetalDenseProjection {
     }
 
     /// Apply the current prefill GEMM policy before returning strided views.
+    #[cfg(any(feature = "metal-paged-attn", all(test, feature = "metal")))]
     pub(super) fn forward_prefill_views(&self, xs: &Tensor) -> Result<Vec<Tensor>> {
         let joined = IsqLinear::Linear(self.linear.clone()).forward(&xs.contiguous()?)?;
         self.split_output(&joined)

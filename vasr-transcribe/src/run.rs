@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::device::resolve_device;
+use crate::device::{auto_dtype, resolve_device};
 use crate::eval::{EvalNormalizer, EvalTimeline};
 use crate::inputs::{CollectedInput, audio_input_from_collected, collect_inputs, is_url_input};
 use crate::perf::{
@@ -305,18 +305,13 @@ fn resolve_run_capacity(
             None
         }
     };
-    let model_profile = estimate_model_memory_profile(
+    vasr::set_cache_dir(pipeline.model.cache_dir.clone());
+    let model_profile = Some(estimate_model_memory_profile(
         &pipeline.model.model,
-        pipeline.model.isq.as_deref(),
+        auto_dtype(&device)?,
+        language,
         backend,
-    );
-    if model_profile.is_none() {
-        tracing::warn!(
-            target: "vasr_transcribe::run",
-            model = %pipeline.model.model,
-            "model memory profile unavailable; run will use one decode sequence"
-        );
-    }
+    )?);
 
     let max_segment_seconds = f64::from(pipeline.vad.vad_max_segment_sec);
     let padded_segment_seconds =
@@ -342,7 +337,7 @@ fn resolve_run_capacity(
         model_id,
         language,
         durations_seconds.clone(),
-        pipeline.vad.vad_max_segment_sec,
+        padded_segment_seconds as f32,
         pipeline.model.max_hotword_tokens,
         pipeline.model.kv_peak_ratio,
     )?;
@@ -411,8 +406,10 @@ fn audio_channel(name: &str) -> Result<AudioChannel> {
     }
 }
 
-
-fn run_items_from_collected(input: &str, collected: &[CollectedInput]) -> Result<Vec<RunInputItem>> {
+fn run_items_from_collected(
+    input: &str,
+    collected: &[CollectedInput],
+) -> Result<Vec<RunInputItem>> {
     let base_dir = run_output_base_dir(input);
     Ok(collected
         .iter()
@@ -576,8 +573,8 @@ mod tests {
         let db = AudioDb::create(&input).expect("create db");
         db.insert(&records[0]).expect("insert audio");
 
-        let collected =
-            crate::inputs::collect_inputs(&input.to_string_lossy(), false).expect("collect records");
+        let collected = crate::inputs::collect_inputs(&input.to_string_lossy(), false)
+            .expect("collect records");
         let items = run_items_from_collected(&input.to_string_lossy(), &collected)
             .expect("map vasr records");
 
@@ -610,8 +607,8 @@ mod tests {
         let db = AudioDb::create(&input).expect("create db");
         db.insert(&records[0]).expect("insert audio");
 
-        let collected =
-            crate::inputs::collect_inputs(&input.to_string_lossy(), false).expect("collect records");
+        let collected = crate::inputs::collect_inputs(&input.to_string_lossy(), false)
+            .expect("collect records");
         let items = run_items_from_collected(&input.to_string_lossy(), &collected)
             .expect("map vasr records");
 

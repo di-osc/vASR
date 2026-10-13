@@ -11,7 +11,8 @@ use crate::model_builder::{
 
 use super::{LoadOptions, Qwen3Asr};
 
-const KV_BLOCK_SIZE: usize = 32;
+/// Physical paged KV block size, shared by capacity planning and allocation.
+pub const KV_BLOCK_SIZE: usize = 32;
 const ASR_SAMPLE_RATE_HZ: f64 = 16_000.0;
 const ASR_FEATURE_HOP_LENGTH: usize = 160;
 const KV_BASE_SEGMENT_SEC: f32 = 1.0;
@@ -246,16 +247,8 @@ fn estimate_kv_cache_sizing(
     model_id: &str,
     req: &OfflineAsrBuildRequest,
 ) -> Result<crate::model_builder::KvCacheSizingStats> {
-    let tokenizer = super::processor::tokenizer::Tokenizer::from_pretrained(model_id)?;
-    let fixed_prompt =
-        super::processor::chat_template::build_prompt("", req.runtime.language.as_deref());
-    let audio_pad_id = tokenizer.token_to_id(super::processor::chat_template::AUDIO_PAD)?;
-    let base_prompt_tokens = tokenizer.encode(&fixed_prompt)?;
-    let fixed_prompt_tokens = base_prompt_tokens
-        .iter()
-        .filter(|&&id| id != audio_pad_id)
-        .count();
-
+    let fixed_prompt_tokens =
+        kv_cache_fixed_prompt_tokens(model_id, req.runtime.language.as_deref())?;
     let base = kv_tokens_for_segment(
         fixed_prompt_tokens,
         req.runtime.max_hotword_tokens,
@@ -268,18 +261,14 @@ fn estimate_kv_cache_sizing(
         req.runtime.max_segment_sec,
         super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
     )?;
-    let base_blocks = req
-        .runtime
-        .max_num_seqs
-        .checked_mul(base.blocks_per_seq)
-        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
-    let extra_blocks_per_seq = peak.blocks_per_seq.saturating_sub(base.blocks_per_seq);
-    let peak_extra_blocks = ((req.runtime.max_num_seqs * extra_blocks_per_seq) as f64
-        * f64::from(req.runtime.kv_peak_ratio))
-    .ceil() as usize;
-    let total_blocks = base_blocks
-        .checked_add(peak_extra_blocks)
-        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
+    let total_blocks = kv_blocks_for_sequences(
+        base.blocks_per_seq,
+        peak.blocks_per_seq,
+        req.runtime.max_num_seqs,
+        req.runtime.kv_peak_ratio,
+    )?;
+    let base_blocks = req.runtime.max_num_seqs * base.blocks_per_seq;
+    let peak_extra_blocks = total_blocks - base_blocks;
 
     Ok(crate::model_builder::KvCacheSizingStats {
         max_num_seqs: req.runtime.max_num_seqs,
@@ -302,6 +291,76 @@ fn estimate_kv_cache_sizing(
         total_blocks,
         block_size: KV_BLOCK_SIZE,
     })
+}
+
+/// Count the fixed template tokens using the same tokenizer as inference.
+pub fn kv_cache_fixed_prompt_tokens(model_id: &str, language: Option<&str>) -> Result<usize> {
+    let tokenizer = super::processor::tokenizer::Tokenizer::from_pretrained(model_id)?;
+    let prompt = super::processor::chat_template::build_prompt("", language);
+    let audio_pad_id = tokenizer.token_to_id(super::processor::chat_template::AUDIO_PAD)?;
+    Ok(tokenizer
+        .encode(&prompt)?
+        .iter()
+        .filter(|&&id| id != audio_pad_id)
+        .count())
+}
+
+/// Block-aligned resident KV tokens, including the exact audio encoder length.
+/// Shared by service capacity planning and the model's KV block planner.
+pub fn kv_cache_tokens_for_sequences(
+    fixed_prompt_tokens: usize,
+    max_hotword_tokens: usize,
+    max_segment_seconds: f32,
+    peak_ratio: f32,
+    sequences: usize,
+) -> Result<usize> {
+    if !max_segment_seconds.is_finite() || max_segment_seconds <= 0.0 {
+        anyhow::bail!("maximum VAD segment duration must be finite and greater than zero");
+    }
+    if !peak_ratio.is_finite() || !(0.0..=1.0).contains(&peak_ratio) {
+        anyhow::bail!("KV peak ratio must be finite and between 0.0 and 1.0");
+    }
+    let base = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        max_hotword_tokens,
+        KV_BASE_SEGMENT_SEC,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+    )?;
+    let peak = kv_tokens_for_segment(
+        fixed_prompt_tokens,
+        max_hotword_tokens,
+        max_segment_seconds,
+        super::QWEN3_ASR_DECODE_TOKENS_PER_SEC,
+    )?;
+    kv_blocks_for_sequences(
+        base.blocks_per_seq,
+        peak.blocks_per_seq,
+        sequences,
+        peak_ratio,
+    )?
+    .checked_mul(KV_BLOCK_SIZE)
+    .ok_or_else(|| anyhow::anyhow!("KV token estimate overflow"))
+}
+
+fn kv_blocks_for_sequences(
+    base: usize,
+    peak: usize,
+    sequences: usize,
+    ratio: f32,
+) -> Result<usize> {
+    let base_blocks = sequences
+        .checked_mul(base)
+        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
+    let extra_blocks = sequences
+        .checked_mul(peak.saturating_sub(base))
+        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))?;
+    let extra = (extra_blocks as f64 * f64::from(ratio)).ceil();
+    if extra >= usize::MAX as f64 {
+        anyhow::bail!("KV cache block estimate overflow");
+    }
+    base_blocks
+        .checked_add(extra as usize)
+        .ok_or_else(|| anyhow::anyhow!("KV cache block estimate overflow"))
 }
 
 /// KV cache work estimate for an entire offline input set, using the same
@@ -331,14 +390,7 @@ pub fn estimate_kv_cache_work(
         anyhow::bail!("KV peak ratio must be finite and between 0.0 and 1.0");
     }
 
-    let tokenizer = super::processor::tokenizer::Tokenizer::from_pretrained(model_id)?;
-    let fixed_prompt = super::processor::chat_template::build_prompt("", language);
-    let audio_pad_id = tokenizer.token_to_id(super::processor::chat_template::AUDIO_PAD)?;
-    let prompt_tokens = tokenizer.encode(&fixed_prompt)?;
-    let fixed_prompt_tokens = prompt_tokens
-        .iter()
-        .filter(|&&id| id != audio_pad_id)
-        .count();
+    let fixed_prompt_tokens = kv_cache_fixed_prompt_tokens(model_id, language)?;
     let base = kv_tokens_for_segment(
         fixed_prompt_tokens,
         max_hotword_tokens,
@@ -550,6 +602,36 @@ fn bytes_to_gib(bytes: usize) -> f64 {
 mod tests {
     #[cfg(feature = "paged-attn")]
     use super::*;
+
+    #[test]
+    fn sequence_capacity_uses_exact_audio_tokens_and_shared_block_rounding() -> anyhow::Result<()> {
+        let one = super::kv_tokens_for_segment(17, 128, 1.0, 4.25)?;
+        let thirty = super::kv_tokens_for_segment(17, 128, 30.0, 4.25)?;
+        assert_eq!(super::max_audio_prompt_tokens(1.0), 13);
+        assert_eq!(super::max_audio_prompt_tokens(30.0), 390);
+        assert_eq!(one.blocks_per_seq, 6);
+        assert_eq!(thirty.blocks_per_seq, 21);
+        // Round the aggregate peak contribution, not every sequence separately.
+        assert_eq!(
+            super::kv_cache_tokens_for_sequences(17, 128, 30.0, 0.25, 3)?,
+            (18 + 12) * 32
+        );
+        assert_eq!(
+            super::kv_cache_tokens_for_sequences(17, 128, 30.0, 0.0, 3)?,
+            18 * 32
+        );
+        assert_eq!(
+            super::kv_cache_tokens_for_sequences(17, 128, 30.0, 1.0, 3)?,
+            63 * 32
+        );
+        assert_eq!(
+            super::kv_cache_tokens_for_sequences(17, 128, 30.0, 0.25, 0)?,
+            0
+        );
+        assert!(super::kv_cache_tokens_for_sequences(17, 128, 30.0, f32::NAN, 1).is_err());
+        assert!(super::kv_cache_tokens_for_sequences(17, 128, 30.0, 0.25, usize::MAX).is_err());
+        Ok(())
+    }
 
     #[cfg(feature = "cuda-graph")]
     #[test]

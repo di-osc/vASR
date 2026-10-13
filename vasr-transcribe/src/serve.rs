@@ -419,10 +419,10 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             None
         }
     };
-    #[allow(unused_mut)]
-    let mut model_profile = crate::serve_tuning::estimate_model_memory_profile(
+    let model_profile = crate::serve_tuning::estimate_model_memory_profile(
         &args.pipeline.model.model,
-        args.pipeline.model.isq.as_deref(),
+        auto_dtype(&device)?,
+        args.language.as_deref(),
         if device.is_cuda() {
             crate::serve_tuning::Backend::Cuda
         } else if device.is_metal() {
@@ -430,7 +430,9 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
         } else {
             crate::serve_tuning::Backend::Cpu
         },
-    );
+    )?;
+    #[allow(unused_mut)]
+    let mut model_profile = Some(model_profile);
     #[cfg(feature = "metal")]
     if let Some(profile) = model_profile.as_mut() {
         // Inspect the same checkpoint configuration the loader will use before
@@ -446,9 +448,6 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             vasr::vasr_paged_attn::metal::profile::validated_m4_pro_48gb(&device),
             &geometry,
         );
-    }
-    if model_profile.is_none() {
-        tracing::warn!(target: "vasr_transcribe::serve", "model memory profile unavailable for {:?}; using baseline fallback values", args.pipeline.model.model);
     }
     let overrides = serve_tuning_overrides(&args.pipeline)?;
     let tuning = resolve_tuning(
@@ -1113,7 +1112,9 @@ fn load_asr_model_for_pipeline_on_device(
             runtime: vasr::AsrRuntimeConfig {
                 language: language.map(str::to_string),
                 max_num_seqs: args.max_num_seqs,
-                max_segment_sec: pipeline.vad.vad_max_segment_sec,
+                max_segment_sec: (f64::from(pipeline.vad.vad_max_segment_sec)
+                    + 2.0 * pipeline.vad.vad_pad_ms as f64 / 1000.0)
+                    as f32,
                 max_hotword_tokens: args.max_hotword_tokens,
                 kv_peak_ratio: args.kv_peak_ratio,
                 gpu_memory_utilization: args.gpu_memory_utilization,

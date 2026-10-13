@@ -14,8 +14,6 @@ const MAX_AUTO_ENCODER_SEGMENTS: usize = 32;
 /// Metal 自动模式下单批 encoder 的默认段数（完整数据集验证过的候选）。
 const METAL_AUTO_ENCODER_SEGMENTS: usize = 8;
 const MAX_AUTO_NUM_SEQS: usize = 512;
-const MIN_KV_DECODE_TOKENS: usize = 32;
-const ESTIMATED_FIXED_PROMPT_TOKENS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Backend {
@@ -38,10 +36,12 @@ pub(super) struct ModelMemoryProfile {
     pub validated_metal_100x: bool,
     pub weight_bytes: u64,
     pub kv_bytes_per_token: u64,
+    pub fixed_prompt_tokens: usize,
     pub encoder_bytes_per_audio_second: u64,
     pub cuda_graph_workspace_bytes: u64,
 }
 
+#[cfg(any(feature = "metal", test))]
 pub(super) fn validated_metal_100x_profile(
     model: &str,
     dtype: candle_core::DType,
@@ -160,12 +160,21 @@ pub(super) fn resolve_tuning(
     } else {
         0
     };
-    let source_memory_bytes =
-        crate::pipeline::source_memory_budget(Some(hardware.available_memory_bytes));
+    // CUDA request bodies and encoded audio live in host RAM, not device VRAM.
+    let source_available = if hardware.backend == Backend::Cuda {
+        probe_host_memory().ok().map(|(_, available)| available)
+    } else {
+        Some(hardware.available_memory_bytes)
+    };
+    let source_memory_bytes = crate::pipeline::source_memory_budget(source_available);
     let reserved_bytes = safety_margin_bytes
         .saturating_add(encoder_workspace_bytes)
         .saturating_add(graph_workspace_bytes)
-        .saturating_add(source_memory_bytes as u64);
+        .saturating_add(if hardware.backend == Backend::Cuda {
+            0
+        } else {
+            source_memory_bytes as u64
+        });
     let mut kv_budget_bytes = memory_after_weights.saturating_sub(reserved_bytes);
     let utilization =
         overrides
@@ -191,21 +200,39 @@ pub(super) fn resolve_tuning(
         );
     }
 
-    let expected_tokens_per_sequence = expected_kv_tokens_per_sequence(
-        vad_max_segment_seconds,
-        max_hotword_tokens,
-        kv_peak_ratio,
-    )?;
-    let bytes_per_sequence = model
-        .kv_bytes_per_token
-        .checked_mul(expected_tokens_per_sequence as u64)
-        .ok_or_else(|| anyhow::anyhow!("KV bytes-per-sequence estimate overflow"))?;
-    let memory_limited_sequences = (kv_budget_bytes / bytes_per_sequence.max(1)) as usize;
     let platform_limit = match hardware.backend {
         Backend::Cpu => hardware.cpu_parallelism.saturating_mul(16).max(1),
         Backend::Metal | Backend::Cuda => MAX_AUTO_NUM_SEQS,
     };
-    let capacity_limit = memory_limited_sequences.min(platform_limit);
+    // Use exactly the same prompt/audio lengths, block rounding and peak-ratio
+    // rounding as the model builder. Reserve one null block in the physical pool.
+    let required_bytes = |sequences| -> Result<u64> {
+        let tokens = vasr::models::qwen3asr::builder::kv_cache_tokens_for_sequences(
+            model.fixed_prompt_tokens,
+            max_hotword_tokens,
+            vad_minimum_audio_seconds as f32,
+            kv_peak_ratio,
+            sequences,
+        )?;
+        model
+            .kv_bytes_per_token
+            .checked_mul(
+                (tokens as u64)
+                    .saturating_add(vasr::models::qwen3asr::builder::KV_BLOCK_SIZE as u64),
+            )
+            .ok_or_else(|| anyhow::anyhow!("KV byte estimate overflow"))
+    };
+    let mut low = 0usize;
+    let mut high = platform_limit;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if required_bytes(middle)? <= kv_budget_bytes {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let capacity_limit = low;
     if capacity_limit == 0 {
         bail!(
             "insufficient memory for one ASR sequence after reserving encoder workspace and a 10% safety margin"
@@ -249,30 +276,6 @@ pub(super) fn resolve_tuning(
         used_fallback: false,
         execution,
     })
-}
-
-fn expected_kv_tokens_per_sequence(
-    max_segment_seconds: f64,
-    max_hotword_tokens: usize,
-    peak_ratio: f32,
-) -> Result<u64> {
-    if !peak_ratio.is_finite() || !(0.0..=1.0).contains(&peak_ratio) {
-        bail!("KV peak ratio must be finite and between 0.0 and 1.0");
-    }
-    let base_tokens = ESTIMATED_FIXED_PROMPT_TOKENS as f64
-        + max_hotword_tokens as f64
-        + vasr::QWEN3_ASR_DECODE_TOKENS_PER_SEC.max(MIN_KV_DECODE_TOKENS as f64);
-    let peak_tokens = ESTIMATED_FIXED_PROMPT_TOKENS as f64
-        + max_hotword_tokens as f64
-        + max_segment_seconds * 25.0
-        + (max_segment_seconds * vasr::QWEN3_ASR_DECODE_TOKENS_PER_SEC)
-            .ceil()
-            .max(MIN_KV_DECODE_TOKENS as f64);
-    let expected = base_tokens + (peak_tokens - base_tokens).max(0.0) * f64::from(peak_ratio);
-    if !expected.is_finite() || expected <= 0.0 || expected > u64::MAX as f64 {
-        bail!("KV token estimate is out of range");
-    }
-    Ok(expected.ceil() as u64)
 }
 
 fn fallback_tuning(
@@ -355,28 +358,33 @@ pub(super) fn probe_hardware(device: &Device) -> Result<HardwareProfile> {
 
 pub(super) fn estimate_model_memory_profile(
     model: &str,
-    isq: Option<&str>,
+    dtype: candle_core::DType,
+    language: Option<&str>,
     backend: Backend,
-) -> Option<ModelMemoryProfile> {
-    let lower = model.to_ascii_lowercase();
-    let (parameters, kv_bytes_per_token) = if lower.contains("1.7b") {
-        (1_700_000_000u64, 112 * 1024u64)
-    } else if lower.contains("0.6b") {
-        (600_000_000u64, 112 * 1024u64)
-    } else {
-        return None;
-    };
-    let bytes_per_parameter = match isq.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("4" | "q4_0" | "q4_k") => 0.65,
-        Some("8" | "q8_0" | "q8") => 1.1,
-        _ if backend == Backend::Cpu => 4.0,
-        _ => 2.0,
-    };
-    Some(ModelMemoryProfile {
+) -> Result<ModelMemoryProfile> {
+    use vasr::models::qwen3asr::{Qwen3ASR, resolve_qwen3_asr_model_id};
+    let model_id = resolve_qwen3_asr_model_id(model);
+    let config = Qwen3ASR::pretrained_config(model_id)?;
+    let text = &config.thinker_config.text_config;
+    let kv_bytes_per_token = [
+        text.num_hidden_layers,
+        text.num_key_value_heads,
+        text.head_dim,
+        2,
+        dtype.size_in_bytes(),
+    ]
+    .into_iter()
+    .try_fold(1u64, |product, n| product.checked_mul(n as u64))
+    .ok_or_else(|| anyhow::anyhow!("KV bytes per token overflow"))?;
+    Ok(ModelMemoryProfile {
         validated_metal_100x: false,
-        weight_bytes: (parameters as f64 * bytes_per_parameter) as u64,
+        // Quantized models keep some tensors dense; use the full dense checkpoint
+        // as a conservative estimate until the loader can report resident ISQ bytes.
+        weight_bytes: Qwen3ASR::pretrained_parameter_bytes(model_id, dtype)? as u64,
         kv_bytes_per_token,
-        // At the 32-segment baseline this reserves roughly 2 GiB for a 30-second batch.
+        fixed_prompt_tokens: vasr::models::qwen3asr::builder::kv_cache_fixed_prompt_tokens(
+            model_id, language,
+        )?,
         encoder_bytes_per_audio_second: 64 * 1024 * 1024,
         cuda_graph_workspace_bytes: if backend == Backend::Cuda
             && cfg!(feature = "cuda-graph")
@@ -510,11 +518,119 @@ mod tests {
                 validated_metal_100x: false,
                 weight_bytes: GIB,
                 kv_bytes_per_token: 112 * 1024,
+                fixed_prompt_tokens: 128,
                 encoder_bytes_per_audio_second: 64 * 1024 * 1024,
                 cuda_graph_workspace_bytes: 1024 * 1024 * 1024,
             },
             ServeTuningOverrides::default(),
         )
+    }
+
+    #[test]
+    #[ignore = "requires VASR_TEST_MODEL_DIR pointing to a complete Qwen3-ASR checkpoint"]
+    fn checkpoint_profile_and_capacity_without_device_allocation() -> anyhow::Result<()> {
+        let path = std::env::var("VASR_TEST_MODEL_DIR")?;
+        let model = super::estimate_model_memory_profile(
+            &path,
+            candle_core::DType::BF16,
+            None,
+            Backend::Cuda,
+        )?;
+        let hardware = HardwareProfile {
+            backend: Backend::Cuda,
+            total_memory_bytes: 24 * GIB,
+            available_memory_bytes: 24 * GIB,
+            cpu_parallelism: 16,
+        };
+        let tuning = resolve_tuning(
+            Some(hardware),
+            Some(model),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides::default(),
+        )?;
+        assert!(model.weight_bytes > 0);
+        assert!(model.fixed_prompt_tokens > 0);
+        println!(
+            "checkpoint weight_bytes={} kv_bytes_per_token={} fixed_prompt_tokens={}\nsimulated free 24 GiB: max_num_seqs={} reserved_gpu_bytes={} encoder_seconds={}",
+            model.weight_bytes,
+            model.kv_bytes_per_token,
+            model.fixed_prompt_tokens,
+            tuning.max_num_seqs,
+            tuning.reserved_gpu_bytes,
+            tuning.encoder_batch_max_audio_seconds
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_reserves_device_workspace_but_not_host_source_buffers() {
+        let (hardware, model, overrides) = input(24);
+        let tuning =
+            resolve_tuning(Some(hardware), Some(model), 30.0, 0, 128, 0.25, overrides).unwrap();
+        let safety =
+            ((hardware.available_memory_bytes - model.weight_bytes) as f64 * 0.1).ceil() as u64;
+        let encoder = (model.encoder_bytes_per_audio_second as f64
+            * tuning.encoder_batch_max_audio_seconds
+            * tuning.encoder_batch_max_segments as f64
+            / 32.0)
+            .ceil() as u64;
+        assert_eq!(
+            tuning.reserved_gpu_bytes as u64,
+            safety + encoder + model.cuda_graph_workspace_bytes
+        );
+        assert!(tuning.source_memory_bytes > 0);
+    }
+
+    #[test]
+    fn capacity_is_the_largest_count_that_fits_exact_block_budget() {
+        let (hardware, model, overrides) = input(24);
+        let tuning =
+            resolve_tuning(Some(hardware), Some(model), 30.0, 0, 128, 0.25, overrides).unwrap();
+        let budget =
+            hardware.available_memory_bytes - model.weight_bytes - tuning.reserved_gpu_bytes as u64;
+        let bytes = |n| {
+            (vasr::models::qwen3asr::builder::kv_cache_tokens_for_sequences(
+                model.fixed_prompt_tokens,
+                128,
+                30.0,
+                0.25,
+                n,
+            )
+            .unwrap() as u64
+                + 32)
+                * model.kv_bytes_per_token
+        };
+        assert!(bytes(tuning.max_num_seqs) <= budget);
+        assert!(bytes(tuning.max_num_seqs + 1) > budget);
+        let allowed = resolve_tuning(
+            Some(hardware),
+            Some(model),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides {
+                max_num_seqs: Some(tuning.max_num_seqs),
+                ..overrides
+            },
+        );
+        assert!(allowed.is_ok());
+        let rejected = resolve_tuning(
+            Some(hardware),
+            Some(model),
+            30.0,
+            0,
+            128,
+            0.25,
+            ServeTuningOverrides {
+                max_num_seqs: Some(tuning.max_num_seqs + 1),
+                ..overrides
+            },
+        );
+        assert!(rejected.is_err());
     }
 
     #[test]
