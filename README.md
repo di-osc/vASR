@@ -33,3 +33,4 @@ cargo install --path vasr-transcribe --force --features cuda
 | 应用 | 模型 | 设备 | 吞吐（音频秒 / 墙钟秒） | 实时率 RTF | 加权 CER | 运行命令 |
 | --- | --- | --- | ---: | ---: | ---: | --- |
 | `vasr-transcribe` | Qwen3-ASR-0.6B | Apple M4 Pro（48 GB，Metal） | **123.30×**（中位） | 0.0081 | 16.5876% | `vasr-transcribe serve --model Qwen3-ASR-0.6B`<br>`vasr-transcribe perf -i datasets/call-100.db` |
+| `vasr-transcribe` | Qwen3-ASR-0.6B | Apple M4 Pro（48 GB，Metal） | **118.65×**（最高实测） | 0.008428 | 4.3336% | `vasr-transcribe serve --model Qwen3-ASR-0.6B`<br>`vasr-transcribe perf -i datasets/aishell1-test-200.db --concurrency 14 --batch-size 16` |
