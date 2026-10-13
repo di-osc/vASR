@@ -10,6 +10,28 @@ pub fn continuous_paged_batch_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CONTINUOUS_BATCH").is_none()
 }
 
+/// Whether encoder chunks are grouped by length before batching.
+///
+/// Length grouping keeps similar-length segments in the same encoder batch, which
+/// sharply lowers the padding the audio encoder has to execute (measured ~1.7x vs
+/// ~2.9x executed/valid frames on `call-100`). It historically followed continuous
+/// batching, but the two are independent and grouping is the better default; set
+/// `VASR_ASR_BUCKET_BY_LENGTH=0` to stream chunks in arrival order instead.
+pub fn bucket_by_length_enabled() -> bool {
+    match std::env::var("VASR_ASR_BUCKET_BY_LENGTH") {
+        Ok(value) => truthy(&value),
+        Err(_) => true,
+    }
+}
+
+/// Parse the truthy spellings shared by optional feature toggles.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Canonical list of languages supported by the official Qwen3-ASR Python stack.
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "Chinese",
@@ -453,6 +475,16 @@ mod tests {
             anyhow::bail!("unexpected parse: lang={lang:?} text={text:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_truthy_flag_spellings() {
+        for value in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(super::truthy(value), "{value} should be truthy");
+        }
+        for value in ["0", "false", "no", "off", ""] {
+            assert!(!super::truthy(value), "{value} should be falsy");
+        }
     }
 
     #[test]
