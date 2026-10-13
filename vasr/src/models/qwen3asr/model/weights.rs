@@ -41,6 +41,47 @@ pub(crate) fn load_config_from_pretrained(model_id_or_path: &str) -> Result<AsrC
     load_config_json(&resolve_model_dir(model_id_or_path)?)
 }
 
+pub(crate) fn pretrained_parameter_bytes(model_id_or_path: &str, dtype: DType) -> Result<usize> {
+    let dir = resolve_model_dir(model_id_or_path)?;
+    let paths = ensure_weights_files(model_id_or_path, &dir)?;
+    let mut bytes = 0usize;
+    for path in paths {
+        let mut file = fs::File::open(&path)?;
+        let mut length = [0u8; 8];
+        file.read_exact(&mut length)?;
+        let header_len = usize::try_from(u64::from_le_bytes(length))?;
+        if header_len as u64 > file.metadata()?.len().saturating_sub(8) {
+            bail!("invalid safetensors header length in {path:?}");
+        }
+        let mut header = vec![0; header_len];
+        file.read_exact(&mut header)?;
+        let tensors: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)?;
+        for (name, tensor) in tensors {
+            if name == "__metadata__" {
+                continue;
+            }
+            let shape = tensor
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| anyhow::anyhow!("missing tensor shape for {name:?}"))?;
+            let mut elements = 1usize;
+            for dimension in shape {
+                let n = dimension
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("invalid tensor shape"))?;
+                elements = elements
+                    .checked_mul(usize::try_from(n)?)
+                    .ok_or_else(|| anyhow::anyhow!("tensor size overflow"))?;
+            }
+            bytes = elements
+                .checked_mul(dtype.size_in_bytes())
+                .and_then(|n| bytes.checked_add(n))
+                .ok_or_else(|| anyhow::anyhow!("parameter bytes overflow"))?;
+        }
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn load_model_from_pretrained(
     model_id_or_path: &str,
     device: &Device,
@@ -551,6 +592,34 @@ mod tests {
         } else {
             fs::write(dir.join("model.safetensors"), [1u8])?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pretrained_parameter_budget_counts_mixed_dtype_shapes_at_load_dtype() -> anyhow::Result<()> {
+        let dir = unique_tmp_dir("qwen_weight_budget")?;
+        write_minimal_local_model(&dir, true, false)?;
+        let header = serde_json::to_vec(&serde_json::json!({
+            "a": {"dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12]},
+            "b": {"dtype": "F32", "shape": [4], "data_offsets": [12, 28]},
+            "__metadata__": {"format": "pt"}
+        }))?;
+        let mut data = (header.len() as u64).to_le_bytes().to_vec();
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&[0; 28]);
+        fs::write(dir.join("model.safetensors"), data)?;
+        let path = dir
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid test path"))?;
+        assert_eq!(
+            super::pretrained_parameter_bytes(path, candle_core::DType::BF16)?,
+            20
+        );
+        assert_eq!(
+            super::pretrained_parameter_bytes(path, candle_core::DType::F32)?,
+            40
+        );
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

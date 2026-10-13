@@ -130,7 +130,12 @@ fn stack_features_inner(
             .ok_or_else(|| anyhow::anyhow!("prepared input_features missing first row"))?
     };
 
-    let mut feats: Vec<f32> = Vec::with_capacity(batch.saturating_mul(mel).saturating_mul(frames));
+    let elements = batch
+        .checked_mul(mel)
+        .and_then(|n| n.checked_mul(frames))
+        .ok_or_else(|| anyhow::anyhow!("stacked feature size overflow"))?;
+    // Zero the final buffer once; only copy valid row data into each slot.
+    let mut feats = vec![0.0f32; elements];
     let mut feature_lens: Vec<usize> = Vec::with_capacity(batch);
 
     for (i, p) in prepared.iter().enumerate() {
@@ -152,31 +157,15 @@ fn stack_features_inner(
                 p.feature_attention_mask.len()
             );
         }
-        for row in &p.input_features {
-            if allow_variable_frames {
-                if row.len() > frames {
-                    bail!(
-                        "prepared[{i}].input_features row len exceeds max frames: max={frames}, got={}",
-                        row.len()
-                    );
-                }
-                feats.extend_from_slice(row);
-                if row.len() < frames {
-                    feats.extend(std::iter::repeat_n(0.0f32, frames - row.len()));
-                }
-            } else if row.len() != frames {
+        for (row_index, row) in p.input_features.iter().enumerate() {
+            if row.len() > frames || (!allow_variable_frames && row.len() != frames) {
                 bail!(
-                    "prepared[{i}].input_features row len mismatch: expected={frames}, got={}",
+                    "prepared[{i}].input_features row length mismatch: frames={frames}, got={}",
                     row.len()
                 );
-            } else {
-                feats.extend_from_slice(row);
             }
-        }
-        if allow_variable_frames {
-            for _ in p.input_features.len()..mel {
-                feats.extend(std::iter::repeat_n(0.0f32, frames));
-            }
+            let offset = (i * mel + row_index) * frames;
+            feats[offset..offset + row.len()].copy_from_slice(row);
         }
         feature_lens.push(p.feature_attention_mask.iter().filter(|&&x| x != 0).count());
     }
@@ -1238,6 +1227,7 @@ fn encode_prepared_audio_features_cpu(
     timings.forward_us = forward_us;
     timings.d2h_us = d2h_us;
     timings.audio_tokens = audio_tokens;
+    crate::profiling::log_snapshot();
     Ok((audio_features_cpu, timings))
 }
 
@@ -1247,7 +1237,7 @@ fn with_metal_model_execution<T>(
     paged_runtime: Option<&SharedPagedCacheRuntime>,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if device.is_metal()
+    if super::execution::model_execution_gate_enabled(device)
         && let Some(runtime) = paged_runtime
     {
         let execution_lock = runtime
@@ -1256,8 +1246,15 @@ fn with_metal_model_execution<T>(
             .model_execution_lock();
         let _execution_guard = execution_lock
             .lock()
-            .map_err(|_| anyhow::anyhow!("Metal model execution lock poisoned"))?;
-        return operation();
+            .map_err(|_| anyhow::anyhow!("model execution lock poisoned"))?;
+        let result = operation();
+        if device.is_cuda() {
+            let sync = device.synchronize();
+            if result.is_ok() {
+                sync?;
+            }
+        }
+        return result;
     }
     operation()
 }
@@ -3093,3 +3090,39 @@ mod batch_grouping_tests {
 #[cfg(test)]
 #[path = "encoded_selection_tests.rs"]
 mod encoded_selection_tests;
+
+#[cfg(test)]
+mod feature_stack_tests {
+    use super::*;
+
+    #[test]
+    fn native_length_features_stack_identically_to_cpu_padded_features() -> Result<()> {
+        let short = PreparedInputs {
+            input_ids: vec![1],
+            attention_mask: vec![1],
+            input_features: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            feature_attention_mask: vec![1, 1],
+        };
+        let long = PreparedInputs {
+            input_ids: vec![1],
+            attention_mask: vec![1],
+            input_features: vec![vec![5.0, 6.0, 7.0], vec![8.0, 9.0, 10.0]],
+            feature_attention_mask: vec![1, 1, 1],
+        };
+        let (native, native_lens) =
+            stack_features_varlen(&[short.clone(), long.clone()], &Device::Cpu)?;
+        let mut padded = short;
+        for row in &mut padded.input_features {
+            row.push(0.0);
+        }
+        padded.feature_attention_mask.push(0);
+        let (reference, reference_lens) = stack_features_varlen(&[padded, long], &Device::Cpu)?;
+        assert_eq!(native_lens, reference_lens);
+        assert_eq!(native.dims(), reference.dims());
+        assert_eq!(
+            native.flatten_all()?.to_vec1::<f32>()?,
+            reference.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+}

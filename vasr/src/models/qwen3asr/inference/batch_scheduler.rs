@@ -1416,7 +1416,7 @@ impl AsrBatchScheduler {
         // directly, so it must hold the same Metal gate across prefill and decode.
         // Fetch the gate and release the cache mutex before waiting on it to keep
         // lock ordering consistent with the shared staged path.
-        let execution_lock = if device.is_metal() {
+        let execution_lock = if super::execution::model_execution_gate_enabled(device) {
             Some(
                 runtime
                     .lock()
@@ -1832,7 +1832,7 @@ impl AsrBatchScheduler {
         // Unlike the asynchronous shared scheduler, this offline path calls the
         // non-shared paged engine while retaining the runtime mutex. Acquire the
         // device gate first to preserve a single lock order across all paths.
-        let execution_lock = if device.is_metal() {
+        let execution_lock = if super::execution::model_execution_gate_enabled(device) {
             Some(
                 runtime
                     .lock()

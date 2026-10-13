@@ -260,6 +260,27 @@ impl CudaGraphPrewarmStats {
     }
 }
 
+fn cuda_graph_batch_step() -> usize {
+    static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("VASR_CUDA_GRAPH_BATCH_STEP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|step| matches!(step, 4 | 8 | 16 | 32))
+            .unwrap_or(16)
+    })
+}
+
+fn rounded_graph_batch(actual_batch: usize, step: usize) -> usize {
+    match actual_batch {
+        1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        5..=8 => 8,
+        n => n.div_ceil(step) * step,
+    }
+}
+
 /// Match osc-transformers/vLLM-style decode graph batch buckets.
 ///
 /// Small batches get exact powers of two. Larger batches use multiples of 16 so a
@@ -273,13 +294,7 @@ pub fn cuda_graph_batch_bucket(actual_batch: usize, max_batch: usize) -> Option<
         return Some(max_batch);
     }
     let min_bucket = cuda_graph_min_bucket(max_batch);
-    let bucket = match actual_batch {
-        1 => 1,
-        2 => 2,
-        3 | 4 => 4,
-        5..=8 => 8,
-        n => n.div_ceil(16) * 16,
-    };
+    let bucket = rounded_graph_batch(actual_batch, cuda_graph_batch_step());
     Some(bucket.max(min_bucket).min(max_batch))
 }
 
@@ -298,12 +313,13 @@ pub fn cuda_graph_batch_buckets(max_batch: usize) -> Vec<usize> {
             out.push(bucket);
         }
     }
-    let mut bucket = 16usize;
+    let step = cuda_graph_batch_step();
+    let mut bucket = (8 / step + 1) * step;
     while bucket <= max_batch {
         if bucket >= min_bucket {
             out.push(bucket);
         }
-        bucket = bucket.saturating_add(16);
+        bucket = bucket.saturating_add(step);
     }
     if out.is_empty() {
         out.push(min_bucket.min(max_batch));
@@ -1019,6 +1035,22 @@ mod tests {
         bucket_block_table_cols, cuda_graph_batch_bucket, cuda_graph_batch_buckets,
         pad_decode_batch_to_max,
     };
+
+    #[test]
+    fn finer_batch_steps_reduce_padding_without_shrinking_active_rows() {
+        for step in [4, 8, 16, 32] {
+            for actual in 1..=512 {
+                let rounded = super::rounded_graph_batch(actual, step);
+                assert!(rounded >= actual);
+                if actual > 8 {
+                    assert!(rounded - actual < step);
+                }
+            }
+        }
+        assert_eq!(super::rounded_graph_batch(17, 8), 24);
+        assert_eq!(super::rounded_graph_batch(17, 4), 20);
+        assert_eq!(super::rounded_graph_batch(9, 4), 12);
+    }
 
     #[test]
     fn cuda_graph_batch_bucket_matches_osc_transformers_schedule() {

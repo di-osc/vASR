@@ -83,6 +83,7 @@ struct ThinkerTextDecoderLayer {
     mlp: ThinkerTextMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    #[cfg(feature = "metal-paged-attn")]
     fused_residual_norm: bool,
 }
 
@@ -116,6 +117,7 @@ impl ThinkerTextDecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            #[cfg(feature = "metal-paged-attn")]
             fused_residual_norm: policy.fused_residual_norm,
         })
     }
@@ -248,6 +250,7 @@ pub struct ThinkerTextModel {
     norm: RmsNorm,
     rotary_emb: MultimodalRope,
     prepared_mrope: bool,
+    #[cfg(feature = "metal-paged-attn")]
     packed_prefill_rope: bool,
     hidden_size: usize,
     use_flash_attn: bool,
@@ -281,7 +284,12 @@ impl ThinkerTextModel {
         policy: &TextOperatorPolicy,
     ) -> Result<Self> {
         if device.is_metal() {
-            tracing::debug!(target: "vasr::execution", fused_residual_norm=policy.fused_residual_norm, "Metal residual RMSNorm policy");
+            tracing::debug!(target: "vasr::execution",
+                fused_residual_norm=policy.fused_residual_norm,
+                prefill_fused_silu_mul=policy.prefill_fused_silu_mul,
+                direct_paged_attention=policy.direct_paged_attention,
+                packed_prefill_rope=policy.packed_prefill_rope,
+                "Metal text operator policy");
         }
         #[cfg(feature = "paged-attn")]
         if device.is_metal() {
@@ -333,6 +341,7 @@ impl ThinkerTextModel {
             norm,
             rotary_emb,
             prepared_mrope: policy.prepared_mrope,
+            #[cfg(feature = "metal-paged-attn")]
             packed_prefill_rope: policy.packed_prefill_rope,
             hidden_size: cfg.hidden_size,
             use_flash_attn,
@@ -532,11 +541,13 @@ impl ThinkerTextModel {
         }
 
         let (cos, sin) = self.rotary_emb.build_cache(inputs_embeds, position_ids)?;
-        let mut prepared = if self.prepared_mrope {
+        let prepared = if self.prepared_mrope {
             self.rotary_emb.prepare_prefill_cache(&cos, &sin, seq_len)?
         } else {
             None
         };
+        #[cfg(feature = "metal-paged-attn")]
+        let mut prepared = prepared;
         #[cfg(feature = "metal-paged-attn")]
         if self.packed_prefill_rope
             && let Some(prepared) = &mut prepared

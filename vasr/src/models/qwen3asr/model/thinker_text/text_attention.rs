@@ -389,7 +389,7 @@ pub(super) fn mask_nonzero_indices_u32(mask: &Tensor, seq_len: usize) -> Result<
 
 #[derive(Debug, Clone)]
 pub(super) struct ThinkerTextAttention {
-    #[cfg(feature = "paged-attn")]
+    #[cfg(feature = "metal-paged-attn")]
     pub(super) direct_paged_attention: bool,
     pub(super) fused_qkv: Option<MetalDenseProjection>,
     pub(super) use_flash_attn: bool,
@@ -469,7 +469,7 @@ impl ThinkerTextAttention {
         let fused_qkv =
             MetalDenseProjection::new(&[&q_proj, &k_proj, &v_proj], policy.dense_fusion)?;
         Ok(Self {
-            #[cfg(feature = "paged-attn")]
+            #[cfg(feature = "metal-paged-attn")]
             direct_paged_attention: policy.direct_paged_attention,
             fused_qkv,
             use_flash_attn,

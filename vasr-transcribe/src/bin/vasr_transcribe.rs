@@ -62,6 +62,48 @@ fn load_dotenv() -> Result<()> {
     Ok(())
 }
 
+/// 一键套用 RTX 4090 上验证过的 CUDA 调优取值。
+///
+/// `VASR_CUDA_TUNED=1/true/on` 时，为尚未显式设置的调优项注入默认值；只补齐缺失
+/// 的键，环境变量与 `.env` 里已有的显式取值始终优先。这样大多数部署保持原有
+/// 默认，需要复现吞吐基线时只需打开这一个开关。
+fn apply_cuda_tuned_preset() {
+    let enabled = env::var("VASR_CUDA_TUNED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    // 编码批次放大到显存容量允许的上限，VAD 移到 CPU 释放 GPU，并放开 CPU VAD
+    // worker、CUDA Graph 步长和预填充合批等待。`VASR_CUDA_CONV_CROSS_SAMPLE` 与
+    // `VASR_CUDA_SERIAL_FORWARD` 已是 CUDA 默认，无需在此重复。
+    const PRESET: &[(&str, &str)] = &[
+        ("VASR_VAD_DEVICE", "cpu"),
+        ("VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS", "240"),
+        ("VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS", "32"),
+        ("VASR_CUDA_CONV_CHUNKS", "64"),
+        ("VASR_CUDA_GRAPH_BATCH_STEP", "4"),
+        ("VASR_VAD_NUM_THREADS", "1"),
+        ("VASR_ASR_PREFILL_COALESCE_WAIT_MS", "50"),
+        ("VASR_NUM_VAD_WORKERS", "8"),
+        ("VASR_NUM_LOAD_WORKERS", "4"),
+    ];
+    for (key, value) in PRESET {
+        if env::var_os(key).is_some() {
+            continue;
+        }
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+}
+
 /// 解析 `.env` 内容：跳过空行和注释，拆掉值两侧成对的引号。
 fn parse_dotenv_entries(content: &str) -> Vec<(String, String)> {
     content
@@ -93,6 +135,7 @@ fn parse_dotenv_entries(content: &str) -> Vec<(String, String)> {
 /// 加载 `.env`，在 tokio 运行时上执行选中的子命令。
 fn main() -> Result<()> {
     load_dotenv()?;
+    apply_cuda_tuned_preset();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

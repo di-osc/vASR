@@ -169,12 +169,11 @@ impl AsrProcessor {
                         }
                     }
                 } else {
-                    let mut feats: Vec<feature_extractor::Features> = wavs
-                        .par_iter()
+                    // Varlen stacking pads directly into the final contiguous
+                    // device input. Avoid first growing every CPU feature row.
+                    wavs.par_iter()
                         .map(|wav| feature_extractor::extract_features(wav))
-                        .collect::<Result<Vec<_>>>()?;
-                    pad_feature_batch_to_max_frames(feats.as_mut_slice())?;
-                    feats
+                        .collect::<Result<Vec<_>>>()?
                 };
                 Ok(feats)
             },

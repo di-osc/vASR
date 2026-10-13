@@ -27,7 +27,13 @@ impl AudioAttention {
         isq: Option<&str>,
     ) -> Result<Self> {
         let env = OperatorEnvironment::capture();
-        let policy = AudioOperatorPolicy::resolve(&env, cfg, vb.device().is_metal(), false)?;
+        let policy = AudioOperatorPolicy::resolve(
+            &env,
+            cfg,
+            vb.device().is_metal(),
+            vb.device().is_cuda(),
+            false,
+        )?;
         Self::load_with_policy(cfg, vb, use_flash_attn, isq, &policy)
     }
 

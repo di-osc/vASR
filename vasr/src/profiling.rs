@@ -93,28 +93,21 @@ pub(crate) fn measure<T, E: From<candle_core::Error>>(
     measure_with_autorelease(stage, device, false, operation)
 }
 
+#[cfg(feature = "metal-paged-attn")]
 pub(crate) fn autorelease_enabled(automatic: bool) -> bool {
-    #[cfg(feature = "metal-paged-attn")]
-    {
-        static AUTORELEASE: OnceLock<Option<bool>> = OnceLock::new();
-        AUTORELEASE
-            .get_or_init(|| {
-                std::env::var("VASR_METAL_AUTORELEASEPOOL")
-                    .ok()
-                    .map(|value| {
-                        matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    })
-            })
-            .unwrap_or(automatic)
-    }
-    #[cfg(not(feature = "metal-paged-attn"))]
-    {
-        let _ = automatic;
-        false
-    }
+    static AUTORELEASE: OnceLock<Option<bool>> = OnceLock::new();
+    AUTORELEASE
+        .get_or_init(|| {
+            std::env::var("VASR_METAL_AUTORELEASEPOOL")
+                .ok()
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+        })
+        .unwrap_or(automatic)
 }
 
 pub(crate) fn measure_with_autorelease<T, E: From<candle_core::Error>>(

@@ -10,6 +10,7 @@ use candle_nn::{Module, VarBuilder};
 pub(super) struct ThinkerTextMlp {
     pub(super) fused_gate_up: Option<MetalDenseProjection>,
     pub(super) prefill_gate_up: Option<MetalDenseProjection>,
+    #[cfg(feature = "metal-paged-attn")]
     pub(super) prefill_fused_silu_mul: bool,
     pub(super) fused_silu_mul: bool,
     pub(super) gate_proj: IsqLinear,
@@ -65,6 +66,7 @@ impl ThinkerTextMlp {
         Ok(Self {
             fused_gate_up,
             prefill_gate_up,
+            #[cfg(feature = "metal-paged-attn")]
             prefill_fused_silu_mul: policy.prefill_fused_silu_mul,
             fused_silu_mul: policy.fused_silu_mul,
             gate_proj,
@@ -74,6 +76,7 @@ impl ThinkerTextMlp {
         })
     }
 
+    #[cfg(feature = "metal-paged-attn")]
     pub(super) fn prefill_projection(&self) -> Option<&MetalDenseProjection> {
         if vasr_quant::isq_linear::linear_is_prefill() {
             self.prefill_gate_up.as_ref()

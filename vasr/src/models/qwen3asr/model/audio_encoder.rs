@@ -329,7 +329,13 @@ impl AudioEncoderLayer {
         isq: Option<&str>,
     ) -> Result<Self> {
         let env = OperatorEnvironment::capture();
-        let policy = AudioOperatorPolicy::resolve(&env, cfg, vb.device().is_metal(), false)?;
+        let policy = AudioOperatorPolicy::resolve(
+            &env,
+            cfg,
+            vb.device().is_metal(),
+            vb.device().is_cuda(),
+            false,
+        )?;
         Self::load_with_policy(cfg, vb, use_flash_attn, isq, &policy)
     }
 
@@ -464,7 +470,13 @@ impl AudioTower {
         progress: &Progress,
     ) -> Result<Self> {
         let env = OperatorEnvironment::capture();
-        let policy = AudioOperatorPolicy::resolve(&env, cfg, vb.device().is_metal(), false)?;
+        let policy = AudioOperatorPolicy::resolve(
+            &env,
+            cfg,
+            vb.device().is_metal(),
+            vb.device().is_cuda(),
+            false,
+        )?;
         Self::load_with_policy(cfg, vb, use_flash_attn, isq, progress, &policy)
     }
 
@@ -824,7 +836,9 @@ impl AudioTower {
         {
             candle_core::bail!("invalid cross-sample CNN input dimensions/lengths/window");
         }
-        let limit = self.conv_micro_batch.clamp(1, 64);
+        let limit = self
+            .conv_micro_batch
+            .clamp(1, if features.device().is_cuda() { 256 } else { 64 });
         let mut chunks = Vec::with_capacity(limit);
         let mut metadata = Vec::with_capacity(limit);
         let mut outputs: Vec<Vec<Tensor>> = vec![Vec::new(); batch];

@@ -246,6 +246,7 @@ fn assert_metal_dense_projection_fusion(
     let down = dense_fixture(8, 12, false, 3, dtype, &device)?;
     let reference = super::ThinkerTextMlp {
         prefill_gate_up: None,
+        #[cfg(feature = "metal-paged-attn")]
         prefill_fused_silu_mul: false,
         fused_silu_mul: false,
         gate_proj: gate.clone(),
@@ -256,6 +257,7 @@ fn assert_metal_dense_projection_fusion(
     };
     let fused = super::ThinkerTextMlp {
         prefill_gate_up: None,
+        #[cfg(feature = "metal-paged-attn")]
         prefill_fused_silu_mul: false,
         fused_silu_mul: true,
         gate_proj: gate.clone(),
