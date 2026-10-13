@@ -7,21 +7,20 @@
 
 use candle_core::Device;
 
-/// Optional CUDA forward serialization for controlled throughput experiments.
-/// Metal always uses the shared model gate for correctness.
+/// CUDA forwards are serialized by default. One GPU can only run one forward at a
+/// time, and the shared gate avoids interleaving encoder/prefill/decode submissions
+/// from concurrent requests. Set `VASR_CUDA_SERIAL_FORWARD=0` to opt out. Metal
+/// always uses the shared model gate for correctness.
 pub(crate) fn model_execution_gate_enabled(device: &Device) -> bool {
     static CUDA_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     device.is_metal()
         || (device.is_cuda()
-            && *CUDA_SERIAL.get_or_init(|| {
-                std::env::var("VASR_CUDA_SERIAL_FORWARD")
-                    .ok()
-                    .is_some_and(|value| {
-                        matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "on"
-                        )
-                    })
+            && *CUDA_SERIAL.get_or_init(|| match std::env::var("VASR_CUDA_SERIAL_FORWARD") {
+                Ok(value) => matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ),
+                Err(_) => true,
             }))
 }
 

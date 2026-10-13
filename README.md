@@ -34,8 +34,10 @@ cargo install --path vasr-transcribe --force --features cuda
 | --- | --- | --- | ---: | ---: | ---: | --- |
 | `vasr-transcribe` | Qwen3-ASR-0.6B | Apple M4 Pro（48 GB，Metal） | **123.30×**（中位） | 0.0081 | 16.5876% | `vasr-transcribe serve --model Qwen3-ASR-0.6B`<br>`vasr-transcribe perf -i datasets/call-100.db` |
 | `vasr-transcribe` | Qwen3-ASR-0.6B | Apple M4 Pro（48 GB，Metal） | **118.65×**（最高实测） | 0.008428 | 4.3336% | `vasr-transcribe serve --model Qwen3-ASR-0.6B`<br>`vasr-transcribe perf -i datasets/aishell1-test-200.db --concurrency 14 --batch-size 16` |
-| `vasr-transcribe` | Qwen3-ASR-0.6B | NVIDIA RTX 4090（24 GB，CUDA） | **833.76×**（中位） | 0.001199 | 16.7558% | `vasr-transcribe serve --vad-device cpu --num-vad-workers 8 --num-load-workers 4 --encoder-batch-max-audio-seconds 240`<br>`vasr-transcribe perf -i datasets/call-100.db --concurrency 8 --batch-size 16` |
+| `vasr-transcribe` | Qwen3-ASR-0.6B | NVIDIA RTX 4090（24 GB，CUDA） | **831.20×**（中位） | 0.001203 | 16.8500% | `VASR_CUDA_TUNED=1 vasr-transcribe serve`<br>`vasr-transcribe perf -i datasets/call-100.db --concurrency 8 --batch-size 16` |
 
-CUDA 一行是 RTX 4090 上 `call-100`（99 条、5,025 秒音频）的实测中位数，同时设置 `VASR_ASR_ENCODER_BATCH_MAX_SEGMENTS=32`、`VASR_CUDA_CONV_CROSS_SAMPLE=1`、`VASR_CUDA_CONV_CHUNKS=64`、`VASR_CUDA_SERIAL_FORWARD=1`、`VASR_VAD_NUM_THREADS=1`、`VASR_CUDA_GRAPH_BATCH_STEP=4`、`VASR_ASR_PREFILL_COALESCE_WAIT_MS=50`，并以 `cargo install --path vasr-transcribe --force --features cuda,cudnn` 构建。
+CUDA 一行为 RTX 4090 上 `call-100`（99 条、5,025 秒音频）的实测中位数。构建使用 `cargo install --path vasr-transcribe --force --features cuda,cudnn`，并让运行时找到 cuDNN 9 库（设置 `LD_LIBRARY_PATH`）。
 
-编码器默认按长度分桶：连续批处理下，长度相近的分段会进入同一编码批次，减少批内补零。`call-100` 上 `encoder_frames` 的 executed/valid 帧由 2.91× 降到 1.66×，端到端吞吐由约 790× 提升到约 830×。可用 `VASR_ASR_BUCKET_BY_LENGTH=0` 退回按到达顺序分组。
+`VASR_CUDA_TUNED=1` 会为尚未显式设置的调优项注入 RTX 4090 上验证过的取值：`VASR_VAD_DEVICE=cpu`、编码批次 240 秒 / 32 段、`VASR_CUDA_CONV_CHUNKS=64`、`VASR_CUDA_GRAPH_BATCH_STEP=4`、`VASR_VAD_NUM_THREADS=1`、`VASR_ASR_PREFILL_COALESCE_WAIT_MS=50`、`VASR_NUM_VAD_WORKERS=8`、`VASR_NUM_LOAD_WORKERS=4`。已有环境变量或 `.env` 取值优先，因此可单项覆盖。
+
+CUDA 上默认开启 `VASR_CUDA_CONV_CROSS_SAMPLE`（跨样本卷积合批）与 `VASR_CUDA_SERIAL_FORWARD`（模型前向串行化），设为 `0` 可关闭。编码器默认按长度分桶：连续批处理下长度相近的分段进入同一编码批次，减少批内补零，`call-100` 上 `encoder_frames` 的 executed/valid 帧由 2.91× 降到 1.66×；`VASR_ASR_BUCKET_BY_LENGTH=0` 可退回按到达顺序分组。

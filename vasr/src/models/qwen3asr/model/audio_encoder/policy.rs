@@ -118,12 +118,14 @@ impl AudioOperatorPolicy {
         } else {
             ("VASR_METAL_CONV_CROSS_SAMPLE", "VASR_METAL_CONV_CHUNKS")
         };
+        // CUDA batches convolutions across samples by default; Metal keeps its
+        // opt-in. An explicit `VASR_CUDA_CONV_CROSS_SAMPLE=0` disables it.
         let cross_sample = (is_metal || is_cuda)
             && match env.var(cross_name) {
                 Ok(value) => {
                     ConvExecutionPolicy::parse_override(Some(value), cross_name)?.unwrap_or(false)
                 }
-                Err(std::env::VarError::NotPresent) => false,
+                Err(std::env::VarError::NotPresent) => is_cuda,
                 Err(error) => candle_core::bail!("invalid {cross_name}: {error}"),
             };
         let max_chunks = if is_cuda { 256 } else { 64 };
@@ -238,6 +240,23 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn cuda_cross_sample_defaults_on_while_metal_stays_opt_in() -> Result<()> {
+        let cfg = AudioEncoderConfig::default();
+        let empty = OperatorEnvironment::default();
+        let cuda = AudioOperatorPolicy::resolve(&empty, &cfg, false, true, false)?;
+        assert!(
+            cuda.cross_sample,
+            "CUDA should batch convs across samples by default"
+        );
+        let metal = AudioOperatorPolicy::resolve(&empty, &cfg, true, false, false)?;
+        assert!(
+            !metal.cross_sample,
+            "Metal cross-sample batching stays opt-in"
+        );
+        Ok(())
+    }
+
     #[test]
     fn cuda_conv_overrides_are_backend_scoped_and_bounded() -> Result<()> {
         let cfg = AudioEncoderConfig::default();
