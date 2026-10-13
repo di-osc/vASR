@@ -2,7 +2,7 @@
 // 工作区对非测试代码依然 deny 这两个 lint。
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod dataset;
+mod inputs;
 mod device;
 pub mod eval;
 mod legacy_audiodb;
@@ -18,7 +18,6 @@ pub mod server;
 pub mod stress;
 mod table;
 
-pub use eval::{EvalArgs, run_eval};
 pub use perf::{PerfArgs, run_perf};
 pub use pipeline::{
     AsyncTranscribePipeline, GlobalAsyncTranscribePipeline, TranscribeInput, TranscribeItemOutcome,

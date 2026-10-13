@@ -8,19 +8,26 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::dataset::read_audio_input_dtos;
+use crate::eval::{EvalNormalizer, EvalTimeline, evaluate_perf_output, has_reference};
+use crate::inputs::{audio_input_from_collected, collect_inputs};
+use crate::protocol::{audio_channel_text, audio_is_bad, audio_seconds};
 use crate::quality::detect_repeated_pattern;
-use crate::{AudioInputDto, InferenceData, TranscribeRequest, table::render_table};
+use crate::{AudioInputDto, TranscribeRequest, table::render_table};
+use asr_data::{Audio, AudioChannel};
 
 #[derive(Debug, Args)]
 pub struct PerfArgs {
-    /// Text file with one audio path/URL per line, or a vASR dataset directory / `.vasr` AudioDb.
-    #[arg(short, long, value_name = "PATH")]
-    input: PathBuf,
+    /// Audio file, directory, URL, or vASR AudioDb (`.db` / `.vasr` / `.vasr.msgpack`).
+    #[arg(short, long, value_name = "INPUT")]
+    input: String,
 
     /// Transcribe service endpoint.
     #[arg(long, default_value = "http://127.0.0.1:8867/transcribe")]
     server: String,
+
+    /// Recursively scan subdirectories when `--input` is a directory.
+    #[arg(long, default_value_t = false)]
+    recursive: bool,
 
     /// HTTP concurrency. Use 0 to auto-select the machine CPU count.
     #[arg(long, default_value_t = 0)]
@@ -38,9 +45,13 @@ pub struct PerfArgs {
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     mono: Option<bool>,
 
-    /// Evaluate concurrent outputs against dataset mono references using the Bench normalizer.
-    #[arg(long, default_value_t = false)]
-    cer: bool,
+    /// Audio timeline/channel to evaluate. CER runs automatically when references exist.
+    #[arg(long, value_enum, default_value_t = EvalTimeline::Mono)]
+    timeline: EvalTimeline,
+
+    /// Text normalization used before CER.
+    #[arg(long, value_enum, default_value_t = EvalNormalizer::Bench)]
+    normalizer: EvalNormalizer,
 
     /// HTTP request retries.
     #[arg(long, default_value_t = 3)]
@@ -63,7 +74,7 @@ pub struct PerfArgs {
 ///
 /// 只保留可再次定位音频的地址和请求参数。base64、`data:` URI 等原始音频载荷不进入该结构。
 #[derive(Debug, Clone, Serialize)]
-struct PerfSavedInput {
+pub(crate) struct PerfSavedInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,30 +93,32 @@ struct PerfSavedInput {
     hotword: Option<String>,
 }
 
+/// 一次请求（`perf` 的 HTTP 请求，或 `run` 的单个进程内批次）的结果。
 #[derive(Debug, Clone, Serialize)]
-struct PerfRequestResult {
-    request_index: usize,
-    batch_size: usize,
-    inputs: Vec<PerfSavedInput>,
-    latency_seconds: f64,
-    ok: bool,
-    bad_items: usize,
-    quality_passed_items: usize,
-    quality_audio_seconds: f64,
-    quality_anomalies: Vec<PerfQualityAnomaly>,
-    audio_seconds: f64,
-    data: Vec<InferenceData>,
-    error: Option<String>,
+pub(crate) struct PerfRequestResult {
+    pub(crate) request_index: usize,
+    pub(crate) batch_size: usize,
+    pub(crate) inputs: Vec<PerfSavedInput>,
+    pub(crate) latency_seconds: f64,
+    pub(crate) ok: bool,
+    pub(crate) bad_items: usize,
+    pub(crate) quality_passed_items: usize,
+    pub(crate) quality_audio_seconds: f64,
+    pub(crate) quality_anomalies: Vec<PerfQualityAnomaly>,
+    pub(crate) audio_seconds: f64,
+    /// 服务端返回的原始 `Audio` 记录（wire format 即 Audio）。
+    pub(crate) data: Vec<Audio>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PerfQualityAnomaly {
+pub(crate) struct PerfQualityAnomaly {
     item_index: usize,
     reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PerfSummary {
+pub(crate) struct PerfSummary {
     requests: usize,
     successful_requests: usize,
     failed_requests: usize,
@@ -129,16 +142,20 @@ struct PerfSummary {
     latency_max_seconds: f64,
 }
 
+/// `perf` / `run` 共用的报告结构。
+///
+/// `service_url` 只在 `perf`（HTTP 客户端）里出现；`run` 是进程内执行，序列化时省略。
 #[derive(Debug, Serialize)]
-struct PerfReport<'a> {
-    timestamp: String,
-    input: &'a str,
-    service_url: &'a str,
-    items: usize,
-    summary: PerfSummary,
-    requests: Vec<PerfRequestResult>,
+pub(crate) struct PerfReport<'a> {
+    pub(crate) timestamp: String,
+    pub(crate) input: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cer: Option<serde_json::Value>,
+    pub(crate) service_url: Option<&'a str>,
+    pub(crate) items: usize,
+    pub(crate) summary: PerfSummary,
+    pub(crate) requests: Vec<PerfRequestResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,25 +166,31 @@ struct PerfRunReport {
 
 pub async fn run_perf(args: PerfArgs) -> Result<()> {
     validate_args(&args)?;
-    let mut sources = read_audio_input_dtos(&args.input, args.mono)?;
-    if sources.is_empty() {
-        bail!("input contains no audio sources: {}", args.input.display());
-    }
+    let mut collected = collect_inputs(&args.input, args.recursive)?;
     if let Some(limit) = args.limit {
-        sources.truncate(limit);
+        collected.truncate(limit);
     }
-    let references = if args.cer {
-        if args.mono == Some(false) {
-            bail!("--cer requires mono output");
-        }
-        let mut records = crate::dataset::read_vasr_audios(&args.input)?;
-        if let Some(limit) = args.limit {
-            records.truncate(limit);
-        }
-        Some(records)
-    } else {
-        None
-    };
+    if collected.is_empty() {
+        bail!("input contains no audio sources: {}", args.input);
+    }
+    let request_mono = resolve_request_mono(&args)?;
+    let sources = collected
+        .iter()
+        .enumerate()
+        .map(|(index, input)| audio_input_from_collected(input, request_mono, index))
+        .collect::<Vec<_>>();
+
+    // 只有 audiodb 输入携带参考文本；存在参考时自动评估 CER。
+    let records = collected
+        .iter()
+        .map(|input| input.record.clone())
+        .collect::<Option<Vec<_>>>();
+    let has_references = records.as_ref().is_some_and(|records| {
+        records
+            .iter()
+            .any(|record| has_reference(record, args.timeline))
+    });
+
     let concurrency = resolve_concurrency(args.concurrency);
     let batch_size = args.batch_size;
 
@@ -178,13 +201,14 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
         .context("failed to build HTTP client")?;
 
     println!(
-        "perf START | input={} items={} server={} batch={} concurrency={} mono={}",
-        args.input.display(),
+        "perf START | input={} items={} server={} batch={} concurrency={} mono={} timeline={}",
+        args.input,
         sources.len(),
         args.server,
         batch_size,
         concurrency,
-        format_mono(args.mono)
+        format_mono(request_mono),
+        args.timeline.name()
     );
     let run = run_one_perf_trial(
         &client,
@@ -197,26 +221,22 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
     .await
     .with_context(|| format!("perf failed: batch_size={batch_size} concurrency={concurrency}"))?;
     let summary = run.summary.clone();
-    let cer = references.map(|records| {
-        let mut ordered = run.requests.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|request| request.request_index);
-        if ordered
-            .iter()
-            .any(|r| !r.ok || r.data.len() != r.batch_size)
-        {
-            return serde_json::json!({"error": "incomplete responses; CER not accepted"});
-        }
-        let data = ordered.into_iter().flat_map(|r| r.data.clone()).collect();
-        match crate::eval::evaluate_perf_output(
+    let cer = if has_references {
+        let records = records.unwrap_or_default();
+        Some(evaluate_cer(
             &records,
-            data,
-            summary.wall_seconds,
-            summary.audio_seconds,
-        ) {
-            Ok(value) => value,
-            Err(error) => serde_json::json!({"error": error.to_string()}),
-        }
-    });
+            &run.requests,
+            &summary,
+            args.timeline,
+            args.normalizer,
+        )?)
+    } else {
+        println!(
+            "perf CER  | skipped: no reference transcripts for timeline {}",
+            args.timeline.name()
+        );
+        None
+    };
     println!(
         "perf DONE  | items={} bad={} quality_passed={} failed={} elapsed={:.3}s audio={:.1}s speed={:.1}x quality_speed={:.1}x",
         summary.items,
@@ -239,8 +259,8 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
         &output,
         &PerfReport {
             timestamp,
-            input: &args.input.to_string_lossy(),
-            service_url: &args.server,
+            input: args.input.as_str(),
+            service_url: Some(args.server.as_str()),
             items: sources.len(),
             summary,
             requests: run.requests,
@@ -252,9 +272,6 @@ pub async fn run_perf(args: PerfArgs) -> Result<()> {
 }
 
 fn validate_args(args: &PerfArgs) -> Result<()> {
-    if !args.input.exists() {
-        bail!("input path does not exist: {}", args.input.display());
-    }
     if args.retries == 0 {
         bail!("--retries must be greater than 0");
     }
@@ -262,6 +279,53 @@ fn validate_args(args: &PerfArgs) -> Result<()> {
         bail!("--batch-size must be greater than 0");
     }
     Ok(())
+}
+
+/// `--timeline` 选左/右声道时请求必须是 stereo；`--mono` 只能在 mono 时间轴上覆盖。
+fn resolve_request_mono(args: &PerfArgs) -> Result<Option<bool>> {
+    if args.timeline == EvalTimeline::Mono {
+        return Ok(args.mono);
+    }
+    if args.mono == Some(true) {
+        bail!(
+            "--mono=true conflicts with --timeline {}; stereo output is required",
+            args.timeline.name()
+        );
+    }
+    Ok(Some(false))
+}
+
+/// 把请求输出按输入顺序拼回数据集记录，自动评估 CER。
+pub(crate) fn evaluate_cer(
+    records: &[asr_data::Audio],
+    requests: &[PerfRequestResult],
+    summary: &PerfSummary,
+    timeline: EvalTimeline,
+    normalizer: EvalNormalizer,
+) -> Result<serde_json::Value> {
+    let mut ordered = requests.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|request| request.request_index);
+    if ordered
+        .iter()
+        .any(|request| !request.ok || request.data.len() != request.batch_size)
+    {
+        return Ok(serde_json::json!({"error": "incomplete responses; CER not accepted"}));
+    }
+    let data: Vec<Audio> = ordered
+        .into_iter()
+        .flat_map(|request| request.data.clone())
+        .collect();
+    match evaluate_perf_output(
+        records,
+        data,
+        summary.wall_seconds,
+        summary.audio_seconds,
+        timeline,
+        normalizer,
+    ) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(serde_json::json!({"error": error.to_string()})),
+    }
 }
 
 fn resolve_concurrency(value: usize) -> usize {
@@ -346,6 +410,88 @@ fn build_batches(sources: &[AudioInputDto], batch_size: usize) -> Vec<Transcribe
         .collect()
 }
 
+/// 一批完成输出（服务端响应或进程内结果）的质量与失败统计。
+pub(crate) struct AudioQualityStats {
+    pub(crate) quality_anomalies: Vec<PerfQualityAnomaly>,
+    pub(crate) quality_passed_items: usize,
+    pub(crate) quality_audio_seconds: f64,
+    pub(crate) bad_items: usize,
+    pub(crate) audio_seconds: f64,
+}
+
+/// 判定一批 `Audio` 输出的异常、坏项和有效音频时长。
+pub(crate) fn audio_quality_stats(audios: &[Audio], batch_size: usize) -> AudioQualityStats {
+    let data_count = audios.len();
+    let mapping_complete = data_count == batch_size;
+    let mut quality_anomalies = Vec::new();
+    if !mapping_complete {
+        quality_anomalies.push(PerfQualityAnomaly {
+            item_index: data_count.min(batch_size),
+            reason: format!("item count mismatch: expected {batch_size}, got {data_count}"),
+        });
+    }
+    for (item_index, audio) in audios.iter().enumerate() {
+        let texts = [
+            audio_channel_text(audio, AudioChannel::Mono),
+            audio_channel_text(audio, AudioChannel::Left),
+            audio_channel_text(audio, AudioChannel::Right),
+        ];
+        let non_empty = texts.iter().filter(|text| !text.trim().is_empty());
+        let anomaly = if audio_seconds(audio) <= 0.0 {
+            Some("missing or invalid audio duration".to_string())
+        } else if non_empty.clone().next().is_none() {
+            Some("empty ASR output for non-empty audio".to_string())
+        } else {
+            non_empty
+                .filter_map(|text| detect_repeated_pattern(text))
+                .next()
+        };
+        if let Some(reason) = anomaly {
+            quality_anomalies.push(PerfQualityAnomaly { item_index, reason });
+        }
+    }
+    let has_anomaly = |index: usize| {
+        quality_anomalies
+            .iter()
+            .any(|anomaly| anomaly.item_index == index)
+    };
+    let quality_passed_items = if mapping_complete {
+        audios
+            .iter()
+            .enumerate()
+            .filter(|(index, audio)| !audio_is_bad(audio) && !has_anomaly(*index))
+            .count()
+    } else {
+        0
+    };
+    let quality_audio_seconds = if mapping_complete {
+        audios
+            .iter()
+            .enumerate()
+            .filter(|(index, audio)| !audio_is_bad(audio) && !has_anomaly(*index))
+            .map(|(_, audio)| audio_seconds(audio))
+            .sum()
+    } else {
+        0.0
+    };
+    let bad_items = if mapping_complete {
+        audios
+            .iter()
+            .enumerate()
+            .filter(|(index, audio)| audio_is_bad(audio) || has_anomaly(*index))
+            .count()
+    } else {
+        batch_size
+    };
+    AudioQualityStats {
+        quality_anomalies,
+        quality_passed_items,
+        quality_audio_seconds,
+        bad_items,
+        audio_seconds: audios.iter().map(audio_seconds).sum(),
+    }
+}
+
 async fn run_one_request(
     client: reqwest::Client,
     server: String,
@@ -366,85 +512,21 @@ async fn run_one_request(
                     .await
                     .context("failed to read transcribe JSONL response")?;
                 let latency_seconds = start.elapsed().as_secs_f64();
-                let response = crate::protocol::parse_transcribe_jsonl(&body, latency_seconds)
+                let audios = crate::protocol::parse_transcribe_audios(&body)
                     .context("failed to decode transcribe response JSONL")?;
-                let data_count = response.data.len();
-                let mapping_complete = data_count == batch_size;
-                let mut quality_anomalies = Vec::new();
-                if !mapping_complete {
-                    quality_anomalies.push(PerfQualityAnomaly {
-                        item_index: data_count.min(batch_size),
-                        reason: format!(
-                            "response item count mismatch: expected {batch_size}, got {data_count}"
-                        ),
-                    });
-                }
-                for (item_index, item) in response.data.iter().enumerate() {
-                    let texts = [&item.text.mono, &item.text.left, &item.text.right];
-                    let non_empty = texts.iter().filter(|text| !text.trim().is_empty());
-                    let anomaly = if item.timings.audio <= 0.0 {
-                        Some("missing or invalid audio duration".to_string())
-                    } else if non_empty.clone().next().is_none() {
-                        Some("empty ASR output for non-empty audio".to_string())
-                    } else {
-                        non_empty
-                            .filter_map(|text| detect_repeated_pattern(text))
-                            .next()
-                    };
-                    if let Some(reason) = anomaly {
-                        quality_anomalies.push(PerfQualityAnomaly { item_index, reason });
-                    }
-                }
-                let quality_items = if mapping_complete {
-                    response
-                        .data
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, item)| {
-                            !item.is_bad
-                                && !quality_anomalies
-                                    .iter()
-                                    .any(|anomaly| anomaly.item_index == *index)
-                        })
-                        .map(|(_, item)| item)
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                let quality_audio_seconds = if quality_items.is_empty() {
-                    0.0
-                } else {
-                    quality_items.iter().map(|item| item.timings.audio).sum()
-                };
-                let bad_items = if mapping_complete {
-                    response
-                        .data
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, item)| {
-                            item.is_bad
-                                || quality_anomalies
-                                    .iter()
-                                    .any(|anomaly| anomaly.item_index == *index)
-                        })
-                        .count()
-                } else {
-                    batch_size
-                };
-                let quality_passed_items = quality_items.len();
-                let audio_seconds = response.inference_performance.total_audio_duration_seconds;
+                let stats = audio_quality_stats(&audios, batch_size);
                 return Ok(PerfRequestResult {
                     request_index,
                     batch_size,
                     inputs,
                     latency_seconds,
                     ok: true,
-                    bad_items,
-                    quality_passed_items,
-                    quality_audio_seconds,
-                    quality_anomalies,
-                    audio_seconds,
-                    data: response.data,
+                    bad_items: stats.bad_items,
+                    quality_passed_items: stats.quality_passed_items,
+                    quality_audio_seconds: stats.quality_audio_seconds,
+                    quality_anomalies: stats.quality_anomalies,
+                    audio_seconds: stats.audio_seconds,
+                    data: audios,
                     error: None,
                 });
             }
@@ -489,7 +571,7 @@ async fn run_one_request(
     })
 }
 
-fn summarize(
+pub(crate) fn summarize(
     concurrency: usize,
     batch_size: usize,
     wall_seconds: f64,
@@ -660,7 +742,7 @@ fn print_perf_summary_table(summary: &PerfSummary) {
     println!("\n{table}\n");
 }
 
-fn save_report(path: &Path, report: &PerfReport<'_>) -> Result<()> {
+pub(crate) fn save_report(path: &Path, report: &PerfReport<'_>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
@@ -706,7 +788,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
 ///
 /// `url` 中的 HTTP(S)、`file://` 和本地路径会保留。`b64_str`，以及写在 `url` 里的
 /// `data:` 内嵌音频，不会保存。
-fn saved_inputs(inputs: &[AudioInputDto]) -> Vec<PerfSavedInput> {
+pub(crate) fn saved_inputs(inputs: &[AudioInputDto]) -> Vec<PerfSavedInput> {
     inputs
         .iter()
         .map(|input| PerfSavedInput {
@@ -753,8 +835,69 @@ fn round6(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_utc_timestamp, saved_inputs};
+    use super::{
+        PerfArgs, PerfReport, format_utc_timestamp, resolve_request_mono, saved_inputs, summarize,
+    };
     use crate::AudioInputDto;
+    use clap::Parser;
+
+    #[test]
+    fn report_is_shared_by_perf_and_run() {
+        let report = PerfReport {
+            timestamp: "20260101_000000".to_string(),
+            input: "a.wav",
+            service_url: Some("http://127.0.0.1:8867/transcribe"),
+            items: 0,
+            summary: summarize(1, 0, 0.0, &[]),
+            requests: Vec::new(),
+            cer: None,
+        };
+        let json = serde_json::to_value(&report).expect("serialize perf report");
+        assert_eq!(json["service_url"], "http://127.0.0.1:8867/transcribe");
+        assert!(json.get("cer").is_none());
+
+        let local = PerfReport {
+            timestamp: "20260101_000000".to_string(),
+            input: "a.wav",
+            service_url: None,
+            items: 0,
+            summary: summarize(1, 0, 0.0, &[]),
+            requests: Vec::new(),
+            cer: None,
+        };
+        let json = serde_json::to_value(&local).expect("serialize run report");
+        assert!(json.get("service_url").is_none());
+    }
+
+    #[derive(Debug, Parser)]
+    struct TestPerfCli {
+        #[command(flatten)]
+        args: PerfArgs,
+    }
+
+    fn perf_args(extra: &[&str]) -> PerfArgs {
+        let mut argv = vec!["perf", "-i", "a.wav"];
+        argv.extend_from_slice(extra);
+        TestPerfCli::try_parse_from(argv)
+            .expect("perf args should parse")
+            .args
+    }
+
+    #[test]
+    fn timeline_left_forces_stereo_and_conflicts_with_mono_true() {
+        assert_eq!(resolve_request_mono(&perf_args(&[])).unwrap(), None);
+        assert_eq!(
+            resolve_request_mono(&perf_args(&["--mono", "true"])).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_request_mono(&perf_args(&["--timeline", "left"])).unwrap(),
+            Some(false)
+        );
+        assert!(
+            resolve_request_mono(&perf_args(&["--timeline", "left", "--mono", "true"])).is_err()
+        );
+    }
 
     #[test]
     fn timestamp_file_name_uses_utc_calendar_format() {

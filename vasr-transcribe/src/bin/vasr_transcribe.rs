@@ -5,8 +5,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::Path};
 use vasr_transcribe::{
-    EvalArgs, PerfArgs, RunTranscribeArgs, ServeTranscribeArgs, StressArgs, init_logging, run_eval,
-    run_local, run_perf, run_stress, run_transcribe,
+    PerfArgs, RunTranscribeArgs, ServeTranscribeArgs, StressArgs, init_logging, run_local,
+    run_perf, run_stress, run_transcribe,
 };
 
 #[derive(Debug, Parser)]
@@ -28,11 +28,9 @@ struct Cli {
 enum Command {
     /// Start the offline transcribe HTTP service.
     Serve(ServeTranscribeArgs),
-    /// Transcribe local AudioSource inputs, estimate KV cache from duration, and write Audio JSONL.
+    /// Transcribe local AudioSource inputs and write a perf-style report JSON.
     Run(RunTranscribeArgs),
-    /// Evaluate service CER with a labeled vASR dataset.
-    Eval(EvalArgs),
-    /// Measure the fastest completion time for an audio source set.
+    /// Benchmark a running service: throughput/latency plus CER when the input is labeled.
     Perf(PerfArgs),
     /// Continuously stress an HTTP service and sample peak GPU memory.
     Stress(StressArgs),
@@ -108,7 +106,6 @@ async fn run_cli() -> Result<()> {
     match cli.command {
         Command::Serve(args) => run_transcribe(args).await,
         Command::Run(args) => run_local(args).await,
-        Command::Eval(args) => run_eval(args).await,
         Command::Perf(args) => run_perf(args).await,
         Command::Stress(args) => run_stress(args).await,
     }

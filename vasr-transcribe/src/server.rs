@@ -21,10 +21,7 @@ use crate::pipeline::{
     GlobalAsyncTranscribePipeline, PipelineMemorySnapshot, PipelineWorkerOptions,
     SourceReservation, StageSpan, TranscribeInput, TranscribeItemSpans, TranscribeItemTiming,
 };
-use crate::protocol::{
-    InferenceData, InferencePerformance, SentenceResult, TextResult, TimingBreakdown,
-    TranscribeRequest,
-};
+use crate::protocol::TranscribeRequest;
 
 const TRANSCRIBE_BODY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
@@ -127,15 +124,14 @@ async fn handle_transcribe(
     let q8_fast_path_start = vasr::models::qwen3asr::model::q8_fast_path_stats();
     let request_items = request.inputs.len();
     let mut inputs = Vec::new();
-    let mut data_slots = vec![None; request_items];
-    let mut request_metas = (0..request_items)
-        .map(|_| RequestMeta::default())
-        .collect::<Vec<_>>();
+    let mut records: Vec<Audio> = Vec::with_capacity(request_items);
+    let mut item_audio_seconds = vec![0.0_f64; request_items];
+    let mut submitted = vec![false; request_items];
+    let mut outcome_seen = vec![false; request_items];
     let mut request_stats = RequestStats::default();
     let mut start_stats = RequestStartStats::default();
 
     for (index, input) in request.inputs.into_iter().enumerate() {
-        let service_id = service.service_id.clone();
         let audio_id = input
             .id
             .unwrap_or_else(|| format!("{}-{index}", request_id));
@@ -190,27 +186,18 @@ async fn handle_transcribe(
         };
         let mut audio = Audio::with_id_from_info(audio_id, source.clone(), &info);
         crate::protocol::clear_legacy_transcribe_metadata(&mut audio);
-        if let Some(error) = source_error.as_ref() {
-            data_slots[index] = Some(error_data(
-                service_id.clone(),
-                "loader",
-                error.clone(),
-                TranscribeItemTiming::default(),
-                0.0,
-            ));
+        match source_error {
+            Some(error) => crate::protocol::mark_transcription_failed(&mut audio, "loader", &error),
+            None => {
+                submitted[index] = true;
+                inputs.push(TranscribeInput {
+                    index,
+                    source,
+                    mono,
+                });
+            }
         }
-        request_metas[index] = RequestMeta {
-            service_id,
-            audio: Some(audio),
-        };
-        if source_error.is_some() {
-            continue;
-        }
-        inputs.push(TranscribeInput {
-            index,
-            source,
-            mono,
-        });
+        records.push(audio);
     }
     tracing::info!(
         target: "vasr_transcribe::serve",
@@ -238,113 +225,81 @@ async fn handle_transcribe(
     let mut active_spans = Vec::new();
 
     for outcome in outcomes {
-        if outcome.channel == "mono" {
+        let item_index = outcome.index;
+        let channel = outcome.channel;
+        let item_seconds = outcome.audio_seconds;
+        let Some(audio) = records.get_mut(item_index) else {
+            continue;
+        };
+        outcome_seen[item_index] = true;
+        if channel == "mono" {
             request_stats.mono += 1;
-        } else if outcome.channel == "left" {
+        } else if channel == "left" {
             request_stats.stereo += 1;
         }
         request_stats.channels += 1;
-        let Some(meta) = request_metas.get(outcome.index) else {
-            continue;
-        };
         collect_active_spans(outcome.spans, &mut active_spans);
+        item_audio_seconds[item_index] += item_seconds;
+        component_timing.add_scaled(outcome.timing, 1.0);
         match outcome.result {
             Ok(timeline) => {
-                total_audio_duration_seconds += outcome.audio_seconds;
-                component_timing.add_scaled(outcome.timing, 1.0);
-                let mut channel_data = InferenceData::from_timeline_channel(
-                    meta.service_id.clone(),
-                    &timeline,
-                    outcome.channel,
-                );
-                fill_timing_fields(&mut channel_data, outcome.timing, outcome.audio_seconds);
-                merge_channel_data(&mut data_slots[outcome.index], channel_data);
+                total_audio_duration_seconds += item_seconds;
+                attach_channel_timeline(audio, channel, &timeline);
             }
             Err(error) => {
                 tracing::error!(
                     target: "vasr_transcribe::serve",
                     "{} request BAD   | index={} channel={} component={} audio={:.1}s reason={}",
                     request_id,
-                    outcome.index,
-                    outcome.channel,
+                    item_index,
+                    channel,
                     outcome.bad_component.unwrap_or("recognizer"),
-                    outcome.audio_seconds,
+                    item_seconds,
                     error
                 );
-                component_timing.add_scaled(outcome.timing, 1.0);
-                merge_channel_data(
-                    &mut data_slots[outcome.index],
-                    error_data(
-                        meta.service_id.clone(),
-                        outcome.bad_component.unwrap_or("recognizer"),
-                        format!("{}: {}", outcome.channel, error),
-                        outcome.timing,
-                        outcome.audio_seconds,
-                    ),
-                )
+                crate::protocol::mark_transcription_failed(
+                    audio,
+                    outcome.bad_component.unwrap_or("recognizer"),
+                    &format!("{channel}: {error}"),
+                );
             }
         }
     }
-    let data = data_slots
-        .into_iter()
-        .enumerate()
-        .map(|(index, slot)| {
-            let mut data = slot.unwrap_or_else(|| {
-                error_data(
-                    request_metas[index].service_id.clone(),
-                    "loader",
-                    "no transcribe outcome".to_string(),
-                    TranscribeItemTiming::default(),
-                    0.0,
-                )
-            });
-            clean_call_boundary_noise(&mut data);
-            data
-        })
-        .collect::<Vec<_>>();
+
+    for (index, audio) in records.iter_mut().enumerate() {
+        if submitted[index] && !outcome_seen[index] {
+            crate::protocol::mark_transcription_failed(audio, "loader", "no transcribe outcome");
+        }
+        clean_call_boundary_noise(audio);
+        repair_fallback_audio_info(audio, item_audio_seconds[index]);
+        crate::protocol::clear_legacy_transcribe_metadata(audio);
+    }
 
     let wall = start.elapsed().as_secs_f64();
     let active = active_spans_seconds(active_spans).min(wall).max(0.0);
     let wait = (wall - active).max(0.0);
-    let num_items = data.len();
-    let bad = data.iter().filter(|item| item.is_bad).count();
-    let performance = InferencePerformance {
-        batch_wall_seconds: wall,
-        num_items,
-        throughput_items_per_second: if wall > 0.0 {
-            num_items as f64 / wall
-        } else {
-            0.0
-        },
-        total_audio_duration_seconds,
-        speedup: if wall > 0.0 {
-            total_audio_duration_seconds / wall
-        } else {
-            0.0
-        },
-        rtf: if total_audio_duration_seconds > 0.0 {
-            wall / total_audio_duration_seconds
-        } else {
-            0.0
-        },
-    };
+    let num_items = records.len();
+    let bad = records
+        .iter()
+        .filter(|audio| crate::protocol::audio_is_bad(audio))
+        .count();
     tracing::info!(
         target: "vasr_transcribe::serve",
         "{} {:<7} {:<5} | items={} bad={} | audio={:>6.1}s ch=mono:{} stereo:{} total:{} | active={:>6.3}s queue={:>6.3}s wall={:>6.3}s | speed={:>6.1}x e2e={:>6.1}x",
         request_id,
         "request",
         "DONE",
-        performance.num_items,
+        num_items,
         bad,
-        performance.total_audio_duration_seconds,
+        total_audio_duration_seconds,
         request_stats.mono,
         request_stats.stereo,
         request_stats.channels,
         active,
         wait,
-        performance.batch_wall_seconds,
-        performance.total_audio_duration_seconds / active.max(f64::EPSILON),
-        performance.total_audio_duration_seconds / performance.batch_wall_seconds.max(f64::EPSILON)
+        wall,
+        total_audio_duration_seconds / active.max(f64::EPSILON),
+        total_audio_duration_seconds / wall.max(f64::EPSILON)
     );
     if let Some(snapshot) = collect_request_memory_debug(request_memory_debug_enabled(), {
         let pipeline = Arc::clone(&service.pipeline);
@@ -360,29 +315,6 @@ async fn handle_transcribe(
             service.baseline_cuda_used_bytes,
         );
     }
-    let records = data.iter().zip(request_metas).map(|(inference, meta)| {
-        let mut audio = meta.audio.unwrap_or_else(|| {
-            Audio::with_id_from_info(
-                "audio-unknown",
-                AudioSource::from_encoded_bytes(Vec::new()),
-                &fallback_audio_info(),
-            )
-        });
-        repair_fallback_audio_info(&mut audio, inference);
-        attach_inference_timelines(&mut audio, inference);
-        if inference.is_bad {
-            crate::protocol::mark_transcription_failed(
-                &mut audio,
-                inference.bad_component.as_deref().unwrap_or("transcriber"),
-                inference
-                    .bad_reason
-                    .as_deref()
-                    .unwrap_or("transcription failed"),
-            );
-        }
-        crate::protocol::clear_legacy_transcribe_metadata(&mut audio);
-        audio
-    });
     audio_jsonl_response(records)
 }
 
@@ -406,20 +338,26 @@ fn valid_audio_info(info: &AudioInfo) -> bool {
         && info.source_format.channels > 0
 }
 
-fn repair_fallback_audio_info(audio: &mut Audio, inference: &InferenceData) {
-    if audio.info.frame_count != 0 || inference.timings.audio <= 0.0 {
+fn repair_fallback_audio_info(audio: &mut Audio, audio_seconds: f64) {
+    if audio.info.frame_count != 0 || audio_seconds <= 0.0 {
         return;
     }
-    let stereo = !inference.text.left.is_empty() || !inference.text.right.is_empty();
+    let has_prediction = |channel| {
+        audio
+            .timeline(channel)
+            .ok()
+            .flatten()
+            .is_some_and(|timeline| !timeline.prediction.is_empty())
+    };
+    let stereo = has_prediction(AudioChannel::Left) || has_prediction(AudioChannel::Right);
     let channels = if stereo { 2 } else { 1 };
-    let inferred_end_ms = inference
-        .sentences
-        .iter()
-        .map(|sentence| sentence.end_time)
+    let inferred_end_ms = prediction_sentences(audio)
+        .into_iter()
+        .map(|(_, sentence)| sentence.range.end_ms)
         .max()
         .unwrap_or_default();
     let duration_seconds =
-        (inference.timings.audio / f64::from(channels)).max(inferred_end_ms as f64 / 1_000.0);
+        (audio_seconds / f64::from(channels)).max(inferred_end_ms as f64 / 1_000.0);
     audio.info.channels = channels;
     audio.info.source_format.channels = channels;
     audio.info.frame_count = (duration_seconds * f64::from(audio.info.sample_rate)).ceil() as u64;
@@ -430,97 +368,140 @@ fn repair_fallback_audio_info(audio: &mut Audio, inference: &InferenceData) {
             timeline.duration = duration_ms;
         }
     }
-    if stereo && inference.text.mono.is_empty() {
+    let mono_empty = audio
+        .timeline(AudioChannel::Mono)
+        .ok()
+        .flatten()
+        .is_none_or(|timeline| timeline.prediction.is_empty());
+    if stereo && mono_empty {
         let _ = audio.remove_timeline(AudioChannel::Mono);
     }
 }
 
-fn attach_inference_timelines(audio: &mut Audio, inference: &InferenceData) {
+/// 把一条推理结果时间轴写进 `Audio` 对应声道，事件来源统一为 `vasr-transcribe`。
+fn attach_channel_timeline(audio: &mut Audio, channel_name: &str, source: &Timeline) {
+    let channel = channel_from_name(channel_name);
     let duration = audio.info.timeline_duration_ms();
-    for (channel_name, channel) in [
-        ("mono", AudioChannel::Mono),
-        ("left", AudioChannel::Left),
-        ("right", AudioChannel::Right),
-    ] {
-        let has_text = match channel_name {
-            "left" => !inference.text.left.is_empty(),
-            "right" => !inference.text.right.is_empty(),
-            _ => !inference.text.mono.is_empty(),
+    let transcript = vasr::prediction_text(source);
+    let mut timeline = Timeline::new(audio.id.clone(), duration);
+    let mut annotation_failed = false;
+    'events: for event in &source.prediction {
+        let Some(transcription) = event.transcription() else {
+            continue;
         };
-        let transcript = match channel_name {
-            "left" => &inference.text.left,
-            "right" => &inference.text.right,
-            _ => &inference.text.mono,
-        };
-        let sentences = inference
-            .sentences
-            .iter()
-            .filter(|sentence| sentence.channel == channel_name)
-            .collect::<Vec<_>>();
-        if !has_text && sentences.is_empty() {
+        if transcription.sentences.is_empty() {
+            let range = event.range();
+            if !annotate_sentence(&mut timeline, &transcription.text, range.start_ms, range.end_ms) {
+                annotation_failed = true;
+                break 'events;
+            }
             continue;
         }
-
-        let mut timeline = Timeline::new(audio.id.clone(), duration);
-        let mut annotation_failed = false;
-        for item in &sentences {
-            let start = item.start_time as usize;
-            let end = item.end_time as usize;
-            if end <= start {
-                continue;
-            }
-            let sentence = Sentence::new(item.text.clone(), start, end);
-            let transcription =
-                Transcription::new(item.text.clone()).with_sentences(vec![sentence]);
-            let speech = Speech::new().with_transcription(transcription);
-            if let Err(error) = timeline.annotate_with(
-                start,
-                end,
-                AudioEvent::from(speech),
-                false,
-                Some("vasr-transcribe"),
+        for sentence in &transcription.sentences {
+            if !annotate_sentence(
+                &mut timeline,
+                &sentence.text,
+                sentence.range.start_ms,
+                sentence.range.end_ms,
             ) {
-                tracing::warn!(
-                    target: "vasr_transcribe::serve",
-                    audio_id = %audio.id,
-                    channel = channel_name,
-                    error = %error,
-                    "could not attach sentence spans to Audio timeline; falling back to full transcript"
-                );
-                timeline.prediction.clear();
                 annotation_failed = true;
-                break;
+                break 'events;
             }
         }
-        if has_text && (sentences.is_empty() || annotation_failed || timeline.prediction.is_empty())
-        {
-            let speech = Speech::new().with_transcription(Transcription::new(transcript.clone()));
-            if let Err(error) = timeline.annotate_with(
-                0,
-                duration,
-                AudioEvent::from(speech),
-                false,
-                Some("vasr-transcribe"),
-            ) {
-                tracing::warn!(
-                    target: "vasr_transcribe::serve",
-                    audio_id = %audio.id,
-                    channel = channel_name,
-                    error = %error,
-                    "could not attach full transcript to Audio timeline"
-                );
+    }
+    if annotation_failed {
+        tracing::warn!(
+            target: "vasr_transcribe::serve",
+            audio_id = %audio.id,
+            channel = channel_name,
+            "could not attach sentence spans to Audio timeline; falling back to full transcript"
+        );
+        timeline.prediction.clear();
+    }
+    if !transcript.is_empty() && (timeline.prediction.is_empty() || annotation_failed) {
+        annotate_sentence(&mut timeline, &transcript, 0, duration);
+    }
+    match audio.ensure_timeline(channel, None) {
+        Ok(slot) => *slot = timeline,
+        Err(error) => tracing::warn!(
+            target: "vasr_transcribe::serve",
+            audio_id = %audio.id,
+            channel = channel_name,
+            error = %error,
+            "could not create Audio timeline for transcription"
+        ),
+    }
+}
+
+fn annotate_sentence(timeline: &mut Timeline, text: &str, start: usize, end: usize) -> bool {
+    if end <= start {
+        return true;
+    }
+    let sentence = Sentence::new(text.to_string(), start, end);
+    let transcription = Transcription::new(text.to_string()).with_sentences(vec![sentence]);
+    let speech = Speech::new().with_transcription(transcription);
+    timeline
+        .annotate_with(
+            start,
+            end,
+            AudioEvent::from(speech),
+            false,
+            Some("vasr-transcribe"),
+        )
+        .is_ok()
+}
+
+fn channel_from_name(name: &str) -> AudioChannel {
+    match name {
+        "left" => AudioChannel::Left,
+        "right" => AudioChannel::Right,
+        _ => AudioChannel::Mono,
+    }
+}
+
+/// 读取 `Audio` 上全部声道的预测句段，按（起始时间，声道名）排序。
+fn prediction_sentences(audio: &Audio) -> Vec<(AudioChannel, Sentence)> {
+    let mut spans = Vec::new();
+    for (channel, timeline) in audio.timelines() {
+        for event in &timeline.prediction {
+            let Some(transcription) = event.transcription() else {
+                continue;
+            };
+            if transcription.sentences.is_empty() {
+                let range = event.range();
+                spans.push((
+                    *channel,
+                    Sentence::new(transcription.text.clone(), range.start_ms, range.end_ms),
+                ));
+            } else {
+                for sentence in &transcription.sentences {
+                    spans.push((*channel, sentence.clone()));
+                }
             }
         }
-        match audio.ensure_timeline(channel, None) {
-            Ok(slot) => *slot = timeline,
-            Err(error) => tracing::warn!(
-                target: "vasr_transcribe::serve",
-                audio_id = %audio.id,
-                channel = channel_name,
-                error = %error,
-                "could not create Audio timeline for transcription"
-            ),
+    }
+    spans.sort_by_key(|(channel, sentence)| (sentence.range.start_ms, channel.name()));
+    spans
+}
+
+/// 用清洗后的句段重写 `Audio` 各声道的预测事件。
+fn write_prediction_sentences(audio: &mut Audio, spans: &[(AudioChannel, Sentence)]) {
+    let duration = audio.info.timeline_duration_ms();
+    for channel in [AudioChannel::Mono, AudioChannel::Left, AudioChannel::Right] {
+        if let Ok(Some(timeline)) = audio.timeline_mut(channel) {
+            timeline.prediction.clear();
         }
+    }
+    for (channel, sentence) in spans {
+        let Ok(timeline) = audio.ensure_timeline(*channel, Some(duration)) else {
+            continue;
+        };
+        annotate_sentence(
+            timeline,
+            &sentence.text,
+            sentence.range.start_ms,
+            sentence.range.end_ms,
+        );
     }
 }
 
@@ -812,88 +793,30 @@ struct RequestStartStats {
     mono_false: usize,
 }
 
-#[derive(Debug, Default)]
-struct RequestMeta {
-    service_id: String,
-    audio: Option<Audio>,
-}
-
 fn short_request_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
-fn merge_channel_data(slot: &mut Option<InferenceData>, channel_data: InferenceData) {
-    let Some(existing) = slot else {
-        *slot = Some(channel_data);
+/// 去掉通话首尾的串音/填充噪声，直接读写 `Audio` 的预测事件。
+fn clean_call_boundary_noise(audio: &mut Audio) {
+    if crate::protocol::audio_is_bad(audio) {
         return;
-    };
-
-    if !channel_data.text.mono.is_empty() {
-        existing.text.mono = channel_data.text.mono;
     }
-    if !channel_data.text.left.is_empty() {
-        existing.text.left = channel_data.text.left;
-    }
-    if !channel_data.text.right.is_empty() {
-        existing.text.right = channel_data.text.right;
-    }
-    let mut sentences = channel_data.sentences;
-    existing.sentences.append(&mut sentences);
-    existing
-        .sentences
-        .sort_by_key(|sentence| (sentence.start_time, sentence.channel.clone()));
-    for (idx, sentence) in existing.sentences.iter_mut().enumerate() {
-        sentence.sentence_index = idx;
-    }
-    if channel_data.is_bad {
-        existing.is_bad = true;
-        existing.bad_component = channel_data.bad_component;
-        existing.bad_reason = match (&existing.bad_reason, channel_data.bad_reason) {
-            (Some(old), Some(new)) => Some(format!("{old}; {new}")),
-            (None, Some(new)) => Some(new),
-            (old, None) => old.clone(),
-        };
-    }
-    existing.spent_seconds = existing.spent_seconds.max(channel_data.spent_seconds);
-    existing.spent_details.loader = existing
-        .spent_details
-        .loader
-        .max(channel_data.spent_details.loader);
-    existing.spent_details.detector = existing
-        .spent_details
-        .detector
-        .max(channel_data.spent_details.detector);
-    existing.spent_details.recognizer = existing
-        .spent_details
-        .recognizer
-        .max(channel_data.spent_details.recognizer);
-    existing.spent_details.sentencizer = existing
-        .spent_details
-        .sentencizer
-        .max(channel_data.spent_details.sentencizer);
-    existing.timings.total = existing.timings.total.max(channel_data.timings.total);
-    existing.timings.loader = existing.timings.loader.max(channel_data.timings.loader);
-    existing.timings.pipeline = existing.timings.pipeline.max(channel_data.timings.pipeline);
-    existing.timings.audio += channel_data.timings.audio;
-}
-
-fn clean_call_boundary_noise(data: &mut InferenceData) {
-    if data.is_bad || data.sentences.is_empty() {
+    let sentences = prediction_sentences(audio);
+    if sentences.is_empty() {
         return;
     }
 
-    let original_len = data.sentences.len();
-    let mut cleaned = Vec::with_capacity(original_len);
+    let mut cleaned: Vec<(AudioChannel, Sentence)> = Vec::with_capacity(sentences.len());
     let mut changed = false;
     let mut start_index = 0usize;
-    while start_index < data.sentences.len()
-        && should_drop_leading_sentence(&data.sentences[start_index])
-    {
+    while start_index < sentences.len() && should_drop_leading_sentence(&sentences[start_index].1) {
         start_index += 1;
     }
     changed |= start_index > 0;
 
-    for (relative_index, mut sentence) in data.sentences[start_index..].iter().cloned().enumerate()
+    for (relative_index, (channel, mut sentence)) in
+        sentences[start_index..].iter().cloned().enumerate()
     {
         if relative_index < 4 {
             let cleaned_text = remove_boundary_artifact_phrases(sentence.text.as_str());
@@ -904,12 +827,12 @@ fn clean_call_boundary_noise(data: &mut InferenceData) {
                 continue;
             }
         }
-        cleaned.push(sentence);
+        cleaned.push((channel, sentence));
     }
 
     while cleaned
         .last()
-        .is_some_and(should_drop_trailing_artifact_sentence)
+        .is_some_and(|(_, sentence)| should_drop_trailing_artifact_sentence(sentence))
     {
         cleaned.pop();
         changed = true;
@@ -918,16 +841,11 @@ fn clean_call_boundary_noise(data: &mut InferenceData) {
     if !changed {
         return;
     }
-
-    for (idx, sentence) in cleaned.iter_mut().enumerate() {
-        sentence.sentence_index = idx;
-    }
-    data.sentences = cleaned;
-    data.text = rebuild_text_from_sentences(&data.sentences);
+    write_prediction_sentences(audio, &cleaned);
 }
 
-fn should_drop_leading_sentence(sentence: &SentenceResult) -> bool {
-    if sentence.start_time > 30_000 || sentence.end_time > 22_000 {
+fn should_drop_leading_sentence(sentence: &Sentence) -> bool {
+    if sentence.range.start_ms > 30_000 || sentence.range.end_ms > 22_000 {
         return false;
     }
     let text = compact_text(sentence.text.as_str());
@@ -942,31 +860,19 @@ fn should_drop_leading_sentence(sentence: &SentenceResult) -> bool {
     (has_noise && !has_strong_anchor) || mostly_filler || short_non_call
 }
 
-fn should_drop_early_artifact_sentence(sentence: &SentenceResult) -> bool {
+fn should_drop_early_artifact_sentence(sentence: &Sentence) -> bool {
     let text = compact_text(sentence.text.as_str());
     text.is_empty()
-        || (sentence.end_time <= 22_000 && contains_any(text.as_str(), BOUNDARY_NOISE_PHRASES))
+        || (sentence.range.end_ms <= 22_000 && contains_any(text.as_str(), BOUNDARY_NOISE_PHRASES))
 }
 
-fn should_drop_trailing_artifact_sentence(sentence: &SentenceResult) -> bool {
-    if sentence.start_time <= 15_000 {
+fn should_drop_trailing_artifact_sentence(sentence: &Sentence) -> bool {
+    if sentence.range.start_ms <= 15_000 {
         return false;
     }
     let text = compact_text(sentence.text.as_str());
     matches!(text.as_str(), "老板" | "好的" | "嗯" | "啊")
         || contains_any(text.as_str(), TRAILING_ARTIFACT_PHRASES)
-}
-
-fn rebuild_text_from_sentences(sentences: &[SentenceResult]) -> TextResult {
-    let mut text = TextResult::default();
-    for sentence in sentences {
-        match sentence.channel.as_str() {
-            "left" => text.left.push_str(sentence.text.as_str()),
-            "right" => text.right.push_str(sentence.text.as_str()),
-            _ => text.mono.push_str(sentence.text.as_str()),
-        }
-    }
-    text
 }
 
 fn remove_boundary_artifact_phrases(text: &str) -> String {
@@ -1086,42 +992,6 @@ const BOUNDARY_ARTIFACT_PHRASES: &[&str] = &[
 ];
 const TRAILING_ARTIFACT_PHRASES: &[&str] = &["新进来的嘛", "做提成"];
 
-fn fill_timing_fields(data: &mut InferenceData, timing: TranscribeItemTiming, audio_seconds: f64) {
-    let pipeline_seconds = timing.vad_seconds + timing.asr_seconds;
-    data.timings = TimingBreakdown {
-        total: timing.loader_seconds + pipeline_seconds,
-        loader: timing.loader_seconds,
-        pipeline: pipeline_seconds,
-        audio: audio_seconds,
-    };
-    data.spent_seconds = data.timings.total;
-    data.spent_details.loader = timing.loader_seconds;
-    data.spent_details.detector = timing.vad_seconds;
-    data.spent_details.recognizer = timing.asr_seconds;
-}
-
-fn error_data(
-    service_id: String,
-    component: &str,
-    reason: String,
-    timing: TranscribeItemTiming,
-    audio_seconds: f64,
-) -> InferenceData {
-    let mut data = InferenceData {
-        service_id,
-        spent_seconds: 0.0,
-        spent_details: Default::default(),
-        timings: TimingBreakdown::default(),
-        text: Default::default(),
-        sentences: Vec::new(),
-        is_bad: true,
-        bad_reason: Some(reason),
-        bad_component: Some(component.to_string()),
-    };
-    fill_timing_fields(&mut data, timing, audio_seconds);
-    data
-}
-
 pub fn build_transcribe_service(
     pipeline: Arc<GlobalAsyncTranscribePipeline>,
 ) -> Arc<TranscribeService> {
@@ -1181,62 +1051,73 @@ mod tests {
     }
     use std::time::Instant;
 
-    use super::{StageSpan, active_spans_seconds, clean_call_boundary_noise, merge_channel_data};
-    use crate::protocol::{InferenceData, SentenceResult, TextResult};
+    use super::{
+        StageSpan, active_spans_seconds, attach_channel_timeline, clean_call_boundary_noise,
+    };
+    use crate::protocol::audio_channel_text;
+    use asr_data::{
+        Audio, AudioChannel, AudioEncoding, AudioEvent, AudioFormat, AudioInfo, AudioSource,
+        Sentence, Speech, Timeline, Transcription,
+    };
 
     #[test]
-    fn merge_channel_data_combines_left_and_right_text() {
-        let mut slot = None;
-        merge_channel_data(&mut slot, channel_data("left", "hello", 20));
-        merge_channel_data(&mut slot, channel_data("right", "world", 10));
+    fn attach_channel_timeline_keeps_left_and_right_text() {
+        let mut audio = test_audio(2);
+        attach_channel_timeline(&mut audio, "left", &source_timeline("hello", 20, 30));
+        attach_channel_timeline(&mut audio, "right", &source_timeline("world", 10, 20));
 
-        let data = slot.expect("merged data");
-        assert_eq!(data.text.mono, "");
-        assert_eq!(data.text.left, "hello");
-        assert_eq!(data.text.right, "world");
+        assert_eq!(audio_channel_text(&audio, AudioChannel::Mono), "");
+        assert_eq!(audio_channel_text(&audio, AudioChannel::Left), "hello");
+        assert_eq!(audio_channel_text(&audio, AudioChannel::Right), "world");
         assert_eq!(
-            data.sentences
+            super::prediction_sentences(&audio)
                 .iter()
-                .map(|sentence| (sentence.channel.as_str(), sentence.sentence_index))
+                .map(|(channel, _)| channel.name())
                 .collect::<Vec<_>>(),
-            vec![("right", 0), ("left", 1)]
+            vec!["right", "left"]
         );
     }
 
     #[test]
     fn clean_call_boundary_noise_drops_leading_crosstalk() {
-        let mut data = channel_data_with_sentences(vec![
-            sentence("嗯。", 920, 1840),
-            sentence("我把他登了公众号。", 12_720, 14_870),
-            sentence("喂，啊，你好。", 20_870, 23_080),
-            sentence("哎，你好，我是小云老师，这个号码加不上。", 23_360, 39_780),
-        ]);
+        let mut audio = test_audio(1);
+        for (text, start, end) in [
+            ("嗯。", 920, 1_840),
+            ("我把他登了公众号。", 12_720, 14_870),
+            ("喂，啊，你好。", 20_870, 23_080),
+            ("哎，你好，我是小云老师，这个号码加不上。", 23_360, 39_780),
+        ] {
+            push_prediction(&mut audio, AudioChannel::Mono, text, start, end);
+        }
 
-        clean_call_boundary_noise(&mut data);
+        clean_call_boundary_noise(&mut audio);
 
-        assert_eq!(data.sentences.len(), 2);
-        assert_eq!(data.sentences[0].sentence_index, 0);
-        assert_eq!(data.sentences[0].text, "喂，啊，你好。");
-        assert!(data.text.mono.starts_with("喂，啊，你好。"));
-        assert!(!data.text.mono.contains("公众号"));
+        let spans = super::prediction_sentences(&audio);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].1.text, "喂，啊，你好。");
+        let text = audio_channel_text(&audio, AudioChannel::Mono);
+        assert!(text.starts_with("喂，啊，你好。"));
+        assert!(!text.contains("公众号"));
     }
 
     #[test]
     fn clean_call_boundary_noise_removes_artifact_phrase_inside_first_sentence() {
-        let mut data = channel_data_with_sentences(vec![
-            sentence(
-                "喂，您好，我是五八到家的，请问您现在还在找工作吗？然后我让他发资料下载APP过来接视频。喂，喂，谁找工作啊？",
-                250,
-                13_930,
-            ),
-            sentence("我没有找工作。", 14_460, 21_450),
-        ]);
+        let mut audio = test_audio(1);
+        push_prediction(
+            &mut audio,
+            AudioChannel::Mono,
+            "喂，您好，我是五八到家的，请问您现在还在找工作吗？然后我让他发资料下载APP过来接视频。喂，喂，谁找工作啊？",
+            250,
+            13_930,
+        );
+        push_prediction(&mut audio, AudioChannel::Mono, "我没有找工作。", 14_460, 21_450);
 
-        clean_call_boundary_noise(&mut data);
+        clean_call_boundary_noise(&mut audio);
 
-        assert_eq!(data.sentences.len(), 2);
-        assert!(!data.text.mono.contains("资料下载APP"));
-        assert!(data.text.mono.contains("请问您现在还在找工作吗？"));
+        let text = audio_channel_text(&audio, AudioChannel::Mono);
+        assert_eq!(super::prediction_sentences(&audio).len(), 2);
+        assert!(!text.contains("资料下载APP"));
+        assert!(text.contains("请问您现在还在找工作吗？"));
     }
 
     #[test]
@@ -1257,66 +1138,57 @@ mod tests {
         assert_eq!(active_spans_seconds(spans), 4.0);
     }
 
-    fn channel_data(channel: &str, text: &str, start_time: u64) -> InferenceData {
-        let mut data = channel_data_with_sentences_for_channel(
-            channel,
-            vec![SentenceResult {
-                text: text.to_string(),
-                start_time,
-                end_time: start_time + 10,
-                duration: 10,
-                channel: channel.to_string(),
-                sentence_index: 0,
-            }],
-        );
-        match channel {
-            "left" => data.text.left = text.to_string(),
-            "right" => data.text.right = text.to_string(),
-            _ => data.text.mono = text.to_string(),
-        }
-        data
+    fn test_audio(channels: u16) -> Audio {
+        let info = AudioInfo {
+            sample_rate: 16_000,
+            channels,
+            frame_count: 16_000 * 60,
+            source_format: AudioFormat {
+                encoding: AudioEncoding::Unknown,
+                sample_rate: 16_000,
+                channels,
+            },
+        };
+        Audio::with_id_from_info(
+            "call-1",
+            AudioSource::from_url("https://example.com/call.wav"),
+            &info,
+        )
     }
 
-    fn channel_data_with_sentences(sentences: Vec<SentenceResult>) -> InferenceData {
-        channel_data_with_sentences_for_channel("mono", sentences)
+    fn source_timeline(text: &str, start: usize, end: usize) -> Timeline {
+        let mut timeline = Timeline::new("offline_audio", 60_000);
+        push_event(&mut timeline, text, start, end);
+        timeline
     }
 
-    fn channel_data_with_sentences_for_channel(
-        channel: &str,
-        sentences: Vec<SentenceResult>,
-    ) -> InferenceData {
-        let mono = sentences
-            .iter()
-            .map(|sentence| sentence.text.as_str())
-            .collect::<String>();
-        let mut text = TextResult::default();
-        match channel {
-            "left" => text.left = mono,
-            "right" => text.right = mono,
-            _ => text.mono = mono,
-        }
-        InferenceData {
-            service_id: String::new(),
-            spent_seconds: 0.0,
-            spent_details: Default::default(),
-            timings: Default::default(),
-            text,
-            sentences,
-            is_bad: false,
-            bad_reason: None,
-            bad_component: None,
-        }
+    fn push_prediction(
+        audio: &mut Audio,
+        channel: AudioChannel,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let duration = audio.info.timeline_duration_ms();
+        let timeline = audio
+            .ensure_timeline(channel, Some(duration))
+            .expect("timeline");
+        push_event(timeline, text, start, end);
     }
 
-    fn sentence(text: &str, start_time: u64, end_time: u64) -> SentenceResult {
-        SentenceResult {
-            text: text.to_string(),
-            start_time,
-            end_time,
-            duration: end_time - start_time,
-            channel: "mono".to_string(),
-            sentence_index: 0,
-        }
+    fn push_event(timeline: &mut Timeline, text: &str, start: usize, end: usize) {
+        let sentence = Sentence::new(text.to_string(), start, end);
+        let transcription = Transcription::new(text.to_string()).with_sentences(vec![sentence]);
+        let speech = Speech::new().with_transcription(transcription);
+        timeline
+            .annotate_with(
+                start,
+                end,
+                AudioEvent::from(speech),
+                false,
+                Some("vasr-transcribe"),
+            )
+            .expect("annotate");
     }
 }
 

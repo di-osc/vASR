@@ -6,7 +6,8 @@
 
 ### 数据布局
 
-- 当前 checkout 已提供 `datasets/call-100.db` 数据集文件，可直接作为 `perf` 的输入。`perf` / `eval` / `stress` / `run` 的 `-i` 接受 `.db` / `.vasr` / `.vasr.msgpack` 数据文件。
+- 当前 checkout 已提供 `datasets/call-100.db` 数据集文件，可直接作为 `perf` 的输入。`perf` / `stress` / `run` 的 `-i` 接受单个音频文件、音频目录、音频 URL，以及 `.db` / `.vasr` / `.vasr.msgpack` 数据文件；目录和数据集会展开成多条来源。
+- `perf` 是打 `serve` 的 HTTP 客户端；输入带参考文本（数据集）时自动计算 CER，否则只测吞吐与延迟。
 - 数据集音频以 ModelScope 引用（`repo_id` + 仓库内相对路径 + `revision`）存在库里，读取时由 modelhub 下载或命中缓存；不再有“数据集目录 + assets/”布局，也没有旧的 `pack` 子命令。
 
 ### Transcribe

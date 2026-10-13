@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use asr_data::{Audio, AudioChannel, AudioInfo, TimeRange, Timeline};
+use asr_data::{Audio, AudioChannel, AudioInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,84 +32,6 @@ pub struct TranscribeRequest {
     pub inputs: Vec<AudioInputDto>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TextResult {
-    pub mono: String,
-    pub left: String,
-    pub right: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SentenceResult {
-    pub text: String,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub duration: u64,
-    pub channel: String,
-    pub sentence_index: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpentDetails {
-    #[serde(default)]
-    pub loader: f64,
-    #[serde(default)]
-    pub detector: f64,
-    #[serde(default)]
-    pub recognizer: f64,
-    #[serde(default)]
-    pub sentencizer: f64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimingBreakdown {
-    #[serde(default)]
-    pub total: f64,
-    #[serde(default)]
-    pub loader: f64,
-    #[serde(default)]
-    pub pipeline: f64,
-    #[serde(default)]
-    pub audio: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceData {
-    #[serde(rename = "serviceId")]
-    pub service_id: String,
-    #[serde(rename = "spentSeconds")]
-    pub spent_seconds: f64,
-    #[serde(rename = "spentDetails")]
-    #[serde(default)]
-    pub spent_details: SpentDetails,
-    #[serde(default)]
-    pub timings: TimingBreakdown,
-    pub text: TextResult,
-    pub sentences: Vec<SentenceResult>,
-    pub is_bad: bool,
-    pub bad_reason: Option<String>,
-    pub bad_component: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferencePerformance {
-    pub batch_wall_seconds: f64,
-    pub num_items: usize,
-    pub throughput_items_per_second: f64,
-    pub total_audio_duration_seconds: f64,
-    pub speedup: f64,
-    pub rtf: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscribeResponse {
-    pub data: Vec<InferenceData>,
-    pub inference_performance: InferencePerformance,
-}
-
 const TRANSCRIBE_ERROR_METADATA_KEY: &str = "vasr-transcribe-error";
 
 /// Remove metadata emitted by earlier transcribe response versions. Audio metadata
@@ -140,9 +62,50 @@ pub fn clear_transcription_error(audio: &mut Audio) {
     audio.metadata.remove(TRANSCRIBE_ERROR_METADATA_KEY);
 }
 
-/// Decode Audio JSONL into the legacy in-process shape used by eval/perf/stress reports.
-/// The wire format remains plain `asr_data::Audio`; timing values are measured by the client.
-pub fn parse_transcribe_jsonl(body: &str, batch_wall_seconds: f64) -> Result<TranscribeResponse> {
+/// 该 Audio 的整段音频时长（秒）。
+pub(crate) fn audio_seconds(audio: &Audio) -> f64 {
+    audio.info.duration_ms() / 1_000.0
+}
+
+/// 该 Audio 是否带 item 级失败标记。
+pub(crate) fn audio_is_bad(audio: &Audio) -> bool {
+    audio.metadata.get(TRANSCRIBE_ERROR_METADATA_KEY).is_some()
+}
+
+/// item 级失败原因，来自 `mark_transcription_failed` 写入的 metadata。
+pub(crate) fn audio_bad_reason(audio: &Audio) -> Option<String> {
+    audio
+        .metadata
+        .get(TRANSCRIBE_ERROR_METADATA_KEY)
+        .and_then(|error| error.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// item 级失败组件，来自 `mark_transcription_failed` 写入的 metadata。
+pub(crate) fn audio_bad_component(audio: &Audio) -> Option<String> {
+    audio
+        .metadata
+        .get(TRANSCRIBE_ERROR_METADATA_KEY)
+        .and_then(|error| error.get("component"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// 指定声道的预测文本；没有该时间轴时返回空串。
+pub(crate) fn audio_channel_text(audio: &Audio, channel: AudioChannel) -> String {
+    audio
+        .timeline(channel)
+        .ok()
+        .flatten()
+        .map(vasr::prediction_text)
+        .unwrap_or_default()
+}
+
+/// 从服务端 Audio JSONL 响应里解出 `asr_data::Audio` 记录。
+///
+/// wire format 本身就是 `Audio`；这里不做任何信息丢失的转换。
+pub(crate) fn parse_transcribe_audios(body: &str) -> Result<Vec<Audio>> {
     let mut audios = Vec::new();
     for (line_index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -152,145 +115,7 @@ pub fn parse_transcribe_jsonl(body: &str, batch_wall_seconds: f64) -> Result<Tra
             format!("failed to decode transcribe JSONL line {}", line_index + 1)
         })?);
     }
-
-    let total_audio_duration_seconds = audios
-        .iter()
-        .map(|audio| audio.info.duration_ms() as f64 / 1_000.0)
-        .sum::<f64>();
-    let num_items = audios.len();
-    let batch_wall_seconds = batch_wall_seconds.max(0.0);
-    let data = audios.iter().map(inference_from_audio).collect();
-    Ok(TranscribeResponse {
-        data,
-        inference_performance: InferencePerformance {
-            batch_wall_seconds,
-            num_items,
-            throughput_items_per_second: num_items as f64 / batch_wall_seconds.max(f64::EPSILON),
-            total_audio_duration_seconds,
-            speedup: total_audio_duration_seconds / batch_wall_seconds.max(f64::EPSILON),
-            rtf: batch_wall_seconds / total_audio_duration_seconds.max(f64::EPSILON),
-        },
-    })
-}
-
-fn inference_from_audio(audio: &Audio) -> InferenceData {
-    let audio_seconds = audio.info.duration_ms() as f64 / 1_000.0;
-    let transcription_error = audio.metadata.get(TRANSCRIBE_ERROR_METADATA_KEY);
-    let mut inference = InferenceData {
-        service_id: audio.id.clone(),
-        spent_seconds: 0.0,
-        spent_details: SpentDetails::default(),
-        timings: TimingBreakdown {
-            audio: audio_seconds,
-            ..TimingBreakdown::default()
-        },
-        text: TextResult::default(),
-        sentences: Vec::new(),
-        is_bad: transcription_error.is_some(),
-        bad_reason: transcription_error
-            .and_then(|error| error.get("reason"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        bad_component: transcription_error
-            .and_then(|error| error.get("component"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    };
-    for (channel, channel_name) in [
-        (AudioChannel::Mono, "mono"),
-        (AudioChannel::Left, "left"),
-        (AudioChannel::Right, "right"),
-    ] {
-        let Ok(Some(timeline)) = audio.timeline(channel) else {
-            continue;
-        };
-        let channel_data =
-            InferenceData::from_timeline_channel(audio.id.clone(), timeline, channel_name);
-        match channel_name {
-            "left" => inference.text.left = channel_data.text.left,
-            "right" => inference.text.right = channel_data.text.right,
-            _ => inference.text.mono = channel_data.text.mono,
-        }
-        inference.sentences.extend(channel_data.sentences);
-    }
-    inference
-        .sentences
-        .sort_by_key(|sentence| (sentence.start_time, sentence.channel.clone()));
-    for (index, sentence) in inference.sentences.iter_mut().enumerate() {
-        sentence.sentence_index = index;
-    }
-    inference
-}
-
-impl InferenceData {
-    pub fn from_timeline(service_id: impl Into<String>, timeline: &Timeline) -> Self {
-        Self::from_timeline_channel(service_id, timeline, "mono")
-    }
-
-    pub fn from_timeline_channel(
-        service_id: impl Into<String>,
-        timeline: &Timeline,
-        channel: &str,
-    ) -> Self {
-        let transcript = vasr::prediction_text(timeline);
-        let mut sentences = Vec::new();
-        for event in &timeline.prediction {
-            let Some(transcription) = event.transcription() else {
-                continue;
-            };
-            if transcription.sentences.is_empty() {
-                let range = event.range();
-                sentences.push(sentence_result(
-                    transcription.text.clone(),
-                    range,
-                    channel,
-                    sentences.len(),
-                ));
-            } else {
-                for sentence in &transcription.sentences {
-                    sentences.push(sentence_result(
-                        sentence.text.clone(),
-                        sentence.range,
-                        channel,
-                        sentences.len(),
-                    ));
-                }
-            }
-        }
-        let mut text = TextResult::default();
-        match channel {
-            "left" => text.left = transcript,
-            "right" => text.right = transcript,
-            _ => text.mono = transcript,
-        }
-        Self {
-            service_id: service_id.into(),
-            spent_seconds: 0.0,
-            spent_details: SpentDetails::default(),
-            timings: TimingBreakdown::default(),
-            text,
-            sentences,
-            is_bad: false,
-            bad_reason: None,
-            bad_component: None,
-        }
-    }
-}
-
-fn sentence_result(
-    text: String,
-    range: TimeRange,
-    channel: &str,
-    sentence_index: usize,
-) -> SentenceResult {
-    SentenceResult {
-        text,
-        start_time: range.start_ms as u64,
-        end_time: range.end_ms as u64,
-        duration: range.duration() as u64,
-        channel: channel.to_string(),
-        sentence_index,
-    }
+    Ok(audios)
 }
 
 fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>

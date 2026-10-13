@@ -1,6 +1,9 @@
-use std::path::Path;
+//! `-i` 输入收集：把单个输入字符串（音频文件 / 目录 / URL / vASR 数据文件）
+//! 展开成音频来源，并在需要时保留 audiodb 记录里的参考文本和 metadata。
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 use asr_data::{
     Audio, AudioDb, AudioDbError, AudioDbMode, AudioQuery, AudioSource, MAX_QUERY_LIMIT,
 };
@@ -22,11 +25,6 @@ pub fn is_vasr_data_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "db" | "vasr" | "msgpack"))
         .unwrap_or(false)
-}
-
-/// 判断路径是否是 vASR 输入。
-pub fn is_vasr_input(path: &Path) -> bool {
-    is_vasr_data_file(path)
 }
 
 /// 读取 vASR 数据文件里的全部音频文档。
@@ -116,37 +114,163 @@ pub fn audio_input_from_source(
 }
 
 pub fn audio_input_from_audio(audio: &Audio, mono: Option<bool>) -> AudioInputDto {
-    let mut input = audio_input_from_source(&audio.source, mono, None);
+    let mut input = audio_input_from_source(&audio.source, mono, hotword_from_record(audio));
     input.id = Some(audio.id.clone());
     input.info = Some(audio.info.clone());
     input
 }
 
-pub fn read_audio_input_dtos(path: &Path, mono: Option<bool>) -> Result<Vec<AudioInputDto>> {
-    if is_vasr_input(path) {
+/// 从 Audio 记录 metadata 里读取热词。
+pub fn hotword_from_record(record: &Audio) -> Option<String> {
+    for key in ["hotword", "hotwords", "fasr_hotword", "fasr_hotwords"] {
+        let Some(value) = record.metadata.get(key) else {
+            continue;
+        };
+        if let Some(text) = value.as_str()
+            && !text.trim().is_empty()
+        {
+            return Some(text.to_string());
+        }
+        if let Some(values) = value.as_array() {
+            let joined = values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+    }
+    None
+}
+
+/// 单个 `-i` 输入展开出的一条音频来源。
+///
+/// `record` 只在输入是 vASR 数据文件（audiodb）时存在，用来保留参考文本、metadata
+/// 和 probe 信息；目录、单个音频文件和 URL 都只有 `source`。
+#[derive(Debug, Clone)]
+pub struct CollectedInput {
+    pub source: AudioSource,
+    pub record: Option<Audio>,
+}
+
+/// 判断 `-i` 字符串是否是远程 URL。
+pub fn is_url_input(value: &str) -> bool {
+    value.contains("://")
+}
+
+/// 音频文件扩展名。
+pub fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "webm"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 把单个 `-i` 输入展开成来源列表。
+///
+/// 支持四种输入：
+///
+/// - 远程 URL（含 `://`）→ 一条 [`AudioSource::Url`]
+/// - vASR 数据文件（`.db` / `.vasr` / `.vasr.msgpack`）→ 每条记录一条来源
+/// - 目录 → 目录下的音频文件，每条一个 [`AudioSource::Path`]
+/// - 单个音频文件 → 一条 [`AudioSource::Path`]
+///
+/// # Errors
+///
+/// 路径不存在、扩展名不是音频、数据文件读取失败或目录里没有音频文件时返回错误。
+pub fn collect_inputs(input: &str, recursive: bool) -> Result<Vec<CollectedInput>> {
+    if is_url_input(input) {
+        return Ok(vec![CollectedInput {
+            source: AudioSource::Url(input.to_string()),
+            record: None,
+        }]);
+    }
+
+    let path = Path::new(input);
+    if is_vasr_data_file(path) {
         let audios = read_vasr_audios(path)?;
+        if audios.is_empty() {
+            bail!("vASR record list is empty: {}", path.display());
+        }
         return Ok(audios
-            .iter()
-            .map(|audio| audio_input_from_audio(audio, mono))
+            .into_iter()
+            .map(|audio| CollectedInput {
+                source: audio.source.clone(),
+                record: Some(audio),
+            })
             .collect());
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .enumerate()
-        .map(|(index, line)| AudioInputDto {
-            id: Some(Audio::id_for_index(index)),
-            info: None,
-            url: Some(line.to_string()),
-            b64_str: None,
-            modelscope: None,
-            mono,
-            hotword: None,
-        })
-        .collect())
+
+    if path.is_dir() {
+        let mut files = Vec::new();
+        collect_audio_files_in_dir(path, recursive, &mut files)?;
+        files.sort();
+        if files.is_empty() {
+            bail!("no audio files found under {}", path.display());
+        }
+        return Ok(files
+            .into_iter()
+            .map(|file| CollectedInput {
+                source: AudioSource::Path(file),
+                record: None,
+            })
+            .collect());
+    }
+
+    if path.is_file() {
+        if !is_audio_file(path) {
+            bail!("unsupported audio file extension: {}", path.display());
+        }
+        return Ok(vec![CollectedInput {
+            source: AudioSource::Path(path.to_path_buf()),
+            record: None,
+        }]);
+    }
+
+    bail!("input path does not exist: {}", path.display())
+}
+
+fn collect_audio_files_in_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recursive {
+                collect_audio_files_in_dir(&path, true, out)?;
+            }
+            continue;
+        }
+        if is_audio_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// 把一条收集到的输入转成 HTTP 请求项。
+pub fn audio_input_from_collected(
+    input: &CollectedInput,
+    mono: Option<bool>,
+    index: usize,
+) -> AudioInputDto {
+    match &input.record {
+        Some(record) => audio_input_from_audio(record, mono),
+        None => {
+            let mut dto = audio_input_from_source(&input.source, mono, None);
+            dto.id = Some(Audio::id_for_index(index));
+            dto
+        }
+    }
 }
 
 #[cfg(test)]
@@ -155,9 +279,8 @@ mod tests {
     fn sqlite_database_file_is_a_dataset_input() {
         let path = std::path::Path::new("datasets/example1.db");
         assert!(super::is_vasr_data_file(path));
-        assert!(super::is_vasr_input(path));
     }
-    use super::{read_audio_input_dtos, read_vasr_audios};
+    use super::{audio_input_from_collected, collect_inputs, read_vasr_audios};
     use asr_data::{AudioSource, TimeRange};
     use base64::Engine;
     use rusqlite::Connection;
@@ -303,24 +426,79 @@ mod tests {
     }
 
     #[test]
-    fn read_audio_input_dtos_accepts_schema2_vasr() {
-        let path = temp_path("schema2-dtos");
+    fn collect_inputs_accepts_schema2_vasr() {
+        let path = temp_path("schema2-inputs");
         write_schema2_db(
             &path,
             &AudioSource::from_encoded_bytes(b"fake-mp3".to_vec()),
             "转写文本",
         );
 
-        let dtos = read_audio_input_dtos(&path, Some(true)).expect("read dtos");
+        let collected = collect_inputs(&path.to_string_lossy(), false).expect("collect inputs");
+        let dtos = collected
+            .iter()
+            .enumerate()
+            .map(|(index, input)| audio_input_from_collected(input, Some(true), index))
+            .collect::<Vec<_>>();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(dtos.len(), 1);
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].record.is_some());
         assert!(dtos[0].url.is_none());
         assert_eq!(
             dtos[0].b64_str,
             Some(base64::engine::general_purpose::STANDARD.encode(b"fake-mp3"))
         );
         assert_eq!(dtos[0].mono, Some(true));
+    }
+
+    #[test]
+    fn collect_inputs_treats_http_url_as_single_source() {
+        let collected =
+            collect_inputs("https://example.com/a.wav", false).expect("collect url input");
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].record.is_none());
+        assert_eq!(
+            collected[0].source,
+            AudioSource::from_url("https://example.com/a.wav")
+        );
+    }
+
+    #[test]
+    fn collect_inputs_expands_directory_audio_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "vasr-dataset-dir-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("b.wav"), b"RIFF").expect("write b");
+        std::fs::write(dir.join("a.mp3"), b"id3").expect("write a");
+        std::fs::write(dir.join("notes.txt"), b"ignore").expect("write txt");
+
+        let collected = collect_inputs(&dir.to_string_lossy(), false).expect("collect dir");
+        let names = collected
+            .iter()
+            .map(|input| match &input.source {
+                AudioSource::Path(path) => path.file_name().unwrap().to_string_lossy().to_string(),
+                other => panic!("expected path source, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.mp3", "b.wav"]);
+        assert!(collected.iter().all(|input| input.record.is_none()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_inputs_rejects_missing_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "vasr-dataset-missing-{}-{}.wav",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let error = collect_inputs(&missing.to_string_lossy(), false).expect_err("missing path");
+        assert!(error.to_string().contains("does not exist"));
     }
 
     #[test]

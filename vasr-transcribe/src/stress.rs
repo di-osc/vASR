@@ -13,15 +13,20 @@ use clap::{ArgAction, Args};
 use serde::Serialize;
 use tokio::task::JoinSet;
 
-use crate::dataset::read_audio_input_dtos;
+use crate::inputs::{audio_input_from_collected, collect_inputs};
 use crate::perf::timestamp_file_name;
+use crate::protocol::{audio_bad_reason, audio_is_bad, audio_seconds, parse_transcribe_audios};
 use crate::{AudioInputDto, TranscribeRequest, table::render_table};
 
 #[derive(Debug, Args)]
 pub struct StressArgs {
-    /// Text file with one audio path/URL per line, or a vASR dataset directory / `.vasr` AudioDb.
-    #[arg(short, long, value_name = "PATH")]
-    input: PathBuf,
+    /// Audio file, directory, URL, or vASR AudioDb (`.db` / `.vasr` / `.vasr.msgpack`).
+    #[arg(short, long, value_name = "INPUT")]
+    input: String,
+
+    /// Recursively scan subdirectories when `--input` is a directory.
+    #[arg(long, default_value_t = false)]
+    recursive: bool,
 
     /// Transcribe service endpoint.
     #[arg(long, default_value = "http://127.0.0.1:8867/transcribe")]
@@ -182,9 +187,14 @@ struct StressStats {
 
 pub async fn run_stress(args: StressArgs) -> Result<()> {
     validate_args(&args)?;
-    let mut sources = read_audio_input_dtos(&args.input, args.mono)?;
+    let collected = collect_inputs(&args.input, args.recursive)?;
+    let mut sources = collected
+        .iter()
+        .enumerate()
+        .map(|(index, input)| audio_input_from_collected(input, args.mono, index))
+        .collect::<Vec<_>>();
     if sources.is_empty() {
-        bail!("input contains no audio sources: {}", args.input.display());
+        bail!("input contains no audio sources: {}", args.input);
     }
     if args.shuffle {
         shuffle_sources(&mut sources);
@@ -211,7 +221,7 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
 
     println!(
         "stress START | input={} items={} server={} batch={} concurrency={} duration={}s mono={}",
-        args.input.display(),
+        args.input,
         sources.len(),
         args.server,
         args.batch_size,
@@ -298,13 +308,13 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| args.results_dir.join(format!("stress_{timestamp}.json")));
-    let input = args.input.to_string_lossy().to_string();
+    let input = args.input.clone();
     save_report(
         &output,
         &StressReport {
             timestamp,
             config: StressConfig {
-                input: &input,
+                input: input.as_str(),
                 server: &args.server,
                 concurrency: args.concurrency,
                 batch_size: args.batch_size,
@@ -330,9 +340,6 @@ pub async fn run_stress(args: StressArgs) -> Result<()> {
 }
 
 fn validate_args(args: &StressArgs) -> Result<()> {
-    if !args.input.exists() {
-        bail!("input path does not exist: {}", args.input.display());
-    }
     if args.concurrency == 0 {
         bail!("--concurrency must be greater than 0");
     }
@@ -414,15 +421,13 @@ async fn run_one_request(
                 let body = response.text().await;
                 let latency_seconds = started.elapsed().as_secs_f64();
                 match body.map_err(|error| error.to_string()).and_then(|body| {
-                    crate::protocol::parse_transcribe_jsonl(&body, latency_seconds)
-                        .map_err(|error| error.to_string())
+                    parse_transcribe_audios(&body).map_err(|error| error.to_string())
                 }) {
-                    Ok(response) => {
-                        let bad_items = response.data.iter().filter(|item| item.is_bad).count();
-                        let error_text = response
-                            .data
+                    Ok(audios) => {
+                        let bad_items = audios.iter().filter(|audio| audio_is_bad(audio)).count();
+                        let error_text = audios
                             .iter()
-                            .filter_map(|item| item.bad_reason.as_deref())
+                            .filter_map(audio_bad_reason)
                             .collect::<Vec<_>>()
                             .join(" | ");
                         let oom = contains_oom(&error_text);
@@ -432,9 +437,7 @@ async fn run_one_request(
                             oom,
                             batch_size,
                             bad_items,
-                            audio_seconds: response
-                                .inference_performance
-                                .total_audio_duration_seconds,
+                            audio_seconds: audios.iter().map(audio_seconds).sum(),
                             error: if error_text.is_empty() {
                                 None
                             } else {
