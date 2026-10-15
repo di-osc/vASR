@@ -132,7 +132,10 @@ pub(crate) fn evaluate_perf_output(
     let items = extract_items(records, &results, normalizer, timeline);
     let summary = summarize(&items, wall_seconds, audio_seconds);
     if summary.labeled_items == 0 {
-        bail!("no reference transcripts for timeline '{}'", timeline.name());
+        bail!(
+            "no reference transcripts for timeline '{}'",
+            timeline.name()
+        );
     }
     Ok(serde_json::json!({
         "normalizer": format!("{normalizer:?}").to_ascii_lowercase(),
@@ -199,9 +202,7 @@ fn extract_items(
                 reference_length,
                 accuracy: round6(accuracy),
                 error_rate: round6(cer),
-                duration_s: result
-                    .map(audio_seconds)
-                    .filter(|duration| *duration > 0.0),
+                duration_s: result.map(audio_seconds).filter(|duration| *duration > 0.0),
                 is_bad,
                 service_is_bad,
                 quality_anomaly,
@@ -262,8 +263,7 @@ fn summarize(items: &[ItemResult], wall_seconds: f64, audio_seconds: f64) -> Sum
             .filter_map(|item| item.duration_s)
             .sum()
     };
-    let throughput_items_per_second =
-        items.len() as f64 / wall_seconds.max(f64::EPSILON);
+    let throughput_items_per_second = items.len() as f64 / wall_seconds.max(f64::EPSILON);
     let speedup = audio_seconds / wall_seconds.max(f64::EPSILON);
     let rtf = wall_seconds / audio_seconds.max(f64::EPSILON);
     let service_performance = serde_json::json!({
@@ -617,7 +617,10 @@ mod tests {
         add_prediction(&mut audio, AudioChannel::Right, "right hypothesis");
 
         assert_eq!(reference_text(&audio, EvalTimeline::Left), "left reference");
-        assert_eq!(reference_text(&audio, EvalTimeline::Right), "right reference");
+        assert_eq!(
+            reference_text(&audio, EvalTimeline::Right),
+            "right reference"
+        );
         assert!(super::has_reference(&audio, EvalTimeline::Left));
         assert!(!super::has_reference(&audio, EvalTimeline::Mono));
         assert_eq!(

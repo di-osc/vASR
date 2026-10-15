@@ -383,14 +383,14 @@ pub type TranscribeArgs = ServeTranscribeArgs;
 
 /// 默认日志过滤器。
 ///
-/// `vasr::execution` 的逐组件策略明细是 DEBUG，只在 `--verbose` 下打开；汇总行
-/// `{name} 执行策略 | ...` 保持 INFO，继续作为性能归档的配置记录。需要在不加
-/// `--verbose` 时保留明细，显式设置 `VASR_LOG=...,vasr::execution=debug`。
+/// 启动配置写在 `start` 行。`vasr::execution` 的逐组件策略明细是 DEBUG，只在
+/// `--verbose` 下打开。需要在不加 `--verbose` 时保留明细，显式设置
+/// `VASR_LOG=...,vasr::execution=debug`。
 pub fn default_log_filter(verbose: bool) -> &'static str {
     if verbose {
         "warn,vasr_transcribe=debug,vasr::models::qwen3asr=debug,vasr::execution=debug"
     } else {
-        "warn,vasr_transcribe=info,vasr::execution=info"
+        "warn,vasr_transcribe=info"
     }
 }
 
@@ -409,8 +409,6 @@ pub fn init_logging(verbose: bool) {
 pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     validate_serve_pipeline(&args.pipeline)?;
     vasr::set_cache_dir(args.pipeline.model.cache_dir.clone());
-    let vad_args = internal_vad_args(&args.pipeline.vad)?;
-    let vad_model = build_vad_model(&vad_args)?;
     let device = resolve_device(&args.pipeline.model.device)?;
     let hardware = match crate::serve_tuning::probe_hardware(&device) {
         Ok(hardware) => Some(hardware),
@@ -461,8 +459,10 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
     )?;
     let pipeline = resolve_serve_pipeline(&args.pipeline, tuning)?;
     validate_pipeline(&pipeline)?;
-    log_transcribe_tuning(
+    // 启动日志固定为 start、vad、asr、gpu/memory、ready。start 只含加载前已知的配置。
+    log_serve_start(
         &pipeline,
+        device_label(&device),
         if tuning.used_fallback {
             "baseline"
         } else {
@@ -478,21 +478,17 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
             "--gpu-memory-utilization",
             "VASR_GPU_MEMORY_UTILIZATION",
         ),
-        tuning_value_source(
-            args.pipeline.encoder_batch_max_audio_seconds.is_some(),
-            "--encoder-batch-max-audio-seconds",
-            "VASR_ASR_ENCODER_BATCH_MAX_AUDIO_SECONDS",
-        ),
+        // CUDA 的活跃槽位由运行时决定，不写进 start。
+        device.is_metal().then_some(tuning.execution),
     );
+    let vad_args = internal_vad_args(&args.pipeline.vad)?;
+    let vad_model = build_vad_model(&vad_args)?;
     let mut asr_options = asr_options_from_pipeline(&pipeline, args.language.clone());
     if device.is_metal() {
         // Metal：使用服务解析出的安全容量，并附加启动时解析出的统一执行策略，
-        // 不再退回调度器内部的默认 8 或只跑 1 个活跃槽位。
+        // 不再退回调度器内部的默认 8 或只跑 1 个活跃槽位。策略字段已经写在 start 行。
         asr_options.decode_max_seqs = tuning.max_num_seqs;
         asr_options.execution = Some(tuning.execution);
-        tuning
-            .execution
-            .log_resolved("serve", "metal", tuning.max_num_seqs);
     } else if args.pipeline.model.max_num_seqs.is_none() && device.is_cuda() {
         // CUDA：paged cache 知道权重加载后的实际容量，交给运行时（CUDA graph）决定。
         asr_options.decode_max_seqs = 0;
@@ -629,19 +625,12 @@ pub fn build_async_transcribe_pipeline(
     pipeline: &TranscribePipelineArgs,
     language: Option<String>,
 ) -> Result<AsyncTranscribePipeline> {
-    log_transcribe_tuning(
-        pipeline,
-        "not-run",
-        "configured",
-        "configured",
-        "configured",
-    );
     build_async_transcribe_pipeline_with_reservation(pipeline, language, 0)
 }
 
-/// 供一次性 `run` 使用的构建入口。
+/// 供一次性 `run` 和库内复用的构建入口。
 ///
-/// 容量已经由 `run` 自己的 `start` 摘要行报告，因此这里不再重复打印 tuning 行。
+/// `start` 与 `ready` 由调用方打印。这里按加载顺序打 `vad`、`asr` 和 `gpu`/`memory`。
 pub(crate) fn build_async_transcribe_pipeline_with_reservation(
     pipeline: &TranscribePipelineArgs,
     language: Option<String>,
@@ -674,13 +663,6 @@ pub fn build_global_transcribe_pipeline(
     validate_pipeline(pipeline)?;
     configure_model_cache_dir(pipeline);
     let vad = build_vad_model(&pipeline.vad)?;
-    log_transcribe_tuning(
-        pipeline,
-        "not-run",
-        "configured",
-        "configured",
-        "configured",
-    );
     let asr = load_asr_model_for_pipeline(
         pipeline,
         language.as_deref(),
@@ -840,40 +822,76 @@ fn bytes_to_gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-fn format_transcribe_tuning_log(
+/// 拼 `serve` 的 `start` 行。
+///
+/// 只写入加载前已经确定的模型、容量和 worker。`execution` 仅在 Metal 上传入；
+/// CUDA 的活跃槽位要等运行时分配 KV 之后才知道。
+fn format_serve_start_log(
     pipeline: &TranscribePipelineArgs,
+    device: &str,
     probe: &str,
     max_num_seqs_source: &str,
-    gpu_memory_utilization_source: &str,
-    encoder_batch_audio_seconds_source: &str,
+    budget_source: &str,
+    execution: Option<vasr::ExecutionPolicy>,
 ) -> String {
-    format!(
-        "transcribe tuning | probe={probe} max_num_seqs={}({max_num_seqs_source}) gpu_memory_budget_fraction={:.3}({gpu_memory_utilization_source}) encoder_batch_max_audio_seconds={:.1}({encoder_batch_audio_seconds_source}) encoder_batch_max_segments={} workers=load:{}/vad:{}",
-        pipeline.model.max_num_seqs,
-        pipeline.model.gpu_memory_utilization,
-        pipeline.encoder_batch_max_audio_seconds,
-        pipeline.encoder_batch_max_segments,
-        pipeline.num_load_workers,
-        pipeline.num_vad_workers,
-    )
+    let mut fields = vec![
+        ("model", pipeline.model.model.clone()),
+        ("device", device.to_string()),
+        ("probe", probe.to_string()),
+        (
+            "max_num_seqs",
+            format!("{}({max_num_seqs_source})", pipeline.model.max_num_seqs),
+        ),
+    ];
+    if let Some(execution) = execution {
+        fields.push(("active_slots", execution.active_slots.to_string()));
+        fields.push(("decode_rows", execution.decode_rows.to_string()));
+        fields.push(("mixed_step", execution.mixed_step.to_string()));
+        fields.push(("prefill_wave", execution.prefill_wave.to_string()));
+    }
+    fields.push((
+        "encoder",
+        format!(
+            "{}seg/{:.1}s",
+            pipeline.encoder_batch_max_segments, pipeline.encoder_batch_max_audio_seconds
+        ),
+    ));
+    fields.push((
+        "budget",
+        format!(
+            "{:.3}({budget_source})",
+            pipeline.model.gpu_memory_utilization
+        ),
+    ));
+    fields.push((
+        "workers",
+        format!(
+            "load:{}/vad:{}",
+            pipeline.num_load_workers, pipeline.num_vad_workers
+        ),
+    ));
+    startup_log_line("start", &fields)
 }
 
-fn log_transcribe_tuning(
+/// 打印 `serve` 的 `start` 行。
+fn log_serve_start(
     pipeline: &TranscribePipelineArgs,
+    device: &str,
     probe: &str,
     max_num_seqs_source: &str,
-    gpu_memory_utilization_source: &str,
-    encoder_batch_audio_seconds_source: &str,
+    budget_source: &str,
+    execution: Option<vasr::ExecutionPolicy>,
 ) {
     tracing::info!(
         target: "vasr_transcribe::serve",
         "{}",
-        format_transcribe_tuning_log(
+        format_serve_start_log(
             pipeline,
+            device,
             probe,
             max_num_seqs_source,
-            gpu_memory_utilization_source,
-            encoder_batch_audio_seconds_source,
+            budget_source,
+            execution,
         )
     );
 }
@@ -917,9 +935,14 @@ fn dtype_label(dtype: DType) -> &'static str {
     }
 }
 
-/// 打印 ASR 加载结果和显存占用。
+/// 加速器占用用 `gpu`，CPU 占用用 `memory`。
+fn memory_log_subject(device: &Device) -> &'static str {
+    if device.is_cpu() { "memory" } else { "gpu" }
+}
+
+/// 打印 ASR 加载结果，再单独打印显存或内存占用。
 ///
-/// ASR 与显存合并成一行启动摘要。显存只保留整卡占用、参数、KV 和 CUDA graph；
+/// 两行各自只有一个 `|`。占用只保留整卡用量、参数、KV 和 CUDA graph；
 /// paged attention workspace 不写入启动日志。
 fn log_model_loaded(
     model: &str,
@@ -927,14 +950,47 @@ fn log_model_loaded(
     stats: &vasr::OfflineAsrBuildStats,
     device: &Device,
 ) {
-    let asr_line = startup_log_line(
-        "asr",
-        &[
-            ("model", model.to_string()),
-            ("load", format_load_seconds(stats.build_seconds)),
-            ("device", device_label(device).to_string()),
-            ("dtype", dtype_label(dtype).to_string()),
-        ],
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{}",
+        startup_log_line(
+            "asr",
+            &[
+                ("model", model.to_string()),
+                ("load", format_load_seconds(stats.build_seconds)),
+                ("device", device_label(device).to_string()),
+                ("dtype", dtype_label(dtype).to_string()),
+            ],
+        )
+    );
+
+    let mut memory_fields = Vec::new();
+    // 没有 CUDA 显存快照时不写 used/total/free。
+    #[cfg(all(feature = "cuda", feature = "paged-attn"))]
+    if device.is_cuda()
+        && let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device)
+    {
+        memory_fields.push(("used", format_gib(memory.used())));
+        memory_fields.push(("total", format_gib(memory.total)));
+        memory_fields.push(("free", format_gib(memory.free)));
+    }
+    memory_fields.push((
+        "params",
+        stats
+            .parameter_bytes
+            .map(format_gib)
+            .unwrap_or_else(|| "unknown".to_string()),
+    ));
+    if let Some(bytes) = stats.kv_cache_bytes {
+        memory_fields.push(("kv", format_gib(bytes)));
+    }
+    if let Some(bytes) = stats.cuda_graph_bytes {
+        memory_fields.push(("graph", format_gib(bytes)));
+    }
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "{}",
+        startup_log_line(memory_log_subject(device), &memory_fields)
     );
 
     if let Some((encoder, text, other)) = stats.quantized_layer_counts
@@ -948,36 +1004,6 @@ fn log_model_loaded(
             "ISQ effective quantized layer counts"
         );
     }
-
-    let mut gpu_fields = Vec::new();
-    // 没有 CUDA 显存快照时不写 used/total/free。
-    #[cfg(all(feature = "cuda", feature = "paged-attn"))]
-    if device.is_cuda()
-        && let Some(memory) = vasr::vasr_paged_attn::cuda_graph::cuda_memory_snapshot(device)
-    {
-        gpu_fields.push(("used", format_gib(memory.used())));
-        gpu_fields.push(("total", format_gib(memory.total)));
-        gpu_fields.push(("free", format_gib(memory.free)));
-    }
-    gpu_fields.push((
-        "params",
-        stats
-            .parameter_bytes
-            .map(format_gib)
-            .unwrap_or_else(|| "unknown".to_string()),
-    ));
-    if let Some(bytes) = stats.kv_cache_bytes {
-        gpu_fields.push(("kv", format_gib(bytes)));
-    }
-    if let Some(bytes) = stats.cuda_graph_bytes {
-        gpu_fields.push(("graph", format_gib(bytes)));
-    }
-    tracing::info!(
-        target: "vasr_transcribe::serve",
-        "{} | {}",
-        asr_line,
-        startup_log_line("gpu", &gpu_fields)
-    );
 }
 
 fn validate_vad_args(vad: &VadCliArgs) -> Result<()> {
@@ -1187,7 +1213,7 @@ async fn serve_app_with_pipeline(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         target: "vasr_transcribe::serve",
-        "server ready | http://{addr} endpoints=health,transcribe"
+        "ready | http://{addr} endpoints=health,transcribe"
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = async move {
@@ -1633,10 +1659,36 @@ mod tests {
             "gpu | used=19.45GiB total=23.52GiB free=4.07GiB params=1.75GiB kv=17.06GiB graph=0.516GiB"
         );
         assert_eq!(gpu.matches('|').count(), 1);
+
+        let asr = startup_log_line(
+            "asr",
+            &[
+                ("model", "Qwen/Qwen3-ASR-0.6B".to_string()),
+                ("load", "2.483".to_string()),
+                ("device", "metal".to_string()),
+                ("dtype", "bf16".to_string()),
+            ],
+        );
+        assert_eq!(
+            asr,
+            "asr | model=Qwen/Qwen3-ASR-0.6B load=2.483 device=metal dtype=bf16"
+        );
+        assert_eq!(asr.matches('|').count(), 1);
+
+        let memory = startup_log_line(
+            "memory",
+            &[
+                ("params", "1.75GiB".to_string()),
+                ("kv", "11.70GiB".to_string()),
+            ],
+        );
+        assert_eq!(memory, "memory | params=1.75GiB kv=11.70GiB");
+        assert_eq!(memory.matches('|').count(), 1);
+        assert_eq!(memory_log_subject(&Device::Cpu), "memory");
     }
 
     #[test]
-    fn transcribe_tuning_log_uses_the_same_schema_for_configured_and_auto_values() {
+    fn serve_start_log_uses_the_same_schema_for_configured_and_auto_values() {
         let mut pipeline = default_pipeline_args();
         pipeline.model.max_num_seqs = 107;
         pipeline.model.gpu_memory_utilization = 1.0;
@@ -1645,35 +1697,52 @@ mod tests {
         pipeline.num_load_workers = 2;
         pipeline.num_vad_workers = 2;
 
-        let auto = format_transcribe_tuning_log(&pipeline, "hardware", "auto", "auto", "auto");
+        let auto = format_serve_start_log(&pipeline, "cpu", "hardware", "auto", "auto", None);
         assert_eq!(
             auto,
-            "transcribe tuning | probe=hardware max_num_seqs=107(auto) gpu_memory_budget_fraction=1.000(auto) encoder_batch_max_audio_seconds=66.0(auto) encoder_batch_max_segments=20 workers=load:2/vad:2"
+            "start | model=Qwen/Qwen3-ASR-0.6B device=cpu probe=hardware max_num_seqs=107(auto) encoder=20seg/66.0s budget=1.000(auto) workers=load:2/vad:2"
         );
+        assert_eq!(auto.matches('|').count(), 1);
 
-        let configured = format_transcribe_tuning_log(
+        let configured = format_serve_start_log(
             &pipeline,
-            "not-run",
+            "cuda",
+            "baseline",
             "configured",
             "configured",
-            "configured",
+            None,
         );
         assert_eq!(
             configured,
-            "transcribe tuning | probe=not-run max_num_seqs=107(configured) gpu_memory_budget_fraction=1.000(configured) encoder_batch_max_audio_seconds=66.0(configured) encoder_batch_max_segments=20 workers=load:2/vad:2"
+            "start | model=Qwen/Qwen3-ASR-0.6B device=cuda probe=baseline max_num_seqs=107(configured) encoder=20seg/66.0s budget=1.000(configured) workers=load:2/vad:2"
         );
+
+        let metal = format_serve_start_log(
+            &pipeline,
+            "metal",
+            "hardware",
+            "auto",
+            "auto",
+            Some(vasr::ExecutionPolicy {
+                active_slots: 64,
+                decode_rows: 64,
+                mixed_step: true,
+                prefill_wave: 16,
+            }),
+        );
+        assert_eq!(
+            metal,
+            "start | model=Qwen/Qwen3-ASR-0.6B device=metal probe=hardware max_num_seqs=107(auto) active_slots=64 decode_rows=64 mixed_step=true prefill_wave=16 encoder=20seg/66.0s budget=1.000(auto) workers=load:2/vad:2"
+        );
+        assert_eq!(metal.matches('|').count(), 1);
     }
 
     #[test]
     fn execution_policy_detail_requires_verbose() {
         let default = default_log_filter(false);
         assert!(
-            default.contains("vasr::execution=info"),
-            "default filter must keep the resolved-policy summary line: {default}"
-        );
-        assert!(
-            !default.contains("vasr::execution=debug"),
-            "default filter must not enable per-component policy detail: {default}"
+            !default.contains("vasr::execution"),
+            "default filter leaves execution detail off; the summary lives on the start line: {default}"
         );
 
         let verbose = default_log_filter(true);

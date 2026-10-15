@@ -112,6 +112,12 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         args.language.clone(),
         tuning.reserved_gpu_bytes,
     )?;
+    // 模型已经加载，转写开始前打 ready，和 serve 的启动顺序对齐。
+    tracing::info!(
+        target: "vasr_transcribe::run",
+        "ready | inputs={}",
+        items.len(),
+    );
     let inputs = items
         .iter()
         .enumerate()

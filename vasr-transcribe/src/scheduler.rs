@@ -193,11 +193,11 @@ impl AsrModel for ScheduledAsrModel {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use asr_data::{Timeline, Waveform};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use asr_data::{Timeline, Waveform};
 
     use super::{InferenceScheduler, ScheduledAsrModel};
     use vasr::{AsrOptions, OfflineAsrModel as AsrModel};

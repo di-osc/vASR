@@ -391,7 +391,12 @@ fn attach_channel_timeline(audio: &mut Audio, channel_name: &str, source: &Timel
         };
         if transcription.sentences.is_empty() {
             let range = event.range();
-            if !annotate_sentence(&mut timeline, &transcription.text, range.start_ms, range.end_ms) {
+            if !annotate_sentence(
+                &mut timeline,
+                &transcription.text,
+                range.start_ms,
+                range.end_ms,
+            ) {
                 annotation_failed = true;
                 break 'events;
             }
@@ -1110,7 +1115,13 @@ mod tests {
             250,
             13_930,
         );
-        push_prediction(&mut audio, AudioChannel::Mono, "我没有找工作。", 14_460, 21_450);
+        push_prediction(
+            &mut audio,
+            AudioChannel::Mono,
+            "我没有找工作。",
+            14_460,
+            21_450,
+        );
 
         clean_call_boundary_noise(&mut audio);
 

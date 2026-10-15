@@ -111,6 +111,8 @@ impl ExecutionPolicy {
     }
 
     /// 解析一次并打印最终生效的策略，便于性能报告复现配置。
+    ///
+    /// `serve` 不再单独打这行，相同字段写在启动日志的 `start` 里。
     pub fn log_resolved(&self, target: &str, device_label: &str, capacity: usize) {
         tracing::info!(
             target: "vasr::execution",

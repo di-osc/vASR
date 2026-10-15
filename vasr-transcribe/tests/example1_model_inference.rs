@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use candle_core::{DType, Device};
-use vasr::{AudioInput, Qwen3ASR, models::qwen3asr::Batch};
 use asr_data::{
     AudioChannel, AudioDb, AudioDbMode, AudioQuery, AudioSource, compute_cer, normalize_for_cer,
 };
+use candle_core::{DType, Device};
+use vasr::{AudioInput, Qwen3ASR, models::qwen3asr::Batch};
 
 const MODEL_ID: &str = "Qwen/Qwen3-ASR-0.6B";
 

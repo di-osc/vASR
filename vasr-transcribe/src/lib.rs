@@ -2,9 +2,9 @@
 // 工作区对非测试代码依然 deny 这两个 lint。
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod inputs;
 mod device;
 pub mod eval;
+mod inputs;
 mod legacy_audiodb;
 pub mod perf;
 pub mod pipeline;
