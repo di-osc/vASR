@@ -36,7 +36,7 @@ with open(os.environ['REFACTOR_TEST_INVOCATIONS'], 'a') as f:
     f.write(json.dumps({'binary':pathlib.Path(sys.argv[0]).name,'command':sys.argv[1],'fast_math':os.environ.get('CANDLE_METAL_ENABLE_FAST_MATH'),
         'options':{k:v for k,v in os.environ.items() if k.startswith('VASR_')}})+'\\n')
 if sys.argv[1] == 'serve':
-    print('server ready | http://0.0.0.0:8868',flush=True)
+    print('ready | http://0.0.0.0:8868 endpoints=health,transcribe',flush=True)
     time.sleep(30)
 else:
     if sys.argv[1] == 'perf':

@@ -46,7 +46,7 @@ PY
     server_pid=$!
     ready=0
     for attempt in {1..90}; do
-        if kill -0 "$server_pid" 2>/dev/null && rg -q 'server ready .*:8868' "$prefix-server.log" && curl -fsS http://127.0.0.1:8868/health >/dev/null 2>&1; then ready=1; break; fi
+        if kill -0 "$server_pid" 2>/dev/null && rg -q 'ready \| http://.*:8868' "$prefix-server.log" && curl -fsS http://127.0.0.1:8868/health >/dev/null 2>&1; then ready=1; break; fi
         if ! kill -0 "$server_pid" 2>/dev/null; then tail -n 30 "$prefix-server.log"; exit 1; fi
         sleep 1
     done
